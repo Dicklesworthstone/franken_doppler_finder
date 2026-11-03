@@ -113,6 +113,11 @@ pub fn parse_dates(s: &str) -> Result<(Ymd, Ymd), String> {
     Ok((d0, d1))
 }
 
+/// `fdop_runs/<media stem>_<unix seconds>`, the run directory when `-o` is not given.
+pub fn default_run_dir(media: &Path) -> PathBuf {
+    PathBuf::from("fdop_runs").join(format!("{}_{}", stem(media), unix_now() as u64))
+}
+
 /// UTC window for the recording START: local midnight of the first day .. local midnight after
 /// the last day, using the region's UTC offset range (DST included).
 pub fn start_window(d0: Ymd, d1: Ymd, off: (f64, f64)) -> (f64, f64) {
@@ -412,13 +417,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         });
         rx
     };
-    let run_dir = a.out.clone().unwrap_or_else(|| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        PathBuf::from("fdop_runs").join(format!("{}_{}", stem(&a.media), now))
-    });
+    let run_dir = a.out.clone().unwrap_or_else(|| default_run_dir(&a.media));
     std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
     // ---- audio --------------------------------------------------------------------------
     let t = Instant::now();
@@ -891,7 +890,9 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         ));
         let place = fdop_geo::geocode::describe_location(net.as_ref(), &gaz, lat, lon);
         log.say(&format!("place: {}", place.headline));
-        if let Some(w) = region.outside_states_warning(place.state_abbr.as_deref()) {
+        if let Some(w) =
+            region.outside_states_warning(place.state_abbr.as_deref(), place.source == "census-api")
+        {
             warnings.push(w);
         }
         report.answer = Answer {

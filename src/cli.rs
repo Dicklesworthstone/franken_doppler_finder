@@ -155,11 +155,16 @@ fn run(cli: Cli) -> Result<i32, String> {
         Cmd::Locate(l) => {
             let log = Log::new(l.common.quiet);
             let cache = cache_of(&l.common);
+            let run_dir = l
+                .out
+                .clone()
+                .unwrap_or_else(|| pipeline::default_run_dir(&l.media));
             let args = LocateArgs {
                 media: l.media.clone(),
                 dates: l.dates.clone(),
                 near: l.near.clone(),
-                out: l.out.clone(),
+                // fixed here, so a run that fails part-way can still name its partial outputs
+                out: Some(run_dir.clone()),
                 cache: cache.clone(),
                 offline: l.common.offline,
                 start: l.start.clone(),
@@ -183,11 +188,11 @@ fn run(cli: Cli) -> Result<i32, String> {
                             region: l.near.clone(),
                             confidence: "error".into(),
                             headline: e.clone(),
-                            run_dir: l
-                                .out
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default(),
+                            run_dir: if run_dir.is_dir() {
+                                run_dir.display().to_string()
+                            } else {
+                                String::new()
+                            },
                             total_s: t0.elapsed().as_secs_f64(),
                             ..Default::default()
                         },

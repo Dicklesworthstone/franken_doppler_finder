@@ -43,23 +43,38 @@ pub struct Region {
 }
 
 impl Region {
-    /// A warning when a state search's answer lies in another state (`state_abbr` from the
-    /// reverse geocode). A state search covers the state's bounding box, which takes in parts
-    /// of its neighbours; other region kinds are boxes or circles by design.
-    pub fn outside_states_warning(&self, state_abbr: Option<&str>) -> Option<String> {
+    /// A warning when a state search's answer lies in another state. `state_abbr` comes from the
+    /// reverse geocode; `contained` says it is a Census containment result rather than the
+    /// offline estimate (nearest gazetteer place or state box), which can be wrong near a
+    /// border. A state search covers the state's bounding box, which takes in parts of its
+    /// neighbours; other region kinds are boxes or circles by design.
+    pub fn outside_states_warning(
+        &self,
+        state_abbr: Option<&str>,
+        contained: bool,
+    ) -> Option<String> {
         let st = state_abbr?;
         if self.kind != RegionKind::States || self.states.iter().any(|s| s == st) {
             return None;
         }
-        Some(format!(
-            "the answer lies in {st}, outside the searched {} {}: a state search covers the bounding box, which takes in parts of neighbouring states",
+        let searched = format!(
+            "{} {}",
             if self.states.len() == 1 {
                 "state"
             } else {
                 "states"
             },
             self.states.join(", ")
-        ))
+        );
+        let why =
+            "a state search covers the bounding box, which takes in parts of neighbouring states";
+        Some(if contained {
+            format!("the answer lies in {st}, outside the searched {searched}: {why}")
+        } else {
+            format!(
+                "the answer appears to lie in {st} (an offline estimate from the gazetteer, not a containment test), outside the searched {searched}: {why}"
+            )
+        })
     }
 }
 
@@ -512,24 +527,30 @@ mod tests {
     fn answer_outside_the_searched_state_is_flagged() {
         let ny = parse_region("NY", &ctx()).unwrap();
         let w = ny
-            .outside_states_warning(Some("CT"))
+            .outside_states_warning(Some("CT"), true)
             .expect("CT is outside NY");
         assert!(
-            w.contains("lies in CT") && w.contains("searched state NY"),
+            w.contains("the answer lies in CT") && w.contains("searched state NY"),
             "{w}"
         );
-        assert_eq!(ny.outside_states_warning(Some("NY")), None);
-        assert_eq!(ny.outside_states_warning(None), None);
-        let two = parse_region("NY, NJ", &ctx()).unwrap();
-        assert_eq!(two.outside_states_warning(Some("NJ")), None);
+        // without the Census containment lookup the state is an estimate, and says so
+        let est = ny.outside_states_warning(Some("CT"), false).unwrap();
         assert!(
-            two.outside_states_warning(Some("PA"))
+            est.contains("appears to lie in CT") && est.contains("estimate"),
+            "{est}"
+        );
+        assert_eq!(ny.outside_states_warning(Some("NY"), true), None);
+        assert_eq!(ny.outside_states_warning(None, true), None);
+        let two = parse_region("NY, NJ", &ctx()).unwrap();
+        assert_eq!(two.outside_states_warning(Some("NJ"), true), None);
+        assert!(
+            two.outside_states_warning(Some("PA"), true)
                 .unwrap()
                 .contains("states NY, NJ")
         );
         // a point region is a circle by design, so a neighbouring state is not news
         let pt = parse_region("40.87,-73.52,25", &ctx()).unwrap();
-        assert_eq!(pt.outside_states_warning(Some("CT")), None);
+        assert_eq!(pt.outside_states_warning(Some("CT"), true), None);
     }
 
     #[test]
