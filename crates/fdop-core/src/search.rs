@@ -1483,6 +1483,12 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
         ));
         if let Some(v) = &set.stored {
             total += v.len();
+        } else if !full {
+            // beyond --max-events is documented; a budget demotion must not be silent
+            warnings.push(format!(
+                "{}: {} hypotheses did not fit the hypothesis budget ({cap} left), so it only confirms; narrow the region or dates to let it drive the search",
+                e.id, set.count
+            ));
         }
         hyps.push(set.stored);
         nulls.push(null);
@@ -2430,7 +2436,16 @@ mod tests {
         });
     }
 
-    fn locate_two(med: fdop_types::atmo::Medium) {
+    /// Two synthetic flyovers of an observer (flights A and B) plus a parallel decoy (D1).
+    struct TwoCase {
+        tracks: Vec<TrackModel>,
+        events: Vec<SearchEvent>,
+        p: SearchParams,
+        t_s: f64,
+        obs: (f64, f64),
+    }
+
+    fn two_flyover_case(med: fdop_types::atmo::Medium) -> TwoCase {
         let c = 343.0;
         let (lat0, lon0) = (40.8765, -73.5250);
         let enu = Enu::new(lat0, lon0, 0.0);
@@ -2476,17 +2491,52 @@ mod tests {
         let region = BBox::new(lat0 - 0.15, lon0 - 0.2, lat0 + 0.15, lon0 + 0.2);
         let mut p = SearchParams::new(t_s - 3600.0, t_s + 3600.0, 3000.0, region);
         p.refine_half_m = 400.0;
+        TwoCase {
+            tracks,
+            events: vec![e1, e2],
+            p,
+            t_s,
+            obs: (lat0, lon0),
+        }
+    }
+
+    fn run_case(case: &TwoCase, med: fdop_types::atmo::Medium) -> SearchResult {
         let dem = FlatElevation(0.0);
         let atmo = fdop_types::atmo::UniformAtmosphere(med);
         let inp = SearchInputs {
-            events: vec![e1, e2],
-            tracks: &tracks,
+            events: case.events.clone(),
+            tracks: &case.tracks,
             heard_times: vec![],
             coarse_dem: &dem,
             fine_dem: &dem,
             atmo: &atmo,
         };
-        let res = run(&inp, &p, &|_s| {});
+        run(&inp, &case.p, &|_s| {})
+    }
+
+    #[test]
+    fn over_budget_events_only_confirm_and_say_so() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        case.p.max_hyp_per_event = 10;
+        let res = run_case(&case, med);
+        assert!(res.candidates.is_empty(), "funnel {:?}", res.funnel);
+        for id in ["e1", "e2"] {
+            assert!(
+                res.warnings
+                    .iter()
+                    .any(|w| w.starts_with(&format!("{id}: ")) && w.contains("only confirms")),
+                "{:?}",
+                res.warnings
+            );
+        }
+    }
+
+    fn locate_two(med: fdop_types::atmo::Medium) {
+        let c = 343.0;
+        let case = two_flyover_case(med);
+        let (t_s, (lat0, lon0)) = (case.t_s, case.obs);
+        let res = run_case(&case, med);
         assert!(!res.candidates.is_empty(), "funnel {:?}", res.funnel);
         let top = &res.candidates[0];
         let r = res.refine.as_ref().unwrap();

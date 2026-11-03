@@ -30,7 +30,7 @@ pub enum Cmd {
         limit: usize,
         #[arg(long)]
         json: bool,
-        /// Cache root holding runs.sqlite (default: $FDOP_CACHE or ~/.cache/fdop).
+        /// Cache root holding runs.sqlite (default: $FDOP_CACHE, $FDOP_CACHE_DIR, $XDG_CACHE_HOME/fdop or ~/.cache/fdop).
         #[arg(long)]
         cache: Option<PathBuf>,
     },
@@ -39,7 +39,7 @@ pub enum Cmd {
         /// Also probe the network services (adsb.lol releases, NGS geoid, Census geocoder, tiles).
         #[arg(long)]
         network: bool,
-        /// Cache root to check (default: $FDOP_CACHE or ~/.cache/fdop).
+        /// Cache root to check (default: $FDOP_CACHE, $FDOP_CACHE_DIR, $XDG_CACHE_HOME/fdop or ~/.cache/fdop).
         #[arg(long)]
         cache: Option<PathBuf>,
     },
@@ -52,7 +52,7 @@ pub enum Cmd {
 
 #[derive(Args, Debug, Clone)]
 pub struct Common {
-    /// Cache root (ADS-B day stores, terrain, gazetteer, map tiles). Default: $FDOP_CACHE or ~/.cache/fdop.
+    /// Cache root (ADS-B day stores, terrain, gazetteer, map tiles). Default: $FDOP_CACHE, $FDOP_CACHE_DIR, $XDG_CACHE_HOME/fdop or ~/.cache/fdop.
     #[arg(long, global = false)]
     pub cache: Option<PathBuf>,
     /// Never use the network (cached data only).
@@ -70,7 +70,7 @@ pub struct LocateCli {
     /// Local date(s) of the recording: YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD.
     #[arg(long)]
     pub dates: String,
-    /// Coarse US region: "NY", "New York", "Long Island"-style place "Oyster Bay, NY", "Nassau County, NY", a ZIP, "lat,lon[,km]", "S,W,N,E", or "CONUS".
+    /// Coarse US region: "NY", "New York", a place "Oyster Bay, NY", a county "Nassau County, NY", a ZIP, "lat,lon[,km]", "S,W,N,E", or "CONUS".
     #[arg(long)]
     pub near: String,
     /// Output directory (default fdop_runs/<name>_<time>).
@@ -283,13 +283,44 @@ fn run(cli: Cli) -> Result<i32, String> {
             } else {
                 fdop_data::geoid_height_or_default(region.center.0, region.center.1).0
             };
-            let spec = fdop_data::IngestSpec {
+            let mut spec = fdop_data::IngestSpec {
                 bbox: region.bbox.padded_km(f.pad_km),
                 t_start: lo - 1200.0,
                 t_end: hi + 4.0 * 3600.0,
                 geoid_n_m: n,
                 keep_unknown: true,
             };
+            // as in `locate`: fetch the published part, name the UTC days still pending
+            let (until, pending) = fdop_data::published_until(
+                spec.t_start,
+                spec.t_end,
+                &cache,
+                f.common.offline,
+                pipeline::unix_now(),
+            )
+            .map_err(|e| format!("ADS-B availability: {e}"))?;
+            if !pending.is_empty() {
+                let why = format!(
+                    "the ADS-B archive for UTC day(s) {} is not published yet{} (adsb.lol releases each UTC day a few hours after it ends)",
+                    pending.join(", "),
+                    if f.common.offline {
+                        " or not cached"
+                    } else {
+                        ""
+                    }
+                );
+                if until <= spec.t_start {
+                    return Err(format!(
+                        "{why}; nothing to fetch for {}: rerun later",
+                        f.dates
+                    ));
+                }
+                log.say(&format!(
+                    "warning: {why}; fetching up to {} only, rerun after the release for the rest",
+                    fdop_types::time::iso_utc(until)
+                ));
+                spec.t_end = until - 1.0;
+            }
             let lg = log.clone();
             let opts = fdop_data::FetchOptions {
                 offline: f.common.offline,

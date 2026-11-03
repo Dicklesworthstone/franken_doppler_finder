@@ -370,9 +370,10 @@ fdop fetch --dates 2026-09-07..2026-09-09 --near "Nassau County, NY" --pad-km 50
 ```
 
 This caches the ADS-B day stores that `locate` will need, which is useful before going offline or before
-several runs. It prints `<legs> legs, <points> points cached under <cache>`. Unlike `locate`, `fetch` does not
-clip to the published archive: a date that runs into a UTC day adsb.lol has not published yet fails until that
-day appears.
+several runs. It prints `<legs> legs, <points> points cached under <cache>`. Like `locate`, it fetches only the
+published part of the archive. When the dates run into a UTC day adsb.lol has not published yet, it warns
+which days are pending and stops before them. If no published day is left, it exits with an error: rerun after
+the release.
 
 ### `fdop runs`: the run ledger
 
@@ -482,8 +483,8 @@ that day again.
 | ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing |
 | Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Jets are dropped; unknown types are kept |
 | Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | First usable source wins; falls back to a 15 °C standard atmosphere with a warning |
-| Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search |
-| Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL; −30 m if unreachable |
+| Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search; a tile that cannot be fetched counts as 0 m, with a warning giving the number of such tiles |
+| Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL; −30 m, with a warning, if unreachable or `--offline` |
 | Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Offline fallback uses the gazetteer's internal points |
 | Basemap | [USGS The National Map](https://www.usgs.gov/programs/national-geospatial-program/national-map) Topo tiles; OSM in the HTML report | |
 
@@ -525,7 +526,8 @@ Design notes:
   physical memory: a tenth of RAM, clamped to 200 M–2 G hypotheses in total (4–40 GB), so on machines with less
   than 40 GB the floor is more than a tenth.
   A pair-join or fine-stage cut is reported in `funnel.truncated` and the warnings. An event that exceeds its
-  hypothesis budget, or falls beyond `--max-events`, drops to confirmer-only, which `funnel.hypotheses` shows.
+  hypothesis budget, or falls beyond `--max-events`, drops to confirmer-only, which `funnel.hypotheses` shows;
+  a budget demotion is also a warning.
 - **Parallel, and repeatable up to exact ties.** rayon runs the STFT frames, the template bank, tracing and
   every search stage. Each FFT is pinned to one worker so it does not nest inside rayon. Null sampling uses a
   fixed hash. Candidates with exactly equal scores can come out in a different order from run to run.
@@ -666,9 +668,6 @@ audio or video recorded somewhere sensitive:
   (low) answer can land outside the state (Connecticut for a New York search).
 - Helicopter passes (rotor tones, speed changes) can fit with confidently wrong speed and distance. They do
   harm only through false pairings, which the margin gate is meant to catch.
-- Two fallbacks put no warning in the report. A failed NGS geoid lookup uses −30 m, and the log line names the
-  source. A terrain tile that cannot be fetched gives 0 m for its area, and only a lower "tiles ready" count in
-  the log shows it.
 
 ---
 

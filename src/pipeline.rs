@@ -75,7 +75,7 @@ pub type Ymd = (i64, u32, u32);
 /// Points and colour of an extra curve on an event figure.
 type ExtraCurve = (Vec<(f64, f64)>, [u8; 3]);
 
-fn unix_now() -> f64 {
+pub(crate) fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -578,6 +578,16 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     } else {
         fdop_data::geoid_height_or_default(region.center.0, region.center.1)
     };
+    if geoid_src != "ngs" {
+        warnings.push(format!(
+            "geoid height N = {geoid_n:.0} m is a default ({}); across CONUS N runs from about -10 to -35 m, so ADS-B GNSS altitudes can be off by up to about 20 m",
+            if a.offline {
+                "--offline"
+            } else {
+                "the NGS GEOID lookup failed"
+            }
+        ));
+    }
     let spec = fdop_data::IngestSpec {
         bbox: fetch_box,
         t_start: full_window.0.min(s_lo) - 1200.0,
@@ -670,6 +680,18 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     let _ = (s_lo, s_hi);
     timings.insert("search_s".into(), json!(t.elapsed().as_secs_f64()));
     warnings.extend(res.warnings.iter().cloned());
+    // a tile that cannot be read or fetched answers 0 m; say how much ground that covered
+    let (lost_coarse, lost_fine) = (coarse.failures(), fine.failures());
+    if lost_coarse + lost_fine > 0 {
+        warnings.push(format!(
+            "terrain: {lost_coarse} coarse (z10) and {lost_fine} fine (z13) tiles could not be {}; ground elevation there was taken as 0 m",
+            if a.offline {
+                "read from the cache (--offline)"
+            } else {
+                "fetched"
+            }
+        ));
+    }
     write_json(&run_dir.join("search.json"), &res)?;
     // ---- answer -------------------------------------------------------------------------
     let t = Instant::now();
