@@ -480,6 +480,7 @@ that day again.
 franken_doppler_finder/
 ├── src/                     fdop binary: cli.rs, pipeline.rs (locate), ledger.rs, doctor.rs, selftest.rs
 ├── examples/explain.rs      score named (event, flight) pairs at a point; residual diagnostics
+├── examples/truth.rs        known place + clock: archived passes near it vs the detected events
 └── crates/
     ├── fdop-types/          shared types: geodesy (WGS84, ECEF, ENU), time, atmosphere, .fdtrk store, engine table
     ├── fdop-http/           HTTP/1.1 client on asupersync + rustls: retries, resumable streaming
@@ -559,6 +560,7 @@ Developer examples (`cargo run --release -p <crate> --example <name> -- ...`):
 |---|---|---|
 | `detect_file <media> [sr]` | fdop-core | Detection and measurement with timings; optional survey and event PNGs |
 | `explain <run_dir> <stores> <lat> <lon> <t_start> <event:icao>...` | root | Scores named (event, flight) pairs at a point; residuals over a grid of sound speeds |
+| `truth <run_dir> <stores> <lat> <lon> <t_start> [elev_m] [max_km]` | root | For a recording whose place and clock are known: lists the archived passes near that place while it recorded and pairs them with the detected events. Without `events.json` in `run_dir` it lists the 24 h after `t_start`, which helps pick test windows |
 | `probe [MiB]` | fdop-http | Streams part of an adsb.lol archive and reports throughput |
 | `ingest_ny`, `check_oracle`, `store_stats` | fdop-data | Reference-case ingest (New York, 2026-09-08 to 2026-09-10, about 12 GB), oracle position checks, store summaries |
 | `live_check <out_dir>` | fdop-geo | Live region parsing, geocoding, map and report rendering |
@@ -600,6 +602,7 @@ audio or video recorded somewhere sensitive:
 | `date range ... spans more than 15 days; narrow it` | Range too long | Split it into several runs |
 | `needs network or a cached file: Census gazetteer ...` | `--offline` before the gazetteer was cached | Run once online, or use a state, point or box region |
 | `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days are cached. A day missing from adsb.lol cannot be searched |
+| Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears a few hours after it ends, usually by 04:00 UTC | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |
 | Answer graded **low** | One or more gates failed | Read the gates in `report.html`. A small margin means another flight pair explains the curves almost as well |
 | Disk filling up | Many cached regions and days | Delete old `adsb/<date>/` folders under the cache root |
 

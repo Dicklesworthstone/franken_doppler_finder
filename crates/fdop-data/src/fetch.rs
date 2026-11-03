@@ -118,6 +118,106 @@ fn find_cached(dir: &Path, feedset: &str, want: &BBox) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// Cache feedset name of a day store built from `main` (prod or staging) plus optional mlatonly.
+fn feedset_name(main: Feed, mlat: bool) -> String {
+    format!("{}{}", main.tag_word(), if mlat { "+mlatonly" } else { "" })
+}
+
+/// Feedset of a store built from release `tags` (e.g. `v2026.11.02-planes-readsb-prod-0`).
+fn feedset_of_tags(tags: &[String]) -> String {
+    let has = |f: Feed| {
+        tags.iter()
+            .any(|t| t.contains(&format!("-{}-", f.tag_word())))
+    };
+    let main = if has(Feed::Prod) {
+        Feed::Prod
+    } else {
+        Feed::Staging
+    };
+    feedset_name(main, has(Feed::Mlatonly))
+}
+
+/// Best feedset obtainable from `rels` (None without a prod or staging release).
+fn feedset_available(rels: &[DayRelease], include_mlat: bool) -> Option<String> {
+    let main = if rels.iter().any(|r| r.feed == Feed::Prod) {
+        Feed::Prod
+    } else if rels.iter().any(|r| r.feed == Feed::Staging) {
+        Feed::Staging
+    } else {
+        return None;
+    };
+    Some(feedset_name(
+        main,
+        include_mlat && rels.iter().any(|r| r.feed == Feed::Mlatonly),
+    ))
+}
+
+/// Lesser feedsets that can stand in for `want` when the day lacks a release.
+fn partial_feedsets(want: &str) -> &'static [&'static str] {
+    if want == "prod+mlatonly" {
+        &["prod", "staging+mlatonly", "staging"]
+    } else {
+        &["staging"]
+    }
+}
+
+/// adsb.lol publishes a UTC day's archive some hours after the day ends; a missing day younger
+/// than this may still appear, an older one never will.
+pub const PUBLISH_LAG_S: f64 = 2.0 * 86_400.0;
+
+/// End of the usable ADS-B archive for `[t0, t1]` at time `now`, and the labels of the trailing
+/// UTC days that are pending: not over yet, or over for less than [`PUBLISH_LAG_S`] with neither
+/// a cached day store nor a prod/staging release (offline: no cached store). Returns `(t1, [])`
+/// when the last day is usable. Older missing days are not pending; `fetch_window` reports them.
+pub fn published_until(
+    t0: f64,
+    t1: f64,
+    cache_dir: &Path,
+    offline: bool,
+    now: f64,
+) -> Result<(f64, Vec<String>), DataError> {
+    let mut until = t1;
+    let mut pending = Vec::new();
+    let mut net: Option<fdop_http::Net> = None;
+    for day in utc_days(t0, t1).into_iter().rev() {
+        let start = days_from_civil(day.0, day.1, day.2) as f64 * 86_400.0;
+        let end = start + 86_400.0;
+        let label = format!("{:04}-{:02}-{:02}", day.0, day.1, day.2);
+        let is_pending = if end > now {
+            true
+        } else if end + PUBLISH_LAG_S > now {
+            let dir = day_dir(cache_dir, day);
+            let cached = std::fs::read_dir(&dir).is_ok_and(|rd| {
+                rd.flatten()
+                    .any(|e| parse_cache_name(&e.file_name().to_string_lossy()).is_some())
+            });
+            if cached {
+                false
+            } else if offline {
+                true
+            } else {
+                if net.is_none() {
+                    net = Some(fdop_http::Net::new()?);
+                }
+                let rels =
+                    find_day_releases_cached(net.as_ref(), day.0, day.1, day.2, &dir, false)?;
+                !rels
+                    .iter()
+                    .any(|r| matches!(r.feed, Feed::Prod | Feed::Staging))
+            }
+        } else {
+            false
+        };
+        if !is_pending {
+            break;
+        }
+        until = start;
+        pending.push(label);
+    }
+    pending.reverse();
+    Ok((until.min(t1), pending))
+}
+
 /// Re-reference GNSS-derived heights from the store's geoid value to `n_target`.
 pub fn adjust_geoid(store: &mut TrackStore, n_target: f64) {
     let d = (store.meta.geoid_n_m - n_target) as f32;
@@ -191,11 +291,41 @@ pub fn fetch_window(
                 )),
             }
         }
+        // a store built while a release was missing: use it when nothing better exists
+        let partial = partial_feedsets(feedset)
+            .iter()
+            .find_map(|fs| find_cached(&dir, fs, &spec.bbox).map(|p| (p, *fs)));
+        let rels = if opts.offline {
+            Vec::new()
+        } else {
+            find_day_releases_cached(net.as_ref(), day.0, day.1, day.2, &dir, false)?
+        };
+        if let Some((p, fs)) = &partial
+            && (opts.offline
+                || feedset_available(&rels, opts.include_mlat).is_none_or(|a| a.as_str() == *fs))
+        {
+            match TrackStore::load(p) {
+                Ok(s) => {
+                    opts.say(&format!(
+                        "[adsb] {label}: cached {} ({} legs; {fs} only, nothing better is published)",
+                        p.display(),
+                        s.legs.len()
+                    ));
+                    notes.push(format!("{label}: {fs} only"));
+                    day_stores[i] = Some(s);
+                    cache_hits += 1;
+                    continue;
+                }
+                Err(e) => opts.say(&format!(
+                    "[adsb] {label}: unreadable cache {} ({e}); refetching",
+                    p.display()
+                )),
+            }
+        }
         if opts.offline {
             missing.push(format!("{label} (offline, not cached)"));
             continue;
         }
-        let rels = find_day_releases_cached(net.as_ref(), day.0, day.1, day.2, &dir, false)?;
         let main = rels
             .iter()
             .find(|r| r.feed == Feed::Prod)
@@ -319,9 +449,12 @@ pub fn fetch_window(
     for (di, (parts, mut tags)) in per_day {
         tags.sort();
         let day = days[di];
+        // named by what was actually streamed, so a day fetched before its mlatonly (or prod)
+        // release existed is not mistaken for a complete one later
+        let fs = feedset_of_tags(&tags);
         let store = build_store(parts, &day_spec(day), tags);
         let dir = day_dir(cache_dir, day);
-        let path = dir.join(format!("{feedset}_{key}.fdtrk"));
+        let path = dir.join(format!("{fs}_{key}.fdtrk"));
         store.save(&path)?;
         opts.say(&format!(
             "[adsb] {:04}-{:02}-{:02}: built {} legs / {} points -> {}",
@@ -451,5 +584,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.legs.len(), 1);
+    }
+
+    #[test]
+    fn recent_unpublished_days_are_pending() {
+        let dir =
+            std::env::temp_dir().join(format!("fdop-data-pending-test-{}", std::process::id()));
+        let d8 = dir.join("adsb").join("2026-09-08");
+        std::fs::create_dir_all(&d8).unwrap();
+        std::fs::write(d8.join("prod_40.0_-74.0_41.0_-73.0.fdtrk"), b"x").unwrap();
+        let t8 = fdop_types::time::parse_iso_utc("2026-09-08T00:00:00Z").unwrap();
+        let day = 86_400.0;
+        // 09-09 is over but young and has no archive; 09-08 is cached
+        let (until, pend) = published_until(
+            t8 + 3600.0,
+            t8 + day + 7200.0,
+            &dir,
+            true,
+            t8 + 2.0 * day + 3600.0,
+        )
+        .unwrap();
+        assert_eq!(until, t8 + day);
+        assert_eq!(pend, vec!["2026-09-09".to_string()]);
+        // days that have not ended cannot be published, cache or not
+        let (until, pend) = published_until(t8, t8 + day, &dir, true, t8 + 5.0 * 3600.0).unwrap();
+        assert_eq!(until, t8);
+        assert_eq!(pend.len(), 2);
+        // an old missing day is not pending: fetch_window reports it as missing
+        let t1 = t8 + day + 7200.0;
+        assert_eq!(
+            published_until(t8, t1, &dir, true, t8 + 10.0 * day).unwrap(),
+            (t1, vec![])
+        );
     }
 }

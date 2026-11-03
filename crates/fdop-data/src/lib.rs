@@ -19,7 +19,7 @@ pub mod weather;
 
 pub use adsblol::{AssetPart, DayRelease, Feed, find_day_releases};
 pub use build::{build_store, merge_stores};
-pub use fetch::{FetchOptions, fetch_window};
+pub use fetch::{FetchOptions, fetch_window, published_until};
 pub use geoid::{geoid_height, geoid_height_or_default};
 pub use ingest::{
     IngestProgress, IngestSpec, IngestStats, RawAircraft, RawPoint, ingest_path, ingest_reader,

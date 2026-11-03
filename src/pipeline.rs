@@ -75,6 +75,13 @@ pub type Ymd = (i64, u32, u32);
 /// Points and colour of an extra curve on an event figure.
 type ExtraCurve = (Vec<(f64, f64)>, [u8; 3]);
 
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 /// Parse "D0", "D0..D1", "D0 to D1", "D0,D1" into inclusive local dates.
 pub fn parse_dates(s: &str) -> Result<(Ymd, Ymd), String> {
     let t = s.trim();
@@ -304,6 +311,41 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     ));
     let (d0, d1) = parse_dates(&a.dates)?;
     let (mut s_lo, mut s_hi) = start_window(d0, d1, region.utc_offset_h);
+    // adsb.lol publishes each UTC day a few hours after it ends, so yesterday's local date
+    // usually reaches into a UTC day without an archive: search the published part, say so
+    let (adsb_end, pending) = fdop_data::published_until(
+        s_lo - 1200.0,
+        s_hi + info.duration_s + 1200.0,
+        &a.cache,
+        a.offline,
+        unix_now(),
+    )
+    .map_err(|e| format!("ADS-B availability: {e}"))?;
+    let adsb_end = if pending.is_empty() {
+        f64::INFINITY
+    } else {
+        // the last flyover needs a couple of minutes of track after the recording ends
+        let hi = s_hi.min(adsb_end - info.duration_s - 300.0);
+        let why = format!(
+            "the ADS-B archive for UTC day(s) {} is not published yet{} (adsb.lol releases each UTC day a few hours after it ends)",
+            pending.join(", "),
+            if a.offline { " or not cached" } else { "" }
+        );
+        if hi < s_lo {
+            return Err(format!(
+                "{why}; no published day covers a {:.0} min recording on {}: rerun later",
+                info.duration_s / 60.0,
+                a.dates
+            ));
+        }
+        warnings.push(format!(
+            "{why}: only recording starts up to {} were searched; rerun after the release to cover the rest of {}",
+            iso_utc(hi),
+            a.dates
+        ));
+        s_hi = hi;
+        adsb_end - 1.0
+    };
     let full_window = (s_lo, s_hi);
     let mut window_note = format!(
         "recording start between {} and {} (local dates {} at UTC{:+}..{:+})",
@@ -313,6 +355,12 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         region.utc_offset_h.0,
         region.utc_offset_h.1
     );
+    if !pending.is_empty() {
+        window_note.push_str(&format!(
+            "; clipped to the published ADS-B archive ({} pending)",
+            pending.join(", ")
+        ));
+    }
     let mut meta_window = false;
     if let Some(s) = &a.start {
         let t = parse_iso_utc(s).map_err(|e| format!("--start: {e}"))?;
@@ -323,6 +371,12 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             iso_utc(t),
             a.clock_tol_s
         );
+        if s_hi + info.duration_s > adsb_end {
+            warnings.push(format!(
+                "--start reaches past the published ADS-B archive (ends {}); flyovers after it cannot be matched",
+                iso_utc(adsb_end)
+            ));
+        }
     } else if !a.ignore_metadata_time
         && let Some(ct) = info.creation_unix
         && ct >= full_window.0 - info.duration_s
@@ -526,8 +580,8 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     };
     let spec = fdop_data::IngestSpec {
         bbox: fetch_box,
-        t_start: full_window.0 - 1200.0,
-        t_end: full_window.1 + dur + 1200.0,
+        t_start: full_window.0.min(s_lo) - 1200.0,
+        t_end: (full_window.1.max(s_hi) + dur + 1200.0).min(adsb_end),
         geoid_n_m: geoid_n,
         keep_unknown: true,
     };

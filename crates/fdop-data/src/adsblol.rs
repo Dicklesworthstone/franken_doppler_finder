@@ -190,8 +190,26 @@ pub fn find_day_releases(net: &Net, y: i64, m: u32, d: u32) -> Result<Vec<DayRel
     Ok(out)
 }
 
-/// [`find_day_releases`] with a JSON cache at `<dir>/releases.json` (only non-empty results are
-/// cached; a missing day is re-checked next time). `offline` never touches the network.
+/// True when a listing has everything a day can have (prod and mlatonly).
+pub fn releases_complete(v: &[DayRelease]) -> bool {
+    v.iter().any(|r| r.feed == Feed::Prod) && v.iter().any(|r| r.feed == Feed::Mlatonly)
+}
+
+/// True when the UTC day ended more than [`crate::fetch::PUBLISH_LAG_S`] ago: whatever releases
+/// it has now are all it will ever have.
+pub fn day_settled(y: i64, m: u32, d: u32) -> bool {
+    let end = (fdop_types::time::days_from_civil(y, m, d) + 1) as f64 * 86_400.0;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.as_secs_f64())
+        .unwrap_or(f64::INFINITY);
+    end + crate::fetch::PUBLISH_LAG_S < now
+}
+
+/// [`find_day_releases`] with a JSON cache at `<dir>/releases.json`. Only non-empty results are
+/// cached, and an incomplete cached listing (no prod or no mlatonly) of a day that is not
+/// [settled](day_settled) is re-checked, since the missing release may have been published
+/// since. `offline` never touches the network.
 pub fn find_day_releases_cached(
     net: Option<&Net>,
     y: i64,
@@ -201,11 +219,14 @@ pub fn find_day_releases_cached(
     offline: bool,
 ) -> Result<Vec<DayRelease>, DataError> {
     let path = dir.join("releases.json");
-    if let Ok(b) = std::fs::read(&path)
-        && let Ok(v) = serde_json::from_slice::<Vec<DayRelease>>(&b)
-        && !v.is_empty()
+    let cached = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<DayRelease>>(&b).ok())
+        .filter(|v| !v.is_empty());
+    if let Some(v) = &cached
+        && (offline || releases_complete(v) || day_settled(y, m, d))
     {
-        return Ok(v);
+        return Ok(v.clone());
     }
     if offline {
         return Ok(Vec::new());
@@ -219,6 +240,11 @@ pub fn find_day_releases_cached(
         }
     };
     let rels = find_day_releases(net, y, m, d)?;
+    if rels.is_empty()
+        && let Some(v) = cached
+    {
+        return Ok(v);
+    }
     if !rels.is_empty() {
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join("releases.json.part");
