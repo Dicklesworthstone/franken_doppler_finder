@@ -294,7 +294,8 @@ results in the commit message.
 
 ## Compiler Checks
 
-After substantive Rust changes (CI runs the same commands, so a local pass should mean a CI pass):
+After substantive Rust changes, run these four checks. `dsr quality franken_doppler_finder` runs the same
+four; it is the project's CI:
 
 ```bash
 cargo fmt --all -- --check
@@ -302,6 +303,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo run --release -- selftest
 ```
+
+**No GitHub Actions, ever.** Do not add `.github/workflows/` files, Actions badges, or anything that waits on
+Actions runs. CI, builds and releases go through dsr: `dsr quality franken_doppler_finder` for the checks, and
+`dsr build` / `dsr release` for artifacts.
 
 Use RCH for heavy Cargo work and never bypass the `rch` cargo shim:
 

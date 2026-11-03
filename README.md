@@ -2,7 +2,6 @@
 
 <div align="center">
 
-[![CI](https://github.com/Dicklesworthstone/franken_doppler_finder/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/franken_doppler_finder/actions/workflows/ci.yml)
 [![Status](https://img.shields.io/badge/status-alpha%20%C2%B7%201%20real%20case%20validated-orange)](#honest-status)
 [![Core](https://img.shields.io/badge/core-Rust%202024%20%C2%B7%20nightly--2026--08--31-b7410e)](#installation)
 [![Runtime](https://img.shields.io/badge/runtime-asupersync%200.6-6f42c1)](#architecture)
@@ -561,8 +560,12 @@ usually spans two UTC days. Worst-case search memory is set by the hypothesis bu
 cargo test --workspace --locked                               # 72 unit tests, no network
 cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings  # as CI runs it
+cargo clippy --workspace --all-targets --locked -- -D warnings  # warnings are errors
 ```
+
+The project has no GitHub Actions CI. The maintainer runs these four checks through
+[dsr](https://github.com/Dicklesworthstone/doodlestein_self_releaser) (`dsr quality franken_doppler_finder`)
+before a push or a release.
 
 The unit tests check:
 - emission-time physics against the light-time equation;

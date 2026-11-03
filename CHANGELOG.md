@@ -29,7 +29,7 @@ at that commit, not per-change commits.
   chi ≤ 2 can stand in for the nats-over-chance test of a core match (section 11). The reference-case runs
   `ny9`, `md2` and `nassau3` used this code.
 - [`593e41f`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/593e41fd673a9e026178cc31a63462ab36697c3c) README,
-  AGENTS.md, this changelog, and CI (rustfmt, clippy with `-D warnings`, tests, `fdop selftest`).
+  AGENTS.md, this changelog, and a GitHub Actions workflow (later removed: the project uses dsr, see below).
 - [`e872b1c`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/e872b1c001592b2d732d3bc49779a15c6b15238e) Recent
   recordings no longer fail on the newest UTC day. adsb.lol publishes each day a few hours after it ends, and a US
   local date runs into the next UTC day, so `--dates <yesterday>` used to stop with "no ADS-B data for UTC day(s)".
@@ -64,6 +64,8 @@ at that commit, not per-change commits.
   0% CPU on open connections to the GitHub release CDN: the client's request timeout does not cover a streamed
   body. Each body frame now has a 60 s idle timeout, after which the download resumes with an HTTP `Range`
   request. 1 new test (a loopback server that stalls mid-body), 72 in total.
+- The GitHub Actions workflow is removed. The project never uses GitHub Actions: its checks (rustfmt, clippy
+  with `-D warnings`, the tests and `fdop selftest`) run through `dsr quality franken_doppler_finder`.
 
 ---
 
