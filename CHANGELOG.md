@@ -51,6 +51,14 @@ at that commit, not per-change commits.
   (margin 5.9 nats) to high (margin 8.3 nats). The reference case (`ny10`) is unchanged. The `truth` example gains
   `dump=<icao>`, which prints an aircraft's archived points and its track models' closest approaches. 2 new tests,
   70 in total.
+- [`6c7f535`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/6c7f535a1eb8a19a51aba77387625add87266a32) Three silent fallbacks now put a warning in the report:
+  - a default geoid height when the NGS lookup fails or the run is `--offline`;
+  - terrain tiles that could not be fetched and were read as 0 m, with their count;
+  - an event dropped to confirmer-only because its hypotheses did not fit the budget.
+
+  `fdop fetch` now fetches only the published part of the archive, like `locate`. Before, it failed on a date
+  that ran into an unpublished UTC day. The `--near` and `--cache` help texts now match the parser and the cache
+  precedence. 1 new test, 71 in total.
 
 ---
 
@@ -94,19 +102,23 @@ and `md2` are the results on `d79d90d` (section 11). `ny10` repeated `ny9` on `1
 ### Field tests
 
 Six recordings from public YouTube live cams, 2–3 h each, all at sites with published locations. Each true clock
-came from the stream's fragment timestamps. Each was run blind, on the builds from `e872b1c` to `1f321cb`, with:
-`fdop locate FILE --dates <local date> --near <state>`.
+came from the stream's fragment timestamps. Each was run blind with
+`fdop locate FILE --dates <local date> --near <state>`. The first runs used working-tree builds made just before
+`e872b1c` was committed; all six were run again on `1f321cb`. The table gives both where they differ.
 
 | Recording | Date | Result | Confidence |
 |---|---|---|---|
 | Osprey cam at the reference site (Oyster Bay, NY) | 2026-11-01 | Oyster Bay: about 150 m from the cam's geocoded street address, just outside the 147 m radius; start off by 0.33 s | medium before `1f321cb`, **high** after |
 | Same osprey cam | 2026-10-31 | wrong: Commack, NY before `1f321cb`, Wethersfield, CT after | low |
-| Railcam, Rochelle, IL | 2026-11-02 | wrong: Charrette, MO | low |
-| Railcam, Tucson, AZ | 2026-11-02 | wrong: Williamson, AZ | low |
-| Bird-feeder cam, Ithaca, NY | 2026-11-02 | wrong: Lincoln, VT | low |
+| Railcam, Rochelle, IL | 2026-11-02 | wrong: Charrette, MO (about 400 km off) at first; Roscoe, IL (about 50 km off) on `1f321cb` | low |
+| Railcam, Tucson, AZ | 2026-11-02 | wrong: Williamson, AZ (about 300 km off) at first; Wet Camp Village, AZ (about 140 km off) on `1f321cb` | low |
+| Bird-feeder cam, Ithaca, NY | 2026-11-02 | wrong: Lincoln, VT (about 330 km off) at first; Hillsgrove, PA (about 120 km off) on `1f321cb` | low |
 | Railcam, Plant City, FL | 2026-11-02 | no location (0 usable flyover events) | none |
 
 One of six was located, at the site the reference recording also came from. Every wrong answer was graded low.
+On `1f321cb` each wrong answer moved but stayed low. Each had only 1 of 2 core matches, and each margin over
+the best different explanation was 0.4–2.1 nats. In Rochelle the first build's answer became the runner-up.
+A low answer that moves between builds is what a chance match looks like.
 The four other sites had only 0–3 non-jet passes within reach during their windows, and their detections were
 mostly trains, idling locomotives, wind and traffic.
 
