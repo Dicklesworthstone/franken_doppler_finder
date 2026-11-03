@@ -46,7 +46,7 @@ finding the faint curves in a spectrogram to naming the town.
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
 | Has it located a real recording? | **One recording, three ways, one answer.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three pass every gate at **high** confidence and give the same spot: a 292 m radius about **224 m** from the location published in the video (221 m for the county search). Each matched the same three flyovers: a Pilatus PC-12, a Cessna 208 and a King Air 350 |
 | Has it been wrong? | **Yes, and so far it has graded every wrong answer low.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off). In the field tests below, four answers were wrong. A low grade does not mean wrong, though: one build put the state-wide answer 129 m off at high confidence but graded the county search low. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points |
-| Is it tested? | **71 unit tests,** all offline: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers and formats. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording and recovers the observer to under 1 m |
+| Is it tested? | **72 unit tests,** all offline: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording and recovers the observer to under 1 m |
 | Has it located a recording it was not developed on? | **Once, at the same site.** Six recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: about 150 m from the cam's geocoded street address, just outside its 147 m radius (an address geocode only approximates where a camera is), with the recording start off by only 0.33 s. The same cam on another day gave a wrong answer graded **low**. At four other sites (railcams in Rochelle, IL, Tucson, AZ and Plant City, FL, and a bird-feeder cam in Ithaca, NY), three answers were wrong and graded **low**, and Plant City gave no location. Those recordings held only 0–3 non-jet passes within reach. No wrong answer was graded above low |
 | What is not validated? | Any site other than the reference one; low-traffic or rural sites (all four tried failed); CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
 | Which code produced these results? | The reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
@@ -499,7 +499,7 @@ franken_doppler_finder/
 ├── examples/truth.rs        known place + clock: archived passes near it vs the detected events
 └── crates/
     ├── fdop-types/          shared types: geodesy (WGS84, ECEF, ENU), time, atmosphere, .fdtrk store, engine table
-    ├── fdop-http/           HTTP/1.1 client on asupersync + rustls: retries, resumable streaming
+    ├── fdop-http/           HTTP/1.1 client on asupersync + rustls: retries, resumable streaming, idle timeout
     ├── fdop-data/           adsb.lol ingest and track-store build, weather, terrain, geoid
     ├── fdop-core/           audio, spectrogram, detection, tracing, fitting, physics, track models, search
     └── fdop-geo/            region parsing, gazetteer, reverse geocoding, static map, reports
@@ -558,7 +558,7 @@ usually spans two UTC days. Worst-case search memory is set by the hypothesis bu
 ## Testing
 
 ```bash
-cargo test --workspace --locked                               # 71 unit tests, no network
+cargo test --workspace --locked                               # 72 unit tests, no network
 cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings  # as CI runs it
@@ -625,6 +625,7 @@ audio or video recorded somewhere sensitive:
 | `date range ... spans more than 15 days; narrow it` | Range too long | Split it into several runs |
 | `needs network or a cached file: Census gazetteer ...` | `--offline` before the gazetteer was cached | Run once online, or use a state, point or box region |
 | `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days are cached. A day missing from adsb.lol cannot be searched |
+| A download pauses for a minute, then carries on | The server stopped sending with the connection still open. After 60 s with no data, `fdop` reconnects and resumes with an HTTP `Range` request | Nothing. After 9 failed tries that brought no new data it stops with an error ending `body idle for 60s`; rerun, finished days are kept |
 | Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears some hours after it ends | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |
 | Answer graded **low** | One or more gates failed | Read the gates in `report.html`. A small margin means another flight pair explains the curves almost as well |
 | Disk filling up | Many cached regions and days | Delete old `adsb/<date>/` folders under the cache root |

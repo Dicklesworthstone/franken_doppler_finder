@@ -96,7 +96,14 @@ pub struct Net {
     /// adsb.lol prod parts are 2 GB each, so streams get a 1 TiB cap.
     stream_client: HttpClient,
     retries: u32,
+    /// A streamed body that sends nothing for this long is treated as a dropped
+    /// connection and resumed: `request_timeout` does not cover streamed bodies, and a
+    /// CDN connection can stall with the socket still open.
+    body_idle: Duration,
 }
+
+/// Default for [`Net::with_body_idle`].
+pub const BODY_IDLE: Duration = Duration::from_secs(60);
 
 impl Net {
     pub fn new() -> Result<Self, HttpError> {
@@ -129,11 +136,18 @@ impl Net {
             client,
             stream_client,
             retries: 4,
+            body_idle: BODY_IDLE,
         })
     }
 
     pub fn with_retries(mut self, retries: u32) -> Self {
         self.retries = retries;
+        self
+    }
+
+    /// How long a streamed body may send nothing before the stream resumes with `Range`.
+    pub fn with_body_idle(mut self, idle: Duration) -> Self {
+        self.body_idle = idle;
         self
     }
 
@@ -230,6 +244,7 @@ impl Net {
             let client = self.stream_client.clone();
             let u = url.to_string();
             let start_at = delivered;
+            let idle = self.body_idle;
             let mut got_this_attempt: u64 = 0;
             let mut skip: u64 = 0;
             let outcome: Result<(), HttpError> = self.rt.block_on(async {
@@ -259,7 +274,10 @@ impl Net {
                     if cancel.load(Ordering::Relaxed) {
                         return Err(HttpError::new(&u, Some(499), "cancelled"));
                     }
-                    let frame = poll_fn(|task| Pin::new(&mut resp.body).poll_frame(task)).await;
+                    let next = poll_fn(|task| Pin::new(&mut resp.body).poll_frame(task));
+                    let frame = asupersync::time::timeout(asupersync::time::wall_now(), idle, next)
+                        .await
+                        .map_err(|_| HttpError::new(&u, None, format!("body idle for {idle:?}")))?;
                     match frame {
                         None => return Ok(()),
                         Some(Ok(Frame::Data(mut data))) => {
@@ -466,5 +484,73 @@ mod tests {
         assert!(HttpError::new("u", Some(503), "").transient());
         assert!(HttpError::new("u", None, "").transient());
         assert!(!HttpError::new("u", Some(404), "").transient());
+    }
+
+    /// Read one request head; return it lower-cased.
+    fn read_head(sock: &mut std::net::TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match sock.read(&mut b) {
+                Ok(1) => head.push(b[0]),
+                _ => break,
+            }
+        }
+        String::from_utf8_lossy(&head).to_ascii_lowercase()
+    }
+
+    /// A server that sends 10 of 100 bytes and then goes silent with the socket open
+    /// (the hang seen on a GitHub release download) must not hang `stream`: the idle
+    /// timeout fires and the download resumes with `Range`.
+    #[test]
+    fn stalled_body_resumes_after_idle_timeout() {
+        let body: Vec<u8> = (0..100u8).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let served = body.clone();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().expect("accept 1");
+            let h1 = read_head(&mut first);
+            first
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .expect("head 1");
+            first.write_all(&served[..10]).expect("part 1");
+            first.flush().expect("flush 1");
+            // Stall: keep `first` open while the client times out and reconnects.
+            let (mut second, _) = listener.accept().expect("accept 2");
+            let h2 = read_head(&mut second);
+            second
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 90\r\n\
+                      Content-Range: bytes 10-99/100\r\n\r\n",
+                )
+                .expect("head 2");
+            second.write_all(&served[10..]).expect("part 2");
+            second.flush().expect("flush 2");
+            drop(first);
+            (h1, h2)
+        });
+        let net = Net::new()
+            .expect("net")
+            .with_body_idle(Duration::from_millis(300));
+        let mut got = Vec::new();
+        let t0 = std::time::Instant::now();
+        let n = net
+            .stream(
+                &format!("http://{addr}/blob"),
+                &[],
+                &AtomicBool::new(false),
+                &mut |c| {
+                    got.extend_from_slice(c);
+                    Ok(())
+                },
+            )
+            .expect("stream");
+        let (h1, h2) = server.join().expect("server");
+        assert_eq!(n, 100);
+        assert_eq!(got, body);
+        assert!(!h1.contains("range:"), "first request: {h1}");
+        assert!(h2.contains("range: bytes=10-"), "resume request: {h2}");
+        assert!(t0.elapsed() < Duration::from_secs(20), "{:?}", t0.elapsed());
     }
 }
