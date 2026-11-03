@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The toolchain comes from rust-toolchain.toml (nightly-2026-08-31 with rustfmt and clippy); rustup installs it on
+  # the first cargo invocation.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Unit tests are offline: synthetic audio and tracks, no network.
+      - name: tests
+        run: cargo test --workspace --locked
+      # End-to-end known answer: synthesised recording -> ffmpeg decode -> detect -> measure -> search.
+      # Needs ffmpeg, no network.
+      - name: install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: fdop selftest
+        run: cargo run --locked -- selftest -o "$RUNNER_TEMP/selftest"
