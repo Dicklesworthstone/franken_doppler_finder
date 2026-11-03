@@ -42,6 +42,27 @@ pub struct Region {
     pub states: Vec<String>,
 }
 
+impl Region {
+    /// A warning when a state search's answer lies in another state (`state_abbr` from the
+    /// reverse geocode). A state search covers the state's bounding box, which takes in parts
+    /// of its neighbours; other region kinds are boxes or circles by design.
+    pub fn outside_states_warning(&self, state_abbr: Option<&str>) -> Option<String> {
+        let st = state_abbr?;
+        if self.kind != RegionKind::States || self.states.iter().any(|s| s == st) {
+            return None;
+        }
+        Some(format!(
+            "the answer lies in {st}, outside the searched {} {}: a state search covers the bounding box, which takes in parts of neighbouring states",
+            if self.states.len() == 1 {
+                "state"
+            } else {
+                "states"
+            },
+            self.states.join(", ")
+        ))
+    }
+}
+
 /// Parsing context: where the gazetteer cache lives and whether downloads are allowed.
 pub struct RegionContext {
     pub cache_dir: PathBuf,
@@ -485,6 +506,30 @@ mod tests {
 
     fn ctx() -> RegionContext {
         RegionContext::from_gazetteer(fixture(), false)
+    }
+
+    #[test]
+    fn answer_outside_the_searched_state_is_flagged() {
+        let ny = parse_region("NY", &ctx()).unwrap();
+        let w = ny
+            .outside_states_warning(Some("CT"))
+            .expect("CT is outside NY");
+        assert!(
+            w.contains("lies in CT") && w.contains("searched state NY"),
+            "{w}"
+        );
+        assert_eq!(ny.outside_states_warning(Some("NY")), None);
+        assert_eq!(ny.outside_states_warning(None), None);
+        let two = parse_region("NY, NJ", &ctx()).unwrap();
+        assert_eq!(two.outside_states_warning(Some("NJ")), None);
+        assert!(
+            two.outside_states_warning(Some("PA"))
+                .unwrap()
+                .contains("states NY, NJ")
+        );
+        // a point region is a circle by design, so a neighbouring state is not news
+        let pt = parse_region("40.87,-73.52,25", &ctx()).unwrap();
+        assert_eq!(pt.outside_states_warning(Some("CT")), None);
     }
 
     #[test]

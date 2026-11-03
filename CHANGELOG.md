@@ -66,6 +66,16 @@ at that commit, not per-change commits.
   request. 1 new test (a loopback server that stalls mid-body), 72 in total.
 - [`852067a`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/852067a4442c5bf96da8ed1c0dd50216dc5b265d) The GitHub Actions workflow is removed. The project never uses GitHub Actions: its checks (rustfmt, clippy
   with `-D warnings`, the tests and `fdop selftest`) run through `dsr quality franken_doppler_finder`.
+- [`4cb7aff`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/4cb7affc057fa9eabcc78d9cde8f8e0d310c2369) Unused dependencies
+  dropped: `fsci-signal` leaves the build, and `fsci-runtime` and `fsci-opt` stop being direct dependencies where
+  nothing used them.
+- [`5770663`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/5770663ff5ec510421d38cf01504ccb84ffcdb8a) CLI
+  fixes:
+  - a date must start with its four-digit year: `09/08/26` used to parse as 26 August of year 9, and now gets
+    "put the four-digit year first";
+  - `fdop detect` no longer takes `--cache` and `--offline`, which it ignored;
+  - the `--dates` help lists every accepted form;
+  - a selftest that finds no candidate prints FAIL and exits 1 instead of 2.
 
 ---
 
@@ -108,10 +118,11 @@ and `md2` are the results on `d79d90d` (section 11). `ny10` repeated `ny9` on `1
 
 ### Field tests
 
-Six recordings from public YouTube live cams, 2–3 h each, all at sites with published locations. Each true clock
-came from the stream's fragment timestamps. Each was run blind with
-`fdop locate FILE --dates <local date> --near <state>`. The first runs used working-tree builds made just before
-`e872b1c` was committed; all six were run again on `1f321cb`. The table gives both where they differ.
+Nine recordings from public YouTube live cams, 2–3 h each, all at sites with published locations. Each true
+clock came from the stream's fragment timestamps. Each was run blind with
+`fdop locate FILE --dates <local date> --near <state>`. The first six ran on working-tree builds made just before
+`e872b1c` was committed, and all six again on `1f321cb`; the table gives both where they differ. The last three
+ran on a build of the tree at `25f12ff`.
 
 | Recording | Date | Result | Confidence |
 |---|---|---|---|
@@ -121,13 +132,30 @@ came from the stream's fragment timestamps. Each was run blind with
 | Railcam, Tucson, AZ | 2026-11-02 | wrong: Williamson, AZ (about 300 km off) at first; Wet Camp Village, AZ (about 140 km off) on `1f321cb` | low |
 | Bird-feeder cam, Ithaca, NY | 2026-11-02 | wrong: Lincoln, VT (about 330 km off) at first; Hillsgrove, PA (about 120 km off) on `1f321cb` | low |
 | Railcam, Plant City, FL | 2026-11-02 | no location (0 usable flyover events) | none |
+| Railcam, Fullerton, CA | 2026-11-01 | no location (1 usable flyover event of 4) | none |
+| Eagle cam, Duke Farms (Hillsborough, NJ) | 2026-11-01 | Hillsborough, NJ 08844, the right township: about 2.2 km from the property's entrance address. The nest position is not published and the grounds span about 3 km, so a smaller error cannot be scored. Start 5.3 s before the stream's first-frame stamp | low |
+| Same osprey cam, a thin day | 2026-11-02 | wrong: Islip, NY (about 40 km off) | low |
 
-One of six was located, at the site the reference recording also came from. Every wrong answer was graded low.
-On `1f321cb` each wrong answer moved but stayed low. Each had only 1 of 2 core matches, and each margin over
-the best different explanation was 0.4–2.1 nats. In Rochelle the first build's answer became the runner-up.
+Of the first six, one was located, at the site the reference recording also came from. Every wrong answer was
+graded low. On `1f321cb` each wrong answer moved but stayed low. Each had only 1 of 2 core matches, and each margin
+over the best different explanation was 0.4–2.1 nats. In Rochelle the first build's answer became the runner-up.
 A low answer that moves between builds is what a chance match looks like.
 The four other sites had only 0–3 non-jet passes within reach during their windows, and their detections were
 mostly trains, idling locomotives, wind and traffic.
+
+The last three:
+- **Fullerton** had 13 non-jet passes within 3 km in its 3 h window, training traffic from an airport about 5 km
+  away, but none was audible. Wind and road noise fill 50–300 Hz, and its 4 detections were trains and vehicles
+  (one with a 42 m closest approach).
+- **Duke Farms** had 16 passes within 3 km, but a wind-saturated microphone. All four matched aircraft (two core,
+  two confirming) were real passes over the property, so the search found the right flights and clock and
+  placed them loosely. Only 1 of 4 traces fit cleanly (chi 1.2; the others 10–12), and a C172 passed 604 m from
+  the answer unheard. The margin passed at 8.7 nats; the core-match and unheard-pass gates failed, correctly.
+- **The osprey cam on 2026-11-02** (15:45–18:30Z) had only 4 passes within 3 km, one of them close: margin
+  4.8 nats, 1 of 2 core.
+
+Two dense-traffic sites had noisy microphones, and neither reached high. Every wrong answer from a committed build
+is still low: nine across the field tests and builds.
 
 ---
 

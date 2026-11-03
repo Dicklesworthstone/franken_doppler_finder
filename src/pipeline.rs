@@ -430,7 +430,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     let t = Instant::now();
     let dp = DetectParams::default();
     let (ls, lin) = detect::survey(&x, a.sr, &dp)?;
-    let dets = detect::detect(&ls, &dp);
+    let (dets, det_cut) = detect::detect_counted(&ls, &dp);
     let n_strong = dets
         .iter()
         .filter(|d| d.score >= dp.thr_db && d.harmonic_of.is_none())
@@ -440,6 +440,14 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         dets.len(),
         n_strong
     ));
+    if det_cut > 0 {
+        warnings.push(format!(
+            "detection kept the {} strongest of {}{} candidate curves; the weaker ones cannot explain an event or mark a pass as heard",
+            dp.max_detections,
+            dp.max_detections + det_cut,
+            if det_cut >= 2 * dp.max_detections { "+" } else { "" },
+        ));
+    }
     timings.insert("detect_s".into(), json!(t.elapsed().as_secs_f64()));
     // ---- measurement --------------------------------------------------------------------
     let t = Instant::now();
@@ -447,11 +455,18 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         c,
         ..Default::default()
     };
+    let max_measured = measure::MAX_MEASURED;
     let prim: Vec<&Detection> = dets
         .iter()
         .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
-        .take(24)
+        .take(max_measured)
         .collect();
+    if n_strong > prim.len() {
+        warnings.push(format!(
+            "measured the {} strongest of {n_strong} flyover detections; the rest neither drive nor confirm the answer, though they still count as heard",
+            prim.len(),
+        ));
+    }
     let mut events: Vec<MeasuredEvent> = prim
         .par_iter()
         .enumerate()
@@ -876,6 +891,9 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         ));
         let place = fdop_geo::geocode::describe_location(net.as_ref(), &gaz, lat, lon);
         log.say(&format!("place: {}", place.headline));
+        if let Some(w) = region.outside_states_warning(place.state_abbr.as_deref()) {
+            warnings.push(w);
+        }
         report.answer = Answer {
             lat,
             lon,

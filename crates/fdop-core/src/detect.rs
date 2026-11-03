@@ -250,9 +250,15 @@ pub struct Detection {
 /// Run the template bank. Returns detections with score >= `thr_silence_db`, strongest first;
 /// those with score >= `thr_db` are the event candidates.
 pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
+    detect_counted(ls, p).0
+}
+
+/// [`detect`], plus how many accepted candidates the cap `p.max_detections` cut. The count is a
+/// lower bound when the scan stopped at three times the cap.
+pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize) {
     let (nt, nr) = (ls.nt(), ls.nr());
     if nt < 8 || nr < 8 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let tmpls = build_templates(p, ls.hop_s);
     // Padded copies: margin rows/frames so every shifted read stays in bounds; a parallel mask
@@ -423,12 +429,13 @@ pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
         });
     }
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let cut = out.len().saturating_sub(p.max_detections);
     out.truncate(p.max_detections);
     for (i, d) in out.iter_mut().enumerate() {
         d.id = i;
     }
     group_harmonics(&mut out, p.bins_per_octave);
-    out
+    (out, cut)
 }
 
 /// Matched-filter halves of template `tm` anchored at (row `r`, frame `i`), with samples on
@@ -683,5 +690,22 @@ mod tests {
         );
         let r = refine(&lin, top, 343.0);
         assert!((r.f0 / 118.0 - 1.0).abs() < 0.01, "refined f0 {}", r.f0);
+    }
+
+    #[test]
+    fn detection_cap_reports_what_it_cut() {
+        // a cap of one on a pass with a harmonic (plus the flat tone) must say what it cut
+        let sr = 4000;
+        let x = synth(sr, 600.0);
+        let mut p = DetectParams::default();
+        let (ls, _) = survey(&x, sr, &p).unwrap();
+        let (all, cut_all) = detect_counted(&ls, &p);
+        assert_eq!(cut_all, 0, "{} detections under the default cap", all.len());
+        assert!(all.len() >= 2, "need two candidates, got {}", all.len());
+        p.max_detections = 1;
+        let (one, cut) = detect_counted(&ls, &p);
+        assert_eq!(one.len(), 1);
+        assert!(cut >= 1, "cut {cut}");
+        assert_eq!(one[0].score, all[0].score, "the cap keeps the strongest");
     }
 }

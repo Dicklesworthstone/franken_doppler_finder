@@ -18,6 +18,11 @@ use crate::spectro::{Spec, stft_band_db};
 use crate::trace::{Trace, ridge_peak};
 use serde::Serialize;
 
+/// At most this many events are measured, strongest primary detections first. Measuring more
+/// of a long recording's flyovers can promote a wrong answer (CHANGELOG, Unreleased), so the cap
+/// stays until the grading accounts for how many events were searched.
+pub const MAX_MEASURED: usize = 24;
+
 #[derive(Clone, Debug)]
 pub struct MeasureParams {
     pub c: f64,

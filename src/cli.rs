@@ -122,6 +122,17 @@ pub struct FetchCli {
     pub common: Common,
 }
 
+/// Add a row to the run ledger; a failure to write it is a warning, not an error.
+fn record_run(cache: &std::path::Path, row: &crate::ledger::RunRow) {
+    let db = cache.join("runs.sqlite");
+    if let Err(e) = crate::ledger::record(&db, row) {
+        eprintln!(
+            "fdop: warning: could not record the run in {}: {e}",
+            db.display()
+        );
+    }
+}
+
 fn cache_of(c: &Common) -> PathBuf {
     c.cache
         .clone()
@@ -158,7 +169,32 @@ fn run(cli: Cli) -> Result<i32, String> {
                 sr: 4000,
                 quiet: l.common.quiet,
             };
-            let out = pipeline::locate(&args, &log)?;
+            let (started, t0) = (pipeline::unix_now(), std::time::Instant::now());
+            let out = match pipeline::locate(&args, &log) {
+                Ok(o) => o,
+                Err(e) => {
+                    // runs that stop with an error are recorded too, so `fdop runs` lists every attempt
+                    record_run(
+                        &cache,
+                        &crate::ledger::RunRow {
+                            created_utc: fdop_types::time::iso_utc(started),
+                            input_file: l.media.display().to_string(),
+                            dates: l.dates.clone(),
+                            region: l.near.clone(),
+                            confidence: "error".into(),
+                            headline: e.clone(),
+                            run_dir: l
+                                .out
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                            total_s: t0.elapsed().as_secs_f64(),
+                            ..Default::default()
+                        },
+                    );
+                    return Err(e);
+                }
+            };
             let a = &out.report.answer;
             let headline = out
                 .report
@@ -166,8 +202,8 @@ fn run(cli: Cli) -> Result<i32, String> {
                 .as_ref()
                 .map(|p| p.headline.clone())
                 .unwrap_or_default();
-            let _ = crate::ledger::record(
-                &cache.join("runs.sqlite"),
+            record_run(
+                &cache,
                 &crate::ledger::RunRow {
                     created_utc: out.report.created_utc.clone(),
                     input_file: out.report.input_file.clone(),
@@ -221,13 +257,35 @@ fn run(cli: Cli) -> Result<i32, String> {
             let x = fdop_core::audio::decode(&d.media, 0.0, None, 4000)?;
             let dp = fdop_core::detect::DetectParams::default();
             let (ls, lin) = fdop_core::detect::survey(&x, 4000, &dp)?;
-            let dets = fdop_core::detect::detect(&ls, &dp);
+            let (dets, det_cut) = fdop_core::detect::detect_counted(&ls, &dp);
+            if det_cut > 0 {
+                eprintln!(
+                    "fdop: warning: kept the {} strongest of {}{} candidate curves",
+                    dp.max_detections,
+                    dp.max_detections + det_cut,
+                    if det_cut >= 2 * dp.max_detections {
+                        "+"
+                    } else {
+                        ""
+                    },
+                );
+            }
             let mp = fdop_core::measure::MeasureParams::default();
-            use rayon::prelude::*;
-            let evs: Vec<_> = dets
+            let max_measured = fdop_core::measure::MAX_MEASURED;
+            let strong: Vec<_> = dets
                 .iter()
                 .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
-                .take(24)
+                .collect();
+            if strong.len() > max_measured {
+                eprintln!(
+                    "fdop: warning: measuring the {max_measured} strongest of {} flyover detections",
+                    strong.len(),
+                );
+            }
+            use rayon::prelude::*;
+            let evs: Vec<_> = strong
+                .into_iter()
+                .take(max_measured)
                 .collect::<Vec<_>>()
                 .par_iter()
                 .enumerate()
