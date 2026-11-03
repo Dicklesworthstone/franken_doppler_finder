@@ -1,20 +1,33 @@
 name: CI
 
+# `master` is an exact mirror of `main` (see AGENTS.md), so only `main` is built: running both would test every
+# commit twice.
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch supersedes a run still in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The toolchain comes from rust-toolchain.toml (nightly-2026-08-31 with rustfmt and clippy); rustup installs it on
-  # the first cargo invocation.
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      # rust-toolchain.toml pins nightly-2026-08-31 with rustfmt and clippy. Install it before rust-cache, which
+      # keys the cache on the active rustc version.
+      - name: install the pinned toolchain
+        run: (rustup toolchain install || rustup show) && rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -24,7 +37,7 @@ jobs:
       - name: tests
         run: cargo test --workspace --locked
       # End-to-end known answer: synthesised recording -> ffmpeg decode -> detect -> measure -> search.
-      # Needs ffmpeg, no network.
+      # Needs ffmpeg, no network. The dev profile is optimised (Cargo.toml), so this reuses the test build.
       - name: install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: fdop selftest

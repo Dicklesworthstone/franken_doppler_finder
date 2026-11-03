@@ -28,7 +28,8 @@ at that commit, not per-change commits.
   calibration for tiny regions: when an event has fewer than 20 chance matches to calibrate against, a fit with
   chi ≤ 2 can stand in for the nats-over-chance test of a core match (section 11). The reference-case runs
   `ny9`, `md2` and `nassau3` used this code.
-- README, AGENTS.md, this changelog, and CI (rustfmt, clippy with `-D warnings`, tests, `fdop selftest`).
+- [`593e41f`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/593e41fd673a9e026178cc31a63462ab36697c3c) README,
+  AGENTS.md, this changelog, and CI (rustfmt, clippy with `-D warnings`, tests, `fdop selftest`).
 - [`e872b1c`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/e872b1c001592b2d732d3bc49779a15c6b15238e) Recent
   recordings no longer fail on the newest UTC day. adsb.lol publishes each day a few hours after it ends, and a US
   local date runs into the next UTC day, so `--dates <yesterday>` used to stop with "no ADS-B data for UTC day(s)".
@@ -38,6 +39,18 @@ at that commit, not per-change commits.
   - an incomplete `releases.json` was never re-checked.
 
   It also adds the `truth` example, which lists the archived passes near a known place and clock.
+- [`1f321cb`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/1f321cbcc9cc861a49eb2d12dce95716bd304fb5) Junk
+  positions inside an archived leg no longer fake an unheard close pass. MLAT mis-solutions, or a second aircraft
+  under the same ICAO address, can put isolated points kilometres off the real path. Track models are now built
+  from each gap-free segment's longest physically consistent chain of points:
+  - horizontal step ≤ v_lim·dt + 250 m, with v_lim = max(1.5 × median ground speed + 30, 80) m/s;
+  - vertical step ≤ 30 m/s·dt + 120 m.
+
+  Evidence: in the 2026-11-01 osprey-cam field test (below), a P28R leg with such points made a phantom pass
+  300 m from the answer, and the unheard-pass gate failed. With the filter, the same point went from medium
+  (margin 5.9 nats) to high (margin 8.3 nats). The reference case (`ny10`) is unchanged. The `truth` example gains
+  `dump=<icao>`, which prints an aircraft's archived points and its track models' closest approaches. 2 new tests,
+  70 in total.
 
 ---
 
@@ -72,7 +85,30 @@ All runs use the raw recording from the source video (one hour) against the publ
 Times are when each run finished. ADS-B was cached for every run after `ny1`, on an Apple M5 Ultra. Every wrong
 answer was graded low. `nassau2` and `ny8` kept the R44 as a fourth match, and their radius touched the
 refinement window's edge; the import's radius gate fails a radius that is only a lower bound. `nassau3`, `ny9`
-and `md2` are the current results (section 11).
+and `md2` are the results on `d79d90d` (section 11). `ny10` repeated `ny9` on `1f321cb`:
+
+| Run | Time | Arguments | Result | Off by | Radius | Confidence | Total |
+|---|---|---|---|---|---|---|---|
+| `ny10` | 17:56 | `--dates 2026-09-08 --near NY` | Oyster Bay, NY 11771 | 224 m | 292 m | **high** | 226 s |
+
+### Field tests
+
+Six recordings from public YouTube live cams, 2–3 h each, all at sites with published locations. Each true clock
+came from the stream's fragment timestamps. Each was run blind, on the builds from `e872b1c` to `1f321cb`, with:
+`fdop locate FILE --dates <local date> --near <state>`.
+
+| Recording | Date | Result | Confidence |
+|---|---|---|---|
+| Osprey cam at the reference site (Oyster Bay, NY) | 2026-11-01 | Oyster Bay: about 150 m from the cam's geocoded street address, just outside the 147 m radius; start off by 0.33 s | medium before `1f321cb`, **high** after |
+| Same osprey cam | 2026-10-31 | wrong: Commack, NY before `1f321cb`, Wethersfield, CT after | low |
+| Railcam, Rochelle, IL | 2026-11-02 | wrong: Charrette, MO | low |
+| Railcam, Tucson, AZ | 2026-11-02 | wrong: Williamson, AZ | low |
+| Bird-feeder cam, Ithaca, NY | 2026-11-02 | wrong: Lincoln, VT | low |
+| Railcam, Plant City, FL | 2026-11-02 | no location (0 usable flyover events) | none |
+
+One of six was located, at the site the reference recording also came from. Every wrong answer was graded low.
+The four other sites had only 0–3 non-jet passes within reach during their windows, and their detections were
+mostly trains, idling locomotives, wind and traffic.
 
 ---
 
@@ -160,7 +196,7 @@ This wave covers everything between a user's "somewhere near Oyster Bay" and the
 
   each with its UTC-offset range, DST included.
 - **Place data:** the Census 2024 gazetteer, downloaded lazily; reverse geocoding through the Census Geocoder,
-  falling back to gazetteer centroids offline. The headline reads "Town, ST ZIP (County)".
+  falling back to the gazetteer's internal points offline. The headline reads "Town, ST ZIP (County)".
 - **Static maps:** a pure-Rust static map on USGS Topo tiles, labelled with an embedded bitmap font, plus an SVG
   twin.
 - **Reports:** HTML (Leaflet), Markdown and CSV, the tables built with frankenpandas.

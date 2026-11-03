@@ -44,11 +44,12 @@ finding the faint curves in a spectrogram to naming the town.
 | Question | Answer |
 |---|---|
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
-| Has it located a real recording? | **One recording, three ways, one answer.** The recording is the raw one from the source video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three pass every gate at **high** confidence and give the same spot: a 292 m radius about **224 m** from the location published in the video (221 m for the county search). Each matched the same three flyovers: a Pilatus PC-12, a Cessna 208 and a King Air 350 |
-| Has it been wrong? | **Yes, during development, and it graded those answers low.** Earlier builds named Old Lyme, CT (116 km off), and later Southold, NY for the three-day window (102 km off); both were graded **low**. One build put the state-wide answer 129 m off at high confidence, but graded the county search low. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points |
-| Is it tested? | **67 unit tests,** all offline: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers and formats. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording and recovers the observer to under 1 m |
-| What is not validated? | Any recording other than the reference one; CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
-| Which code produced these results? | The three runs (`ny9`, `md2`, `nassau3`) used this repository's second commit: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against. See [CHANGELOG.md](CHANGELOG.md) section 11 |
+| Has it located a real recording? | **One recording, three ways, one answer.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three pass every gate at **high** confidence and give the same spot: a 292 m radius about **224 m** from the location published in the video (221 m for the county search). Each matched the same three flyovers: a Pilatus PC-12, a Cessna 208 and a King Air 350 |
+| Has it been wrong? | **Yes, and so far it has graded every wrong answer low.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off). In the field tests below, four answers were wrong. A low grade does not mean wrong, though: one build put the state-wide answer 129 m off at high confidence but graded the county search low. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points |
+| Is it tested? | **70 unit tests,** all offline: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers and formats. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording and recovers the observer to under 1 m |
+| Has it located a recording it was not developed on? | **Once, at the same site.** Six recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: about 150 m from the cam's geocoded street address, just outside its 147 m radius (an address geocode only approximates where a camera is), with the recording start off by only 0.33 s. The same cam on another day gave a wrong answer graded **low**. At four other sites (railcams in Rochelle, IL, Tucson, AZ and Plant City, FL, and a bird-feeder cam in Ithaca, NY), three answers were wrong and graded **low**, and Plant City gave no location. Those recordings held only 0–3 non-jet passes within reach. No wrong answer was graded above low |
+| What is not validated? | Any site other than the reference one; low-traffic or rural sites (all four tried failed); CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
+| Which code produced these results? | The reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran on the builds from `e872b1c` to `1f321cb`; on the build before `1f321cb` the osprey-cam answer was the same point graded **medium**. See [CHANGELOG.md](CHANGELOG.md) |
 | Is it fast? | **Three measurements on one machine.** The state-wide run took 295 s and the three-day run 440 s on an Apple M5 Ultra, with the ADS-B days already cached. See [Performance](#performance) |
 
 ---
@@ -77,14 +78,14 @@ against everything else in the recording and grades it.
 | **Refuses rather than guesses** | Five gates grade every answer **high / medium / low**. One flyover, or no consistent flight pair, gives "no location" and exit code 1 |
 | **Explains itself** | `report.html` shows a map, a heat map, ranked alternatives, per-event fits against the ADS-B prediction, the search funnel and the margin over the next-best explanation |
 | **Free public data** | adsb.lol (ODbL), NOAA, USGS, Census and Open-Meteo. Everything is cached, so reruns work `--offline` |
-| **Pure Rust, one binary** | Built on frankenscipy (FFT, bounded least squares, F distribution), asupersync (HTTP over rustls), frankenpandas and FrankenSQLite. `ffmpeg` is the only external tool |
+| **One native binary** | Rust on frankenscipy (FFT, bounded least squares, F distribution), asupersync (HTTP over rustls), frankenpandas and FrankenSQLite. `ffmpeg` and `ffprobe` are the only external tools |
 
 ---
 
 ## See it work
 
-The reference case: the raw recording from the source video, searched across all of New York State with only
-the date given.
+The reference case: colsto's raw upload of the recording ([youtu.be/4CxVxuMVkMc](https://youtu.be/4CxVxuMVkMc),
+the recorder's 1:00:00–2:00:00 window), searched across all of New York State with only the date given.
 
 ```console
 $ fdop locate ref_raw.m4a --dates 2026-09-08 --near NY -o runs/ny9
@@ -120,9 +121,13 @@ rescales them for the real atmosphere before comparing them with ADS-B:
 In the search, the King Air's match uses the one-change-point tone model: its tone steps up by about 4 Hz
 partway through the pass.
 
-The search funnel for that run: 10,550 track legs in the padded state box; 24 flyovers measured, 14 driving the
-search; about 3.4 M joined place-and-clock hypotheses; 1.1 M past the quick check; the best 4,000 scored exactly;
-535 passed.
+The search funnel for that run:
+- 10,550 track models (from 7,167 ADS-B legs) in the padded state box;
+- 24 flyovers measured, 14 used: 12 drove the pair join and 2 only confirmed;
+- about 3.4 M joined place-and-clock hypotheses, after which the pair join stopped at its 3 M budget with 64 of
+  its 66 event pairs done (reported in `funnel.truncated` and the warnings);
+- 1.1 M passed the quick check and merged into 426 k cells, of which the best 4,000 were scored exactly and 535
+  passed.
 
 The same recording with a three-day window (`--dates 2026-09-07..2026-09-09`, run `md2`) gave the same point,
 radius and flights at high confidence, with a 7.9-nat margin over a rival 130 km away. Searching only Nassau
@@ -158,11 +163,12 @@ t0r = t0e + d / c                                          the CPA as heard, lat
 f_pre = f0·c/(c − v)    f_post = f0·c/(c + v)    steepest slope = f0·v²/(c·d)
 ```
 
-The pitch drop sets `v`, the steepness sets `d`, and the curve's centre sets the heard CPA time `t0r`. One
-flyover therefore puts the recorder on a line beside one flight path at one moment. Two flyovers, with the real
-time gap between them, intersect at a point and fix the recording clock. Detection and fitting use still air at
-343 m/s. The search uses the real atmosphere: the effective speed of sound and the along-path wind for each
-pass, which rescale the fitted `v` and `d` consistently.
+The pitch drop sets `v`, the steepness sets `d`, and the curve's centre sets the heard CPA time `t0r`. Matched to
+one flight, one flyover therefore puts the recorder on a line beside that flight's path, each point of it tied to
+a different recording clock. Two flyovers, with the real time gap between them, intersect at a point and fix the
+recording clock. Detection and fitting use still air at 343 m/s. The search uses the real atmosphere: the
+effective speed of sound and the along-path wind for each pass, which rescale the fitted `v` and `d`
+consistently.
 
 ### The pipeline
 
@@ -198,7 +204,7 @@ pass, which rescale the fitted `v` and `d` consistently.
 
 | Gate | Passes when |
 |---|---|
-| core matches | at least 2 matches locate the observer: each fits its ADS-B prediction with chi ≤ 4, has its own best clock within 4 s, and beats chance by ≥ 2 nats |
+| core matches | at least 2 matches locate the observer: each fits its ADS-B prediction with chi ≤ 4, has its own best clock within 4 s, and beats chance by ≥ 2 nats. When an event has fewer than 20 chance samples to calibrate against (a tiny region), chi ≤ 2 stands in for the nats test |
 | clock lock | every match's own best clock is within its timing tolerance (clamped to 4–6 s) of the shared clock |
 | margin | the answer beats the best *different* explanation by ≥ 6 nats, or no rival survived. A rival is different if it matches a shared event to another flight, shares no match, or lies more than 5 km away |
 | no unheard close pass | no tonal aircraft passed much closer than the heard ones without leaving a detection |
@@ -245,6 +251,8 @@ pass, which rescale the fitted `v` and `d` consistently.
 
 - **Rust** via [rustup](https://rustup.rs). The repository pins `nightly-2026-08-31` (Rust 2024 edition) in
   `rust-toolchain.toml`, and rustup installs it on the first build.
+- **A C compiler** (Xcode Command Line Tools, or `build-essential`): a few dependencies compile C or assembly,
+  among them `ring` for TLS and the SQLite that frankenpandas bundles.
 - **ffmpeg and ffprobe** on `PATH`, for decoding (`brew install ffmpeg`, `apt install ffmpeg`, ...).
 - **Network** on first use for each date and region, plus disk for the cache (see
   [Configuration](#configuration)). Expect about 4 GB of download per uncached UTC day; only the regional
@@ -299,8 +307,9 @@ fdop selftest           # offline end-to-end known-answer run
 ## Command reference
 
 `fdop` has six subcommands. Run `fdop <cmd> --help` for the built-in text. The shared options `--cache`,
-`--offline` and `-q/--quiet` belong to `locate`, `detect` and `fetch`, and go after the subcommand. `runs` and
-`doctor` take `--cache` too.
+`--offline` and `-q/--quiet` belong to `locate`, `detect` and `fetch`, and go after the subcommand. `detect`
+accepts `--cache` and `--offline` but does not use them, since it needs no data. `runs` and `doctor` take
+`--cache` too.
 
 | Shared option | Meaning |
 |---|---|
@@ -338,7 +347,8 @@ conventions. If that finds nothing, it widens to the full window and says so in 
 ### `fdop detect <MEDIA>`: flyovers only, no ADS-B
 
 Detects and measures up to 24 flyovers and writes `events.json`, `survey.png`, and `e<N>.png` plus
-`e<N>_trace.csv` for every fitted event. The default output directory is `fdop_runs/detect`. One line per event goes to stdout:
+`e<N>_trace.csv` for every fitted event. The default output directory is `fdop_runs/detect`. One line per event
+goes to stdout:
 
 ```text
 e<N>  t_rec <seconds into file> s  f0 <Hz> Hz  v <m/s> m/s  d <m> m  rms <Hz>  ok | <failed quality gates>
@@ -360,7 +370,9 @@ fdop fetch --dates 2026-09-07..2026-09-09 --near "Nassau County, NY" --pad-km 50
 ```
 
 This caches the ADS-B day stores that `locate` will need, which is useful before going offline or before
-several runs. It prints `<legs> legs, <points> points cached under <cache>`.
+several runs. It prints `<legs> legs, <points> points cached under <cache>`. Unlike `locate`, `fetch` does not
+clip to the published archive: a date that runs into a UTC day adsb.lol has not published yet fails until that
+day appears.
 
 ### `fdop runs`: the run ledger
 
@@ -370,8 +382,9 @@ fdop runs --limit 100 --json
 fdop runs --cache DIR     # the ledger of runs made with locate --cache DIR
 ```
 
-Each `locate` run, found or not, is recorded in FrankenSQLite at `<cache>/runs.sqlite`: time, input, dates,
-region, lat/lon, radius, confidence, headline, run directory and total time.
+Each `locate` run that completes, found or not, is recorded in FrankenSQLite at `<cache>/runs.sqlite`: time,
+input, dates, region, lat/lon, radius, confidence, headline, run directory and total time. Runs that stop with an
+error are not recorded.
 
 ### `fdop doctor [--network] [--cache DIR]`
 
@@ -393,20 +406,22 @@ clock error under 2 s. It writes to `fdop_runs/selftest` by default.
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | `locate` found no location; `selftest` FAIL; `doctor` had a failed check |
-| 2 | Error (bad input, region not found, fetch failure, ...), printed as `fdop: error: ...`; also clap usage errors |
+| 1 | `locate` found no location; `selftest` FAIL (a wrong answer); `doctor` had a failed check |
+| 2 | Error (bad input, region not found, fetch failure, `selftest` finding no candidate, ...), printed as `fdop: error: ...`; also clap usage errors |
 
 ### Region syntax
 
-`--near` is case-insensitive. Leading words such as "near", "in", "around" and "somewhere near" are ignored.
+`--near` is case-insensitive, with one exception: a two-letter state after a place name with no comma must be
+upper case (`Oyster Bay NY`; `oyster bay, ny` also works). Leading words such as "near", "in", "around" and
+"somewhere near" are ignored.
 
 | Form | Examples | Search area |
 |---|---|---|
-| State (abbreviation, name or FIPS), or a list | `NY`, `New York`, `NY, NJ, CT`, `NY and NJ` | union of state bounding boxes |
+| State (abbreviation, name or a single FIPS code), or a list of abbreviations or names | `NY`, `New York`, `36`, `NY, NJ, CT`, `NY and NJ` | union of state bounding boxes |
 | Whole country | `CONUS`, `US`, `USA`, `lower 48`, `contiguous US` | 24.4–49.5° N, 125–66.9° W |
 | Place | `Oyster Bay, NY`, `Oyster Bay NY`, `Oyster Bay New York` | Census place, radius max(30 km, 3 × its equal-area radius) |
 | County | `Nassau County, NY`, `Orleans Parish, LA` | Census county, radius max(25 km, 1.5 × its equal-area radius) |
-| ZIP | `11771`, `11771-1234` | Census ZCTA centroid, 25 km |
+| ZIP | `11771`, `11771-1234` | Census ZCTA internal point, 25 km |
 | DC | `Washington DC`, `District of Columbia` | DC |
 | Point | `40.87,-73.52`, `40.87 -73.52`, `40.87N 73.52W` | 30 km radius |
 | Point and radius | `40.87,-73.52,20`, `40.87,-73.52,20km` | the given radius, up to 3,000 km |
@@ -423,8 +438,8 @@ Each `locate` run writes a directory:
 | `report.html` | Single-page report with a Leaflet map (USGS Topo, USGS Imagery and OSM layers), heat map, top candidates and answer circle. The map loads Leaflet and tiles from the internet |
 | `report.md` | The same report in Markdown: answer, gates, ranked candidates, events, funnel, margin, timings, warnings, data attribution |
 | `map.png`, `map.svg` | Static 1024² map on USGS Topo tiles with the radius ring and runner-up markers |
-| `result.json` | Everything: answer and gates, place, top 25 candidates, events, funnel, margin, warnings, heat map, timings, atmosphere, log |
-| `candidates.csv` | Ranked candidate table |
+| `result.json` | Everything: answer and gates, place, top 25 candidates, events, chance-match calibration, atmosphere, funnel, margin, warnings, heat map, figures, timings |
+| `candidates.csv` | The top 25 candidates, one row per (candidate, matched event) |
 | `survey.png` | Whole-file log-frequency spectrogram with detections and traces marked |
 | `e<N>.png`, `e<N>_trace.csv` | Per-event spectrogram with the fitted curve, and the traced points |
 | `e<N>_match.png` | Each winning event's trace against the ADS-B prediction |
@@ -465,11 +480,11 @@ that day again.
 | Data | Source | Notes |
 |---|---|---|
 | ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing |
-| Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric. Jets are dropped; unknown types are kept |
+| Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Jets are dropped; unknown types are kept |
 | Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | First usable source wins; falls back to a 15 °C standard atmosphere with a warning |
 | Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search |
 | Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL; −30 m if unreachable |
-| Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Offline fallback uses gazetteer centroids |
+| Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Offline fallback uses the gazetteer's internal points |
 | Basemap | [USGS The National Map](https://www.usgs.gov/programs/national-geospatial-program/national-map) Topo tiles; OSM in the HTML report | |
 
 ---
@@ -489,25 +504,28 @@ franken_doppler_finder/
     └── fdop-geo/            region parsing, gazetteer, reverse geocoding, static map, reports
 ```
 
-| Crate | Depends on | Built with |
+| Crate | Depends on | Main external crates in use |
 |---|---|---|
-| `fdop-types` | — | serde, flate2 |
-| `fdop-http` | — | asupersync (`tls-webpki-roots`) |
-| `fdop-data` | types, http | tar, flate2, png, rayon |
-| `fdop-core` | types | fsci-fft, fsci-opt, fsci-stats, rayon |
+| `fdop-types` | — | serde, serde_json, flate2 |
+| `fdop-http` | — | asupersync (`tls-webpki-roots`), serde_json |
+| `fdop-data` | types, http | tar, flate2, png, rayon, serde_json |
+| `fdop-core` | types | fsci-fft, fsci-opt, fsci-stats, rayon, png, serde_json |
 | `fdop-geo` | types, http | frankenpandas, zip, png, jpeg-decoder |
-| `franken_doppler_finder` (`fdop`) | all five | clap, fsqlite, asupersync, fsci-fft, fsci-spatial |
+| `franken_doppler_finder` (`fdop`) | all five | clap, fsqlite, asupersync, rayon, serde_json; fsci-fft, fsci-spatial and frankenpandas in `doctor`'s smoke tests |
 
 Design notes:
 - **Detection is a template bank, not peak picking.** On a log-frequency axis, changing `f0` only shifts a
   curve vertically, so one template per (speed, distance) scans every (time, pitch). Scoring takes the
   *minimum* of the approach and recede halves, which rejects flat tones and one-sided transients.
-- **The search is flight-centric.** It does not grid the whole region. For each event and each flight, the
-  points that could have heard that flight's CPA lie on a line perpendicular to the flight path. A hash join
+- **The search is flight-centric.** It does not grid the whole region. For each event and each flight, every
+  moment of the flight is a candidate CPA: the recorder then sits on the perpendicular to the path through that
+  point, at a distance that fits the measured CPA distance, and the moment fixes the recording start. A hash join
   on (east, north, recording start) finds the places two events share in O(N) time.
-- **Hypotheses are compact.** Each is 20 bytes of f32. The budgets are sized from physical memory: a tenth of RAM,
-  between 200 M and 2 G hypotheses in total.
-  Truncation is reported in the funnel and the warnings, never silent.
+- **Hypotheses are compact.** Each is 20 bytes (a `u32` track index and four `f32`). The budgets are sized from
+  physical memory: a tenth of RAM, clamped to 200 M–2 G hypotheses in total (4–40 GB), so on machines with less
+  than 40 GB the floor is more than a tenth.
+  A pair-join or fine-stage cut is reported in `funnel.truncated` and the warnings. An event that exceeds its
+  hypothesis budget, or falls beyond `--max-events`, drops to confirmer-only, which `funnel.hypotheses` shows.
 - **Parallel, and repeatable up to exact ties.** rayon runs the STFT frames, the template bank, tracing and
   every search stage. Each FFT is pinned to one worker so it does not nest inside rayon. Null sampling uses a
   fixed hash. Candidates with exactly equal scores can come out in a different order from run to run.
@@ -528,20 +546,20 @@ Three runs of the reference case, on one machine. Treat them as an order of magn
 | answer, geocode, map, report | 0.6 | 0.7 | 0.7 |
 | **total** | **294.6** | **440.2** | **101.5** |
 
-The state-wide run searched 10,550 track legs. All three ran on an Apple M5 Ultra with the ADS-B days already
+The state-wide run searched 10,550 track models. All three ran on an Apple M5 Ultra with the ADS-B days already
 cached. A first run adds the archive download (about 4 GB per UTC day) and the store build. One local date
-usually spans two UTC days. Worst-case search memory is set by the hypothesis budget: about a tenth of RAM,
-between 4 GB and 40 GB.
+usually spans two UTC days. Worst-case search memory is set by the hypothesis budget: a tenth of RAM, clamped to
+4–40 GB. A 3 h field recording took 509 s, 205 s of it in measurement.
 
 ---
 
 ## Testing
 
 ```bash
-cargo test --workspace                  # 67 unit tests, no network
-cargo run --release -- selftest         # end-to-end known answer, needs ffmpeg
+cargo test --workspace --locked                               # 70 unit tests, no network
+cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets --locked -- -D warnings  # as CI runs it
 ```
 
 The unit tests check:
@@ -551,18 +569,21 @@ The unit tests check:
 - fit recovery and range coverage;
 - Hermite track models against closed forms;
 - a two-flyover search, with and without wind, that locates the observer within 60 m and the clock within 1 s;
+- junk positions inside an ADS-B leg are dropped before track models are built;
+- trailing UTC days that adsb.lol has not published yet are recognised;
 - the store format, ADS-B parsing and leg building, weather payloads, terrain decoding, region parsing,
   gazetteer and geocoder payloads, reports and maps.
 
-Developer examples (`cargo run --release -p <crate> --example <name> -- ...`):
+Developer examples (`cargo run --release -p <package> --example <name> -- ...`; the root package is
+`franken_doppler_finder`):
 
 | Example | Crate | What it does |
 |---|---|---|
 | `detect_file <media> [sr]` | fdop-core | Detection and measurement with timings; optional survey and event PNGs |
-| `explain <run_dir> <stores> <lat> <lon> <t_start> <event:icao>...` | root | Scores named (event, flight) pairs at a point; residuals over a grid of sound speeds |
-| `truth <run_dir> <stores> <lat> <lon> <t_start> [elev_m] [max_km]` | root | For a recording whose place and clock are known: lists the archived passes near that place while it recorded and pairs them with the detected events. Without `events.json` in `run_dir` it lists the 24 h after `t_start`, which helps pick test windows |
+| `explain <run_dir> <stores> <lat> <lon> <t_start> <event:icao>...` | franken_doppler_finder | Scores named (event, flight) pairs at a point; residuals over a grid of sound speeds. `t_start` is unix seconds; `stores` is a comma-separated list of `.fdtrk` files |
+| `truth <run_dir> <stores> <lat> <lon> <t_start> [elev_m] [max_km] [dump=<icao>]` | franken_doppler_finder | For a recording whose place and clock are known: lists the archived passes near that place while it recorded and pairs them with the detected events. `t_start` is ISO 8601 or unix seconds. Without `events.json` in `run_dir` it lists the 24 h after `t_start`, which helps pick test windows. `dump=<icao>` also prints that aircraft's archived points near the place and each track model's closest approach, which is what the unheard-pass gate sees |
 | `probe [MiB]` | fdop-http | Streams part of an adsb.lol archive and reports throughput |
-| `ingest_ny`, `check_oracle`, `store_stats` | fdop-data | Reference-case ingest (New York, 2026-09-08 to 2026-09-10, about 12 GB), oracle position checks, store summaries |
+| `ingest_ny [icao_prefix...]`, `check_oracle`, `store_stats <file.fdtrk>` | fdop-data | Reference-case ingest (New York, 2026-09-08 to 2026-09-10, about 12 GB of download), oracle position checks, store summaries |
 | `live_check <out_dir>` | fdop-geo | Live region parsing, geocoding, map and report rendering |
 
 ---
@@ -594,15 +615,15 @@ audio or video recorded somewhere sensitive:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ffprobe/ffmpeg not runnable (...); install ffmpeg` | ffmpeg is not on `PATH` | Install ffmpeg; check with `fdop doctor` |
+| `ffprobe not runnable (...); install ffmpeg` (or `ffmpeg not runnable`) | ffmpeg is not on `PATH` | Install ffmpeg; check with `fdop doctor` |
 | `GitHub API refused ... limited to 60/hour, set GITHUB_TOKEN` | Unauthenticated GitHub API quota | `export GITHUB_TOKEN=$(gh auth token)` or any read-only token |
-| `no location: need at least two clear propeller flyovers` | Fewer than two usable passes | Look at `survey.png` for faint falling curves the detector missed. One flyover cannot be located; a longer recording may hold more |
-| `no location: no ADS-B flight pair explains two events at one place and clock` | Wrong date or region, or the aircraft had no ADS-B | Check `--dates` (local dates) and widen `--near`; try `--ignore-metadata-time` if the file's `creation_time` is wrong |
+| `no location: no location found: N usable flyover events; need at least two clear propeller flyovers` | Fewer than two usable passes | Look at `survey.png` for faint falling curves the detector missed. One flyover cannot be located; a longer recording may hold more |
+| `no location: ...; no ADS-B flight pair explains two events at one place and clock (...)` | Wrong date or region, or the aircraft had no ADS-B | Check `--dates` (local dates) and widen `--near`; try `--ignore-metadata-time` if the file's `creation_time` is wrong |
 | `ambiguous location: 'Springfield' matches places in K states` | Bare place name | Add the state: `"Springfield, IL"` |
 | `date range ... spans more than 15 days; narrow it` | Range too long | Split it into several runs |
 | `needs network or a cached file: Census gazetteer ...` | `--offline` before the gazetteer was cached | Run once online, or use a state, point or box region |
 | `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days are cached. A day missing from adsb.lol cannot be searched |
-| Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears a few hours after it ends, usually by 04:00 UTC | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |
+| Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears some hours after it ends | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |
 | Answer graded **low** | One or more gates failed | Read the gates in `report.html`. A small margin means another flight pair explains the curves almost as well |
 | Disk filling up | Many cached regions and days | Delete old `adsb/<date>/` folders under the cache root |
 
@@ -617,8 +638,9 @@ audio or video recorded somewhere sensitive:
   broadcast ADS-B or were seen by MLAT. Aircraft without transponders, or outside adsb.lol's feeder coverage,
   cannot be matched.
 - **A stationary recorder, and simple passes.**
-  - Detection and fitting assume a straight, constant-speed, constant-pitch pass. A manoeuvre raises
-    warnings, widens the ranges and halves the event's weight.
+  - Detection and fitting assume a straight, constant-speed, constant-pitch pass. A likely manoeuvre raises
+    a warning and widens the ranges. A model misfit, or approach and recede halves that disagree, also
+    halves the event's weight in the search.
   - The search follows each aircraft's real ADS-B path. For misfit events it also allows one change of tone,
     such as an RPM or power change.
 - **Detection envelope:** 35–1100 Hz, about 40–175 m/s and 250 m–12 km at detection, with the decode at
@@ -627,14 +649,26 @@ audio or video recorded somewhere sensitive:
 - **Data volume:** each new UTC day costs about 4 GB of download, and adsb.lol archives cannot be fetched
   partially. adsb.lol has gaps on some days.
 - **The HTML report's map needs internet** to load Leaflet and tiles. `map.png` is self-contained.
-- **Validated on one real recording.** Three search configurations of it agree at high confidence, but one
-  recording cannot show how often the method fails elsewhere, and earlier builds gave wrong low-confidence
-  answers on it. See [Honest status](#honest-status).
+- **Located real recordings at one site only.** The reference recording, and a public osprey cam at the same
+  site on a different day with different flights, both came out high. Five further field recordings, one from
+  the same cam on another day and four from sites with sparse light-aircraft traffic, were graded low or gave
+  no location. See [Honest status](#honest-status).
 
 ### Known issues
 
 - Jets are excluded when the ADS-B archive is ingested, so they can neither explain an event nor count as an
   unheard close pass. There is no option to include them.
+- Detection and measurement are sized for about an hour of audio: at most 60 detections, the 24 strongest
+  measured, and 12 driving the pair join (`--max-events`). Long recordings with many flyovers lose the weaker
+  ones.
+- Measurement is slow on long traces: 205 s of a 509 s run on a 3 h recording.
+- `--near <state>` searches the state's bounding box, which takes in parts of neighbouring states, so a wrong
+  (low) answer can land outside the state (Connecticut for a New York search).
+- Helicopter passes (rotor tones, speed changes) can fit with confidently wrong speed and distance. They do
+  harm only through false pairings, which the margin gate is meant to catch.
+- Two fallbacks put no warning in the report. A failed NGS geoid lookup uses −30 m, and the log line names the
+  source. A terrain tile that cannot be fetched gives 0 m for its area, and only a lower "tiles ready" count in
+  the log shows it.
 
 ---
 
@@ -651,18 +685,21 @@ not heard counts against it.
 **Why ignore jets?** Jet noise is broadband roar without a stable tone, so there is no clean curve to fit.
 Unknown aircraft types are kept.
 
-**How precise is it?** On the one real recording, the high-confidence answers landed 221–224 m from the
-published location, inside their 292 m radius. Precision depends on how many clean passes there are, how close they were,
-and the ADS-B cadence. The radius is the honest measure for each run, but only for a **high** or **medium**
+**How precise is it?** On the reference recording, the high-confidence answers landed 221–224 m from the
+published location, inside their 292 m radius. On the osprey-cam field recording it was about 150 m from the
+cam's geocoded street address, just outside its 147 m radius; an address geocode only approximates where a
+camera is. Precision depends on how many clean passes there are, how close they were, and the ADS-B cadence. The
+radius is the run's own measure of its uncertainty, and is meaningful only for a **high** or **medium**
 answer. A **low** answer can be far off; one was 102 km off.
 
-**How long does it take?** A one-day state-wide search took about 5 minutes with the data cached; a three-day
-window took about 7.5. The first run on new
-dates is dominated by the archive download.
+**How long does it take?** A one-day state-wide search of a 1 h recording took about 5 minutes with the data
+cached; a three-day window took about 7.5, and a 3 h recording about 8.5. The first run on new dates is
+dominated by the archive download.
 
 **Can I search the whole country?** `--near CONUS` is accepted. It downloads the same daily archives but keeps
-far more tracks, and the hypothesis budgets may truncate the search, which the funnel and warnings report. It
-has not been validated on real data at that scale.
+far more tracks, and the budgets may truncate the search: a pair-join or fine-stage cut appears in the funnel
+and the warnings, and an event over its hypothesis budget drops to confirmer-only. It has not been validated on
+real data at that scale.
 
 **Will it work on a phone call or a compressed video?** The source video reports curves surviving a phone call's
 audio path. `fdop` decodes anything ffmpeg reads, but it has only been validated on the reference recording.

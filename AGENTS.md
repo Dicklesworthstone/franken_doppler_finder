@@ -160,13 +160,17 @@ run (`result.json`) or the test that produced it.
 
 1. **Never print an answer that bypasses the gates.** Every location carries its radius, confidence and gate
    results.
-2. **Refuse, never fabricate.** A single flyover is refused. Missing ADS-B days are errors unless explicitly
-   allowed. Every fallback (standard atmosphere, flat terrain, default geoid, missing basemap) adds a warning to
-   the report.
-3. **Report truncation.** Budget cuts in the search appear in `funnel.truncated` and the warnings.
-4. **Do not overfit the reference case.** There is one real recording. A change to a threshold or constant
-   needs a synthetic or metamorphic test that justifies it on its own terms. Report its effect on the reference
-   case, including when it gets worse.
+2. **Refuse, never fabricate.** A single flyover is refused. An ADS-B day missing from the archive is an error.
+   The one exception is a trailing day adsb.lol has not published yet: it clips the search window, with a warning.
+   Every fallback must add a warning to the report. The standard atmosphere, a failed terrain prefetch and a
+   failed basemap do. Two gaps remain, listed in README "Known issues": the default geoid only logs, and a single
+   missing terrain tile silently becomes 0 m.
+3. **Report truncation.** Pair-join and fine-stage cuts appear in `funnel.truncated` and the warnings. An event
+   demoted to confirmer-only, by its hypothesis budget or by `--max-events`, shows only in `funnel.hypotheses`.
+   Do not add a new silent cut.
+4. **Do not overfit the reference case.** There is one reference recording and a handful of field tests. A
+   change to a threshold or constant needs a synthetic or metamorphic test that justifies it on its own terms.
+   Report its effect on the reference case and the field tests, including when it gets worse.
 5. **Report failures as failures.** A wrong or low-confidence result on the reference case is recorded, not
    rerun until it passes.
 
@@ -180,6 +184,9 @@ run (`result.json`) or the test that produced it.
 - **One real location only.** The only real-world location in tests and fixtures is the answer published in the
   source video: 40.876466, −73.524951 (Oyster Bay, NY, 2026-09-08), and the flights the video shows there. Do
   not add anyone else's location, recording or flight history.
+- **Field tests on public live cams** (streams with published locations) may be summarised in the docs at town
+  level: the site type, the town, the date, the confidence and the error. Never commit their recordings, their
+  coordinates or the registrations of the aircraft heard.
 - **No personal data** in fixtures, docs, examples or commit messages.
 - **Network etiquette.** The HTTP User-Agent (`crates/fdop-http/src/lib.rs`) names the tool honestly; keep it
   that way. Cache every response, respect the GitHub API limit (60/hour without `GITHUB_TOKEN`), and never
@@ -194,11 +201,11 @@ run (`result.json`) or the test that produced it.
 | Item | Pin |
 |---|---|
 | Toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), Rust 2024 edition, resolver 3, one Cargo workspace |
-| Async runtime and HTTP | asupersync `0.6.2` with `tls-webpki-roots` (rustls); the sole async runtime |
+| Async runtime and HTTP | asupersync `0.6.2` with `tls-webpki-roots` (rustls), the only runtime our code uses. fsqlite `0.4.13` brings its own asupersync `0.5.0` internally |
 | Numerics | frankenscipy `0.4.0` (`fsci-fft`, `fsci-opt`, `fsci-stats`, `fsci-signal`, `fsci-spatial`, `fsci-runtime`) |
 | Tables | frankenpandas `0.6.0` |
 | Run ledger | fsqlite `0.4.13` (`native`, no default features) |
-| External tools | `ffmpeg` and `ffprobe` on `PATH`; nothing else |
+| External tools | `ffmpeg` and `ffprobe` on `PATH`, plus `sysctl` on macOS to read physical memory. A C compiler for the build (`ring`, bundled SQLite). `yt-dlp` only to fetch the reference recording |
 
 Moving a pin is a deliberate event. Afterwards, run `fdop selftest` and the reference case, and record both
 results in the commit message.
@@ -213,13 +220,17 @@ results in the commit message.
 - **Banned as direct dependencies:**
   - tokio, hyper, reqwest, axum;
   - rusqlite, sqlx;
-  - arrow, parquet, polars (they arrive transitively through frankenpandas; do not depend on them directly);
+  - arrow, parquet, polars;
   - petgraph;
   - chrono and time;
   - Python or other runtimes reached by subprocess.
+
+  arrow, parquet, rusqlite (with its bundled C SQLite) and chrono already arrive transitively through
+  frankenpandas. That is accepted, but none of them may become a direct dependency.
 - **Layering.**
   - `fdop-types` is the leaf.
-  - `fdop-core` depends only on `fdop-types` and the numerics, and never touches the network.
+  - `fdop-core` depends only on `fdop-types`, the numerics and small utilities (rayon, serde, png), and never
+    touches the network.
   - Only `fdop-http` does HTTP; `fdop-data` and `fdop-geo` go through it.
   - The root crate wires everything together.
 - **No new crates without approval.**
@@ -264,6 +275,7 @@ results in the commit message.
 
   All three matched N22NY (PC-12) and N501EX (C208) as the core pair, with N93CQ (B350) as a confirmer. They
   ran on the import commit plus the 5-line evidence-calibration change described in CHANGELOG section 11.
+  `ny10` repeated the first row on `1f321cb`: high, 224 m off, radius 292 m, margin 7.7 nats, the same flights.
   Earlier builds got the second and third rows wrong or low (CHANGELOG reference-case table), so re-run all
   three after any change to detection, measurement, search or grading, and update this table and README
   "Honest status" with the result. The county margin (6.8 nats) sits closest to its gate (6 nats).
@@ -275,19 +287,19 @@ results in the commit message.
 - **stdout carries results; stderr carries progress** (`[   12.3s] message`).
 - `--json` output and `result.json` field names are an interface; change them deliberately and note it in
   `CHANGELOG.md`.
-- **Exit codes:** 0 success; 1 no location, selftest FAIL or a doctor failure; 2 error. Errors print as
-  `fdop: error: ...`.
+- **Exit codes:** 0 success; 1 no location, a selftest FAIL (wrong answer) or a doctor failure; 2 error,
+  including a selftest that finds no candidate. Errors print as `fdop: error: ...`.
 
 ---
 
 ## Compiler Checks
 
-After substantive Rust changes:
+After substantive Rust changes (CI runs the same commands, so a local pass should mean a CI pass):
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 cargo run --release -- selftest
 ```
 
@@ -371,7 +383,14 @@ fdop runs --json                                         # the run ledger
 
 ## Current Repository State
 
-The pipeline runs end to end. It has one validated real case (above) and offline unit tests and a selftest. The
-open issues are listed in README "Known issues". `src/probe_deps.rs` is an unreferenced dependency probe (not
-declared in `src/lib.rs`), kept pending a decision. `data/icao_engine_class.tsv` at the repository root is an
-unused byte-identical copy of `crates/fdop-types/data/icao_engine_class.tsv`, which is the one compiled in.
+The pipeline runs end to end. It has offline unit tests, a selftest and one validated reference case (above).
+Field tests on public live-cam recordings are summarised in README "Honest status": the reference site was
+located again from a recording on another day, and four sparse-traffic sites failed, graded low or with no
+location. The open issues are listed in README "Known issues".
+
+Loose ends, kept pending a decision (RULE 1):
+- `src/probe_deps.rs` is an unreferenced dependency probe, not declared in `src/lib.rs`.
+- `data/icao_engine_class.tsv` at the repository root is an unused, byte-identical copy of
+  `crates/fdop-types/data/icao_engine_class.tsv`, which is the one compiled in.
+- Some dependencies are declared but not used: `fsci-signal`, `fsci-spatial` and `fsci-runtime` in `fdop-core`;
+  `fsci-opt` and `fsci-signal` in the root crate (used only by `src/probe_deps.rs`).

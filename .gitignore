@@ -15,8 +15,9 @@ flamegraph.svg
 
 # === franken_doppler_finder specific ===
 
-# Run directories written by `fdop locate | detect | selftest` (default ./fdop_runs/), plus older layouts.
-/fdop_runs/
+# Run directories written by `fdop locate | detect | selftest` (default ./fdop_runs/ under the working
+# directory, so match it at any depth), plus the older top-level layout.
+fdop_runs/
 /runs/
 *.fspec
 
@@ -30,19 +31,19 @@ runs.sqlite
 runs.sqlite-*
 
 # Recordings. This tool infers where a recording was made, so a committed recording can leak a location.
-# Tests synthesise their audio; real recordings stay outside the repository.
-*.m4a
-*.mp3
-*.wav
-*.flac
-*.ogg
-*.opus
-*.aac
-*.mp4
-*.mov
-*.MOV
-*.mkv
-*.webm
+# Tests synthesise their audio; real recordings stay outside the repository. The patterns are case-insensitive
+# (CLIP.MP4 as well as clip.mp4), because git matches case-sensitively on Linux.
+*.[mM]4[aA]
+*.[mM][pP]3
+*.[wW][aA][vV]
+*.[fF][lL][aA][cC]
+*.[oO][gG][gG]
+*.[oO][pP][uU][sS]
+*.[aA][aA][cC]
+*.[mM][pP]4
+*.[mM][oO][vV]
+*.[mM][kK][vV]
+*.[wW][eE][bB][mM]
 
 # Secrets (GITHUB_TOKEN and friends belong in the environment, never in a file here)
 .env
