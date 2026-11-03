@@ -1,0 +1,16 @@
+[package]
+name = "fdop-data"
+description = "ADS-B archive discovery and streaming ingest (adsb.lol globe_history), terrain tiles, geoid lookups"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+fdop-types.workspace = true
+fdop-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+tar.workspace = true
+png.workspace = true
+rayon.workspace = true

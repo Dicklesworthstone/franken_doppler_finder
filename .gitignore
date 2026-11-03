@@ -1,0 +1,65 @@
+# Rust build output
+/target/
+target/
+**/*.rs.bk
+*.pdb
+
+# Keep Cargo.lock tracked: fdop is a binary, and a pinned lock keeps runs reproducible.
+
+# Profiling and benchmark scratch
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+flamegraph.svg
+
+# === franken_doppler_finder specific ===
+
+# Run directories written by `fdop locate | detect | selftest` (default ./fdop_runs/), plus older layouts.
+/fdop_runs/
+/runs/
+*.fspec
+
+# Downloaded data never belongs in git. ADS-B day stores, terrain and map tiles, gazetteer zips, weather
+# responses and the run ledger live under the cache root ($FDOP_CACHE, default ~/.cache/fdop); this keeps
+# stray copies out of the tree too.
+/cache/
+*.fdtrk
+*.fdtrk.part
+runs.sqlite
+runs.sqlite-*
+
+# Recordings. This tool infers where a recording was made, so a committed recording can leak a location.
+# Tests synthesise their audio; real recordings stay outside the repository.
+*.m4a
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.opus
+*.aac
+*.mp4
+*.mov
+*.MOV
+*.mkv
+*.webm
+
+# Secrets (GITHUB_TOKEN and friends belong in the environment, never in a file here)
+.env
+.env.*
+
+# Agent and tool state
+.ee/
+.ntm/
+.rch/
+.bv/
+.beads/beads.db*
+.beads/*.lock
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# rustc internal-compiler-error dumps
+rustc-ice-*.txt

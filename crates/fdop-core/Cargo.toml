@@ -1,0 +1,19 @@
+[package]
+name = "fdop-core"
+description = "Signal processing, Doppler physics, event detection/fitting, track models, search and scoring for franken_doppler_finder"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+fdop-types.workspace = true
+fsci-fft.workspace = true
+fsci-opt.workspace = true
+fsci-signal.workspace = true
+fsci-spatial.workspace = true
+fsci-runtime.workspace = true
+fsci-stats.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+png.workspace = true

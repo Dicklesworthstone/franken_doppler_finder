@@ -1,0 +1,81 @@
+[workspace]
+members = [".", "crates/fdop-types", "crates/fdop-core", "crates/fdop-http", "crates/fdop-data", "crates/fdop-geo"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+fdop-types = { path = "crates/fdop-types" }
+fdop-core = { path = "crates/fdop-core" }
+fdop-http = { path = "crates/fdop-http" }
+fdop-data = { path = "crates/fdop-data" }
+fdop-geo = { path = "crates/fdop-geo" }
+# frankenscipy: FFT (STFT), bounded TRF least squares (curve fits), KD-tree, signal helpers.
+fsci-fft = "0.4.0"
+fsci-opt = "0.4.0"
+fsci-signal = "0.4.0"
+fsci-spatial = "0.4.0"
+fsci-runtime = "0.4.0"
+fsci-stats = "0.4.0"
+# asupersync: structured-concurrency runtime + HTTP/1.1 client over rustls.
+asupersync = { version = "0.6.2", features = ["tls-webpki-roots"] }
+# frankenpandas: tabular outputs.
+frankenpandas = "0.6.0"
+# frankensqlite: run ledger + cache index.
+fsqlite = { version = "0.4.13", default-features = false, features = ["native"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+tar = "0.4"
+png = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+
+[package]
+name = "franken_doppler_finder"
+description = "Locate an audio recording from propeller-aircraft Doppler curves matched against ADS-B tracks"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fdop"
+path = "src/main.rs"
+
+[lib]
+name = "fdop"
+path = "src/lib.rs"
+
+[dependencies]
+fdop-types.workspace = true
+fdop-core.workspace = true
+fdop-http.workspace = true
+fdop-data.workspace = true
+fdop-geo.workspace = true
+fsci-fft.workspace = true
+fsci-opt.workspace = true
+fsci-signal.workspace = true
+fsci-spatial.workspace = true
+asupersync.workspace = true
+frankenpandas.workspace = true
+fsqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+clap.workspace = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

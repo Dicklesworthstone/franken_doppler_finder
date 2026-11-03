@@ -1,0 +1,305 @@
+//! Event measurement: turn a survey detection into a fitted, quality-gated Doppler event.
+//!
+//! 1. Adaptive STFT around the detection: window from the expected maximum chirp rate
+//!    (win ~ 1/sqrt(RoC)), hop 0.1 s, bins <= 0.25 Hz, band from the detection's asymptotes;
+//!    rows median-normalised over a wide context (+-`context_s`) so the pass itself does not
+//!    raise its own noise floor.
+//! 2. Model-guided ridge trace: at every frame, the ridge is searched only within `band` Hz of
+//!    the current model curve (integrating along the model's local slope), so the trace cannot
+//!    wander onto a crossing engine tone or a neighbouring flyover.
+//! 3. Retarded-time constant-velocity fit of the trace; the fitted curve becomes the next model
+//!    and the band shrinks to a few fit-RMS. Three rounds.
+//! 4. Quality gates: points, coverage of both sides of the CPA, fit RMS, plausible v and d.
+
+use crate::detect::Detection;
+use crate::fit::{FitResult, Side, fit_constant_velocity};
+use crate::physics::{cv_curve, window_for_roc};
+use crate::spectro::{Spec, stft_band_db};
+use crate::trace::{Trace, ridge_peak};
+use serde::Serialize;
+
+#[derive(Clone, Debug)]
+pub struct MeasureParams {
+    pub c: f64,
+    pub hop_s: f64,
+    pub df_max: f64,
+    /// Row-normalisation context on each side of the event (s).
+    pub context_s: f64,
+    pub min_snr: f64,
+    pub min_z: f64,
+    pub min_points: usize,
+    /// Minimum traced span on each side of the CPA (s).
+    pub min_side_s: f64,
+    pub max_rmse_hz: f64,
+    pub rounds: usize,
+}
+
+impl Default for MeasureParams {
+    fn default() -> Self {
+        Self {
+            c: fdop_types::C_SOUND,
+            hop_s: 0.1,
+            df_max: 0.25,
+            context_s: 600.0,
+            min_snr: 3.0,
+            min_z: 4.0,
+            min_points: 80,
+            min_side_s: 8.0,
+            max_rmse_hz: 1.5,
+            rounds: 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EventQuality {
+    pub n_points: usize,
+    pub span_approach_s: f64,
+    pub span_recede_s: f64,
+    pub median_snr_db: f64,
+    pub rmse_hz: f64,
+    /// Ranking value: median SNR (dB) x sqrt(effective independent points).
+    pub score: f64,
+    pub ok: bool,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MeasuredEvent {
+    pub id: String,
+    pub detection: Detection,
+    pub fit: Option<FitResult>,
+    pub trace: Trace,
+    pub quality: EventQuality,
+    /// STFT window used (s).
+    pub win_s: f64,
+    #[serde(skip)]
+    pub spec: Option<Spec>,
+}
+
+impl MeasuredEvent {
+    pub fn t_rec(&self) -> f64 {
+        self.fit.as_ref().map_or(self.detection.t0r, |f| f.best.t0r)
+    }
+}
+
+fn model_fn(f0: f64, v: f64, d: f64, t0r: f64, c: f64) -> impl Fn(f64) -> f64 {
+    let t0e = t0r - d / c;
+    move |t| cv_curve(t, f0, v, d, t0e, c)
+}
+
+/// Trace the ridge within `band` Hz of `model` over frames whose time lies in [ta, tb].
+pub fn guided_trace(
+    spec: &Spec,
+    model: &(dyn Fn(f64) -> f64 + Sync),
+    ta: f64,
+    tb: f64,
+    band: f64,
+    min_snr: f64,
+    min_z: f64,
+) -> Trace {
+    let nt = spec.nt();
+    let hop = spec.dt();
+    let half = ((1.5 / hop).round() as usize).max(1);
+    let noise_band = (4.0 * band).max(8.0);
+    let rows: Vec<Option<(f64, f64, f64)>> = {
+        use rayon::prelude::*;
+        (0..nt)
+            .into_par_iter()
+            .map(|j| {
+                let t = spec.t[j];
+                if t < ta || t > tb {
+                    return None;
+                }
+                let fp = model(t);
+                let slope = (model(t + 0.5) - model(t - 0.5)) / 1.0;
+                ridge_peak(spec, j, fp, slope, band, noise_band, half).and_then(|(fh, snr, z)| {
+                    (snr >= min_snr && z >= min_z && (fh - fp).abs() <= band)
+                        .then_some((t, fh, snr))
+                })
+            })
+            .collect()
+    };
+    let mut tr = Trace::default();
+    for (t, f, s) in rows.into_iter().flatten() {
+        tr.t.push(t);
+        tr.f.push(f);
+        tr.snr.push(s);
+    }
+    tr
+}
+
+/// Measure one detection. `x` is the whole recording at `sr`; times are recording seconds.
+pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams) -> MeasuredEvent {
+    let c = p.c;
+    let dur = x.len() as f64 / sr as f64;
+    let tau = det.d / det.v.max(10.0);
+    let span = (4.0 * tau).clamp(45.0, 300.0);
+    let (ta, tb) = ((det.t0r - span).max(0.0), (det.t0r + span).min(dur));
+    let v_hi = (det.v * 1.4).min(0.8 * c);
+    let fmin = (det.f0 * c / (c + v_hi) * 0.93 - 3.0).max(15.0);
+    let fmax = (det.f0 * c / (c - v_hi) * 1.07 + 3.0).min(sr as f64 * 0.45);
+    let roc = det.f0 * det.v * det.v / (c * det.d.max(50.0));
+    let win = window_for_roc(roc).clamp(0.5, 2.0);
+    let (ca, cb) = ((ta - p.context_s).max(0.0), (tb + p.context_s).min(dur));
+    let mut quality = EventQuality {
+        n_points: 0,
+        span_approach_s: 0.0,
+        span_recede_s: 0.0,
+        median_snr_db: 0.0,
+        rmse_hz: f64::NAN,
+        score: 0.0,
+        ok: false,
+        reasons: Vec::new(),
+    };
+    let s0 = (ca * sr as f64) as usize;
+    let s1 = ((cb * sr as f64) as usize).min(x.len());
+    let mut spec = match stft_band_db(&x[s0..s1], sr, win, p.hop_s, fmin, fmax, p.df_max, ca) {
+        Ok(s) => s,
+        Err(e) => {
+            quality.reasons.push(format!("spectrogram: {e}"));
+            return MeasuredEvent {
+                id: id.into(),
+                detection: det.clone(),
+                fit: None,
+                trace: Trace::default(),
+                quality,
+                win_s: win,
+                spec: None,
+            };
+        }
+    };
+    spec.normalize_rows(None);
+    let mut model: Box<dyn Fn(f64) -> f64 + Sync> =
+        Box::new(model_fn(det.f0, det.v, det.d, det.t0r, c));
+    let mut band = (0.04 * det.f0).clamp(3.0, 12.0);
+    let mut fit: Option<FitResult> = None;
+    let mut trace = Trace::default();
+    for round in 0..p.rounds {
+        let tr = guided_trace(&spec, &*model, ta, tb, band, p.min_snr, p.min_z);
+        if tr.len() < 20 {
+            if round == 0 {
+                quality
+                    .reasons
+                    .push(format!("guided trace found only {} ridge points", tr.len()));
+            }
+            break;
+        }
+        match fit_constant_velocity(&tr.t, &tr.f, c, Side::Both) {
+            Ok(fr) => {
+                let b = fr.best;
+                model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
+                band = (3.0 * b.rmse).clamp(1.0, band);
+                trace = tr;
+                fit = Some(fr);
+            }
+            Err(e) => {
+                quality.reasons.push(format!("fit: {e}"));
+                trace = tr;
+                break;
+            }
+        }
+    }
+    // Keep only the analysis window plus a scoring margin in memory.
+    let keep_a = spec.frame_index((ta - 60.0).max(spec.t[0]));
+    let keep_b = (spec.frame_index((tb + 60.0).min(spec.t[spec.nt() - 1])) + 1).min(spec.nt());
+    let spec = spec.crop(keep_a, keep_b, 0, spec.nf());
+    quality.n_points = trace.len();
+    if let Some(fr) = &fit {
+        let t0r = fr.best.t0r;
+        let (mut amin, mut rmax) = (t0r, t0r);
+        for &t in &trace.t {
+            amin = amin.min(t);
+            rmax = rmax.max(t);
+        }
+        quality.span_approach_s = t0r - amin;
+        quality.span_recede_s = rmax - t0r;
+        let mut snr = trace.snr.clone();
+        quality.median_snr_db = crate::spectro::median_f64(&mut snr);
+        quality.rmse_hz = fr.best.rmse;
+        let n_eff = fr.diagnostics.n_eff.max(1.0);
+        quality.score = quality.median_snr_db.max(0.0) * n_eff.sqrt();
+        let b = fr.best;
+        if trace.len() < p.min_points {
+            quality
+                .reasons
+                .push(format!("{} trace points < {}", trace.len(), p.min_points));
+        }
+        if quality.span_approach_s < p.min_side_s || quality.span_recede_s < p.min_side_s {
+            quality.reasons.push(format!(
+                "one-sided trace (approach {:.0}s, recede {:.0}s): CPA not observed",
+                quality.span_approach_s, quality.span_recede_s
+            ));
+        }
+        if b.rmse > p.max_rmse_hz {
+            quality
+                .reasons
+                .push(format!("fit RMS {:.2} Hz > {:.2}", b.rmse, p.max_rmse_hz));
+        }
+        if !(15.0..=0.8 * c).contains(&b.v) {
+            quality
+                .reasons
+                .push(format!("implausible speed {:.0} m/s", b.v));
+        }
+        if !(60.0..=25_000.0).contains(&b.d) {
+            quality
+                .reasons
+                .push(format!("implausible CPA distance {:.0} m", b.d));
+        }
+        if (b.t0r - det.t0r).abs() > (0.5 * span).max(20.0) {
+            quality.reasons.push(format!(
+                "fit CPA {:.1}s drifted from detection {:.1}s",
+                b.t0r, det.t0r
+            ));
+        }
+    } else if quality.reasons.is_empty() {
+        quality.reasons.push("no fit".into());
+    }
+    quality.ok = fit.is_some() && quality.reasons.is_empty();
+    MeasuredEvent {
+        id: id.into(),
+        detection: det.clone(),
+        fit,
+        trace,
+        quality,
+        win_s: win,
+        spec: Some(spec),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::{DetectParams, detect, refine, survey};
+
+    #[test]
+    fn detect_then_measure_recovers_parameters() {
+        let sr = 4000u32;
+        let (f0, v, d, t0e) = (118.0, 120.0, 3000.0, 300.0);
+        let n = sr as usize * 600;
+        let mut seed = 99u64;
+        let mut phase = 0.0f64;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr as f64;
+                phase += 2.0 * std::f64::consts::PI * cv_curve(t, f0, v, d, t0e, 343.0) / sr as f64;
+                (0.08 * phase.sin() + 0.9 * ((seed as f64 / u64::MAX as f64) * 2.0 - 1.0)) as f32
+            })
+            .collect();
+        let dp = DetectParams::default();
+        let (ls, lin) = survey(&x, sr, &dp).unwrap();
+        let dets = detect(&ls, &dp);
+        let det = refine(&lin, &dets[0], 343.0);
+        let ev = measure(&x, sr, &det, "e1", &MeasureParams::default());
+        let fr = ev.fit.as_ref().expect("fit");
+        assert!(ev.quality.ok, "{:?}", ev.quality.reasons);
+        let t0r = t0e + d / 343.0;
+        assert!((fr.best.t0r - t0r).abs() < 0.3, "t0r {}", fr.best.t0r);
+        assert!((fr.best.f0 - f0).abs() < 0.3, "f0 {}", fr.best.f0);
+        assert!((fr.best.v - v).abs() < 4.0, "v {}", fr.best.v);
+        assert!((fr.best.d / d - 1.0).abs() < 0.08, "d {}", fr.best.d);
+    }
+}

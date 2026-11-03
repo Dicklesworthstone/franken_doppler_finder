@@ -1,0 +1,4 @@
+[toolchain]
+# Same pin as the franken* libraries this crate builds on (frankenscipy, asupersync, frankenpandas).
+channel = "nightly-2026-08-31"
+components = ["rustfmt", "clippy"]
