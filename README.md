@@ -306,9 +306,8 @@ fdop selftest           # offline end-to-end known-answer run
 ## Command reference
 
 `fdop` has six subcommands. Run `fdop <cmd> --help` for the built-in text. The shared options `--cache`,
-`--offline` and `-q/--quiet` belong to `locate`, `detect` and `fetch`, and go after the subcommand. `detect`
-accepts `--cache` and `--offline` but does not use them, since it needs no data. `runs` and `doctor` take
-`--cache` too.
+`--offline` and `-q/--quiet` belong to `locate` and `fetch`, and go after the subcommand. `detect` needs no data
+and takes only `-o` and `-q`. `runs` and `doctor` take `--cache` too.
 
 | Shared option | Meaning |
 |---|---|
@@ -321,7 +320,7 @@ accepts `--cache` and `--offline` but does not use them, since it needs no data.
 | Option | Default | Meaning |
 |---|---|---|
 | `<MEDIA>` | required | Audio or video file, anything ffmpeg reads |
-| `--dates <D>` | required | Local date(s) of the recording: `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD` (also `D0 to D1`, `D0,D1`, `YYYY/MM/DD`, `YYYYMMDD`). At most 15 days |
+| `--dates <D>` | required | Local date(s) of the recording: `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD` (also `D0 to D1`, `D0,D1`, `YYYY/MM/DD`, `YYYYMMDD`). The year comes first: `09/08/2026` is refused as ambiguous. At most 15 days |
 | `--near <REGION>` | required | Coarse US region; see [Region syntax](#region-syntax) |
 | `-o, --out <DIR>` | `fdop_runs/<name>_<unix time>` | Output directory |
 | `--start <ISO>` | — | Exact recording start if known, e.g. `2026-09-08T19:17:30-04:00`. Without a zone it is read as **UTC**. Unix seconds also work |
@@ -406,8 +405,8 @@ clock error under 2 s. It writes to `fdop_runs/selftest` by default.
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | `locate` found no location; `selftest` FAIL (a wrong answer); `doctor` had a failed check |
-| 2 | Error (bad input, region not found, fetch failure, `selftest` finding no candidate, ...), printed as `fdop: error: ...`; also clap usage errors |
+| 1 | `locate` found no location; `selftest` FAIL (a wrong answer or no candidate); `doctor` had a failed check |
+| 2 | Error (bad input, region not found, fetch failure, ...), printed as `fdop: error: ...`; also clap usage errors |
 
 ### Region syntax
 

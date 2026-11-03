@@ -67,7 +67,7 @@ pub struct Common {
 pub struct LocateCli {
     /// Audio or video file (anything ffmpeg reads).
     pub media: PathBuf,
-    /// Local date(s) of the recording: YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD.
+    /// Local date(s) of the recording: YYYY-MM-DD, or a range YYYY-MM-DD..YYYY-MM-DD (also "D0 to D1" or "D0,D1"; YYYY/MM/DD and YYYYMMDD work too). At most 15 days.
     #[arg(long)]
     pub dates: String,
     /// Coarse US region: "NY", "New York", a place "Oyster Bay, NY", a county "Nassau County, NY", a ZIP, "lat,lon[,km]", "S,W,N,E", or "CONUS".
@@ -97,17 +97,22 @@ pub struct LocateCli {
 
 #[derive(Args, Debug)]
 pub struct DetectCli {
+    /// Audio or video file (anything ffmpeg reads).
     pub media: PathBuf,
+    /// Output directory (default fdop_runs/detect).
     #[arg(short, long)]
     pub out: Option<PathBuf>,
-    #[command(flatten)]
-    pub common: Common,
+    /// Less progress output on stderr.
+    #[arg(short, long)]
+    pub quiet: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct FetchCli {
+    /// Local date(s) of the recording: YYYY-MM-DD, or a range YYYY-MM-DD..YYYY-MM-DD (also "D0 to D1" or "D0,D1"; YYYY/MM/DD and YYYYMMDD work too). At most 15 days.
     #[arg(long)]
     pub dates: String,
+    /// Coarse US region: "NY", "New York", a place "Oyster Bay, NY", a county "Nassau County, NY", a ZIP, "lat,lon[,km]", "S,W,N,E", or "CONUS".
     #[arg(long)]
     pub near: String,
     /// Extra padding around the region (km).
@@ -208,7 +213,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             Ok(if out.found { 0 } else { 1 })
         }
         Cmd::Detect(d) => {
-            let log = Log::new(d.common.quiet);
+            let log = Log::new(d.quiet);
             let out = d
                 .out
                 .unwrap_or_else(|| PathBuf::from("fdop_runs").join("detect"));
@@ -373,6 +378,10 @@ fn run(cli: Cli) -> Result<i32, String> {
         Cmd::Selftest { out } => {
             let dir = out.unwrap_or_else(|| PathBuf::from("fdop_runs").join("selftest"));
             let r = crate::selftest::run(&dir, &|s| eprintln!("{s}"))?;
+            if let Some(why) = &r.no_answer {
+                println!("selftest: FAIL | {why}, {} events", r.n_events);
+                return Ok(1);
+            }
             println!(
                 "selftest: {} | error {:.1} m, radius {:.0} m, clock error {:+.2} s, {} events, flights {:?}",
                 if r.ok { "PASS" } else { "FAIL" },

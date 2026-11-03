@@ -286,8 +286,8 @@ results in the commit message.
 - **stdout carries results; stderr carries progress** (`[   12.3s] message`).
 - `--json` output and `result.json` field names are an interface; change them deliberately and note it in
   `CHANGELOG.md`.
-- **Exit codes:** 0 success; 1 no location, a selftest FAIL (wrong answer) or a doctor failure; 2 error,
-  including a selftest that finds no candidate. Errors print as `fdop: error: ...`.
+- **Exit codes:** 0 success; 1 no location, a selftest FAIL (wrong answer or no candidate) or a doctor
+  failure; 2 error. Errors print as `fdop: error: ...`.
 
 ---
 

@@ -76,6 +76,12 @@ pub fn parse_date(s: &str) -> Result<(i64, u32, u32), String> {
     if parts.len() != 3 {
         return Err(format!("unrecognised date '{s}' (want YYYY-MM-DD)"));
     }
+    // "09/08/2026" is month-first in the US and day-first elsewhere: refuse rather than guess.
+    if parts[0].len() != 4 || !parts[0].chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "unrecognised date '{s}': put the four-digit year first (YYYY-MM-DD, e.g. 2026-09-08)"
+        ));
+    }
     let y: i64 = parts[0].parse().map_err(|_| format!("bad year in '{s}'"))?;
     let m: u32 = parts[1]
         .parse()
@@ -193,5 +199,12 @@ mod tests {
         assert!(parse_date("2026-02-30").is_err());
         assert!(parse_date("2026-13-01").is_err());
         assert!(parse_date("2024-02-29").is_ok());
+        assert!(parse_date("2026/09/08").is_ok());
+        assert!(parse_date("20260908").is_ok());
+        // month- or day-first forms are ambiguous; "09/08/26" used to parse as 26 Aug of year 9
+        for bad in ["09/08/26", "09/08/2026", "8-9-2026", "26-09-08"] {
+            let e = parse_date(bad).unwrap_err();
+            assert!(e.contains("four-digit year first"), "{bad}: {e}");
+        }
     }
 }

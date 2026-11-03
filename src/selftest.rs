@@ -40,6 +40,8 @@ pub struct SelftestResult {
     pub n_events: usize,
     pub flights: Vec<String>,
     pub ok: bool,
+    /// Why there is no answer to grade (the search returned no candidate).
+    pub no_answer: Option<String>,
 }
 
 pub fn run(dir: &Path, say: &(dyn Fn(&str) + Sync)) -> Result<SelftestResult, String> {
@@ -193,11 +195,16 @@ pub fn run(dir: &Path, say: &(dyn Fn(&str) + Sync)) -> Result<SelftestResult, St
     };
     let res = fdop_core::search::run(&inp, &sp, say);
     let Some(top) = res.candidates.first() else {
-        return Err(format!(
-            "selftest: no candidate (events {}, funnel {:?})",
-            sevs.len(),
-            res.funnel
-        ));
+        // a test that finds nothing has failed (exit 1), like a wrong answer; not a usage error
+        return Ok(SelftestResult {
+            err_m: f64::NAN,
+            radius_m: f64::NAN,
+            clock_err_s: f64::NAN,
+            n_events: sevs.len(),
+            flights: Vec::new(),
+            ok: false,
+            no_answer: Some(format!("no candidate (funnel {:?})", res.funnel)),
+        });
     };
     let (lat, lon, radius) = res
         .refine
@@ -237,5 +244,6 @@ pub fn run(dir: &Path, say: &(dyn Fn(&str) + Sync)) -> Result<SelftestResult, St
         n_events: sevs.len(),
         flights,
         ok,
+        no_answer: None,
     })
 }
