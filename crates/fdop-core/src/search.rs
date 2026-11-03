@@ -1342,15 +1342,15 @@ fn best_confirmer(
 fn evidence(events: &mut [EventMatch], nulls: &[EventNull], unheard: usize) -> f64 {
     let mut s = 0.0;
     for m in events.iter_mut() {
-        let (n, t) = nulls
-            .iter()
-            .find(|n| n.event == m.event)
-            .map_or((0.0, 0.0), |n| (n.nats(m.chi), n.trace_nats(m.chi)));
+        let null = nulls.iter().find(|n| n.event == m.event);
+        let (n, t) = null.map_or((0.0, 0.0), |n| (n.nats(m.chi), n.trace_nats(m.chi)));
+        // too few chance matches to calibrate against (tiny region): demand a near-noise fit
+        let thin = null.is_none_or(|n| n.chi_null.len() < 20);
         m.nats = n;
         m.trace_nats = t;
         m.core = m.chi <= CORE_CHI
             && m.dt_free.is_some_and(|d| d.abs() <= CORE_LOCK_S)
-            && t >= CORE_TRACE_NATS;
+            && (t >= CORE_TRACE_NATS || (thin && m.chi <= 2.0));
         s += n;
     }
     s - UNHEARD_NATS * unheard as f64
