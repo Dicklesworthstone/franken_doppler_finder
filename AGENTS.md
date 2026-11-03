@@ -162,12 +162,11 @@ run (`result.json`) or the test that produced it.
    results.
 2. **Refuse, never fabricate.** A single flyover is refused. An ADS-B day missing from the archive is an error.
    The one exception is a trailing day adsb.lol has not published yet: it clips the search window, with a warning.
-   Every fallback must add a warning to the report. The standard atmosphere, a failed terrain prefetch and a
-   failed basemap do. Two gaps remain, listed in README "Known issues": the default geoid only logs, and a single
-   missing terrain tile silently becomes 0 m.
+   Every fallback adds a warning to the report: the standard atmosphere, a default geoid, terrain tiles read as
+   0 m, a failed terrain prefetch and a missing basemap. A new fallback must do the same.
 3. **Report truncation.** Pair-join and fine-stage cuts appear in `funnel.truncated` and the warnings. An event
-   demoted to confirmer-only, by its hypothesis budget or by `--max-events`, shows only in `funnel.hypotheses`.
-   Do not add a new silent cut.
+   demoted to confirmer-only by its hypothesis budget gets a warning. Events beyond `--max-events` only confirm
+   by design (shown in `funnel.hypotheses`). Do not add a silent cut.
 4. **Do not overfit the reference case.** There is one reference recording and a handful of field tests. A
    change to a threshold or constant needs a synthetic or metamorphic test that justifies it on its own terms.
    Report its effect on the reference case and the field tests, including when it gets worse.

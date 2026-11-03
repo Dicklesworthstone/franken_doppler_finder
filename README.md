@@ -701,8 +701,8 @@ dominated by the archive download.
 
 **Can I search the whole country?** `--near CONUS` is accepted. It downloads the same daily archives but keeps
 far more tracks, and the budgets may truncate the search: a pair-join or fine-stage cut appears in the funnel
-and the warnings, and an event over its hypothesis budget drops to confirmer-only. It has not been validated on
-real data at that scale.
+and the warnings, and an event over its hypothesis budget drops to confirmer-only with a warning. It has not
+been validated on real data at that scale.
 
 **Will it work on a phone call or a compressed video?** The source video reports curves surviving a phone call's
 audio path. `fdop` decodes anything ffmpeg reads, but it has only been validated on the reference recording.
