@@ -87,7 +87,7 @@ at that commit, not per-change commits.
   wrong answer graded low became a wrong answer graded **medium**, 103 km off. Its two core events were ones the
   old cap never measured, and its margin was 3.01 nats against the medium bar of 3. The medium bar does not grow
   with the number of events searched; raising the caps waits on that.
-- `fdop doctor` prints an `[info]` line naming the Census gazetteer tables that are not cached yet. `--offline`
+- [`532fb15`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/532fb15ab0d4daf2c6b7303d4ad89e78465d6384) `fdop doctor` prints an `[info]` line naming the Census gazetteer tables that are not cached yet. `--offline`
   needs them for place, county and ZIP regions and for the report's place names.
 
 ---
