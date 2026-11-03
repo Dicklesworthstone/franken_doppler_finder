@@ -13,12 +13,10 @@ fdop-core = { path = "crates/fdop-core" }
 fdop-http = { path = "crates/fdop-http" }
 fdop-data = { path = "crates/fdop-data" }
 fdop-geo = { path = "crates/fdop-geo" }
-# frankenscipy: FFT (STFT), bounded TRF least squares (curve fits), KD-tree, signal helpers.
+# frankenscipy: FFT (STFT), bounded TRF least squares (curve fits), F distribution, KD-tree (doctor).
 fsci-fft = "0.4.0"
 fsci-opt = "0.4.0"
-fsci-signal = "0.4.0"
 fsci-spatial = "0.4.0"
-fsci-runtime = "0.4.0"
 fsci-stats = "0.4.0"
 # asupersync: structured-concurrency runtime + HTTP/1.1 client over rustls.
 asupersync = { version = "0.6.2", features = ["tls-webpki-roots"] }
@@ -57,8 +55,6 @@ fdop-http.workspace = true
 fdop-data.workspace = true
 fdop-geo.workspace = true
 fsci-fft.workspace = true
-fsci-opt.workspace = true
-fsci-signal.workspace = true
 fsci-spatial.workspace = true
 asupersync.workspace = true
 frankenpandas.workspace = true

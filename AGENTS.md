@@ -201,7 +201,7 @@ run (`result.json`) or the test that produced it.
 |---|---|
 | Toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), Rust 2024 edition, resolver 3, one Cargo workspace |
 | Async runtime and HTTP | asupersync `0.6.2` with `tls-webpki-roots` (rustls), the only runtime our code uses. fsqlite `0.4.13` brings its own asupersync `0.5.0` internally |
-| Numerics | frankenscipy `0.4.0` (`fsci-fft`, `fsci-opt`, `fsci-stats`, `fsci-signal`, `fsci-spatial`, `fsci-runtime`) |
+| Numerics | frankenscipy `0.4.0`: `fsci-fft` (STFT), `fsci-opt` (bounded least squares), `fsci-stats` (F distribution), `fsci-spatial` (`fdop doctor` smoke test only) |
 | Tables | frankenpandas `0.6.0` |
 | Run ledger | fsqlite `0.4.13` (`native`, no default features) |
 | External tools | `ffmpeg` and `ffprobe` on `PATH`, plus `sysctl` on macOS to read physical memory. A C compiler for the build (`ring`, bundled SQLite). `yt-dlp` only to fetch the reference recording |
@@ -396,5 +396,3 @@ Loose ends, kept pending a decision (RULE 1):
 - `src/probe_deps.rs` is an unreferenced dependency probe, not declared in `src/lib.rs`.
 - `data/icao_engine_class.tsv` at the repository root is an unused, byte-identical copy of
   `crates/fdop-types/data/icao_engine_class.tsv`, which is the one compiled in.
-- Some dependencies are declared but not used: `fsci-signal`, `fsci-spatial` and `fsci-runtime` in `fdop-core`;
-  `fsci-opt` and `fsci-signal` in the root crate (used only by `src/probe_deps.rs`).

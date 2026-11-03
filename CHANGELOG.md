@@ -64,7 +64,7 @@ at that commit, not per-change commits.
   0% CPU on open connections to the GitHub release CDN: the client's request timeout does not cover a streamed
   body. Each body frame now has a 60 s idle timeout, after which the download resumes with an HTTP `Range`
   request. 1 new test (a loopback server that stalls mid-body), 72 in total.
-- The GitHub Actions workflow is removed. The project never uses GitHub Actions: its checks (rustfmt, clippy
+- [`852067a`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/852067a4442c5bf96da8ed1c0dd50216dc5b265d) The GitHub Actions workflow is removed. The project never uses GitHub Actions: its checks (rustfmt, clippy
   with `-D warnings`, the tests and `fdop selftest`) run through `dsr quality franken_doppler_finder`.
 
 ---

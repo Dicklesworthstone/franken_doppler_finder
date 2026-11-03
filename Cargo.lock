@@ -1370,9 +1370,6 @@ dependencies = [
  "fdop-types",
  "fsci-fft",
  "fsci-opt",
- "fsci-runtime",
- "fsci-signal",
- "fsci-spatial",
  "fsci-stats",
  "png",
  "rayon",
@@ -1714,8 +1711,6 @@ dependencies = [
  "fdop-types",
  "frankenpandas",
  "fsci-fft",
- "fsci-opt",
- "fsci-signal",
  "fsci-spatial",
  "fsqlite",
  "rayon",
@@ -1797,17 +1792,6 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "fsci-signal"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12bd6902ab6c038b65d8c7c4fc8295ab270dc968cd6edd27c7bd0e168967b861"
-dependencies = [
- "fsci-fft",
- "fsci-linalg",
- "fsci-runtime",
 ]
 
 [[package]]
