@@ -720,4 +720,39 @@ mod tests {
         assert!(r.ranges_generous.v[0] <= v && r.ranges_generous.v[1] >= v);
         assert!(r.ranges_generous.d[0] <= d && r.ranges_generous.d[1] >= d);
     }
+
+    /// A pass heard 110 s before its CPA but only 23 s after (the recording or the detector cut
+    /// it), with a slow power drift: v, d and f0 trade off along a ridge, and the generous
+    /// ranges must still hold the truth (C172-like: 64 m/s at 3.7 km).
+    #[test]
+    fn short_side_generous_ranges_hold_truth() {
+        let c = 343.0;
+        let (f0, v, d) = (78.5, 64.0, 3734.0);
+        let t0r = 1000.0;
+        let t0e = t0r - d / c;
+        let t: Vec<f64> = (0..535).map(|i| t0r - 110.0 + i as f64 * 0.25).collect();
+        let f: Vec<f64> = t
+            .iter()
+            .enumerate()
+            .map(|(i, &tt)| {
+                // slow power drift (0.4 % of f0 over the pass) plus 0.2 Hz pseudo-noise
+                cv_curve(tt, f0, v, d, t0e, c) * (1.0 + 0.004 * (tt - t0r) / 133.0)
+                    + 0.2
+                        * ((i as f64 * 12.9898).sin() * 43_758.545)
+                            .fract()
+                            .mul_add(2.0, -1.0)
+            })
+            .collect();
+        let r = fit_constant_velocity(&t, &f, c, Side::Both).unwrap();
+        let g = &r.ranges_generous;
+        assert!(
+            g.v[0] <= v && g.v[1] >= v && g.d[0] <= d && g.d[1] >= d,
+            "best v {:.1} d {:.0}; generous v {:.1?} d {:.0?}; warnings {:?}",
+            r.best.v,
+            r.best.d,
+            g.v,
+            g.d,
+            r.warnings
+        );
+    }
 }

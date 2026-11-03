@@ -4,6 +4,10 @@
 //! detector missed it" or "the search mis-scored it".
 //!
 //! usage: truth <run_dir> <store.fdtrk>[,<store2>...] <lat> <lon> <t_start_utc> [elev_m] [max_km]
+//!        [dump=<icao>]
+//!
+//! `dump=<icao>` also prints that aircraft's archived points near the observer and the closest
+//! approaches its interpolated track model gives (what the search's gates see).
 //!
 //! `t_start_utc` is ISO 8601 or unix seconds; `elev_m` (default 0) is the ground elevation;
 //! `max_km` (default 8) the slant-distance cut. Reads `<run_dir>/events.json`; without one it
@@ -39,6 +43,9 @@ fn main() {
         .expect("t_start: ISO 8601 or unix seconds");
     let elev: f64 = a.get(6).map_or(0.0, |s| s.parse().unwrap());
     let max_m: f64 = a.get(7).map_or(8.0, |s| s.parse().unwrap()) * 1000.0;
+    let dump: Option<String> = a
+        .iter()
+        .find_map(|s| s.strip_prefix("dump=").map(|x| x.to_ascii_lowercase()));
     // without events.json (e.g. scanning a whole day for good test windows) list passes only
     let evs: Value = std::fs::read(run.join("events.json"))
         .ok()
@@ -66,6 +73,9 @@ fn main() {
     let mut passes = Vec::new();
     for p in a[2].split(',') {
         let s = TrackStore::load(std::path::Path::new(p)).expect("store");
+        if let Some(icao) = &dump {
+            dump_leg(&s, icao, o, t_start, dur);
+        }
         for l in &s.legs {
             let mut best: Option<(f64, f64, f64, f64)> = None;
             for q in &l.points {
@@ -137,6 +147,60 @@ fn main() {
                 e.1,
                 e.2,
                 if e.3 { "" } else { " (failed quality)" }
+            );
+        }
+    }
+}
+
+/// Archived points of `icao` within the window, and the CPAs of its track models.
+fn dump_leg(s: &TrackStore, icao: &str, o: fdop_types::geo::V3, t_start: f64, dur: f64) {
+    let bp = fdop_core::track::BuildParams::default();
+    for l in s.legs.iter().filter(|l| l.icao.eq_ignore_ascii_case(icao)) {
+        println!("leg {} ({} points, {})", l.key, l.points.len(), l.source);
+        let mut last = f64::NAN;
+        for q in &l.points {
+            if q.t < t_start - 120.0 || q.t > t_start + dur + 120.0 {
+                continue;
+            }
+            let d = norm(sub(geodetic_to_ecef(q.lat, q.lon, q.alt_m as f64), o));
+            println!(
+                "  t_rec {:8.1}  gap {:6.1} s  {:.5},{:.5}  alt {:6.0} m  gs {:5.1}  trk {:5.1}  vr {:5.1}  slant {:7.0} m",
+                q.t - t_start,
+                q.t - last,
+                q.lat,
+                q.lon,
+                q.alt_m,
+                q.gs_mps,
+                q.track_deg,
+                q.vrate_mps,
+                d
+            );
+            last = q.t;
+        }
+        for tm in fdop_core::track::build(l, &bp) {
+            let (a, b) = (
+                tm.t0().max(t_start - 120.0),
+                tm.t1().min(t_start + dur + 120.0),
+            );
+            if b <= a {
+                continue;
+            }
+            let mut best = (f64::INFINITY, f64::NAN);
+            let mut t = a;
+            while t <= b {
+                let d = norm(sub(tm.pos_at(t), o));
+                if d < best.0 {
+                    best = (d, t);
+                }
+                t += 1.0;
+            }
+            println!(
+                "  model {}: [{:.0}, {:.0}] s rec, closest {:.0} m at t_rec {:.0}",
+                tm.key,
+                tm.t0() - t_start,
+                tm.t1() - t_start,
+                best.0,
+                best.1 - t_start
             );
         }
     }

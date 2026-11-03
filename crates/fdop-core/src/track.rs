@@ -2,7 +2,10 @@
 //! vectors (velocity-Hermite). Reported ground speed / track / vertical rate are used when
 //! present and consistent with the positions; otherwise velocity comes from second-order
 //! finite differences. Tracks are split at gaps longer than `max_gap_s` so interpolation never
-//! invents geometry across a coverage hole.
+//! invents geometry across a coverage hole. Within each piece only the longest physically
+//! consistent chain of positions is kept: archived legs can interleave junk positions (MLAT
+//! mis-solutions, another aircraft's position under the same address) that the interpolation
+//! would otherwise fly through.
 
 use fdop_types::engine::EngineClass;
 use fdop_types::geo::{Enu, V3, add, dot, ecef_to_geodetic, geodetic_to_ecef, norm, scale, sub};
@@ -30,6 +33,11 @@ pub struct BuildParams {
     pub max_gap_s: f64,
     /// Reported velocity rejected when it disagrees with finite differences by more than this.
     pub vel_consistency_mps: f64,
+    /// Fastest vertical speed two positions of one chain may imply (m/s). GA climbs at
+    /// 3-8 m/s and turboprops at up to ~15 m/s; junk positions jump kilometres in seconds.
+    pub max_vz_mps: f64,
+    /// Position noise allowed between two points of one chain (horizontal, vertical; m).
+    pub pos_slack_m: (f64, f64),
 }
 
 impl Default for BuildParams {
@@ -37,8 +45,71 @@ impl Default for BuildParams {
         Self {
             max_gap_s: 180.0,
             vel_consistency_mps: 25.0,
+            max_vz_mps: 30.0,
+            pos_slack_m: (250.0, 120.0),
         }
     }
+}
+
+/// Indices of the longest chain of points (time-sorted) in which every consecutive pair is
+/// physically consistent: horizontal distance <= v_lim * dt + slack and height change <=
+/// `max_vz_mps` * dt + slack, with v_lim from the leg's median reported ground speed. Junk
+/// interleaved with a real track (even several junk points in a row) cannot form the longer
+/// chain, so it drops out; a clean leg keeps every point.
+fn consistent_chain(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) -> Vec<usize> {
+    const LOOKBACK: usize = 48;
+    let n = pts.len();
+    if n < 3 {
+        return (0..n).collect();
+    }
+    let mut gs: Vec<f64> = pts
+        .iter()
+        .filter(|p| p.gs_mps.is_finite() && p.gs_mps > 0.0)
+        .map(|p| p.gs_mps as f64)
+        .collect();
+    let v_lim = if gs.is_empty() {
+        200.0
+    } else {
+        gs.sort_by(f64::total_cmp);
+        let med = gs[gs.len() / 2];
+        (1.5 * med + 30.0).max(80.0)
+    };
+    // horizontal position at the leg's mean height (ENU around the first point)
+    let enu = Enu::new(pts[0].lat, pts[0].lon, 0.0);
+    let xy: Vec<[f64; 2]> = pts
+        .iter()
+        .map(|p| {
+            let e = enu.from_ecef(geodetic_to_ecef(p.lat, p.lon, 0.0));
+            [e[0], e[1]]
+        })
+        .collect();
+    let ok = |i: usize, j: usize| -> bool {
+        let dt = pts[j].t - pts[i].t;
+        let dh = ((xy[j][0] - xy[i][0]).powi(2) + (xy[j][1] - xy[i][1]).powi(2)).sqrt();
+        let dz = (pts[j].alt_m - pts[i].alt_m).abs() as f64;
+        dh <= v_lim * dt + bp.pos_slack_m.0 && dz <= bp.max_vz_mps * dt + bp.pos_slack_m.1
+    };
+    let mut best = vec![1usize; n];
+    let mut prev = vec![usize::MAX; n];
+    for j in 1..n {
+        for i in (j.saturating_sub(LOOKBACK)..j).rev() {
+            if pts[j].t - pts[i].t > bp.max_gap_s {
+                break;
+            }
+            if best[i] + 1 > best[j] && ok(i, j) {
+                best[j] = best[i] + 1;
+                prev[j] = i;
+            }
+        }
+    }
+    let mut k = (0..n).max_by_key(|&k| (best[k], k)).unwrap_or(0);
+    let mut chain = vec![k];
+    while prev[k] != usize::MAX {
+        k = prev[k];
+        chain.push(k);
+    }
+    chain.reverse();
+    chain
 }
 
 fn fd_velocity(t: &[f64], p: &[V3]) -> Vec<V3> {
@@ -77,7 +148,9 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
     let mut part = 0;
     for i in 1..=pts.len() {
         if i == pts.len() || pts[i].t - pts[i - 1].t > bp.max_gap_s {
-            let seg = &pts[start..i];
+            let keep = consistent_chain(&pts[start..i], bp);
+            let seg_owned: Vec<_> = keep.iter().map(|&k| pts[start + k]).collect();
+            let seg = &seg_owned[..];
             if seg.len() >= 2 {
                 let t: Vec<f64> = seg.iter().map(|p| p.t).collect();
                 let pos: Vec<V3> = seg
@@ -471,6 +544,68 @@ mod tests {
             (cpa.t_e - 1000.0).abs() < 0.01
                 && (cpa.d - d).abs() < 0.5
                 && (cpa.speed - v).abs() < 1e-6
+        );
+    }
+
+    /// An archived leg (shape of a real 2026-11-01 P28R) where the genuine level track at
+    /// 2,097 m is interleaved with junk: 4,574 m positions (three in a row at one point), a
+    /// position 6 km off-track and one at 11 km. Only the genuine points may build the model.
+    #[test]
+    fn junk_positions_interleaved_in_a_leg_are_dropped() {
+        let enu = Enu::new(40.84, -73.52, 0.0);
+        let pt = |t: f64, e: f64, n: f64, alt: f32, gs: f32| {
+            let (lat, lon, _) = ecef_to_geodetic(enu.to_ecef([e, n, 0.0]));
+            fdop_types::store::TrackPoint {
+                t,
+                lat,
+                lon,
+                alt_m: alt,
+                gs_mps: gs,
+                track_deg: 90.0,
+                vrate_mps: 0.0,
+                alt_src: 0,
+                flags: 0,
+            }
+        };
+        // genuine: east at 72 m/s, 4.5 km south of the observer, a point every 6 s
+        let mut points: Vec<_> = (0..60)
+            .map(|k| {
+                let t = 1000.0 + 6.0 * k as f64;
+                pt(t, -2000.0 + 72.0 * (t - 1000.0), 0.0, 2097.0, 72.0)
+            })
+            .collect();
+        let n_real = points.len();
+        for (t, e, n, alt, gs) in [
+            (1007.0, -1500.0, 300.0, 4574.0, 53.0),
+            (1009.5, -1200.0, 600.0, 4574.0, 86.0),
+            (1011.0, -1000.0, 800.0, 4574.0, 106.0),
+            (1100.5, 4600.0, 4400.0, 4574.0, 62.0),
+            (1180.2, 9000.0, -6000.0, 4574.0, 172.0),
+            (1250.3, 14000.0, 3000.0, 11096.0, 236.0),
+        ] {
+            points.push(pt(t, e, n, alt, gs));
+        }
+        points.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let leg = FlightLeg {
+            key: "a49ba8_test".into(),
+            icao: "a49ba8".into(),
+            reg: "N39611".into(),
+            typ: "P28R".into(),
+            source: "prod+mlat".into(),
+            engine: EngineClass::Piston,
+            points,
+        };
+        let models = build(&leg, &BuildParams::default());
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].t.len(), n_real, "junk survived the chain filter");
+        let x = enu.to_ecef([0.0, 4500.0, 0.0]);
+        let closest = (1000..1360)
+            .map(|t| norm(sub(models[0].pos_at(t as f64), x)))
+            .fold(f64::INFINITY, f64::min);
+        let true_d = (4500.0f64.powi(2) + 2097.0f64.powi(2)).sqrt();
+        assert!(
+            (closest - true_d).abs() < 20.0,
+            "closest {closest:.0} m vs {true_d:.0} m"
         );
     }
 }
