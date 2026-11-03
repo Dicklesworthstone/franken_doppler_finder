@@ -59,6 +59,11 @@ at that commit, not per-change commits.
   `fdop fetch` now fetches only the published part of the archive, like `locate`. Before, it failed on a date
   that ran into an unpublished UTC day. The `--near` and `--cache` help texts now match the parser and the cache
   precedence. 1 new test, 71 in total.
+- [`25f12ff`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/25f12ffa96af6411dbb7a3a177a9b514b11641b9) A
+  streamed download whose server goes silent no longer hangs. `fdop fetch --dates 2026-11-01 --near CA` sat at
+  0% CPU on open connections to the GitHub release CDN: the client's request timeout does not cover a streamed
+  body. Each body frame now has a 60 s idle timeout, after which the download resumes with an HTTP `Range`
+  request. 1 new test (a loopback server that stalls mid-body), 72 in total.
 
 ---
 
