@@ -76,6 +76,19 @@ at that commit, not per-change commits.
   - `fdop detect` no longer takes `--cache` and `--offline`, which it ignored;
   - the `--dates` help lists every accepted form;
   - a selftest that finds no candidate prints FAIL and exits 1 instead of 2.
+- [`b2256c7`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/b2256c73df4fc170ecaa1ab280dd35eb8a5d1855) The detection cap
+  (60 candidate curves) and the measurement cap (24 events) now put a warning in the report when they cut. Every
+  reference run cuts both (82 curves, 32 strong flyovers). A state search whose answer reverse-geocodes into
+  another state is flagged. A `locate` that stops with an error is recorded in the run ledger. 2 new tests, 74 in
+  total.
+
+  The caps themselves stay. A working-tree build that scaled them with duration gave the reference recording
+  the ny10 answer. On the 3 h osprey-cam recording of 2026-10-31 it measured 72 events instead of 24, and a
+  wrong answer graded low became a wrong answer graded **medium**, 103 km off. Its two core events were ones the
+  old cap never measured, and its margin was 3.01 nats against the medium bar of 3. The medium bar does not grow
+  with the number of events searched; raising the caps waits on that.
+- `fdop doctor` prints an `[info]` line naming the Census gazetteer tables that are not cached yet. `--offline`
+  needs them for place, county and ZIP regions and for the report's place names.
 
 ---
 

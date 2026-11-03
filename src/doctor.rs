@@ -79,6 +79,31 @@ pub fn run(network: bool, cache: &std::path::Path) -> i32 {
             },
         );
     }
+    // Census gazetteer tables: downloaded on first use, so a missing one is information, not a
+    // failure; offline runs need them for named regions and the place lookup.
+    {
+        use fdop_geo::gazetteer::{GazKind, Gazetteer};
+        let gaz = Gazetteer::new(cache.to_path_buf(), false);
+        let kinds = [
+            GazKind::Place,
+            GazKind::Zcta,
+            GazKind::County,
+            GazKind::CountySubdivision,
+        ];
+        let missing: Vec<&str> = kinds
+            .iter()
+            .filter(|k| !gaz.available_offline(**k))
+            .map(|k| k.file_stem())
+            .collect();
+        if missing.is_empty() {
+            println!("[info] gazetteer: all {} Census tables cached", kinds.len());
+        } else {
+            println!(
+                "[info] gazetteer: not cached yet: {} (downloaded on first use; --offline needs them for place, county and ZIP regions and the place names in the report)",
+                missing.join(", ")
+            );
+        }
+    }
     if network {
         match fdop_http::Net::new() {
             Ok(net) => {

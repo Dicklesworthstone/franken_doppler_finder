@@ -389,9 +389,11 @@ carries on.
 ### `fdop doctor [--network] [--cache DIR]`
 
 Checks `ffmpeg` and `ffprobe`, that the cache directory is writable, smoke-tests the FFT and k-d tree, and does
-a FrankenSQLite write/read round trip (plus a read of `runs.sqlite` if present). With
-`--network`, it also GETs the adsb.lol release index, the NGS geoid API, the Census geocoder and one terrain
-tile. It prints `[ ok ]` or `[FAIL]` per check and exits 1 if any check failed.
+a FrankenSQLite write/read round trip (plus a read of `runs.sqlite` if present). An `[info]` line says which
+Census gazetteer tables are cached; `--offline` needs them for place, county and ZIP regions and for the report's
+place names, and they download on first use. With `--network`, it also GETs the adsb.lol release index, the NGS
+geoid API, the Census geocoder and one terrain tile. It prints `[ ok ]` or `[FAIL]` per check and exits 1 if any
+check failed.
 
 ### `fdop selftest [-o DIR]`
 
