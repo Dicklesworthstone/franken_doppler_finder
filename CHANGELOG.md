@@ -29,6 +29,15 @@ at that commit, not per-change commits.
   chi ≤ 2 can stand in for the nats-over-chance test of a core match (section 11). The reference-case runs
   `ny9`, `md2` and `nassau3` used this code.
 - README, AGENTS.md, this changelog, and CI (rustfmt, clippy with `-D warnings`, tests, `fdop selftest`).
+- [`e872b1c`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/e872b1c001592b2d732d3bc49779a15c6b15238e) Recent
+  recordings no longer fail on the newest UTC day. adsb.lol publishes each day a few hours after it ends, and a US
+  local date runs into the next UTC day, so `--dates <yesterday>` used to stop with "no ADS-B data for UTC day(s)".
+  `locate` now searches up to the published part and warns which days are pending.
+  The same commit fixes two cache bugs:
+  - a day streamed before its mlatonly (or prod) release existed was cached as complete;
+  - an incomplete `releases.json` was never re-checked.
+
+  It also adds the `truth` example, which lists the archived passes near a known place and clock.
 
 ---
 
