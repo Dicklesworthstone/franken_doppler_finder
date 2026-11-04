@@ -398,6 +398,7 @@ quoted field tests can be re-run, which needs a Mac build:
 - The medium grade does not allow for how many events were searched (README "Known issues"). Fix it before
   raising the detection or measurement caps.
 
-The sparse-turn velocity rejection is now corrected with a circular-arc chord consistency check at the
-existing 25 m/s residual limit. Analytic turning-track regressions cover the correction; the historical
-reference and field recordings still need to be rerun on it (README "Honest status").
+Landed without that re-run: `f717f6f` keeps reported ADS-B velocities on sparsely sampled turns, by checking
+the position chords against the arc implied by neighbouring headings at the same 25 m/s limit. Synthetic
+turning-track tests cover it; the reference configurations and field recordings still need to be rerun on it
+(README "Honest status").

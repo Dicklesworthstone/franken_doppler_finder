@@ -19,7 +19,7 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
-### Curved-track reconstruction
+### Curved-track reconstruction ([`f717f6f`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/f717f6faec84803d360207884e91c8b830e3578c))
 
 - Correct reported ADS-B velocities are retained on sparsely sampled turns. The old comparison treated a
   position chord as an instantaneous tangent, so a 100 m/s aircraft turning at 3 degrees/s could lose its
