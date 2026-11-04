@@ -1223,10 +1223,10 @@ mod tests {
         // The availability check, weather and store load all use this outer window.
         // Even with a one-hour recording and track padding, no adjacent UTC day is needed.
         assert_eq!(
-            fdop_data::utc_days(requested.0 - 1200.0, requested.1 + 3600.0 + 1200.0),
+            fdop_data::fetch::utc_days(requested.0 - 1200.0, requested.1 + 3600.0 + 1200.0),
             vec![(2026, 9, 8)]
         );
-        assert!(fdop_data::utc_days(dates.0 - 1200.0, dates.1 + 4800.0).len() > 1);
+        assert!(fdop_data::fetch::utc_days(dates.0 - 1200.0, dates.1 + 4800.0).len() > 1);
         assert_eq!(requested_start_window(dates, None, 180.0).unwrap(), dates);
     }
 
@@ -1237,7 +1237,7 @@ mod tests {
         let start = parse_iso_utc("2026-09-08T23:50:00Z").unwrap();
         let (lo, hi) = requested_start_window(dates, Some(start), 60.0).unwrap();
         assert_eq!(
-            fdop_data::utc_days(lo - 1200.0, hi + 3600.0 + 1200.0),
+            fdop_data::fetch::utc_days(lo - 1200.0, hi + 3600.0 + 1200.0),
             vec![(2026, 9, 8), (2026, 9, 9)]
         );
     }

@@ -44,6 +44,11 @@ at that commit, not per-change commits.
 
 ### Changes
 
+- Successful Open-Meteo pressure-level weather no longer waits for or requests unused radiosonde and surface
+  fallbacks. If the preferred source fails, the two fallbacks still load concurrently with the same selection
+  order and warning behavior. Five offline tests cover the preferred source and every fallback combination.
+  Pinned formatting and source review passed; the new tests could not run after dependency OOM failures and
+  execution-environment loss. No live-service latency claim is made.
 - Measurement now computes profile-likelihood ranges and manoeuvre diagnostics only once, for its final
   accepted ridge trace. All refinement rounds keep the same robust point fits and model/band updates; the
   public fitting API still returns complete diagnostics. A failed later round retains the last successful
