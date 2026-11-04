@@ -173,6 +173,37 @@ fn write_json(path: &Path, v: &impl serde::Serialize) -> Result<(), String> {
     std::fs::write(path, s).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Below this low-band ratio the input has lost its low band, as a high-pass filter does.
+/// Nine outdoor recordings measured +10.0 to +19.5 dB unfiltered; a cam high-passed at about
+/// 125 Hz (-3 dB, 24 dB per octave) measured -26.1 dB. Speech-heavy audio, which sits at
+/// 150-600 Hz, can read low too.
+const LOW_BAND_WARN_DB: f64 = -15.0;
+
+/// Mean power at 45-95 Hz over mean power at 150-600 Hz, in dB, from 1 s Hann frames.
+/// A high-pass filter empties this band first. Slower propellers' fundamentals sit in it
+/// (two blades at 2400 RPM: 80 Hz); turboprops' (about 95-135 Hz) sit near a typical cut.
+/// `None` when the audio is shorter than one frame or the bands fall above Nyquist.
+fn low_band_ratio_db(x: &[f32], sr: u32) -> Option<f64> {
+    let s = fdop_core::spectro::stft_band_db(x, sr, 1.0, 1.0, 40.0, 650.0, 1.0, 0.0).ok()?;
+    let (mut lo, mut n_lo, mut hi, mut n_hi) = (0.0f64, 0usize, 0.0f64, 0usize);
+    for (fi, &f) in s.f.iter().enumerate() {
+        let (in_lo, in_hi) = ((45.0..=95.0).contains(&f), (150.0..=600.0).contains(&f));
+        if !(in_lo || in_hi) {
+            continue;
+        }
+        let p: f64 = s.row(fi).iter().map(|&d| 10f64.powf(d as f64 / 10.0)).sum();
+        if in_lo {
+            lo += p;
+            n_lo += s.nt();
+        } else {
+            hi += p;
+            n_hi += s.nt();
+        }
+    }
+    (n_lo > 0 && n_hi > 0 && hi > 0.0)
+        .then(|| 10.0 * ((lo / n_lo as f64) / (hi / n_hi as f64)).log10())
+}
+
 fn stem(p: &Path) -> String {
     p.file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -471,6 +502,14 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     let x = audio::decode(&a.media, 0.0, None, a.sr)?;
     let dur = x.len() as f64 / a.sr as f64;
     log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
+    if let Some(r) = low_band_ratio_db(&x, a.sr)
+        && r < LOW_BAND_WARN_DB
+    {
+        warnings.push(format!(
+            "the audio has little energy below 100 Hz (45-95 Hz is {:.0} dB below 150-600 Hz). A high-pass filter does this; it removes the fundamentals of slower propellers and weakens those near the cut, so expect fewer usable flyovers",
+            -r
+        ));
+    }
     timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
     // ---- detection ----------------------------------------------------------------------
     let t = Instant::now();
@@ -1234,6 +1273,46 @@ mod tests {
         let (d0, d1) = parse_dates("2026-09-08..2026-09-10").unwrap();
         assert_eq!((d0.2, d1.2), (8, 10));
         assert!(parse_dates("2026-09-10..2026-09-08").is_err());
+    }
+
+    /// A tone mix with power below 100 Hz reads well above zero; the same mix through a
+    /// 110 Hz high-pass (the low tones removed) reads far below the warning bar.
+    #[test]
+    fn low_band_ratio_flags_high_passed_audio() {
+        let sr = 4000u32;
+        let n = (sr * 20) as usize;
+        let tone = |f: f64, a: f64, i: usize| {
+            a * (2.0 * std::f64::consts::PI * f * i as f64 / sr as f64).sin()
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut noise = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let full: Vec<f32> = (0..n)
+            .map(|i| {
+                (tone(70.0, 0.5, i) + tone(85.0, 0.3, i) + tone(300.0, 0.1, i) + 0.01 * noise())
+                    as f32
+            })
+            .collect();
+        let passed: Vec<f32> = (0..n)
+            .map(|i| (tone(300.0, 0.1, i) + 0.01 * noise()) as f32)
+            .collect();
+        let r_full = low_band_ratio_db(&full, sr).expect("ratio");
+        let r_hp = low_band_ratio_db(&passed, sr).expect("ratio");
+        assert!(r_full > 0.0, "{r_full}");
+        assert!(r_hp < LOW_BAND_WARN_DB, "{r_hp}");
+        assert!(
+            low_band_ratio_db(&full[..1000], sr).is_none(),
+            "shorter than one frame"
+        );
+        let silent = vec![0f32; n];
+        assert!(
+            low_band_ratio_db(&silent, sr).is_some_and(|r| r.abs() < 1e-6),
+            "silence is not high-passed"
+        );
     }
 
     #[test]
