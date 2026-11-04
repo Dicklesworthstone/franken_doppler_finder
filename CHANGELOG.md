@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Overlapping flyovers and harmonic families
+
+- Distinct Doppler curves no longer disappear solely because their closest-approach times overlap and
+  their tones have a harmonic ratio. Detection compares modelled shapes using the existing coarse
+  ridge-mask width; search compares measured traces at the same recording times using their combined
+  noise scales and the existing clean-fit threshold. A fitted frequency ratio allows for different
+  sampling and imperfect tone estimates. Insufficient two-sided overlap keeps a possible harmonic
+  grouped rather than treating it as another aircraft.
+- Harmonic ratios are symmetric, so a stronger high harmonic and a weaker fundamental stay in one
+  family. Search now uses the detector's small-integer ratio limits (numerators through eight,
+  denominators through four); its former numerator limit of six could let a seventh or eighth
+  harmonic of the fundamental count as an independent flyover.
+- A synthetic simultaneous two-flight regression recovers both correct matches, the observer within
+  60 m and the recording clock within 1 s. Regressions also cover fifth, seventh and eighth harmonics
+  in both strength orders, neighbouring coarse templates, unequal sampling, independent noise,
+  fitted-tone/CPA offsets and insufficient overlap. The reference configurations and field recordings
+  have not been rerun; these are synthetic checks only.
+- After integrating the concurrent terrain, hypothesis-budget and clock-pruning changes, all 39 default
+  core tests and all 13 shared-type tests passed. The explicit multi-track media test passed too. Workspace
+  formatting passed; the full workspace test build was killed while compiling `asupersync` under the
+  shared host's memory limit, before any workspace tests ran.
+
 ### Resumable archive completion
 
 - A successful partial response no longer implies that the whole archive is complete. Its range-body length

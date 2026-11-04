@@ -1511,6 +1511,83 @@ fn fit_score(events: &[EventMatch], evs: &[SearchEvent], kappa: f64) -> f64 {
         .sum()
 }
 
+/// A shared CPA and tone ratio suggest harmonics, but distinct measured Doppler shapes can
+/// establish two independent flyovers. Compare at the same recording times; fitted CPA and
+/// f0 estimates can differ between harmonics with different trace coverage.
+fn harmonic_events(a: &SearchEvent, b: &SearchEvent, cap_sigma: f64) -> bool {
+    if (a.t_rec - b.t_rec).abs() >= 8.0
+        || !crate::physics::harmonic_frequencies(a.f0, b.f0, 8, 0.03, true)
+    {
+        return false;
+    }
+    let (low, high) = if a.f0 <= b.f0 { (a, b) } else { (b, a) };
+    let n = low.tr_t.len().min(low.tr_f.len());
+    if n < 2 {
+        return true;
+    }
+    let mut points = Vec::new();
+    let mut j = 0;
+    for (&t, &f) in high.tr_t.iter().zip(&high.tr_f) {
+        if t < low.tr_t[0] || t > low.tr_t[n - 1] || !f.is_finite() || f <= 0.0 {
+            continue;
+        }
+        while j + 1 < n - 1 && low.tr_t[j + 1] < t {
+            j += 1;
+        }
+        let dt = low.tr_t[j + 1] - low.tr_t[j];
+        let (fl, fr) = (low.tr_f[j], low.tr_f[j + 1]);
+        if dt <= 0.0 || !(fl > 0.0 && fr > 0.0 && fl.is_finite() && fr.is_finite()) {
+            continue;
+        }
+        let w = (t - low.tr_t[j]) / dt;
+        let fm = fl * (1.0 - w) + fr * w;
+        // The full bracket span is an interpolation allowance: sparse or unequal sampling
+        // must not make one curved ridge appear to be two independent flight constraints.
+        let (flo, fhi) = if w == 0.0 || w == 1.0 {
+            (fm, fm)
+        } else {
+            (fl.min(fr), fl.max(fr))
+        };
+        points.push((t, fm, f, flo, fhi));
+    }
+    if points.len() < 8
+        || !points.iter().any(|p| p.0 < a.t_rec.min(b.t_rec))
+        || !points.iter().any(|p| p.0 > a.t_rec.max(b.t_rec))
+    {
+        // No two-sided comparison means no evidence that these are different aircraft.
+        return true;
+    }
+    let mut ratios: Vec<f64> = points.iter().map(|p| p.2 / p.1).collect();
+    let mut ratio = crate::spectro::median_f64(&mut ratios);
+    let sigma2 = |r: f64| high.sigma_hz.powi(2) + (r * low.sigma_hz).powi(2);
+    let s2 = sigma2(ratio);
+    if !s2.is_finite() || s2 <= 0.0 {
+        return true;
+    }
+    // Robust constant-ratio fit, allowing the same bounded stray-point influence used by
+    // trace scoring. The fitted f0 values are only a coarse family screen, not the scale fit.
+    let (mut xy, mut xx) = (0.0, 0.0);
+    for &(_, fm, f, flo, fhi) in &points {
+        if (f - ratio * fm).abs() <= cap_sigma * s2.sqrt() + ratio * (fhi - flo) {
+            xy += fm * f;
+            xx += fm * fm;
+        }
+    }
+    if xx > 0.0 {
+        ratio = xy / xx;
+    }
+    let s2 = sigma2(ratio);
+    let chi = points
+        .iter()
+        .map(|&(_, _, f, flo, fhi)| {
+            let residual = (ratio * flo - f).max(f - ratio * fhi).max(0.0);
+            (residual * residual / s2).min(cap_sigma * cap_sigma)
+        })
+        .sum::<f64>()
+        / points.len() as f64;
+    chi <= CORE_CHI
+}
+
 pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync)) -> SearchResult {
     let c = p.c;
     let frame = Frame::new(&p.region);
@@ -1529,18 +1606,9 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             .then(b.quality.total_cmp(&a.quality))
     });
     let mut keep: Vec<SearchEvent> = Vec::new();
-    'ev: for e in evs {
-        for k in &keep {
-            if (k.t_rec - e.t_rec).abs() < 8.0 {
-                let r = e.f0 / k.f0;
-                for m in 1..=6u32 {
-                    for q in 1..=4u32 {
-                        if (r / (m as f64 / q as f64) - 1.0).abs() < 0.03 {
-                            continue 'ev;
-                        }
-                    }
-                }
-            }
+    for e in evs {
+        if keep.iter().any(|k| harmonic_events(k, &e, p.cap_sigma)) {
+            continue;
         }
         keep.push(e);
     }
@@ -3142,6 +3210,127 @@ mod tests {
             10_000,
         );
         assert_eq!(cloud.count, 0, "minimum AGL still applies to gap samples");
+    }
+
+    #[test]
+    fn harmonic_noise_sampling_and_fit_offsets_do_not_split_one_pass() {
+        let c = 343.0;
+        let mut fundamental = plain_event(100.0, false);
+        fundamental.t_rec = 100.0;
+        fundamental.tr_t = (0..240).map(|i| 40.0 + 0.5 * i as f64).collect();
+        fundamental.tr_f = fundamental
+            .tr_t
+            .iter()
+            .map(|&t| {
+                cv_curve(t, 100.0, 100.0, 3000.0, 100.0 - 3000.0 / c, c) + 0.06 * (t * 1.7).sin()
+            })
+            .collect();
+        // Same physical pass, but a different analysis window/cadence, independent noise,
+        // and fitted f0/CPA offsets. The observed frequency ratio is still five.
+        let mut fifth = plain_event(505.0, false);
+        fifth.t_rec = 101.0;
+        fifth.tr_t = (0..120).map(|i| 60.15 + 0.65 * i as f64).collect();
+        fifth.tr_f = fifth
+            .tr_t
+            .iter()
+            .map(|&t| {
+                cv_curve(t, 500.0, 100.0, 3000.0, 100.0 - 3000.0 / c, c) + 0.15 * (t * 2.3).sin()
+            })
+            .collect();
+        for (a, b) in [(&fundamental, &fifth), (&fifth, &fundamental)] {
+            assert!(harmonic_events(a, b, 5.0));
+        }
+        // A real shift in the observed curve must not be fitted away by aligning the CPAs.
+        let mut shifted = fifth.clone();
+        shifted.t_rec += 6.0;
+        for t in &mut shifted.tr_t {
+            *t += 6.0;
+        }
+        assert!(!harmonic_events(&fundamental, &shifted, 5.0));
+        // Missing two-sided support cannot establish an independent aircraft.
+        let n = fifth.tr_t.partition_point(|&t| t < fundamental.t_rec);
+        fifth.tr_t.truncate(n);
+        fifth.tr_f.truncate(n);
+        assert!(harmonic_events(&fundamental, &fifth, 5.0));
+    }
+
+    #[test]
+    fn simultaneous_independent_flyovers_locate_the_observer() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let prop = Prop::from_medium(&med, &enu);
+        // Move B's pass so its *received* CPA coincides with A's, with a 2:1 tone ratio.
+        // Different Doppler shapes still supply two independent flight constraints.
+        let t_b = case.t_s + 1900.0 + case.events[0].t_rec - case.events[1].t_rec;
+        let mut b = straight_track(
+            &enu,
+            [2500.0, 0.0, 900.0],
+            [0.0, 104.0, 0.0],
+            t_b,
+            t_b - 600.0,
+            t_b + 600.0,
+            5.0,
+        );
+        b.key = "B".into();
+        case.events[1] = synth_event(
+            "e2",
+            &b,
+            x,
+            case.t_s,
+            2.0 * case.events[0].f0,
+            343.0,
+            t_b,
+            &prop,
+        );
+        case.tracks[1] = b;
+        assert!((case.events[0].t_rec - case.events[1].t_rec).abs() < 0.01);
+
+        let res = run_case(&case, med);
+        assert_eq!(res.funnel.events_used, 2, "{:?}", res.warnings);
+        assert!(!res.candidates.is_empty(), "funnel {:?}", res.funnel);
+        let top = &res.candidates[0];
+        let r = res.refine.as_ref().unwrap();
+        let err = haversine_m(r.lat, r.lon, case.obs.0, case.obs.1);
+        assert!(err < 60.0, "observer error {err:.1} m");
+        assert!((top.t_start_utc - case.t_s).abs() < 1.0);
+        for (event, flight) in [("e1", "A"), ("e2", "B")] {
+            assert!(
+                top.events
+                    .iter()
+                    .any(|m| m.event == event && m.flight == flight && m.role == "pair"),
+                "matches {:?}",
+                top.events
+            );
+        }
+    }
+
+    #[test]
+    fn harmonic_higher_orders_never_count_as_independent_flyovers() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        for order in [5.0, 7.0, 8.0] {
+            for harmonic_stronger in [false, true] {
+                let mut case = two_flyover_case(med);
+                let mut harmonic = case.events[0].clone();
+                harmonic.id = format!("harmonic_{order}");
+                harmonic.f0 *= order;
+                harmonic.f0_tol *= order;
+                harmonic.sigma_hz *= order;
+                for f in harmonic.tr_f.iter_mut().chain(harmonic.q_f.iter_mut()) {
+                    *f *= order;
+                }
+                harmonic.quality = if harmonic_stronger { 200.0 } else { 50.0 };
+                case.events = vec![case.events[0].clone(), harmonic];
+
+                let res = run_case(&case, med);
+                assert_eq!(
+                    res.funnel.events_used, 1,
+                    "order {order}, harmonic stronger: {harmonic_stronger}"
+                );
+                assert!(res.candidates.is_empty());
+            }
+        }
     }
 
     #[test]

@@ -63,6 +63,27 @@ pub fn window_for_roc(roc: f64) -> f64 {
     (1.0 / roc.sqrt()).clamp(0.25, 2.0)
 }
 
+/// Small-integer tone ratios, independent of which member of a harmonic family is louder.
+/// Compare the larger frequency to the smaller so the same relative tolerance applies in
+/// both strength orders, including a strong fifth harmonic and its weaker fundamental.
+pub(crate) fn harmonic_frequencies(
+    a: f64,
+    b: f64,
+    max_order: u32,
+    tolerance: f64,
+    include_unison: bool,
+) -> bool {
+    if !(a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0) {
+        return false;
+    }
+    let ratio = a.max(b) / a.min(b);
+    (1..=max_order).any(|m| {
+        (1..=m.min(4)).any(|q| {
+            (include_unison || m != q) && (ratio / (m as f64 / q as f64) - 1.0).abs() < tolerance
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

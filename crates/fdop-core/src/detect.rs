@@ -8,10 +8,12 @@
 //! only light one. Detections are then refined on the linear spectrogram (continuous f0, t0r,
 //! v, d) so that ridge-trace seeds land on the ridge, and grouped into harmonic families.
 
-use crate::physics::cv_ratio_rel_t0r;
+use crate::physics::{cv_ratio_rel_t0r, harmonic_frequencies};
 use crate::spectro::{Spec, stft_band_db};
 use rayon::prelude::*;
 use serde::Serialize;
+
+const RIDGE_HALF_ROWS: i64 = 3;
 
 #[derive(Clone, Debug)]
 pub struct DetectParams {
@@ -410,7 +412,7 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
         for j in j0..j1 {
             let fr = f0 * cv_ratio_rel_t0r(ls.t[j] - t0r, tm.v, tm.d, p.c);
             let row = ((fr / ls.freqs[0]).log2() * bpo).round() as i64;
-            for rr2 in (row - 3).max(0)..=(row + 3).min(nr as i64 - 1) {
+            for rr2 in (row - RIDGE_HALF_ROWS).max(0)..=(row + RIDGE_HALF_ROWS).min(nr as i64 - 1) {
                 known[rr2 as usize * nt + j] = true;
             }
         }
@@ -434,7 +436,7 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
     for (i, d) in out.iter_mut().enumerate() {
         d.id = i;
     }
-    group_harmonics(&mut out, p.bins_per_octave);
+    group_harmonics(&mut out, p);
     (out, cut)
 }
 
@@ -466,7 +468,7 @@ fn residual_halves(ls: &LogSpec, r: usize, i: usize, tm: &Template, known: &[boo
 
 /// Mark detections that are harmonics of a stronger one (same t0r within 4 s, same shape,
 /// small-integer frequency ratio within 1.5 %).
-fn group_harmonics(dets: &mut [Detection], _bpo: usize) {
+fn group_harmonics(dets: &mut [Detection], p: &DetectParams) {
     let n = dets.len();
     for j in 0..n {
         for i in 0..j {
@@ -477,27 +479,32 @@ fn group_harmonics(dets: &mut [Detection], _bpo: usize) {
             if (a.t0r - b.t0r).abs() > 4.0 || (a.v - b.v).abs() > 30.0 {
                 continue;
             }
-            let ratio = b.f0 / a.f0;
-            let mut hit = false;
-            'outer: for m in 1..=8u32 {
-                for q in 1..=4u32 {
-                    if m == q {
-                        continue;
-                    }
-                    let r = m as f64 / q as f64;
-                    if (ratio / r - 1.0).abs() < 0.015 {
-                        hit = true;
-                        break 'outer;
-                    }
-                }
-            }
-            if hit {
+            if harmonic_frequencies(a.f0, b.f0, 8, 0.015, false) && harmonic_shapes(a, b, p) {
+                let ratio = b.f0 / a.f0;
                 dets[j].harmonic_of = Some(dets[i].id);
                 dets[i].harmonics.push(ratio);
                 break;
             }
         }
     }
+}
+
+fn harmonic_shapes(a: &Detection, b: &Detection, p: &DetectParams) -> bool {
+    let ta = (a.t0r - a.half_s).max(b.t0r - b.half_s);
+    let tb = (a.t0r + a.half_s).min(b.t0r + b.half_s);
+    if tb <= ta {
+        return false;
+    }
+    let n = ((tb - ta) / p.path_dt.max(p.hop_s)).ceil() as usize;
+    // Use the combined widths of the existing +/- RIDGE_HALF_ROWS accepted-curve masks.
+    // This permits neighbouring v/d grid choices for the same physical pass,
+    // but not different Doppler transitions that only share a CPA time and tone ratio.
+    (0..=n).all(|k| {
+        let t = ta + (tb - ta) * k as f64 / n.max(1) as f64;
+        let ra = cv_ratio_rel_t0r(t - a.t0r, a.v, a.d, p.c);
+        let rb = cv_ratio_rel_t0r(t - b.t0r, b.v, b.d, p.c);
+        ((ra / rb).log2() * p.bins_per_octave as f64).abs() <= 2.0 * RIDGE_HALF_ROWS as f64
+    })
 }
 
 /// Mean of the linear spectrogram along the modelled curve (approach, recede halves) for a
@@ -608,6 +615,59 @@ pub fn refine(spec: &Spec, det: &Detection, c: f64) -> Detection {
 mod tests {
     use super::*;
     use crate::physics::cv_curve;
+
+    fn harmonic_detection(id: usize, f0: f64, d: f64) -> Detection {
+        Detection {
+            id,
+            t0r: 300.0,
+            f0,
+            v: 100.0,
+            d,
+            score: 20.0 - id as f64,
+            score_approach: 20.0 - id as f64,
+            score_recede: 20.0 - id as f64,
+            half_s: 120.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn simultaneous_different_shapes_are_not_harmonics() {
+        // Equal CPA times, equal speeds and a 2:1 tone ratio do not identify one plane:
+        // these passes have very different Doppler transitions because their ranges differ.
+        let mut dets = vec![
+            harmonic_detection(0, 100.0, 1000.0),
+            harmonic_detection(1, 200.0, 9000.0),
+        ];
+        group_harmonics(&mut dets, &DetectParams::default());
+        assert!(dets.iter().all(|d| d.harmonic_of.is_none()), "{dets:?}");
+    }
+
+    #[test]
+    fn harmonic_fifth_groups_in_either_strength_order() {
+        for (first, second) in [(100.0, 500.0), (500.0, 100.0)] {
+            let mut dets = vec![
+                harmonic_detection(0, first, 3000.0),
+                harmonic_detection(1, second, 3000.0),
+            ];
+            group_harmonics(&mut dets, &DetectParams::default());
+            assert_eq!(dets[1].harmonic_of, Some(0), "{dets:?}");
+            assert_eq!(dets[0].harmonics, vec![second / first]);
+        }
+    }
+
+    #[test]
+    fn harmonic_neighbouring_templates_share_a_family() {
+        let mut dets = vec![
+            harmonic_detection(0, 100.0, 3000.0),
+            harmonic_detection(1, 200.0, 4000.0),
+        ];
+        dets[1].v = 113.0;
+        dets[1].t0r += 2.0;
+        group_harmonics(&mut dets, &DetectParams::default());
+        assert_eq!(dets[1].harmonic_of, Some(0), "{dets:?}");
+    }
 
     /// Synthesise a flyover (fundamental + 2nd harmonic) plus a flat engine tone in noise.
     fn synth(sr: u32, dur: f64) -> Vec<f32> {
