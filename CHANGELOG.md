@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### `search.json` no longer grows with the search; missing winds aloft fall back
+
+- **`search.json` keeps the best 10,000 candidates, with a new field `candidates_total`.** A complete comparison had
+  made it 521 MB on the busy osprey run and 290 MB on the osprey cam's 10-31 recording, built in memory and written
+  before `result.json`, so a run short of memory or disk could fail at the very end. The answer sits at the front and
+  `margin` names the rival wherever it ranks, so neither is lost. `result.json` does not change.
+  `search_json_keeps_the_best_candidates_and_counts_the_rest` fails without this.
+- **Winds aloft are no longer invented.** A pressure-level response with no upper winds at some hour copied the 10 m
+  wind to every height, and a radiosonde with no winds read as calm air. Both still reported `winds_aloft: true`,
+  which keeps the speed gates narrow. Such a response now fails with `open-meteo: no winds aloft`, which falls back
+  to radiosondes with the usual warning, and a sounding with no wind above its lowest level is skipped. None of the recordings here hit this.
+  `pressure_levels_without_winds_aloft_are_refused` and `a_sounding_without_wind_is_not_calm_air` fail without this.
+- **The ridge check's refusal now says what it measures:** `trace follows only N % of the central frequency drop`,
+  in `quality` and in `reasons`. The check is unchanged. It compares against the central 80 % of the fitted drop,
+  so the 15 % line is 12 % of the whole drop, and a tone that keeps falling can read above 1.
+- **Correction to the message of `4b88d7c`.** It says the 2 Hz step limit comes from the guided trace because "its
+  band floors at 1 Hz, so a clean fit cannot step further than that". A floor is not a ceiling: the band reaches
+  4.5 Hz at a passing RMS, and a wider band can step further, which makes a real ridge read low. Removing the limit
+  changed none of the synthetic passes, and the comment now says this.
+- **Replays on this code.** On `630bba5` with these changes, the county and state-wide reference searches match exact `630bba5` on answer, radius, margin, rival, funnel, gates, warnings and every candidate's score, and `fdop selftest` gives the same 7.1 m. The three-day run and the wrong dates were not replayed, because the only search-path change is what `search.json` keeps. `b8c0819`, which this lands on, has no real-recording replay of its own yet.
+
 ### Frequency calibration through the full Doppler curve
 
 - Ordinary-window ridge integration now follows the complete model curve, as the steep branch already
@@ -277,6 +298,12 @@ at that commit, not per-change commits.
 | eagle-nest cam, Lee County, FL, state search | `s_swfl_fl_s7b` | 135 km | 75 m | low | 0.20 | 408 | 219 s |
 | same recording, county search | `s_swfl_lee_s7a` | about 4 km | 92 m | low | no rival | 20 | 237 s |
 
+- **The clock each field answer implies, against the stream's.** Osprey cam on 11-01 +0.1 s; eagle cam at Duke Farms
+  −6.4 s; osprey cam on 10-31 −3.8 h and on 11-02 +1.1 h; bird-feeder cam +7.0 h; Rochelle +9.3 h; eagle-nest cam in Lee
+  County, FL +53 min searched by state and +55 min by county. So the county search's "about 4 km" is chance, and the
+  Duke Farms answer is a real match despite its low grade: it searched the whole day and its 0.11-nat rival is 140 m
+  away. Without `--start` the search cannot make this check. With a rough one, every wrong answer here would be ruled
+  out; what it answers instead has not been measured.
 - **What got worse.** Against `d55ef79` the reference answers are 47–85 m further from the published location, the
   state-wide search falls from high to medium and the three-day window from medium to low. The reference recording
   has 4 usable events of 24 where `d55ef79` had 19, 3 of them searched. One refused event, at 13 %, was a confirmer
@@ -307,13 +334,16 @@ at that commit, not per-change commits.
 |---|---|---|---:|
 | `r_nassau_cap60` | high, 306 m, margin 12.77 | high, 306 m, margin 11.06 | 58 → 92 s |
 | `r_ny_cap60` | medium, 271 m, margin 5.01 | medium, 271 m, margin 4.72 | 226 → 340 s |
+| `r_md_cap60` | low, 271 m, margin 2.92, rival 138 km away | low, 271 m, margin 1.91, rival 52 km away | 509 → 940 s |
 | `n_ref_on_0907_cap60` | low, 138 km, core 2 of 2, margin 2.37 | low, 138 km, core 2 of 2, margin 0.25 | 359 → 513 s |
 | `n_ref_on_0909_cap60` | low, 73 km, core 1 of 2, margin 5.49 | low, 73 km, core 1 of 2, margin 1.89 | 124 → 210 s |
 
-  Only one new event passes quality on this recording (at 958 s, 534.5 Hz). No archived flight fits it out to 40 km, and
-  whether it is a real sound is unresolved: its ridge is faint and intermittent, and the fit could be joining separate
-  sounds. It joins the best rival on all four runs, so margins fall on right and wrong dates alike. The three-day run and the other three wrong-date runs have not been run on it, so the effect on false grades
-  is only partly measured, and AGENTS wants the medium grade's scaling fixed first.
+  Peak memory went from 3.06 to 4.66 GiB on the county run and from 8.83 to 9.67 GiB on the three-day run; the state-wide
+  run stayed near 5 GiB. Only one new event passes quality on this recording (at 958 s, 534.5 Hz). No archived flight
+  fits it out to 40 km, and whether it is a real sound is unresolved: its ridge is faint and intermittent, and the fit
+  could be joining separate sounds. It joins the best rival on all five runs, so margins fall on right and wrong dates
+  alike. The other three wrong-date runs and the other field recordings have not finished on it, so the effect on false
+  grades is only partly measured, and AGENTS wants the medium grade's scaling fixed first.
 - **Checks.** On `7e5cf3e`, whose code is that of `4b88d7c`: `cargo test --workspace --locked -j 2` passed 139 with
   0 failed and 2 ignored, and clippy with warnings denied passed. A release build passed `fdop selftest`: 0.4 m
   error, 75 m radius, +0.20 s clock error, 4 events (known answer, not evidence about real recordings).

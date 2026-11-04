@@ -38,7 +38,7 @@ pub struct MeasureParams {
     pub min_points: usize,
     /// Minimum traced span on each side of the CPA (s).
     pub min_side_s: f64,
-    /// Least share of the fitted frequency drop the trace must travel through (`drop_traversed`).
+    /// Least `EventQuality::drop_traversed` of an event that counts.
     pub min_drop_traversed: f64,
     pub max_rmse_hz: f64,
     pub rounds: usize,
@@ -67,7 +67,8 @@ pub struct EventQuality {
     pub n_points: usize,
     pub span_approach_s: f64,
     pub span_recede_s: f64,
-    /// Share of the fitted frequency drop the trace travels through.
+    /// Net fall of the trace's continuous stretches, as a share of the central 80 % of the fitted
+    /// frequency drop. Falls of a wandering tone add up, so it can exceed 1.
     pub drop_traversed: f64,
     pub median_snr_db: f64,
     pub rmse_hz: f64,
@@ -118,7 +119,8 @@ const STEEP_TIME_ERROR_S: f64 = 0.25;
 /// on both sides of the CPA, a low RMS and a plausible speed. Within the central 80 % of the drop,
 /// this adds up the net fall of each continuous stretch of the trace (`t` ascending) and divides by
 /// the model's fall there. A trace hopping down from tone to tone earns nothing for its hops, but
-/// tones spaced within `MAX_STEP_OFF_MODEL_HZ` of each other can still pass for a ridge.
+/// tones spaced within `MAX_STEP_OFF_MODEL_HZ` of each other can still pass for a ridge, and a tone
+/// that keeps falling and jumping back earns each fall.
 fn drop_traversed(
     t: &[f64],
     f: &[f64],
@@ -129,8 +131,9 @@ fn drop_traversed(
     /// A longer silence ends a stretch: the fall across it was not observed.
     const MAX_GAP_S: f64 = 3.0;
     /// A step this far from the model's own step is a move to another ridge, and ends a stretch.
-    /// The trace takes the peak nearest the model in each frame with no limit on continuity, and
-    /// `band` is at least 1 Hz, so a clean fit's trace cannot step further than this.
+    /// The trace takes the peak nearest the model in each frame with no limit on continuity, so at
+    /// the 1 Hz band of a clean fit it cannot step further than this. A wider band can, and then a
+    /// real ridge reads low; on synthetic passes this limit changed none.
     const MAX_STEP_OFF_MODEL_HZ: f64 = 2.0;
     const MIN_STRETCH_POINTS: usize = 5;
     let net_fall = |stretch: &[f64]| {
@@ -435,7 +438,7 @@ fn measure_with_fit(
         }
         if quality.drop_traversed < p.min_drop_traversed {
             quality.reasons.push(format!(
-                "trace follows only {:.0} % of the fitted frequency drop: no ridge through the CPA",
+                "trace follows only {:.0} % of the central frequency drop: no ridge through the CPA",
                 100.0 * quality.drop_traversed
             ));
         }
@@ -773,7 +776,17 @@ mod tests {
         }
         // steeper than its window at first sight: judged only once the fit has rated it
         let ev = measured_pass(70.0, 80.0, 200.0, 0.05, silent, &p);
-        assert!(!ev.quality.ok, "{}", ev.quality.drop_traversed);
+        assert!(
+            !ev.quality.ok
+                && ev
+                    .quality
+                    .reasons
+                    .iter()
+                    .any(|r| r.contains("frequency drop")),
+            "{} {:?}",
+            ev.quality.drop_traversed,
+            ev.quality.reasons
+        );
         // the only gate that notices an ordinary one
         let ev = measured_pass(118.0, 120.0, 3000.0, 0.2, silent, &unchecked);
         assert!(ev.quality.ok, "{:?}", ev.quality.reasons);
@@ -793,7 +806,7 @@ mod tests {
                 );
             }
         }
-        // a faint tone at the steepest the main window holds
+        // a faint tone whose CPA chirp is what the main window just holds
         let ev = measured_pass(70.0, 140.0, 1000.0, 0.012, None, &p);
         assert!(
             ev.quality.ok,

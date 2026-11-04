@@ -835,7 +835,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             }
         ));
     }
-    write_json(&run_dir.join("search.json"), &res)?;
+    write_json(&run_dir.join("search.json"), &res.dump())?;
     // ---- answer -------------------------------------------------------------------------
     let t = Instant::now();
     let net = if a.offline {

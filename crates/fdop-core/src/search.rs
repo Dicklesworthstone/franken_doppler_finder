@@ -983,7 +983,36 @@ pub struct SearchResult {
     pub warnings: Vec<String>,
 }
 
+/// How many candidates `search.json` keeps. A complete comparison of a busy recording passes
+/// hundreds of thousands, over 500 MB of JSON built in memory, and the answer sits at the front;
+/// the rival behind the margin is named in `margin` wherever it ranks.
+const DUMP_CANDIDATES: usize = 10_000;
+
+/// What `search.json` holds: a result with only its best candidates, and how many there were.
+#[derive(Debug, Serialize)]
+pub struct SearchDump<'a> {
+    pub funnel: &'a Funnel,
+    pub nulls: &'a [EventNull],
+    pub candidates_total: usize,
+    pub candidates: &'a [Candidate],
+    pub refine: &'a Option<RefineResult>,
+    pub margin: &'a serde_json::Value,
+    pub warnings: &'a [String],
+}
+
 impl SearchResult {
+    pub fn dump(&self) -> SearchDump<'_> {
+        SearchDump {
+            funnel: &self.funnel,
+            nulls: &self.nulls,
+            candidates_total: self.candidates.len(),
+            candidates: &self.candidates[..self.candidates.len().min(DUMP_CANDIDATES)],
+            refine: &self.refine,
+            margin: &self.margin,
+            warnings: &self.warnings,
+        }
+    }
+
     /// Test the reported gap against a confidence threshold only when no comparison-budget
     /// cut was recorded. An unchecked rival can increase its score, so an incomplete search's
     /// measured gap is only an upper bound. This does not calibrate searching many events.
@@ -3182,6 +3211,32 @@ mod tests {
             &mut scratch,
         );
         assert!(one.chi < 1e-6, "{one:?}");
+    }
+
+    #[test]
+    fn search_json_keeps_the_best_candidates_and_counts_the_rest() {
+        let mut result = SearchResult {
+            funnel: Funnel::default(),
+            nulls: vec![],
+            candidates: vec![Candidate::default(); DUMP_CANDIDATES + 3],
+            refine: None,
+            margin: serde_json::json!({"margin_nats": 7.5}),
+            warnings: vec![],
+        };
+        result.candidates[0].score = 42.0;
+        result.candidates[DUMP_CANDIDATES].score = -1.0;
+        let dump = serde_json::to_value(result.dump()).unwrap();
+        let kept = dump["candidates"].as_array().unwrap();
+        assert_eq!(kept.len(), DUMP_CANDIDATES);
+        assert_eq!(dump["candidates_total"], DUMP_CANDIDATES + 3);
+        assert_eq!(kept[0]["score"], 42.0, "the answer stays at the front");
+        assert!(kept.iter().all(|c| c["score"] != -1.0), "the rest are cut");
+        assert_eq!(dump["margin"]["margin_nats"], 7.5);
+
+        result.candidates.truncate(2);
+        let dump = serde_json::to_value(result.dump()).unwrap();
+        assert_eq!(dump["candidates"].as_array().unwrap().len(), 2);
+        assert_eq!(dump["candidates_total"], 2);
     }
 
     #[test]

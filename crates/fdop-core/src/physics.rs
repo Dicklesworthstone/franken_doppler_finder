@@ -50,6 +50,7 @@ fn cv_ratio(u: f64, v: f64, d: f64, c: f64) -> f64 {
 pub struct Readouts {
     pub f_pre: f64,
     pub f_post: f64,
+    /// Rate of fall at the CPA. The steepest comes just after it, faster by (1 - M^2)^(-3/2).
     pub max_roc: f64,
 }
 

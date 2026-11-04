@@ -220,13 +220,18 @@ fn parse_location(
         if lv.len() < 3 {
             return Err(DataError::new("open-meteo: too few pressure levels"));
         }
+        // the surface wind alone would be copied to every height and pass for winds aloft
+        if lv[1..].iter().all(|l| l.wind_e.is_nan()) {
+            return Err(DataError::new("open-meteo: no winds aloft"));
+        }
         fill_wind(&mut lv);
         out.push(lv);
     }
     Ok((times, out))
 }
 
-/// Replace NaN winds by linear interpolation in height (constant beyond the ends).
+/// Replace NaN winds by linear interpolation in height (constant beyond the ends). At least one
+/// level must have a wind: callers refuse a profile that has none rather than call it calm.
 fn fill_wind(lv: &mut [Level]) {
     let good: Vec<(f64, f64, f64)> = lv
         .iter()
@@ -235,10 +240,6 @@ fn fill_wind(lv: &mut [Level]) {
         .collect();
     for l in lv.iter_mut() {
         if l.wind_e.is_finite() && l.wind_n.is_finite() {
-            continue;
-        }
-        if good.is_empty() {
-            (l.wind_e, l.wind_n) = (0.0, 0.0);
             continue;
         }
         let k = good.partition_point(|g| g.0 <= l.z_msl);
@@ -456,6 +457,11 @@ fn parse_raob(profile: &serde_json::Value) -> Vec<Level> {
             l.t_c = a.1 + (l.z_msl - a.0) / (b.0 - a.0) * (b.1 - a.1);
         }
         out.push(l);
+    }
+    // no wind reported is not calm air, and the lowest level's alone would pass for winds aloft:
+    // the caller drops a sounding with too few levels
+    if out.iter().skip(1).all(|l| l.wind_e.is_nan()) {
+        return Vec::new();
     }
     fill_wind(&mut out);
     out
@@ -861,6 +867,63 @@ mod tests {
         let m = g.medium(40.9, -73.5, t[0], 32.0, 5557.0);
         assert!((m.c - 336.5).abs() < 1.5, "{}", m.c);
         assert!(m.wind_e > 5.0 && m.wind_n < -4.0, "NW wind blows SE: {m:?}");
+    }
+
+    #[test]
+    fn pressure_levels_without_winds_aloft_are_refused() {
+        let mut hourly = serde_json::json!({
+            "time": [1788900000, 1788903600],
+            "temperature_2m": [26.0, 25.0], "relative_humidity_2m": [40, 45],
+            "wind_speed_10m": [2.0, 2.0], "wind_direction_10m": [270, 270],
+            "surface_pressure": [1023.0, 1023.0],
+        });
+        for (p, t) in [(925, 17.4), (850, 13.4), (700, 5.6), (500, -9.8)] {
+            hourly[format!("temperature_{p}hPa")] = serde_json::json!([t, t]);
+        }
+        let loc = |h: &serde_json::Value| serde_json::json!({"elevation": 30.0, "hourly": h});
+        let err = parse_location(&loc(&hourly), true).err().unwrap();
+        assert!(err.0.contains("no winds aloft"), "{err}");
+        // one hour without them is enough: the grid would hold a false profile there
+        hourly["wind_speed_500hPa"] = serde_json::json!([20.0, null]);
+        hourly["wind_direction_500hPa"] = serde_json::json!([315, 315]);
+        let err = parse_location(&loc(&hourly), true).err().unwrap();
+        assert!(err.0.contains("no winds aloft"), "{err}");
+        // one level with them is fine: the others take it, and the surface keeps its own
+        hourly["wind_speed_500hPa"] = serde_json::json!([20.0, 20.0]);
+        let (_, p) = parse_location(&loc(&hourly), true).unwrap();
+        let (surface, top) = (p[0].first().unwrap(), p[0].last().unwrap());
+        assert!(surface.wind_e > 1.9 && surface.wind_e < 2.1, "{surface:?}");
+        assert!(top.wind_e > 14.0 && top.wind_n < -14.0, "{top:?}");
+    }
+
+    #[test]
+    fn a_sounding_without_wind_is_not_calm_air() {
+        let levels = |with_wind: i32| {
+            (0..6)
+                .map(|i| {
+                    let wind = i < with_wind;
+                    serde_json::json!({
+                        "hght": 100.0 + 1200.0 * f64::from(i),
+                        "tmpc": 20.0 - 7.0 * f64::from(i),
+                        "dwpc": 5.0 - 7.0 * f64::from(i),
+                        "drct": wind.then_some(270.0),
+                        "sknt": wind.then_some(20.0),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(parse_raob(&serde_json::json!(levels(0))).is_empty());
+        assert!(
+            parse_raob(&serde_json::json!(levels(1))).is_empty(),
+            "the surface wind alone is not winds aloft"
+        );
+        assert_eq!(parse_raob(&serde_json::json!(levels(2))).len(), 6);
+        let lv = parse_raob(&serde_json::json!(levels(6)));
+        assert_eq!(lv.len(), 6);
+        assert!(
+            lv.iter().all(|l| (l.wind_e - 20.0 * KT).abs() < 0.01),
+            "{lv:?}"
+        );
     }
 
     #[test]
