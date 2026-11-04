@@ -54,7 +54,8 @@ finding the faint curves in a spectrogram to naming the town.
 [`f717f6f`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/f717f6faec84803d360207884e91c8b830e3578c), which changed how ADS-B tracks are interpolated through turns,
 came after every run above. Its synthetic tests pass, but the reference and field recordings have not been rerun
 on it, so the distances and grades above do not validate it. The later correction that prevents empty hypothesis
-clouds from consuming search-driver slots also has synthetic regression coverage only.
+clouds from consuming search-driver slots and the correction to refinement-window boundary detection also have
+synthetic regression coverage only.
 
 ---
 
@@ -213,6 +214,10 @@ consistently.
 | margin | the answer beats the best *different* explanation by ≥ 6 nats, or no rival survived. A rival is different if it matches a shared event to another flight, shares no match, or lies more than 5 km away |
 | no unheard close pass | no tonal aircraft passed much closer than the heard ones without leaving a detection |
 | radius | the 95 % radius is ≤ 1,000 m and is not merely a lower bound (the region did not reach the edge of the refinement window) |
+
+Refinement widens and recenters its grid when any accepted confidence-contour cell touches a grid edge,
+including when the best point lies off center. If the contour still reaches an edge after the available
+expansions, the radius remains a lower bound.
 
 **High** confidence needs every gate. **Medium** needs two core matches, clock lock, and a margin of at least
 3 nats (or no rival). Everything else is **low**. The full gate details are in `result.json` and `report.html`.

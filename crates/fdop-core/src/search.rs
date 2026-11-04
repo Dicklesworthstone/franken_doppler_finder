@@ -2180,6 +2180,7 @@ fn refine_on(
     let (bla, blo, _, _) = grid[k_best];
     let mut rmax: f64 = 0.0;
     let mut cells = 0usize;
+    let mut edge = false;
     for (k, e) in evals.iter().enumerate() {
         let (iy, ix) = (k / n, k % n);
         if let Some(pe) = e {
@@ -2187,6 +2188,9 @@ fn refine_on(
             dchi[iy][ix] = dc;
             if dc <= 5.99 {
                 cells += 1;
+                // The grid is centered on the previous winner, not necessarily this
+                // minimum. A small contour can still be clipped at any grid boundary.
+                edge |= iy == 0 || iy + 1 == n || ix == 0 || ix + 1 == n;
                 let (la, lo, _, _) = grid[k];
                 rmax = rmax.max(haversine_m(bla, blo, la, lo));
             }
@@ -2197,7 +2201,6 @@ fn refine_on(
     let area_r = (cells as f64 * p.refine_step_m * p.refine_step_m / std::f64::consts::PI).sqrt();
     let floor = 75.0;
     let radius = (rmax + 0.5 * p.refine_step_m).max(floor);
-    let edge = rmax >= p.refine_half_m - p.refine_step_m;
     Some(RefineResult {
         lat: bla,
         lon: blo,
@@ -2583,6 +2586,70 @@ mod tests {
                     .any(|m| m.event == event && m.flight == flight && m.role == "pair"),
                 "matches {:?}",
                 top.events
+            );
+        }
+    }
+
+    #[test]
+    fn refinement_expands_when_the_contour_reaches_an_offset_grid_edge() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        case.p.refine_half_m = 100.0;
+        case.p.refine_step_m = 25.0;
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let assign = [(0, 0, case.t_s + 1000.0), (1, 1, case.t_s + 1900.0)];
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(case.obs.0);
+        // A coarse winner can put the true minimum on any edge of the refinement grid.
+        // Its small contour extent about that minimum does not mean the contour is closed.
+        for (east, north) in [(100.0, 0.0), (-100.0, 0.0), (0.0, 100.0), (0.0, -100.0)] {
+            let lat = case.obs.0 + north / mlat;
+            let lon = case.obs.1 + east / mlon;
+            let r = refine_on(
+                lat,
+                lon,
+                &assign,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &dem,
+                &atmo,
+            )
+            .unwrap();
+            let last = r.dchi2.len() - 1;
+            let touches_edge = r.dchi2.iter().enumerate().any(|(iy, row)| {
+                row.iter()
+                    .enumerate()
+                    .any(|(ix, &dc)| (iy == 0 || iy == last || ix == 0 || ix == last) && dc <= 5.99)
+            });
+            assert!(
+                touches_edge,
+                "test must exercise a clipped contour: {east}, {north}"
+            );
+            assert!(
+                r.radius_lower_bound,
+                "contour at grid edge was treated as complete: {east}, {north}, {r:?}"
+            );
+
+            // Re-centering and widening must recover a complete contour and the known point.
+            let mut wide = case.p.clone();
+            wide.refine_half_m *= 2.0;
+            wide.refine_step_m *= 2.0;
+            let complete = refine_on(
+                r.lat,
+                r.lon,
+                &assign,
+                &case.events,
+                &case.tracks,
+                &wide,
+                &dem,
+                &atmo,
+            )
+            .unwrap();
+            assert!(!complete.radius_lower_bound, "{complete:?}");
+            assert!(
+                haversine_m(complete.lat, complete.lon, case.obs.0, case.obs.1) < 35.0,
+                "refined location must recover the synthetic observer"
             );
         }
     }

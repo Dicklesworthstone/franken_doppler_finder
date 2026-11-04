@@ -19,6 +19,17 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Confidence-radius refinement
+
+- Refinement checks whether the accepted 95% contour reaches any edge of its actual grid before
+  deciding whether to widen and recenter. Previously it compared the contour's extent around the best
+  point with the grid's half-width, which could mistake a clipped contour for a complete one when the
+  best point was near an edge. The search now explores the wider window in that case; if the contour
+  remains clipped after the existing expansion limit, the radius is reported as a lower bound.
+- A synthetic two-flight regression covers minima at all four grid edges and checks that widening
+  recovers a complete contour around the known observer. The reference configurations and field
+  recordings have not been rerun; their historical distances and grades do not validate this change.
+
 ### Search driver selection ([`b2a6906`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/b2a69069876e5d25f319305ffc7f46ca9ffd6ba0))
 
 - Events with no eligible ADS-B hypotheses no longer consume `--max-events` driver slots or form empty
