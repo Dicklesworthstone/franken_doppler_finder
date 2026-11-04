@@ -93,6 +93,9 @@ at that commit, not per-change commits.
   from the gazetteer (offline, or when the Census Geocoder fails), the outside-state warning says it is an
   estimate, since only the Census lookup tests containment. A `locate` that fails without `-o` now records the
   default run directory holding its partial outputs.
+- [`b92a799`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/b92a799ceca8f6b92b9ede73b718cd0d8807e8e9) A `locate` that fails
+  without `-o` names its run directory in the error message, if it wrote anything there. README Troubleshooting
+  covers the year-first date refusal, the cap warnings and the outside-state warning.
 
 ---
 
