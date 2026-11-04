@@ -289,3 +289,42 @@ file. So `r2_dpdem` and `sd_dpdem` use the tool's default sources, as its docs d
 then Copernicus GLO-30. `conus_1000m` stays on Terrarium, as its docs say. The tools therefore read different elevation
 data: `fdop` Terrarium at zooms 10 and 13, `dopplertrack` Terrarium at zoom 12, `dopplerprint` the sources above. Each uses
 its own.
+
+## Addendum 5, 2026-11-04, with R2 running: five of set E's captures have no sound
+
+### Void cases
+
+Over each whole file, the mean and the peak of these captures are both -91 dB, which is digital silence:
+`e_aransas`, `e_bayfield`, `e_fridayharbor`, `e_oxnard`, `e_sheboygan`. So is the uncaptured `e_colchester`, at both windows.
+The same capture tool got sound from the other three, whose means are -36.0 dB (`e_olympia`), -34.9 dB (`e_fortmadison`) and
+-19.3 dB (`e_porthenry`), so these streams carry a silent track.
+
+The rule above asked for "an audio track" and nothing checked that the track had sound. That is this file's mistake. It
+came to light because `dopplerprint` reported no passes at all on these five, and `fdop`'s event counts had been read
+when the level was measured. The test itself is the level alone.
+
+No answer on a silent file is evidence about a tool. These cases are **void for every tool in every regime**: they stay
+in the table marked void, they leave the counts and the medians, and R3 and R1 do not run on them.
+
+### Replacements, under a rule fixed before any search
+
+Three recordings say little about "set E alone", so five more are added.
+
+- **Search.** YouTube's live filter, in its own order, on: train camera, railroad live, train station live, airport live,
+  airport camera, harbor, marina.
+- **Qualifying.** As in the first addendum: in the US, at a named public site, new to all three projects, no ban on
+  recording, no private residences. Virtual Railfan, LIVE Trains, Duluth Harbor Cam and every cam already considered for set E
+  or B stay out.
+- **Sound.** About 60 s of the stream's audio. It qualifies if its mean level is above -60 dB. That number is the only thing
+  taken from the audio: nobody listens to it, no tool runs on it, and no spectrogram, ADS-B or aircraft data is consulted.
+- **Selection.** The first five to qualify, taking the queries in the order above. They are listed in a later section before
+  capture.
+- **Capture.** Two hours of DVR audio from 2026-11-04T17:00Z with the true clock from the fragment server, by the same tool.
+  The outage rule is unchanged. A stream whose DVR does not reach that far is listed as not captured, and the next to qualify
+  takes its place.
+- **Truth and limits.** As before: an OpenStreetMap feature or the operator's published address, 1 km for a single building,
+  station or marina, 5 km where the operator gives no building.
+- **Runs.** R2, R3 and R1 as for the rest of set E, including the `dp48` and `dpdem` runs, once that day's ADS-B archive is out.
+  `fdop` stays pinned at `7e66501`.
+
+"Set E alone" in the claim now means the three recordings with sound and these replacements.
