@@ -79,7 +79,7 @@ pub struct LocateCli {
     /// Exact recording start if known (ISO 8601, e.g. 2026-09-08T19:17:30-04:00).
     #[arg(long)]
     pub start: Option<String>,
-    /// Clock tolerance around --start or the file's creation_time (s).
+    /// Finite, nonnegative clock tolerance around --start or the file's creation_time (s).
     #[arg(long, default_value_t = 180.0)]
     pub clock_tol: f64,
     /// Ignore the container's creation_time metadata.

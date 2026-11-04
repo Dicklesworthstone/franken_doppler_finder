@@ -42,6 +42,17 @@ at that commit, not per-change commits.
   interpolated positions checked against an analytic circle. These are synthetic checks only: the three
   reference configurations and field recordings have not been rerun on this change.
 
+### Changes
+
+- An explicit `locate --start` now limits archive-availability checks, weather retrieval and ADS-B downloads
+  as well as the search. A broader `--dates` range no longer requires unrelated UTC-day archives, so a known
+  recording clock can run with only its required days cached. Track padding and recordings crossing UTC
+  midnight still request both days. The clock window must overlap the selected local dates, its tolerance
+  must be finite and nonnegative, and unpublished coverage clips the actual requested window. An unusable
+  metadata hint no longer creates an inverted search window; a metadata fallback reports the window actually
+  searched. Four offline regressions cover day selection, midnight coverage, invalid clocks and metadata
+  conventions. No new real-recording accuracy or timing claim is made.
+
 ### Representative commits
 
 - [`3e62867`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/3e62867b3d5d278a8588bccf9528a43e5ebd99bb) Initial

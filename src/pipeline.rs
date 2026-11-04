@@ -126,6 +126,47 @@ pub fn start_window(d0: Ymd, d1: Ymd, off: (f64, f64)) -> (f64, f64) {
     (a, b)
 }
 
+/// An explicit clock constrains every data request, not just the final search. Keep it
+/// inside the date window so an inconsistent clock cannot silently search another day.
+fn requested_start_window(
+    dates: (f64, f64),
+    start: Option<f64>,
+    tolerance: f64,
+) -> Result<(f64, f64), String> {
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err("--clock-tol must be finite and nonnegative".into());
+    }
+    let Some(t) = start else {
+        return Ok(dates);
+    };
+    if !t.is_finite() {
+        return Err("--start must be a finite timestamp".into());
+    }
+    let window = ((t - tolerance).max(dates.0), (t + tolerance).min(dates.1));
+    if window.0 > window.1 {
+        return Err("--start and --clock-tol do not overlap --dates in the selected region".into());
+    }
+    Ok(window)
+}
+
+/// Container clocks may mark either end of the recording. An unusable hint must not
+/// produce an inverted search window; retain the full-date fallback instead.
+fn metadata_start_window(
+    full: (f64, f64),
+    creation: f64,
+    duration: f64,
+    tolerance: f64,
+) -> Option<(f64, f64)> {
+    if !creation.is_finite() || creation < full.0 - duration || creation > full.1 + duration {
+        return None;
+    }
+    let window = (
+        (creation - duration - tolerance).max(full.0),
+        (creation + tolerance).min(full.1),
+    );
+    (window.0 <= window.1).then_some(window)
+}
+
 /// serde_json writes non-finite floats as null, so the output is always valid JSON.
 fn write_json(path: &Path, v: &impl serde::Serialize) -> Result<(), String> {
     let s = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
@@ -315,7 +356,17 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         region.utc_offset_h
     ));
     let (d0, d1) = parse_dates(&a.dates)?;
-    let (mut s_lo, mut s_hi) = start_window(d0, d1, region.utc_offset_h);
+    let given_start = a
+        .start
+        .as_deref()
+        .map(parse_iso_utc)
+        .transpose()
+        .map_err(|e| format!("--start: {e}"))?;
+    let (mut s_lo, mut s_hi) = requested_start_window(
+        start_window(d0, d1, region.utc_offset_h),
+        given_start,
+        a.clock_tol_s,
+    )?;
     // adsb.lol publishes each UTC day a few hours after it ends, so yesterday's local date
     // usually reaches into a UTC day without an archive: search the published part, say so
     let (adsb_end, pending) = fdop_data::published_until(
@@ -338,7 +389,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         );
         if hi < s_lo {
             return Err(format!(
-                "{why}; no published day covers a {:.0} min recording on {}: rerun later",
+                "{why}; no published day covers a {:.0} min recording in the requested start window on {}: rerun later",
                 info.duration_s / 60.0,
                 a.dates
             ));
@@ -352,14 +403,25 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         adsb_end - 1.0
     };
     let full_window = (s_lo, s_hi);
-    let mut window_note = format!(
-        "recording start between {} and {} (local dates {} at UTC{:+}..{:+})",
-        iso_utc(s_lo),
-        iso_utc(s_hi),
-        a.dates,
-        region.utc_offset_h.0,
-        region.utc_offset_h.1
-    );
+    let mut window_note = if let Some(t) = given_start {
+        format!(
+            "recording start between {} and {} (--start {} +- {:.0} s, within local dates {})",
+            iso_utc(s_lo),
+            iso_utc(s_hi),
+            iso_utc(t),
+            a.clock_tol_s,
+            a.dates
+        )
+    } else {
+        format!(
+            "recording start between {} and {} (local dates {} at UTC{:+}..{:+})",
+            iso_utc(s_lo),
+            iso_utc(s_hi),
+            a.dates,
+            region.utc_offset_h.0,
+            region.utc_offset_h.1
+        )
+    };
     if !pending.is_empty() {
         window_note.push_str(&format!(
             "; clipped to the published ADS-B archive ({} pending)",
@@ -367,29 +429,14 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         ));
     }
     let mut meta_window = false;
-    if let Some(s) = &a.start {
-        let t = parse_iso_utc(s).map_err(|e| format!("--start: {e}"))?;
-        s_lo = t - a.clock_tol_s;
-        s_hi = t + a.clock_tol_s;
-        window_note = format!(
-            "recording start {} +- {:.0} s (given)",
-            iso_utc(t),
-            a.clock_tol_s
-        );
-        if s_hi + info.duration_s > adsb_end {
-            warnings.push(format!(
-                "--start reaches past the published ADS-B archive (ends {}); flyovers after it cannot be matched",
-                iso_utc(adsb_end)
-            ));
-        }
-    } else if !a.ignore_metadata_time
+    if given_start.is_none()
+        && !a.ignore_metadata_time
         && let Some(ct) = info.creation_unix
-        && ct >= full_window.0 - info.duration_s
-        && ct <= full_window.1 + info.duration_s
+        && let Some((lo, hi)) =
+            metadata_start_window(full_window, ct, info.duration_s, a.clock_tol_s)
     {
-        // containers disagree on whether creation_time marks the start or the end
-        s_lo = (ct - info.duration_s - a.clock_tol_s).max(full_window.0);
-        s_hi = (ct + a.clock_tol_s).min(full_window.1);
+        s_lo = lo;
+        s_hi = hi;
         meta_window = true;
         window_note = format!(
             "recording start in [{}, {}] from the file's creation_time {} (start or end convention, +-{:.0} s); full-day fallback if nothing is found",
@@ -604,8 +651,8 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     }
     let spec = fdop_data::IngestSpec {
         bbox: fetch_box,
-        t_start: full_window.0.min(s_lo) - 1200.0,
-        t_end: (full_window.1.max(s_hi) + dur + 1200.0).min(adsb_end),
+        t_start: full_window.0 - 1200.0,
+        t_end: (full_window.1 + dur + 1200.0).min(adsb_end),
         geoid_n_m: geoid_n,
         keep_unknown: true,
     };
@@ -690,6 +737,11 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         res = run_search(full_window.0, full_window.1);
         s_lo = full_window.0;
         s_hi = full_window.1;
+        window_note = format!(
+            "recording start between {} and {} (full date window after the creation_time hint gave no candidate)",
+            iso_utc(s_lo),
+            iso_utc(s_hi)
+        );
     }
     let _ = (s_lo, s_hi);
     timings.insert("search_s".into(), json!(t.elapsed().as_secs_f64()));
@@ -1159,5 +1211,79 @@ mod tests {
         let (d0, d1) = parse_dates("2026-09-08..2026-09-10").unwrap();
         assert_eq!((d0.2, d1.2), (8, 10));
         assert!(parse_dates("2026-09-10..2026-09-08").is_err());
+    }
+
+    #[test]
+    fn known_clock_requests_only_its_archive_day() {
+        let (d0, d1) = parse_dates("2026-09-07..2026-09-09").unwrap();
+        let dates = start_window(d0, d1, (-5.0, -4.0));
+        let start = parse_iso_utc("2026-09-08T16:17:30-04:00").unwrap();
+        let requested = requested_start_window(dates, Some(start), 180.0).unwrap();
+        assert_eq!(requested, (start - 180.0, start + 180.0));
+        // The availability check, weather and store load all use this outer window.
+        // Even with a one-hour recording and track padding, no adjacent UTC day is needed.
+        assert_eq!(
+            fdop_data::utc_days(requested.0 - 1200.0, requested.1 + 3600.0 + 1200.0),
+            vec![(2026, 9, 8)]
+        );
+        assert!(fdop_data::utc_days(dates.0 - 1200.0, dates.1 + 4800.0).len() > 1);
+        assert_eq!(requested_start_window(dates, None, 180.0).unwrap(), dates);
+    }
+
+    #[test]
+    fn known_clock_keeps_midnight_track_coverage() {
+        let (d0, d1) = parse_dates("2026-09-08").unwrap();
+        let dates = start_window(d0, d1, (-5.0, -4.0));
+        let start = parse_iso_utc("2026-09-08T23:50:00Z").unwrap();
+        let (lo, hi) = requested_start_window(dates, Some(start), 60.0).unwrap();
+        assert_eq!(
+            fdop_data::utc_days(lo - 1200.0, hi + 3600.0 + 1200.0),
+            vec![(2026, 9, 8), (2026, 9, 9)]
+        );
+    }
+
+    #[test]
+    fn known_clock_stays_inside_dates_and_rejects_bad_inputs() {
+        let dates = (1000.0, 2000.0);
+        assert_eq!(
+            requested_start_window(dates, Some(1050.0), 180.0).unwrap(),
+            (1000.0, 1230.0)
+        );
+        assert_eq!(
+            requested_start_window(dates, Some(1950.0), 180.0).unwrap(),
+            (1770.0, 2000.0)
+        );
+        assert_eq!(
+            requested_start_window(dates, Some(1500.0), 0.0).unwrap(),
+            (1500.0, 1500.0)
+        );
+        assert!(requested_start_window(dates, Some(3000.0), 180.0).is_err());
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(requested_start_window(dates, Some(bad), 180.0).is_err());
+            assert!(requested_start_window(dates, Some(1500.0), bad).is_err());
+            assert!(requested_start_window(dates, None, bad).is_err());
+        }
+        assert!(requested_start_window(dates, None, -1.0).is_err());
+    }
+
+    #[test]
+    fn metadata_hints_support_both_conventions_without_inverting_the_window() {
+        let full = (1000.0, 2000.0);
+        // The timestamp can mark the start or end of this 300-second recording.
+        assert_eq!(
+            metadata_start_window(full, 1500.0, 300.0, 10.0),
+            Some((1190.0, 1510.0))
+        );
+        assert_eq!(
+            metadata_start_window(full, 2200.0, 300.0, 10.0),
+            Some((1890.0, 2000.0))
+        );
+        // A creation time before the earliest allowed start used to produce lo > hi.
+        assert_eq!(metadata_start_window(full, 800.0, 300.0, 10.0), None);
+        assert_eq!(
+            metadata_start_window(full, f64::INFINITY, 300.0, 10.0),
+            None
+        );
+        assert_eq!(metadata_start_window(full, f64::NAN, 300.0, 10.0), None);
     }
 }
