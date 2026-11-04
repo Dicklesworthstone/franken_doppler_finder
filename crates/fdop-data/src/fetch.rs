@@ -152,6 +152,21 @@ fn feedset_available(rels: &[DayRelease], include_mlat: bool) -> Option<String> 
     ))
 }
 
+const NO_MLATONLY: &str = "no mlatonly release, so aircraft located only by multilateration \
+                           (transponders without ADS-B Out) are missing";
+
+/// What a day built from feedset `fs` lacks, for warnings (`label` is the day).
+fn feedset_gaps(label: &str, fs: &str, include_mlat: bool) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if fs.starts_with("staging") {
+        gaps.push(format!("{label}: prod release missing, using staging"));
+    }
+    if include_mlat && !fs.contains("mlatonly") {
+        gaps.push(format!("{label}: {NO_MLATONLY}"));
+    }
+    gaps
+}
+
 /// Lesser feedsets that can stand in for `want` when the day lacks a release.
 fn partial_feedsets(want: &str) -> &'static [&'static str] {
     if want == "prod+mlatonly" {
@@ -311,7 +326,7 @@ pub fn fetch_window(
                         p.display(),
                         s.legs.len()
                     ));
-                    notes.push(format!("{label}: {fs} only"));
+                    notes.extend(feedset_gaps(&label, fs, opts.include_mlat));
                     day_stores[i] = Some(s);
                     cache_hits += 1;
                     continue;
@@ -356,7 +371,7 @@ pub fn fetch_window(
                     day,
                     rel: r.clone(),
                 }),
-                None => notes.push(format!("{label}: no mlatonly release")),
+                None => notes.push(format!("{label}: {NO_MLATONLY}")),
             }
         }
     }
@@ -517,6 +532,16 @@ pub fn fetch_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_stand_in_feedset_is_reported() {
+        for want in ["prod+mlatonly", "prod"] {
+            let mlat = want.contains("mlatonly");
+            for fs in partial_feedsets(want) {
+                assert!(!feedset_gaps("d", fs, mlat).is_empty(), "{want} <- {fs}");
+            }
+        }
+    }
 
     #[test]
     fn keys_days_and_names() {

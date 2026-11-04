@@ -724,6 +724,16 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         store.legs.len(),
         store.n_points()
     ));
+    // a day built from a lesser feed can lack aircraft: those can neither match an event nor
+    // count as unheard close passes
+    if let Some(notes) = store.meta.stats["notes"].as_array() {
+        warnings.extend(
+            notes
+                .iter()
+                .filter_map(|n| n.as_str())
+                .map(|n| format!("ADS-B {n}")),
+        );
+    }
     timings.insert("adsb_s".into(), json!(t.elapsed().as_secs_f64()));
     let t = Instant::now();
     let bp = track::BuildParams::default();
