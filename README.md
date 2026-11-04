@@ -703,9 +703,9 @@ before reaching the project crates.
 
 Those builds have since completed on remote workers. On `56cb23e`, `cargo test --workspace --locked -j 2`
 passed 128 tests with 0 failed and 2 ignored, and `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings`
-passed. A release build of `18d8476`, the same production code, passed `fdop selftest`: 0.4 m error, 75 m
-radius, +0.20 s clock error and 4 events. A selftest does not show that real recordings work; the reference
-and field reruns on that build are in [Honest status](#honest-status).
+passed. On `b4c3107`, which adds only documentation, `cargo run --release --locked -j 2 -- selftest` passed:
+0.4 m error, 75 m radius, +0.20 s clock error and 4 events. A selftest does not show that real recordings
+work; the reference and field reruns are in [Honest status](#honest-status).
 
 ```bash
 cargo test --workspace --locked                               # 128 unit tests, no network

@@ -61,12 +61,13 @@ at that commit, not per-change commits.
   published location, radius 214 m, low, failing only margin on its recorded cuts at 13.20 nats (`f_osprey_1101_18d8476`).
   `d55ef79` had it 150 m from that point at high, 23.29 nats. The bird-feeder cam stays wrong, on the same Long
   Island town: low, radius 1,176 m, 2.85 nats (`f_feederwatch_18d8476`). `d55ef79` graded that wrong answer
-  **medium**, radius 2,019 m, 5.06 nats, which retracts the earlier claim here and in the README that no committed
-  build graded a wrong answer above low. The other seven field recordings were not rerun.
+  **medium**, radius 2,019 m, 5.06 nats, which retracts the README's earlier claim that no committed build graded
+  a wrong answer above low. The other seven field recordings were not rerun.
 - **Wrong dates.** All five wrong-date runs on `d55ef79` were low, failing the core and margin gates on their
   own numbers, one also failing the unheard-pass gate. They have not been repeated on the current code.
-- **Checks.** See README "Testing". A release build of `18d8476` passed `fdop selftest`: 0.4 m error, 75 m radius,
-  +0.20 s clock error, 4 events (known answer, not evidence about real recordings).
+- **Checks.** See README "Testing". Release builds of `18d8476` and of the pushed tip `b4c3107` each passed
+  `fdop selftest`: 0.4 m error, 75 m radius, +0.20 s clock error, 4 events (known answer, not evidence about real
+  recordings).
 
 ### Warn when the audio looks high-passed
 
