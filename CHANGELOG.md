@@ -19,6 +19,17 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Curved-track reconstruction
+
+- Correct reported ADS-B velocities are retained on sparsely sampled turns. The old comparison treated a
+  position chord as an instantaneous tangent, so a 100 m/s aircraft turning at 3 degrees/s could lose its
+  correct velocity when reports were 25–29 s apart. The builder now also compares each nearby position chord
+  with the circular-arc average implied by the reported headings, using the existing 25 m/s residual limit.
+  The fallback requires neighbouring headings and still rejects inconsistent speed, heading and vertical rate.
+- Synthetic regressions cover both turn directions, uneven sampling, endpoints and heading wraparound, with
+  interpolated positions checked against an analytic circle. These are synthetic checks only: the three
+  reference configurations and field recordings have not been rerun on this change.
+
 ### Representative commits
 
 - [`3e62867`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/3e62867b3d5d278a8588bccf9528a43e5ebd99bb) Initial

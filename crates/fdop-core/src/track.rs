@@ -31,7 +31,7 @@ pub struct TrackModel {
 #[derive(Clone, Copy, Debug)]
 pub struct BuildParams {
     pub max_gap_s: f64,
-    /// Reported velocity rejected when it disagrees with finite differences by more than this.
+    /// Maximum velocity residual against the positions, allowing for reported heading changes.
     pub vel_consistency_mps: f64,
     /// Fastest vertical speed two positions of one chain may imply (m/s). GA climbs at
     /// 3-8 m/s and turboprops at up to ~15 m/s; junk positions jump kilometres in seconds.
@@ -131,6 +131,60 @@ fn fd_velocity(t: &[f64], p: &[V3]) -> Vec<V3> {
     v
 }
 
+/// A secant measures the average velocity along an arc, not its endpoint tangent. For a
+/// constant-speed turn through angle `a`, that average has the middle heading and speed
+/// `gs * sin(a/2)/(a/2)`. Compare this prediction with each nearby position chord separately:
+/// a bogus report must not gain an unbounded tolerance just by implying a rapid turn.
+fn turn_consistent(
+    pts: &[fdop_types::store::TrackPoint],
+    pos: &[V3],
+    k: usize,
+    enu: &Enu,
+    vu: f64,
+    tolerance: f64,
+) -> bool {
+    let p = &pts[k];
+    if p.gs_mps <= 0.0 {
+        return false;
+    }
+    let heading = (p.track_deg as f64).to_radians();
+    let mut checked = false;
+    for j in [k.checked_sub(1), (k + 1 < pts.len()).then_some(k + 1)]
+        .into_iter()
+        .flatten()
+    {
+        let dt = pts[j].t - p.t;
+        if dt.abs() >= 30.0 {
+            continue;
+        }
+        if !pts[j].track_deg.is_finite() {
+            return false;
+        }
+        let half_turn = (((pts[j].track_deg as f64).to_radians() - heading + std::f64::consts::PI)
+            .rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI)
+            * 0.5;
+        let chord_speed = p.gs_mps as f64
+            * if half_turn.abs() < 1e-8 {
+                1.0
+            } else {
+                half_turn.sin() / half_turn
+            };
+        let middle_heading = heading + half_turn;
+        let expected = [
+            chord_speed * middle_heading.sin(),
+            chord_speed * middle_heading.cos(),
+            vu,
+        ];
+        let chord = enu.vec_from_ecef(scale(sub(pos[j], pos[k]), 1.0 / dt));
+        if norm(sub(expected, chord)) > tolerance {
+            return false;
+        }
+        checked = true;
+    }
+    checked
+}
+
 /// Build track models from one stored leg (possibly several, split at gaps).
 pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
     let mut pts: Vec<_> = leg
@@ -175,7 +229,10 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
                         // consistency (only meaningful when neighbours are close in time)
                         let near = (k > 0 && t[k] - t[k - 1] < 30.0)
                             || (k + 1 < t.len() && t[k + 1] - t[k] < 30.0);
-                        if !near || norm(sub(rep, fd[k])) <= bp.vel_consistency_mps {
+                        if !near
+                            || norm(sub(rep, fd[k])) <= bp.vel_consistency_mps
+                            || turn_consistent(seg, &pos, k, &enu, vu, bp.vel_consistency_mps)
+                        {
                             vel[k] = rep;
                             n_rep += 1;
                         }
@@ -511,6 +568,112 @@ pub fn straight_track(
 mod tests {
     use super::*;
     use crate::physics::cv_curve;
+
+    // Analytic, level circular motion in one tangent plane. Reported velocities are rotated
+    // into each sample's own ENU frame, just as actual ADS-B ground tracks are defined.
+    fn turn_state(enu: &Enu, t: f64, omega: f64) -> (V3, V3) {
+        let angle = omega * t + 60.0_f64.to_radians();
+        let radius = 100.0 / omega;
+        (
+            enu.to_ecef([radius * angle.sin(), radius * (1.0 - angle.cos()), 1200.0]),
+            enu.vec_to_ecef([100.0 * angle.cos(), 100.0 * angle.sin(), 0.0]),
+        )
+    }
+
+    fn turning_leg(enu: &Enu, times: &[f64], omega: f64) -> FlightLeg {
+        let points = times
+            .iter()
+            .map(|&t| {
+                let (p, v) = turn_state(enu, t, omega);
+                let (lat, lon, alt) = ecef_to_geodetic(p);
+                let [ve, vn, vu] = Enu::new(lat, lon, 0.0).vec_from_ecef(v);
+                fdop_types::store::TrackPoint {
+                    t: 1000.0 + t,
+                    lat,
+                    lon,
+                    alt_m: alt as f32,
+                    gs_mps: ve.hypot(vn) as f32,
+                    track_deg: ve.atan2(vn).to_degrees().rem_euclid(360.0) as f32,
+                    vrate_mps: vu as f32,
+                    alt_src: 0,
+                    flags: 0,
+                }
+            })
+            .collect();
+        FlightLeg {
+            key: "synthetic-turn".into(),
+            icao: "000000".into(),
+            reg: String::new(),
+            typ: "PC12".into(),
+            source: "synthetic".into(),
+            engine: EngineClass::Turboprop,
+            points,
+        }
+    }
+
+    #[test]
+    fn sparse_turns_keep_correct_tangents_and_reconstruct_the_arc() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        // Both turn directions, unequal sampling, endpoints and headings crossing north.
+        for degrees_per_second in [-3.0_f64, 3.0] {
+            let omega = degrees_per_second.to_radians();
+            for times in [
+                vec![0.0, 25.0, 50.0, 75.0, 100.0],
+                vec![0.0, 29.0, 58.0, 87.0, 116.0],
+                vec![0.0, 25.0, 53.0, 77.0, 106.0],
+            ] {
+                let leg = turning_leg(&enu, &times, omega);
+                let models = build(&leg, &BuildParams::default());
+                assert_eq!(models.len(), 1);
+                let model = &models[0];
+                assert_eq!(model.t.len(), times.len());
+                assert_eq!(model.reported_vel_frac, 1.0);
+                for (&t, &v) in times.iter().zip(&model.vel) {
+                    assert!(norm(sub(v, turn_state(&enu, t, omega).1)) < 0.001);
+                }
+                let mut finite_difference = model.clone();
+                finite_difference.vel = fd_velocity(&model.t, &model.pos);
+                let (mut arc_error, mut fd_error) = (0.0_f64, 0.0_f64);
+                for interval in times.windows(2) {
+                    for j in 1..10 {
+                        let t = interval[0] + (interval[1] - interval[0]) * j as f64 / 10.0;
+                        let truth = turn_state(&enu, t, omega).0;
+                        arc_error = arc_error.max(norm(sub(model.pos_at(1000.0 + t), truth)));
+                        fd_error =
+                            fd_error.max(norm(sub(finite_difference.pos_at(1000.0 + t), truth)));
+                    }
+                }
+                assert!(arc_error < 30.0, "Hermite arc error {arc_error:.3} m");
+                assert!(fd_error > 100.0, "FD comparison error {fd_error:.3} m");
+            }
+        }
+    }
+
+    #[test]
+    fn turning_does_not_exempt_bad_speed_heading_or_vertical_rate() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let leg = turning_leg(&enu, &[0.0, 25.0, 50.0, 75.0, 100.0], 3.0_f64.to_radians());
+        for field in 0..3 {
+            let mut corrupt = leg.clone();
+            match field {
+                0 => corrupt.points[2].gs_mps += 60.0,
+                1 => corrupt.points[2].track_deg += 90.0,
+                _ => corrupt.points[2].vrate_mps += 60.0,
+            }
+            let models = build(&corrupt, &BuildParams::default());
+            assert_eq!(models.len(), 1);
+            let model = &models[0];
+            let fd = fd_velocity(&model.t, &model.pos);
+            assert_eq!(model.vel[2], fd[2], "corrupt field {field} was accepted");
+        }
+        let mut missing_headings = leg.clone();
+        missing_headings.points[1].track_deg = f32::NAN;
+        missing_headings.points[3].track_deg = f32::NAN;
+        let models = build(&missing_headings, &BuildParams::default());
+        let model = &models[0];
+        let fd = fd_velocity(&model.t, &model.pos);
+        assert_eq!(model.vel[2], fd[2], "an unobserved turn was assumed");
+    }
 
     #[test]
     fn hermite_exact_on_straight_line_and_emission_matches_closed_form() {

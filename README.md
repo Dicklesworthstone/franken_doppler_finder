@@ -51,6 +51,10 @@ finding the faint curves in a spectrogram to naming the town.
 | Which code produced these results? | The reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
 | Is it fast? | **Three measurements on one machine.** The state-wide run took 295 s and the three-day run 440 s on an Apple M5 Ultra, with the ADS-B days already cached. See [Performance](#performance) |
 
+The track interpolation changes after those recorded runs have synthetic regression coverage. The reference
+recording and field recordings have not yet been rerun on those changes; the historical distances and grades
+above are not a validation of the updated interpolation.
+
 ---
 
 ## TL;DR
@@ -533,6 +537,10 @@ Design notes:
 - **Parallel, and repeatable up to exact ties.** rayon runs the STFT frames, the template bank, tracing and
   every search stage. Each FFT is pinned to one worker so it does not nest inside rayon. Null sampling uses a
   fixed hash. Candidates with exactly equal scores can come out in a different order from run to run.
+- **Sparse turns retain valid reported velocities.** If a reported tangent disagrees with the finite
+  difference of nearby positions, the track builder also checks the position chords against the circular arc
+  implied by neighbouring headings. Both checks use the same 25 m/s residual limit; a turn does not disable
+  checks for incorrect ground speed, heading or vertical rate.
 
 ---
 
@@ -576,6 +584,7 @@ The unit tests check:
 - detect → measure recovery of `f0`, `v`, `d` and `t0r`;
 - fit recovery and range coverage;
 - Hermite track models against closed forms;
+- sparse turning tracks, including unequal sample spacing and heading wraparound, against an analytic circle;
 - a two-flyover search, with and without wind, that locates the observer within 60 m and the clock within 1 s;
 - junk positions inside an ADS-B leg are dropped before track models are built;
 - trailing UTC days that adsb.lol has not published yet are recognised;

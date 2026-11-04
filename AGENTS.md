@@ -397,8 +397,7 @@ Known fixes not landed. Each one changes answers, so it waits until the referenc
 quoted field tests can be re-run, which needs a Mac build:
 - The medium grade does not allow for how many events were searched (README "Known issues"). Fix it before
   raising the detection or measurement caps.
-- `crates/fdop-core/src/track.rs` rejects a reported ADS-B velocity that differs from the three-point
-  finite difference by more than 25 m/s (`vel_consistency_mps`). On an arc the finite difference itself
-  falls short by about v(ωh)²/6. In a standard-rate turn with reports 25–30 s apart, a 100 m/s aircraft's
-  exact report is therefore rejected and the worse estimate kept. Proposed tolerance: 25 + gs·(ωh)²/6, with ω
-  the turn rate of the reported track and h the larger adjacent gap.
+
+The sparse-turn velocity rejection is now corrected with a circular-arc chord consistency check at the
+existing 25 m/s residual limit. Analytic turning-track regressions cover the correction; the historical
+reference and field recordings still need to be rerun on it (README "Honest status").
