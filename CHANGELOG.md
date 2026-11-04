@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Match individual passes by returning aircraft
+
+- An aircraft already assigned to one event can now explain a later confirming event. Confirmation
+  excludes the used physical pass, with the same 30 s emission-CPA separation used by pair joining,
+  rather than excluding its whole track. The original CPA is recovered geometrically from its stored
+  heard time; failed or boundary recovery keeps the conservative exclusion. Existing fitting, clock,
+  quality and event-limit rules are unchanged.
+- The unheard-pass check also no longer exempts an entire explained track. Its half-distance threshold
+  already excludes the explained CPAs themselves; later, closer CPAs must satisfy the same 25 s detection
+  window as any other aircraft. Hearing one distant pass cannot hide a silent close return.
+- `returning_aircraft_pass_can_confirm_a_candidate` first reproduced a genuine third event being lost
+  when two driver slots were occupied. It now retains that event as a core confirmer, recovering the
+  synthetic observer within 60 m and the clock within 1 s. The same-pass duplicate control passes in
+  still air and wind. `unheard_closer_return_of_an_explained_aircraft_counts` reproduced the silent return
+  being missed and covers the original explained passes, a detected return and a detection outside the
+  existing hearing window. These are synthetic checks; reference and field recordings have not been rerun.
+
 ### Preserve recording time through missing audio packets
 
 - Decoding now preserves timestamp gaps as silence instead of shifting later flyovers earlier in the

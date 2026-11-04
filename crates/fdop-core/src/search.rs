@@ -553,6 +553,8 @@ fn hypotheses(
 type PairKey = (usize, usize, u32, u32);
 /// A flight pair in one 1 km cell.
 type CellKey = (usize, usize, u32, u32, i32, i32);
+/// Minimum emission-CPA separation between events assigned to the same flight.
+const SAME_FLIGHT_MIN_DT_S: f64 = 30.0;
 
 #[derive(Clone, Copy, Debug)]
 struct Joined {
@@ -1408,15 +1410,12 @@ fn best_confirmer(
     tix: &TimeIndex,
     p: &SearchParams,
     atmo: &dyn Atmosphere,
-    exclude: &[u32],
+    exclude: &[(u32, f64)],
 ) -> Option<(f64, EventMatch, u32)> {
     let c = p.c;
     let t_heard = t_start + ev.t_rec;
     let mut best: Option<(f64, EventMatch, u32)> = None;
     for ti in tix.overlapping(t_heard - 1.2 * ev.d_gate[1] / c - 120.0, t_heard + 30.0) {
-        if exclude.contains(&ti) {
-            continue;
-        }
         let tr = &tracks[ti as usize];
         if p.tonal_only && !tr.engine.tonal() {
             continue;
@@ -1428,6 +1427,20 @@ fn best_confirmer(
         ) else {
             continue;
         };
+        // A returning aircraft can explain another event, but one physical pass cannot.
+        // Stored matches provide heard-CPA times: re-find their emission CPAs from the
+        // approximate still-air seeds before applying the same separation as the pair join.
+        // If a prior CPA cannot be recovered, retain the exclusion for that track.
+        if exclude.iter().any(|&(used_track, t_e_guess)| {
+            used_track == ti
+                && tr
+                    .cpa_near(o.x, t_e_guess, SAME_FLIGHT_MIN_DT_S)
+                    .is_none_or(|used| {
+                        !used.interior || (cpa.t_e - used.t_e).abs() < SAME_FLIGHT_MIN_DT_S
+                    })
+        }) {
+            continue;
+        }
         if cpa.d > 1.15 * ev.d_gate[1] {
             continue;
         }
@@ -1723,7 +1736,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             (j, i, hj, hi)
         };
         let tt = evs[i].t_tol + evs[j].t_tol + slop;
-        let mut jv = join(ha, hb, a, b, r_join, tt, 30.0, t_base);
+        let mut jv = join(ha, hb, a, b, r_join, tt, SAME_FLIGHT_MIN_DT_S, t_base);
         progress(&format!("join {}x{}: {}", evs[a].id, evs[b].id, jv.len()));
         joined.append(&mut jv);
         pairs_done += 1;
@@ -1911,7 +1924,12 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             if used.contains(&ek) {
                 continue;
             }
-            let excl: Vec<u32> = cand.trk.iter().map(|t| t.1).collect();
+            let excl: Vec<(u32, f64)> = cand
+                .trk
+                .iter()
+                .zip(&cand.events)
+                .map(|(&(_, ti), m)| (ti, m.t_cpa_heard_utc - m.d / m.c_path))
+                .collect();
             if let Some((_, m, ti)) =
                 best_confirmer(&o, cand.t_start_utc, ev, tracks, &tix, p, atmo, &excl)
             {
@@ -2082,13 +2100,14 @@ fn unheard_passes(
         return out;
     }
     let thr = 0.5 * dmin;
-    let explained: Vec<&str> = cand.events.iter().map(|m| m.flight.as_str()).collect();
     let (ta, tb) = (cand.t_start_utc, cand.t_start_utc + p.duration);
     for ti in tix.overlapping(ta - thr / c - 60.0, tb + 60.0) {
         let tr = &tracks[ti as usize];
-        if explained.contains(&tr.key.as_str()) || (p.tonal_only && !tr.engine.tonal()) {
+        if p.tonal_only && !tr.engine.tonal() {
             continue;
         }
+        // The distance threshold already excludes every explained CPA. The same aircraft
+        // can return much closer, so check those other passes against the detections too.
         for cpa in cpas_in(tr, o.x, ta - thr / c, tb, thr) {
             let t_rec = cpa.t_r(c) - cand.t_start_utc;
             if !(30.0..=p.duration - 30.0).contains(&t_rec) {
@@ -3104,6 +3123,199 @@ mod tests {
             atmo: &atmo,
         };
         run(&inp, &case.p, &|_s| {})
+    }
+
+    fn circuit_flyover_case(med: fdop_types::atmo::Medium) -> TwoCase {
+        let (lat, lon) = (40.8765, -73.5250);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let t_s = 1_788_895_000.0;
+        let omega = 2.0 * std::f64::consts::PI / 800.0;
+        let mut circuit = straight_track(
+            &enu,
+            [1000.0, 0.0, 900.0],
+            [0.0, -5000.0 * omega, 0.0],
+            t_s + 400.0,
+            t_s,
+            t_s + 1600.0,
+            5.0,
+        );
+        circuit.key = "circuit".into();
+        // One continuous aircraft track, with two real CPAs a full circuit apart.
+        for (i, &t) in circuit.t.iter().enumerate() {
+            let theta = std::f64::consts::PI + omega * (t - t_s - 400.0);
+            let (sin, cos) = theta.sin_cos();
+            circuit.pos[i] = enu.to_ecef([6000.0 + 5000.0 * cos, 5000.0 * sin, 900.0]);
+            circuit.vel[i] = enu.vec_to_ecef([-5000.0 * omega * sin, 5000.0 * omega * cos, 0.0]);
+        }
+        let mut crossing = straight_track(
+            &enu,
+            [0.0, 2000.0, 1200.0],
+            [100.0, 0.0, 0.0],
+            t_s + 800.0,
+            t_s + 200.0,
+            t_s + 1400.0,
+            5.0,
+        );
+        crossing.key = "crossing".into();
+        let prop = Prop::from_medium(&med, &enu);
+        let first = synth_event("first", &circuit, x, t_s, 112.7, 343.0, t_s + 400.0, &prop);
+        let middle = synth_event(
+            "middle",
+            &crossing,
+            x,
+            t_s,
+            129.5,
+            343.0,
+            t_s + 800.0,
+            &prop,
+        );
+        let mut returning = synth_event(
+            "returning",
+            &circuit,
+            x,
+            t_s,
+            114.5,
+            343.0,
+            t_s + 1200.0,
+            &prop,
+        );
+        returning.quality = 90.0;
+        let region = BBox::new(lat - 0.025, lon - 0.035, lat + 0.025, lon + 0.035);
+        let mut p = SearchParams::new(t_s - 10.0, t_s + 10.0, 1600.0, region);
+        // The returning pass must confirm; it cannot create a second pair seed instead.
+        p.max_events = 2;
+        p.refine_half_m = 400.0;
+        TwoCase {
+            tracks: vec![circuit, crossing],
+            events: vec![first, middle, returning],
+            p,
+            t_s,
+            obs: (lat, lon),
+        }
+    }
+
+    #[test]
+    fn returning_aircraft_pass_can_confirm_a_candidate() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let case = circuit_flyover_case(med);
+        let result = run_case(&case, med);
+        assert_eq!(result.funnel.events_used, 3);
+        assert!(result.funnel.hypotheses[2].1.is_none());
+        let top = result
+            .candidates
+            .first()
+            .expect("the two initial flyovers locate the observer");
+        assert_eq!(top.n_explained, 3, "{:?}", top.events);
+        let returning = top.events.iter().find(|m| m.event == "returning").unwrap();
+        assert_eq!(returning.flight, "circuit");
+        assert_eq!(returning.role, "confirmer");
+        assert!(returning.core, "{returning:?}");
+        assert!((top.t_start_utc - case.t_s).abs() < 1.0);
+        let refined = result.refine.as_ref().unwrap();
+        assert!(haversine_m(refined.lat, refined.lon, case.obs.0, case.obs.1) < 60.0);
+    }
+
+    #[test]
+    fn same_aircraft_pass_cannot_confirm_twice() {
+        for med in [
+            fdop_types::atmo::Medium::still(343.0),
+            fdop_types::atmo::Medium {
+                c: 339.0,
+                wind_e: 7.0,
+                wind_n: -5.0,
+            },
+        ] {
+            let case = circuit_flyover_case(med);
+            let dem = FlatElevation(0.0);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let atmo = fdop_types::atmo::UniformAtmosphere(med);
+            let tix = TimeIndex::new(&case.tracks);
+            let mut duplicate = case.events[0].clone();
+            duplicate.id = "another-tone-of-first".into();
+            let explain = |exclude: &[(u32, f64)]| {
+                best_confirmer(
+                    &o,
+                    case.t_s,
+                    &duplicate,
+                    &case.tracks,
+                    &tix,
+                    &case.p,
+                    &atmo,
+                    exclude,
+                )
+            };
+            let (_, original, _) = explain(&[]).expect("the original pass must fit");
+            let emission_seed = original.t_cpa_heard_utc - original.d / original.c_path;
+            assert!(
+                explain(&[(0, emission_seed)]).is_none(),
+                "one pass cannot supply two matches"
+            );
+        }
+    }
+
+    #[test]
+    fn unheard_closer_return_of_an_explained_aircraft_counts() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = circuit_flyover_case(med);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let o = observer(case.obs.0, case.obs.1, &dem);
+        let tix = TimeIndex::new(&case.tracks);
+        let candidate = explain_at(
+            &SearchInputs {
+                events: case.events[..2].to_vec(),
+                tracks: &case.tracks,
+                heard_times: vec![],
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            },
+            &case.p,
+            case.obs.0,
+            case.obs.1,
+            case.t_s,
+            5.0,
+            &[
+                ("first".into(), "circuit".into()),
+                ("middle".into(), "crossing".into()),
+            ],
+        )
+        .unwrap();
+        // Explained passes and an equally distant return cannot fall inside half the
+        // nearest explained distance, even without a separate list of heard detections.
+        assert!(unheard_passes(&candidate, &o, &case.tracks, &tix, &[], &case.p).is_empty());
+
+        // Between the two circuit passes, smoothly shift the circle 900 m toward the
+        // observer and descend 700 m. The original explained traces remain unchanged.
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let circuit = &mut case.tracks[0];
+        for (i, &t) in circuit.t.iter().enumerate() {
+            let u = ((t - case.t_s - 600.0) / 400.0).clamp(0.0, 1.0);
+            let shift = u * u * (3.0 - 2.0 * u);
+            let rate = 6.0 * u * (1.0 - u) / 400.0;
+            let pos = enu.from_ecef(circuit.pos[i]);
+            let vel = enu.vec_from_ecef(circuit.vel[i]);
+            circuit.pos[i] = enu.to_ecef([pos[0] - 900.0 * shift, pos[1], pos[2] - 700.0 * shift]);
+            circuit.vel[i] =
+                enu.vec_to_ecef([vel[0] - 900.0 * rate, vel[1], vel[2] - 700.0 * rate]);
+        }
+        let close = circuit.cpa_near(o.x, case.t_s + 1200.0, 100.0).unwrap();
+        assert!(candidate.events.iter().all(|m| close.d < 0.5 * m.d));
+        let t_rec = close.t_r(case.p.c) - candidate.t_start_utc;
+        let silent = unheard_passes(&candidate, &o, &case.tracks, &tix, &[], &case.p);
+        assert_eq!(
+            silent.len(),
+            1,
+            "the silent close return was missed: {silent:?}"
+        );
+        assert!(silent[0].starts_with("circuit "), "{silent:?}");
+        assert!(unheard_passes(&candidate, &o, &case.tracks, &tix, &[t_rec], &case.p).is_empty());
+        // An unrelated detection outside the existing 25-second hearing window cannot excuse it.
+        assert_eq!(
+            unheard_passes(&candidate, &o, &case.tracks, &tix, &[t_rec + 30.0], &case.p).len(),
+            1
+        );
     }
 
     #[test]
