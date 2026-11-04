@@ -57,7 +57,6 @@ impl Default for BuildParams {
 /// interleaved with a real track (even several junk points in a row) cannot form the longer
 /// chain, so it drops out; a clean leg keeps every point.
 fn consistent_chain(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) -> Vec<usize> {
-    const LOOKBACK: usize = 48;
     let n = pts.len();
     if n < 3 {
         return (0..n).collect();
@@ -91,9 +90,14 @@ fn consistent_chain(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) -> 
     };
     let mut best = vec![1usize; n];
     let mut prev = vec![usize::MAX; n];
+    let mut prefix_best = vec![1usize; n];
     for j in 1..n {
-        for i in (j.saturating_sub(LOOKBACK)..j).rev() {
-            if pts[j].t - pts[i].t > bp.max_gap_s {
+        // A burst of bad reports must not hide an earlier valid predecessor. Bound the
+        // window by elapsed time, not sample count. The prefix maximum is an exact upper
+        // bound on every remaining chain; it makes clean tracks stop after their immediate
+        // predecessor without sacrificing a longer chain across arbitrarily dense junk.
+        for i in (0..j).rev() {
+            if pts[j].t - pts[i].t > bp.max_gap_s || prefix_best[i] + 1 <= best[j] {
                 break;
             }
             if best[i] + 1 > best[j] && ok(i, j) {
@@ -101,6 +105,7 @@ fn consistent_chain(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) -> 
                 prev[j] = i;
             }
         }
+        prefix_best[j] = prefix_best[j - 1].max(best[j]);
     }
     let mut k = (0..n).max_by_key(|&k| (best[k], k)).unwrap_or(0);
     let mut chain = vec![k];
@@ -770,5 +775,64 @@ mod tests {
             (closest - true_d).abs() < 20.0,
             "closest {closest:.0} m vs {true_d:.0} m"
         );
+    }
+
+    #[test]
+    fn dense_bad_position_bursts_do_not_replace_the_real_track() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let point = |t: f64, bad: bool| {
+            let p = enu.to_ecef([
+                100.0 * (t - 1000.0),
+                if bad { 30_000.0 } else { 0.0 },
+                if bad { 12_000.0 } else { 1200.0 },
+            ]);
+            let (lat, lon, alt) = ecef_to_geodetic(p);
+            fdop_types::store::TrackPoint {
+                t,
+                lat,
+                lon,
+                alt_m: alt as f32,
+                gs_mps: 100.0,
+                track_deg: 90.0,
+                vrate_mps: 0.0,
+                alt_src: 0,
+                flags: if bad { pt_flags::MLAT } else { 0 },
+            }
+        };
+        let genuine: Vec<_> = (0..80)
+            .chain(100..180)
+            .map(|i| point(1000.0 + i as f64, false))
+            .collect();
+        for bad_count in [2, 49, 97] {
+            let mut points = genuine.clone();
+            // Same physical coverage gap, with increasingly frequent corrupt positions.
+            // Neither a point-count window nor the denser wrong track may remove the two
+            // genuine sections, whose 21 s separation is within the allowed time gap.
+            points.extend(
+                (0..bad_count)
+                    .map(|i| point(1079.1 + 19.0 * i as f64 / (bad_count - 1) as f64, true)),
+            );
+            let leg = FlightLeg {
+                key: "synthetic-burst".into(),
+                icao: "000000".into(),
+                reg: String::new(),
+                typ: "PC12".into(),
+                source: "synthetic".into(),
+                engine: EngineClass::Turboprop,
+                points,
+            };
+            let models = build(&leg, &BuildParams::default());
+            assert_eq!(models.len(), 1, "burst of {bad_count}");
+            let model = &models[0];
+            assert_eq!(
+                model.t,
+                genuine.iter().map(|p| p.t).collect::<Vec<_>>(),
+                "burst of {bad_count} displaced genuine samples"
+            );
+            assert_eq!(model.mlat_frac, 0.0);
+            assert_eq!(model.gap_at(1090.0), 21.0);
+            let truth = enu.to_ecef([9000.0, 0.0, 1200.0]);
+            assert!(norm(sub(model.pos_at(1090.0), truth)) < 1.0);
+        }
     }
 }

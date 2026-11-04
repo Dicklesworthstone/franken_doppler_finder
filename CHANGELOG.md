@@ -19,6 +19,19 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Track recovery across dense corrupt reports
+
+- Track cleaning now considers every possible predecessor within the configured time gap, replacing its
+  fixed 48-report lookback. Dense bursts of corrupt ADS-B positions can no longer hide both sides of a
+  genuine flight from the longest-chain calculation. An exact prefix bound stops the scan when earlier
+  chains cannot improve the answer, retaining fast processing of clean tracks without changing physical
+  speed, vertical-rate or gap limits.
+- `dense_bad_position_bursts_do_not_replace_the_real_track` first reproduced half of a valid trajectory
+  being discarded after 49 bad reports. All five track tests pass with the correction. The regression
+  retains all 160 genuine samples with 2, 49 or 97 corrupt reports, keeps the actual 21 s gap visible and
+  interpolates through it within 1 m of synthetic truth. The reference configurations and field recordings
+  have not been rerun; integrated core and selftest checks are recorded separately when completed.
+
 ### Interior hypotheses inside the requested region
 
 - A cross-track side now skips its interior sample only when an ordinary grid point passed all
