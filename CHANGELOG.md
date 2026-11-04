@@ -29,8 +29,8 @@ at that commit, not per-change commits.
   as a high one, under a location and a radius: `f_feederwatch_s7a` did so at 338 km from the true town with an
   818 m radius. `verdict_says_when_an_answer_is_unconfirmed` fails without this.
 - `fdop detect` now prints the high-pass warning that `fdop locate` already reported, through a shared
-  `low_band_warning`. Pink noise put through three cascaded 200 Hz high-passes warns "39 dB below"; the previous
-  binary printed nothing.
+  `low_band_warning`. Pink noise put through three cascaded 200 Hz high-passes (`c1_detect/steep.wav`, a local
+  synthetic file) warns "39 dB below" on `7e66501`; `7e5cf3e` printed nothing, and the unfiltered file warns on neither.
 - **Checks.** `cargo test --workspace --locked` passed 140 with 0 failed and 2 ignored, clippy with warnings denied
   passed, and `fdop selftest` passed: 0.4 m error, 75 m radius (known answer, not evidence about real recordings).
   Reruns of three real searches, one at each grade (`v_nassau` high, `v_ny` medium, `v_rochelle` low), match their
