@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve recording time through missing audio packets
+
+- Decoding now preserves timestamp gaps as silence instead of shifting later flyovers earlier in the
+  recording. It retains long transport-stream discontinuities, normalizes arbitrary container origins,
+  preserves audio delayed behind video, and shifts seeked output to the requested relative origin.
+  FFmpeg's fill/trim mode does not enable signal stretching. A duration limit is applied after filling,
+  so a requested interval wholly inside a gap returns the appropriate silence. First-stream selection
+  remains consistent with the media probe.
+- `decode_preserves_recording_timestamps` reproduced 4 s of decoded samples from a 6 s timeline before
+  the fix. Both actual FFmpeg/FFprobe integration tests now pass, covering the exact 2 s gap, four seek
+  windows, a nonzero 123 s origin, delayed audio and a 16 s MPEG-TS gap. Surviving unresampled PCM samples
+  are identical to the continuous reference, and the first-track selection test stays green. These are
+  generated fixtures; the reference configurations and field recordings have not been rerun.
+
 ### Provisional numerical margins after comparison cuts
 
 - Both numerical and absent-rival margins now fail the confidence gate after a recorded pair, fine or

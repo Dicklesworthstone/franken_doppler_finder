@@ -45,7 +45,7 @@ finding the faint curves in a spectrogram to naming the town.
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
 | Has it located a real recording? | **One recording, three ways, one answer.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three pass every gate at **high** confidence and give the same spot: a 292 m radius about **224 m** from the location published in the video (221 m for the county search). Each matched the same three flyovers: a Pilatus PC-12, a Cessna 208 and a King Air 350 |
 | Has it been wrong? | **Yes, and so far every committed build has graded its wrong answers low.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off). In the field tests below, five answers were wrong. A low grade does not mean wrong, though: one build put the state-wide answer 129 m off at high confidence but graded the county search low. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points. A working-tree experiment that measured more of a 3 h recording's flyovers graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer either |
-| Is it tested? | **117 offline unit tests,** plus an opt-in FFmpeg/FFprobe integration test: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. See [Testing](#testing) for the checks completed on the current code. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording |
+| Is it tested? | **117 offline unit tests,** plus two opt-in FFmpeg/FFprobe integration tests: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. See [Testing](#testing) for the checks completed on the current code. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording |
 | Has it located a recording it was not developed on? | **Once, at the same site.** Nine recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: about 150 m from the cam's geocoded street address, just outside its 147 m radius (an address geocode only approximates where a camera is), with the recording start off by only 0.33 s. The same cam on two other days gave wrong answers graded **low**. An eagle cam at Duke Farms (Hillsborough, NJ) came out in the right township, about 2.2 km from the property's entrance address, graded **low** (the nest position is not published, so a smaller error cannot be scored). At five other sites (railcams in Rochelle, IL, Tucson, AZ, Plant City, FL and Fullerton, CA, and a bird-feeder cam in Ithaca, NY), three answers were wrong and graded **low**, and Plant City and Fullerton gave no location. All but Fullerton held only 0–3 non-jet passes within reach. Fullerton (13 within 3 km) and Duke Farms (16) had more traffic but poor audio. Fullerton's is high-pass filtered at about 125 Hz, which removes or weakens the propeller fundamentals, under broadband wind and road noise; Duke Farms has a wind-saturated microphone. No wrong answer from a committed build was graded above low |
 | What is not validated? | Any site other than the reference one; low-traffic or rural sites (all four tried failed); CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
 | Which code produced these results? | The reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
@@ -329,6 +329,10 @@ and takes only `-o` and `-q`. `runs` and `doctor` take `--cache` too.
 
 For media with multiple audio tracks, `locate` and `detect` analyse the first audio track, matching the
 stream described by the media probe. A preferred or higher-channel-count alternate track does not replace it.
+Decoding preserves elapsed recording time: missing packet intervals become silence, and audio delayed
+relative to video retains that delay. The container's arbitrary starting timestamp is normalized without
+collapsing internal gaps. Tones are not stretched to repair timing, so a gap does not shift later flyovers
+or change their Doppler frequencies.
 
 | Shared option | Meaning |
 |---|---|
@@ -584,7 +588,7 @@ Design notes:
   difference of nearby positions, the track builder also checks the position chords against the circular arc
   implied by neighbouring headings. Both checks use the same 25 m/s residual limit; a turn does not disable
   checks for incorrect ground speed, heading or vertical rate.
-- **Dense bad-position bursts do not hide valid track sections.** Track cleaning searches every possible
+- **Dense bad-position bursts do not hide valid predecessors.** Track cleaning searches every possible
   predecessor within its allowed time gap. The former 48-report lookback could discard usable sections or
   choose the corrupt positions merely because bad reports arrived more frequently. Exact chain-length
   bounds keep clean trajectories fast without imposing a sample-count cutoff; the physical speed,
@@ -630,6 +634,12 @@ a partially evaluated rival trails by 8.79 nats, but its two unchecked confirmin
 and leave only a 0.0245-nat separation. The old gate incorrectly certified that incomplete numerical margin.
 The existing 3/6-nat boundaries still apply when no comparison cut is recorded.
 
+Both actual media integration tests pass. The timestamp regression failed on the previous decoder,
+which returned 4 s of PCM from a 6 s timeline with a 2 s packet gap. The corrected decoder preserves the
+gap, four seek intervals (including one wholly inside the gap), a 123 s container origin, audio delayed
+behind video and a 16 s MPEG-TS gap. Surviving unresampled PCM samples match a continuous reference exactly.
+The first-audio-stream regression also remains green. These fixtures are synthesized with FFmpeg.
+
 The integrated search and detection snapshot
 ([`d55ef79`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/d55ef7948b887090d7bbb6e41ed9c347743235c6))
 passed all 39 default `fdop-core` tests and all 13 `fdop-types` tests. After integrating the final
@@ -665,7 +675,7 @@ on these changes.
 
 ```bash
 cargo test --workspace --locked                               # 117 unit tests, no network
-cargo test -p fdop-core multistream_decode_matches_the_probed_audio -- --ignored  # needs ffmpeg/ffprobe
+cargo test -p fdop-core audio::tests -- --ignored              # media integration, needs ffmpeg/ffprobe
 cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings  # warnings are errors
