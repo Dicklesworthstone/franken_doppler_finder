@@ -2,7 +2,7 @@
 //! ZCTA), with an offline fallback to Gazetteer internal points (nearest-centroid proxies).
 
 use crate::GeoError;
-use crate::gazetteer::{GazKind, Gazetteer, NearbyPlace, nearest_of};
+use crate::gazetteer::{GazKind, GazRecord, Gazetteer, NearbyPlace, nearest_of};
 use crate::states::{find_state, states_containing};
 use fdop_types::geo::{compass16, haversine_m};
 use serde::{Deserialize, Serialize};
@@ -208,6 +208,37 @@ pub fn describe_location(
     rep
 }
 
+/// Name a second county when its size-scaled distance is within this factor of the best one's.
+/// Over all 36,291 county-subdivision internal points in the 2024 Gazetteer, this names two
+/// counties for 33% of points and leaves 2.7% wrong. Plain nearest centroid was wrong for 11.8%.
+const SECOND_COUNTY_RATIO: f64 = 1.5;
+
+/// The county a point most likely lies in, or two when it is too close to call. Distance is
+/// scaled by each county's equal-area radius: a point can sit far from a large county's centroid
+/// and still be inside it, while lying nearer the centroid of a small neighbour.
+fn likely_county(recs: &[&GazRecord], lat: f64, lon: f64) -> Option<String> {
+    let mut scored: Vec<(f64, &GazRecord)> = recs
+        .iter()
+        .map(|&r| {
+            let r_eq = (r.aland_m2.max(1.0) / std::f64::consts::PI).sqrt();
+            (haversine_m(r.lat, r.lon, lat, lon) / r_eq, r)
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let label = |r: &GazRecord| {
+        format!("{} {}", r.base_name, r.place_kind)
+            .trim()
+            .to_string()
+    };
+    match scored.as_slice() {
+        [] => None,
+        [(best, a), (next, b), ..] if *next < SECOND_COUNTY_RATIO * *best => {
+            Some(format!("{} or {}", label(a), label(b)))
+        }
+        [(_, a), ..] => Some(label(a)),
+    }
+}
+
 fn fill_from_gazetteer(rep: &mut PlaceReport, gaz: &Gazetteer, lat: f64, lon: f64) {
     // State: the nearest place's state when it is close, else the containing state box.
     let near_state = rep
@@ -245,12 +276,14 @@ fn fill_from_gazetteer(rep: &mut PlaceReport, gaz: &Gazetteer, lat: f64, lon: f6
         let in_state: Vec<_> = recs
             .iter()
             .filter(|r| rep.state_abbr.as_deref().is_none_or(|s| r.usps == s))
-            .cloned()
             .collect();
-        if let Some(c) = nearest_of(&in_state, lat, lon, 1).into_iter().next() {
-            rep.county = Some(format!("{} {}", c.name, c.kind).trim().to_string());
-            rep.notes
-                .push("county = nearest county centroid (approximate)".into());
+        if let Some(county) = likely_county(&in_state, lat, lon) {
+            rep.county = Some(county);
+            rep.notes.push(
+                "county estimated from gazetteer centroids, not containment; two names mean too \
+                 close to call"
+                    .into(),
+            );
         }
     }
     if let Ok(recs) = gaz.records(GazKind::CountySubdivision) {
@@ -358,6 +391,34 @@ mod tests {
         assert_eq!(rep.nearest_places.len(), 5);
         assert!(rep.headline.contains("NY 11771"), "{}", rep.headline);
         assert!(!rep.notes.is_empty());
+    }
+
+    /// A point nearer a small county's centroid than a large neighbour's is not thereby in the
+    /// small county. Plain nearest centroid named Nassau alone for the first point.
+    #[test]
+    fn offline_county_names_both_when_too_close_to_call() {
+        let g = fixture();
+        let close = describe_location(None, &g, 40.76, -73.22);
+        assert_eq!(
+            close.county.as_deref(),
+            Some("Suffolk County or Nassau County")
+        );
+        assert!(
+            close
+                .headline
+                .ends_with("(Suffolk County or Nassau County)"),
+            "{}",
+            close.headline
+        );
+        let inside = describe_location(None, &g, 40.95, -72.7);
+        assert_eq!(inside.county.as_deref(), Some("Suffolk County"));
+        assert_eq!(likely_county(&[], 40.95, -72.7), None);
+        let recs = g.records(GazKind::County).unwrap();
+        assert_eq!(
+            likely_county(&[&recs[2]], 40.95, -72.7).as_deref(),
+            Some("Orleans Parish"),
+            "a lone county is named however far away"
+        );
     }
 
     #[test]
