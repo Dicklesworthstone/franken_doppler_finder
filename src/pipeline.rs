@@ -882,7 +882,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             ),
             (
                 "margin".to_string(),
-                margin_nats.is_none_or(|m| m >= 6.0),
+                res.margin_passes(6.0),
                 match (margin_nats, alt_km) {
                     (Some(m), Some(k)) => format!(
                         "evidence {:.1} nats vs {:.1} for the best different explanation ({}, {:.1} km away): {:.1} nats (likelihood ratio ~{:.0}:1)",
@@ -900,6 +900,15 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                         k,
                         m,
                         m.min(700.0).exp()
+                    ),
+                    (None, _) if !res.margin_passes(6.0) => format!(
+                        "evidence {:.1} nats; no verified margin: {}",
+                        top.score,
+                        if res.funnel.truncated.is_empty() {
+                            "margin data unavailable".to_string()
+                        } else {
+                            format!("comparison truncated ({})", res.funnel.truncated.join("; "))
+                        }
                     ),
                     _ => format!(
                         "evidence {:.1} nats; no distinct alternative survived",
@@ -931,7 +940,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         let passed = gates.iter().filter(|g| g.1).count();
         let confidence = if passed == gates.len() {
             "high"
-        } else if n_core >= 2 && gates[1].1 && margin_nats.is_none_or(|m| m >= 3.0) {
+        } else if n_core >= 2 && gates[1].1 && res.margin_passes(3.0) {
             "medium"
         } else {
             "low"

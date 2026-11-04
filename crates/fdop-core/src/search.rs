@@ -938,6 +938,22 @@ pub struct SearchResult {
     pub warnings: Vec<String>,
 }
 
+impl SearchResult {
+    /// Test the reported gap against a confidence threshold. A missing rival passes only
+    /// when no comparison-budget cut was recorded. Measured gaps keep their existing
+    /// threshold semantics; this is not a correction for searching many events.
+    pub fn margin_passes(&self, minimum_nats: f64) -> bool {
+        if self.candidates.is_empty() {
+            return false;
+        }
+        match self.margin.get("margin_nats") {
+            Some(serde_json::Value::Null) => self.funnel.truncated.is_empty(),
+            Some(value) => value.as_f64().is_some_and(|margin| margin >= minimum_nats),
+            None => false,
+        }
+    }
+}
+
 /// Exact evaluation of an observer point for a set of (event, track) assignments with a joint
 /// clock. Returns per-event matches and the joint clock.
 struct PointEval {
@@ -1874,6 +1890,15 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     // confirmers + unheard close passes for the leading candidates
     let tix = TimeIndex::new(tracks);
     let n_conf = cands.len().min(p.max_confirm);
+    if n_conf < cands.len() {
+        funnel
+            .truncated
+            .push(format!("confirmers: {} -> {n_conf}", cands.len()));
+        warnings.push(format!(
+            "confirmation budget: checking {n_conf} of {} fine candidates; rival comparison is incomplete",
+            cands.len()
+        ));
+    }
     let heard = &inp.heard_times;
     let cdone = AtomicUsize::new(0);
     cands[..n_conf].par_iter_mut().for_each(|cand| {
@@ -2557,6 +2582,64 @@ mod tests {
             true,
         );
         assert!(one.chi < 1e-6, "{one:?}");
+    }
+
+    #[test]
+    fn margin_requires_a_candidate_and_complete_missing_rival_comparison() {
+        let mut result = SearchResult {
+            funnel: Funnel::default(),
+            nulls: vec![],
+            candidates: vec![Candidate::default()],
+            refine: None,
+            margin: serde_json::json!({"margin_nats": null}),
+            warnings: vec![],
+        };
+        assert!(result.margin_passes(3.0));
+        assert!(result.margin_passes(6.0));
+        for stage in ["pairs", "fine", "confirmers"] {
+            result.funnel.truncated = vec![format!("{stage}: 2 -> 1")];
+            assert!(!result.margin_passes(3.0), "{stage}");
+            assert!(!result.margin_passes(6.0), "{stage}");
+        }
+
+        // Numerical margins retain the 3/6-nat thresholds. Only the no-rival shortcut changes.
+        for truncated in [false, true] {
+            result.funnel.truncated = if truncated {
+                vec!["fine: 2 -> 1".into()]
+            } else {
+                vec![]
+            };
+            for (nats, medium, high) in [
+                (2.9, false, false),
+                (3.0, true, false),
+                (5.9, true, false),
+                (6.0, true, true),
+            ] {
+                result.margin = serde_json::json!({"margin_nats": nats});
+                assert_eq!(result.margin_passes(3.0), medium);
+                assert_eq!(result.margin_passes(6.0), high);
+            }
+        }
+
+        // Neither an otherwise sufficient margin nor an absent rival supplies a winner.
+        result.candidates.clear();
+        assert!(!result.margin_passes(3.0));
+        assert!(!result.margin_passes(6.0));
+        result.funnel.truncated.clear();
+        result.margin = serde_json::json!({"margin_nats": null});
+        assert!(!result.margin_passes(3.0));
+        assert!(!result.margin_passes(6.0));
+
+        // A missing or malformed record is not an explicit no-rival result.
+        result.candidates.push(Candidate::default());
+        for margin in [
+            serde_json::json!({}),
+            serde_json::json!({"margin_nats": "unavailable"}),
+        ] {
+            result.margin = margin;
+            assert!(!result.margin_passes(3.0));
+            assert!(!result.margin_passes(6.0));
+        }
     }
 
     #[test]

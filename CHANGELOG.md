@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Confidence after incomplete rival comparisons
+
+- An absent distinct rival no longer automatically passes either confidence margin threshold when pair,
+  fine or confirmation comparisons were cut. Confirmation-budget cuts are now included in the funnel and
+  warnings. Explicit numerical margins retain the existing 3/6-nat comparisons; missing or malformed margin
+  records cannot supply confidence. Reports explain when the comparison is incomplete.
+- The new policy regression covers both threshold boundaries, absent/malformed margins, empty candidates,
+  and all three recorded comparison cuts. It passes in an isolated Rust build of the production helper and
+  data fields using the pinned `serde_json` dependency. Both changed Rust files pass pinned rustfmt, and
+  targeted UBS reports no critical issues. The full latest search/CLI integration, workspace checks, release
+  selftest and real-recording replays remain unverified under the host's resource limits.
+- This does not establish search-wide calibration or resolve the documented expanded-cap false-medium case;
+  detection and measurement caps stay unchanged. The concurrent Doppler-shape harmonic fix is preserved.
+
 ### Overlapping flyovers and harmonic families
 
 - Distinct Doppler curves no longer disappear solely because their closest-approach times overlap and
