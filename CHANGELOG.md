@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Low answers say they are unconfirmed; `fdop detect` warns on high-passed audio
+
+- **The text of `verdict` in `result.json` changes** for answers below high, and so does the same line in the CLI
+  summary, `report.md` and `report.html`. A low answer now reads `unconfirmed, failed: <gates>. This place can be
+  close or far off, and the radius holds only if it is right. <match>`. A medium answer reads
+  `failed: <gates>. <match>`. A high answer keeps the bare match, and "no location" is unchanged. No field name,
+  gate, grade, number or exit code changes. Before this, a low answer printed the same "N flyovers matched" sentence
+  as a high one, under a location and a radius: `f_feederwatch_s7a` did so at 338 km from the true town with an
+  818 m radius. `verdict_says_when_an_answer_is_unconfirmed` fails without this.
+- `fdop detect` now prints the high-pass warning that `fdop locate` already reported, through a shared
+  `low_band_warning`. Pink noise put through three cascaded 200 Hz high-passes warns "39 dB below"; the previous
+  binary printed nothing.
+- **Checks.** `cargo test --workspace --locked` passed 140 with 0 failed and 2 ignored, clippy with warnings denied
+  passed, and `fdop selftest` passed: 0.4 m error, 75 m radius (known answer, not evidence about real recordings).
+  Reruns of three real searches, one at each grade (`v_nassau` high, `v_ny` medium, `v_rochelle` low), match their
+  `7e5cf3e` runs in every field of `result.json` except the verdict text, the timings and the run's own metadata.
+  The change moves no number or grade, so the reference and field results recorded on `7e5cf3e` stand. Four
+  deliberate breaks of the new code each failed the test meant to catch them.
+
 ### Complete comparisons, and refusing fits with no ridge through their drop
 
 - **Why.** `9620d2e` fails the margin gate on any recorded comparison cut, and `fine: N -> 4000` fired on every real

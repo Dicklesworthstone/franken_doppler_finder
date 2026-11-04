@@ -267,6 +267,9 @@ fn run(cli: Cli) -> Result<i32, String> {
                 .unwrap_or_else(|| PathBuf::from("fdop_runs").join("detect"));
             std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
             let x = fdop_core::audio::decode(&d.media, 0.0, None, 4000)?;
+            if let Some(w) = pipeline::low_band_warning(&x, 4000) {
+                eprintln!("fdop: warning: {w}");
+            }
             let dp = fdop_core::detect::DetectParams::default();
             let (ls, lin) = fdop_core::detect::survey(&x, 4000, &dp)?;
             let (dets, det_cut) = fdop_core::detect::detect_counted(&ls, &dp);

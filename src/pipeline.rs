@@ -204,6 +204,35 @@ fn low_band_ratio_db(x: &[f32], sr: u32) -> Option<f64> {
         .then(|| 10.0 * ((lo / n_lo as f64) / (hi / n_hi as f64)).log10())
 }
 
+/// The warning for audio that has lost its low band: `locate` reports it, `detect` prints it.
+pub fn low_band_warning(x: &[f32], sr: u32) -> Option<String> {
+    let r = low_band_ratio_db(x, sr).filter(|&r| r < LOW_BAND_WARN_DB)?;
+    Some(format!(
+        "the audio has little energy below 100 Hz (45-95 Hz is {:.0} dB below 150-600 Hz). A high-pass filter does this; it removes the fundamentals of slower propellers and weakens those near the cut, so expect fewer usable flyovers",
+        -r
+    ))
+}
+
+/// The answer's one-line verdict, shown by the CLI and both reports and stored in `result.json`.
+/// A low answer still prints a location and a radius and exits 0, so it says first that it is
+/// unconfirmed and which gates failed. The radius comes from the fit around this one candidate,
+/// so it cannot say whether the candidate is the right place.
+fn verdict_text(confidence: &str, gates: &[(String, bool, String)], matched: &str) -> String {
+    let failed = gates
+        .iter()
+        .filter(|g| !g.1)
+        .map(|g| g.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match confidence {
+        "low" => format!(
+            "unconfirmed, failed: {failed}. This place can be close or far off, and the radius holds only if it is right. {matched}"
+        ),
+        "medium" => format!("failed: {failed}. {matched}"),
+        _ => matched.to_string(),
+    }
+}
+
 fn stem(p: &Path) -> String {
     p.file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -502,14 +531,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     let x = audio::decode(&a.media, 0.0, None, a.sr)?;
     let dur = x.len() as f64 / a.sr as f64;
     log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
-    if let Some(r) = low_band_ratio_db(&x, a.sr)
-        && r < LOW_BAND_WARN_DB
-    {
-        warnings.push(format!(
-            "the audio has little energy below 100 Hz (45-95 Hz is {:.0} dB below 150-600 Hz). A high-pass filter does this; it removes the fundamentals of slower propellers and weakens those near the cut, so expect fewer usable flyovers",
-            -r
-        ));
-    }
+    warnings.extend(low_band_warning(&x, a.sr));
     timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
     // ---- detection ----------------------------------------------------------------------
     let t = Instant::now();
@@ -1031,19 +1053,23 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             radius_m: radius,
             radius_basis: basis,
             confidence: confidence.into(),
-            verdict: format!(
-                "{} flyovers matched to {} at one location and one recording clock (start {})",
-                top.n_explained,
-                top.events
-                    .iter()
-                    .map(|m| format!(
-                        "{} {}",
-                        if m.reg.is_empty() { &m.icao } else { &m.reg },
-                        m.typ
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                iso_utc(top.t_start_utc)
+            verdict: verdict_text(
+                confidence,
+                &gates,
+                &format!(
+                    "{} flyovers matched to {} at one location and one recording clock (start {})",
+                    top.n_explained,
+                    top.events
+                        .iter()
+                        .map(|m| format!(
+                            "{} {}",
+                            if m.reg.is_empty() { &m.icao } else { &m.reg },
+                            m.typ
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    iso_utc(top.t_start_utc)
+                ),
             ),
             gates,
         };
@@ -1320,6 +1346,12 @@ mod tests {
         let r_hp = low_band_ratio_db(&passed, sr).expect("ratio");
         assert!(r_full > 0.0, "{r_full}");
         assert!(r_hp < LOW_BAND_WARN_DB, "{r_hp}");
+        assert!(low_band_warning(&full, sr).is_none());
+        let warning = low_band_warning(&passed, sr).expect("warning");
+        assert!(
+            warning.contains(&format!("{:.0} dB below", -r_hp)),
+            "{warning}"
+        );
         assert!(
             low_band_ratio_db(&full[..1000], sr).is_none(),
             "shorter than one frame"
@@ -1329,6 +1361,32 @@ mod tests {
             low_band_ratio_db(&silent, sr).is_some_and(|r| r.abs() < 1e-6),
             "silence is not high-passed"
         );
+    }
+
+    /// A low answer prints a location and a radius, so its verdict must say it is unconfirmed and
+    /// name only the gates that failed. A high answer keeps the bare match.
+    #[test]
+    fn verdict_says_when_an_answer_is_unconfirmed() {
+        let gates = |failed: &[&str]| -> Vec<(String, bool, String)> {
+            ["core matches", "clock lock", "margin", "radius"]
+                .iter()
+                .map(|g| (g.to_string(), !failed.contains(g), String::new()))
+                .collect()
+        };
+        let matched = "2 flyovers matched to AAA C172, BBB PA28 at one location";
+        assert_eq!(verdict_text("high", &gates(&[]), matched), matched);
+        assert_eq!(
+            verdict_text("medium", &gates(&["margin"]), matched),
+            format!("failed: margin. {matched}")
+        );
+        let low = verdict_text("low", &gates(&["core matches", "margin"]), matched);
+        assert!(
+            low.starts_with("unconfirmed, failed: core matches, margin. "),
+            "{low}"
+        );
+        assert!(low.contains("close or far off"), "{low}");
+        assert!(low.ends_with(matched), "{low}");
+        assert!(!low.contains("clock lock"), "{low}");
     }
 
     #[test]
