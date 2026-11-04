@@ -526,7 +526,7 @@ franken_doppler_finder/
 | `fdop-data` | types, http | tar, flate2, png, rayon, serde_json |
 | `fdop-core` | types | fsci-fft, fsci-opt, fsci-stats, rayon, png, serde_json |
 | `fdop-geo` | types, http | frankenpandas, zip, png, jpeg-decoder |
-| `franken_doppler_finder` (`fdop`) | all five | clap, fsqlite, asupersync, rayon, serde_json; fsci-fft, fsci-spatial and frankenpandas in `doctor`'s smoke tests |
+| `franken_doppler_finder` (`fdop`) | all five | clap, fsqlite, asupersync, rayon, serde_json; fsci-fft and fsci-spatial in `doctor`'s smoke tests |
 
 Design notes:
 - **Detection is a template bank, not peak picking.** On a log-frequency axis, changing `f0` only shifts a
