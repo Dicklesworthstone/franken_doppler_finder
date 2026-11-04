@@ -40,19 +40,24 @@ finding the faint curves in a spectrogram to naming the town.
 
 ## Honest status
 
+**Real-recording validation baseline:** the location errors and confidence grades below come from
+the archived `7e5cf3e` replays. The latest moving-medium propagation correction changes scored
+predictions and has synthetic physics coverage; fresh reference, wrong-date and field replays are
+still pending. The reference media endpoint returned a “Site Unavailable” page during this update.
+
 | Question | Answer |
 |---|---|
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
-| Has it located a real recording? | **One recording, three ways, one area: high, medium and low on the current code.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three match the same aircraft, a Pilatus PC-12 and a Cessna 208 as the core pair and a King Air 350 as confirmer, and land near the location published in the video. The county search is **high**: 306 m off, radius 316 m, margin 12.8 nats. The state-wide search is **medium**: 271 m off, radius 304 m, margin 5.0 nats. The three-day window finds the same point but is **low**, because other flights 138 km away score within 2.9 nats of it. Earlier builds graded the same recording higher: `d79d90d` gave **high** on all three at 221–224 m with a 292 m radius, the results shown in [See it work](#see-it-work) |
-| Has it been wrong? | **Yes, at low and at medium.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off); `9aeeb9a` put the county search 14.4 km off and the state-wide search 87 km off, both low, until the guided-peak fix. A complete comparison without the ridge check described below put the state-wide search 34.8 km off, low. In the field tests below, five answers are wrong on the current code, all low. On `d55ef79` one of them was **medium**: a bird-feeder cam in Ithaca, NY placed on Long Island. The current code grades it low, 0.11 nats under the medium line, which is a narrow miss and not a fix. A working-tree experiment that measured more of a 3 h recording's flyovers also graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer. A low grade does not mean wrong either: the three-day reference search lands 271 m off at low. All five runs with a deliberately wrong date grade low on the current code, but two came close to medium: one had both core matches and was 0.63 nats short, and one had a 5.49-nat margin but only one core match of two. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points |
-| Is it tested? | **140 offline unit tests,** plus two opt-in FFmpeg/FFprobe integration tests: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. See [Testing](#testing) for the checks completed on the current code. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording |
-| Has it located a recording it was not developed on? | **Once, at the same site.** Nine recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state, and all nine were replayed on the current code. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: 223 m from the reference recording's published location, just outside its 214 m radius, with a 24.9-nat margin. The same cam on two other days gave wrong answers graded **low**, 152 km and 365 km off. An eagle cam at Duke Farms (Hillsborough, NJ) came out in the right township, about 2.3 km from the town centre, graded **low** (the nest position is not published, so a smaller error cannot be scored). At five other sites, a bird-feeder cam in Ithaca, NY was placed on Long Island (338 km off) and a railcam in Rochelle, IL at Sycamore, IL (36 km off), both **low**, and railcams in Tucson, AZ, Plant City, FL and Fullerton, CA gave no location, because no event passed the quality gates. All but Fullerton held only 0–3 non-jet passes within reach. Fullerton (13 within 3 km) and Duke Farms (16) had more traffic but poor audio. Fullerton's is high-pass filtered at about 125 Hz, which removes or weakens the propeller fundamentals, under broadband wind and road noise; Duke Farms has a wind-saturated microphone. A tenth recording, a public eagle-nest live cam in Lee County, FL, recorded 2024-12-28, is the only one that did not inform the ridge check's line: searched across Florida it is wrong and **low** (135 km off), and searched in the county it lands about 4 km away, **low**, on two events. It was low and wrong on `d55ef79` too, so it shows little either way |
+| Has it located a real recording? | **One recording, three ways, one area: high, medium and low on the validated `7e5cf3e` build.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three match the same aircraft, a Pilatus PC-12 and a Cessna 208 as the core pair and a King Air 350 as confirmer, and land near the location published in the video. The county search is **high**: 306 m off, radius 316 m, margin 12.8 nats. The state-wide search is **medium**: 271 m off, radius 304 m, margin 5.0 nats. The three-day window finds the same point but is **low**, because other flights 138 km away score within 2.9 nats of it. Earlier builds graded the same recording higher: `d79d90d` gave **high** on all three at 221–224 m with a 292 m radius, the results shown in [See it work](#see-it-work) |
+| Has it been wrong? | **Yes, at low and at medium.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off); `9aeeb9a` put the county search 14.4 km off and the state-wide search 87 km off, both low, until the guided-peak fix. A complete comparison without the ridge check described below put the state-wide search 34.8 km off, low. In the field tests below, five answers are wrong on the validated `7e5cf3e` build, all low. On `d55ef79` one of them was **medium**: a bird-feeder cam in Ithaca, NY placed on Long Island. The validated `7e5cf3e` build grades it low, 0.11 nats under the medium line, which is a narrow miss and not a fix. A working-tree experiment that measured more of a 3 h recording's flyovers also graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer. A low grade does not mean wrong either: the three-day reference search lands 271 m off at low. All five runs with a deliberately wrong date grade low on the validated `7e5cf3e` build, but two came close to medium: one had both core matches and was 0.63 nats short, and one had a 5.49-nat margin but only one core match of two. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points |
+| Is it tested? | **Offline unit tests,** plus two opt-in FFmpeg/FFprobe integration tests: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. See [Testing](#testing) for the latest checks and earlier validation. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording |
+| Has it located a recording it was not developed on? | **Once, at the same site.** Nine recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state, and all nine were replayed on the validated `7e5cf3e` build. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: 223 m from the reference recording's published location, just outside its 214 m radius, with a 24.9-nat margin. The same cam on two other days gave wrong answers graded **low**, 152 km and 365 km off. An eagle cam at Duke Farms (Hillsborough, NJ) came out in the right township, about 2.3 km from the town centre, graded **low** (the nest position is not published, so a smaller error cannot be scored). At five other sites, a bird-feeder cam in Ithaca, NY was placed on Long Island (338 km off) and a railcam in Rochelle, IL at Sycamore, IL (36 km off), both **low**, and railcams in Tucson, AZ, Plant City, FL and Fullerton, CA gave no location, because no event passed the quality gates. All but Fullerton held only 0–3 non-jet passes within reach. Fullerton (13 within 3 km) and Duke Farms (16) had more traffic but poor audio. Fullerton's is high-pass filtered at about 125 Hz, which removes or weakens the propeller fundamentals, under broadband wind and road noise; Duke Farms has a wind-saturated microphone. A tenth recording, a public eagle-nest live cam in Lee County, FL, recorded 2024-12-28, is the only one that did not inform the ridge check's line: searched across Florida it is wrong and **low** (135 km off), and searched in the county it lands about 4 km away, **low**, on two events. It was low and wrong on `d55ef79` too, so it shows little either way |
 | What is not validated? | Any site other than the reference one; low-traffic or rural sites (all four tried failed); following real passes steeper than 4 Hz/s (real ridges that steep exist in the recordings, but no event follows one, so that side rests on synthetic tests); CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
-| Which code produced these results? | "The current code" means replays on a local build of `7e5cf3e`, whose code is the same as `4b88d7c`: the three reference runs (`r_ny_s7b`, `r_md_s7b`, `r_nassau_s7b`), five wrong-date runs, all nine field recordings and the Lee County recording. The code changes since, the wording of `verdict` and a high-pass warning in `fdop detect`, move no number or grade (CHANGELOG). They ran on an Apple M4 with 32 GiB of RAM, two at a time; the Performance timings are separate runs with nothing else running. The older reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
+| Which code produced these results? | These real-recording replays used a local build of `7e5cf3e`, whose code is the same as `4b88d7c`: the three reference runs (`r_ny_s7b`, `r_md_s7b`, `r_nassau_s7b`), five wrong-date runs, all nine field recordings and the Lee County recording. The later verdict wording and high-pass warning changes were replayed without changing numbers or grades (CHANGELOG). The latest wind-physics changes still need new real-recording replays. They ran on an Apple M4 with 32 GiB of RAM, two at a time; the Performance timings are separate runs with nothing else running. The older reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
 | Is it fast? | **It depends on the search.** On an Apple M4 with the ADS-B days cached, the reference recording took 36 s for a county, 119 s state-wide and 356 s for a three-day window. A busy 3 h recording searched across a state took about 2 hours 40 minutes while another replay ran. Narrowing the region is the way to shorten a search. See [Performance](#performance) |
 
-These replays are the only real-recording evidence for the current code; results quoted from older builds do not
-validate it. The search now compares every rival at its default budgets, and none of these runs recorded a pair,
+The real-recording evidence is limited to these archived replays; it does not establish the latest wind
+model's field accuracy. The search now compares every rival at its default budgets, and none of these runs recorded a pair,
 fine or confirmation cut. Two findings came with that. A complete comparison reached false events, fits that join
 two steady tones across an empty stretch, and they could decide the answer, so an event with no ridge through its
 drop is now refused. That took the reference recording from 19 usable events on `d55ef79` to 4. A complete
@@ -96,7 +101,7 @@ The reference case: colsto's raw upload of the recording ([youtu.be/4CxVxuMVkMc]
 the recorder's 1:00:00–2:00:00 window), searched across all of New York State with only the date given.
 
 This section shows run `ny9` from an early build (`d79d90d`), because it shows a full set of passing gates on
-the state-wide search. **The current code does not reproduce it:** the same search matches the same three
+the state-wide search. **The validated `7e5cf3e` build does not reproduce it:** the same search matches the same three
 aircraft and lands 271 m off, but its margin is 5.0 nats, so it grades medium ([Honest status](#honest-status)).
 
 ```console
@@ -175,12 +180,19 @@ t0r = t0e + d / c                                          the CPA as heard, lat
 f_pre = f0·c/(c − v)    f_post = f0·c/(c + v)    steepest slope = f0·v²/(c·d)
 ```
 
+The frequency calculation differentiates the closed-form emission time directly, evaluating one square root
+per prediction instead of reconstructing the range with a second one. It agrees with the radial-velocity
+form over the subsonic fit domain to floating-point roundoff.
+
 The pitch drop sets `v`, the steepness sets `d`, and the curve's centre sets the heard CPA time `t0r`. Matched to
 one flight, one flyover therefore puts the recorder on a line beside that flight's path, each point of it tied to
 a different recording clock. Two flyovers, with the real time gap between them, intersect at a point and fix the
-recording clock. Detection and fitting use still air at 343 m/s. The search uses the real atmosphere: the
-effective speed of sound and the along-path wind for each pass, which rescale the fitted `v` and `d`
-consistently.
+recording clock. Detection and fitting use still air at 343 m/s. The search uses path-averaged sound speed
+and wind for each pass as a homogeneous moving medium. For `r = source − observer`, wind vector `w`,
+source ground velocity `v_s` and acoustic travel time `T`, its predictions satisfy
+`|r + w T| = c T` and `f/f0 = 1 / (1 + dT/dt_e)`. The emission-time solver uses that same derivative,
+including crosswind displacement. This approximation does not trace refracted rays through atmospheric
+layers. Coarse gates retain the existing first-order wind rescaling of the fitted `v` and `d`.
 
 ### The pipeline
 
@@ -634,7 +646,7 @@ Design notes:
 
 ## Performance
 
-Three runs of the reference case on one machine, an Apple M4 with 4 performance and 6 efficiency cores and 32 GiB of
+Historical runs of the reference case on one machine, an Apple M4 with 4 performance and 6 efficiency cores and 32 GiB of
 RAM, one after another with nothing else running. Treat them as an order of magnitude, not a benchmark.
 
 | Stage | `r_nassau_clean`: county, 1 day (s) | `r_ny_clean`: NY, 1 day (s) | `r_md_clean`: NY, 3 days (s) |
@@ -667,6 +679,28 @@ Search clock scans also reuse trace-fit and result buffers, preserving the origi
 candidate comparisons. Before/after synthetic comparisons check complete point scores and chosen clocks
 bit-for-bit; the size of the end-to-end speedup has not yet been measured on a real recording.
 
+**Component measurements, 2026-11-04.** Optimized Rust builds on a shared AMD EPYC 9V74 host, with
+alternating old/new execution order. The detector uses four Rayon workers; other probes are serial.
+These medians compare the actual old and new functions, with unchanged supporting physics for the
+detector and search probes. Competing builds caused substantial scheduling noise, especially in the
+three-hour detector case, so these are indicative component measurements, not `fdop locate` timings.
+
+| Component and synthetic workload | Old median (s) | New median (s) | Ratio, old/new |
+|---|---:|---:|---:|
+| Full detector, 240 rows × 3,600 frames, 3 trials | 22.566 | 6.317 | 3.57× |
+| Full detector, 240 rows × 10,800 frames, 3 trials | 93.303 | 10.766 | 8.67× |
+| Complete point scoring, clean two-event traces, 375 evaluations × 7 trials | 0.227 | 0.194 | 1.17× |
+| Complete point scoring, changing-tone traces, 125 evaluations × 7 trials | 0.262 | 0.257 | 1.02× |
+| Quick point scoring, 750 evaluations × 7 trials | 0.0748 | 0.0752 | 0.99× |
+| Constant-velocity frequency kernel, 16,777,216 predictions × 7 trials | 0.438 | 0.246 | 1.78× |
+
+All six detector comparisons produced identical serialized detections and cap results. Paired detector
+ratios ranged from 3.3–3.8× for 3,600 frames and 5.3–11.2× for 10,800 frames. Search equivalence checks
+cover 2,178 trace/clock fits and 75 complete point evaluations, bit-for-bit. Changing-tone and quick
+timings show no material improvement in these probes; the clean-pair result does not imply a uniform
+search speedup. The direct frequency kernel is algebraically equivalent, with worst observed relative
+error below 6e-15 against the previous formula in the numerical sweep.
+
 Weather retrieval overlaps audio analysis. After audio analysis, the pipeline waits up to 190 s for weather:
 the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. This retains
 the configured fallback allowance after the preferred request has been tried.
@@ -674,6 +708,36 @@ the configured fallback allowance after the preferred request has been tried.
 ---
 
 ## Testing
+
+### Latest detector, search and propagation changes
+
+The detector oracle compares every score bit and template index across edges, partial residual masks,
+duplicate templates and one versus three workers. Trace-buffer reuse is checked against golden outputs
+from the allocating Rust implementation, including alternating trace sizes, outliers, tone changes,
+missing coverage and early returns.
+
+The constant-velocity frequency regressions compare 53,970 cases against retarded-time/radial-velocity
+reconstruction and 675 independent emitted-pulse pairs against their received spacing. Moving-medium
+tests check the advected wavefront with an independent bisection solver, one-dimensional pulse speeds,
+the reception-time derivative, rotation invariance, near-sonic cancellation, and 72 cold/warm emission
+solves. Invalid media cannot return an emission-time match. These checks establish the model's numerical
+consistency; the reference recording, wrong-date controls and field recordings still need replaying with
+the corrected wind model.
+
+The pinned-nightly core suite passes **70 tests**, with zero failures and two opt-in media tests
+ignored; all **13 shared-type tests** also pass. Core/shared-type Clippy passes for all targets with warnings denied, and workspace formatting
+passes. The full workspace test build was attempted with two jobs,
+then one job and `profile.dev.package.asupersync.opt-level=0` / `debug=0`; both were killed by SIGKILL
+while compiling the unchanged `asupersync 0.6.2` dependency on the shared host. Those workspace attempts
+did not reach test execution.
+
+The unchanged `src/selftest.rs`, linked through an external launcher to a fresh optimized build of
+the current core, passes its full 1,300 s synthesis → FFmpeg decode → detection → measurement → search
+→ refinement path: **0.417 m** position error, **75 m** radius, **+0.192 s** clock error, four events,
+and both intended aircraft (`ACE391`, `A1DFEB`). This verifies the synthetic core pipeline; it does
+not replace a full CLI release build or exercise ledger/reporting integration.
+
+### Earlier validation
 
 The ridge tests send synthetic passes through `measure()`. Eight passes with chirps up to 76 Hz/s keep more than 40
 % of their drop and are accepted; the same curves with a silent crossing, at two tone strengths, fall under the 15 %
@@ -748,7 +812,7 @@ radius, +0.20 s clock error and 4 events. A selftest does not show that real rec
 field reruns are in [Honest status](#honest-status).
 
 ```bash
-cargo test --workspace --locked                               # 140 unit tests, no network
+cargo test --workspace --locked                               # unit tests, no network
 cargo test -p fdop-core audio::tests -- --ignored              # media integration, needs ffmpeg/ffprobe
 cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
@@ -883,8 +947,9 @@ audio or video recorded somewhere sensitive:
   partially. adsb.lol has gaps on some days.
 - **The HTML report's map needs internet** to load Leaflet and tiles. `map.png` is self-contained.
 - **Located real recordings at one site only.** The reference recording, and a public osprey cam at the same
-  site on a different day with different flights, both came out high on earlier builds; on the current code
-  both still land there, graded low. Eight further field recordings were graded low or gave no location on
+  site on a different day with different flights, have both produced high grades. The reference recording's
+  grade depends on the search configuration; see the archived results in [Honest status](#honest-status).
+  Eight further field recordings were graded low or gave no location on
   those earlier builds: two from the same cam on other days, four from sites with sparse light-aircraft
   traffic, and two from busier sites with poor audio (a high-pass filter under road noise, and a
   wind-saturated microphone). One of those, at Duke Farms, NJ, was low but in the right township. One
@@ -960,9 +1025,9 @@ not heard counts against it.
 **Why ignore jets?** Jet noise is broadband roar without a stable tone, so there is no clean curve to fit.
 Unknown aircraft types are kept.
 
-**How precise is it?** On the reference recording, the current code lands 271–306 m from the published location
+**How precise is it?** On the reference recording, the validated `7e5cf3e` build lands 271–306 m from the published location
 with a 304–316 m radius. Earlier builds' high-confidence answers landed 221–224 m away, inside a 292 m radius. On
-the osprey-cam field recording, the current code is 223 m from the reference recording's published location, just
+the osprey-cam field recording, the validated `7e5cf3e` build is 223 m from the reference recording's published location, just
 outside its 214 m radius; an early build was about 150 m from the cam's geocoded street address, just outside its
 147 m radius. An address geocode only approximates where a camera is. Precision depends on how many clean passes
 there are, how close they were, and the ADS-B cadence. The radius is the run's own measure of its uncertainty, and

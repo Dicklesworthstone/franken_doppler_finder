@@ -652,7 +652,8 @@ fn join(
         .collect()
 }
 
-/// Frequency-ratio curve c/(c+v_r) on a uniform reception-time grid for one (track, observer).
+/// Frequency-ratio curve f/f0 through the propagation medium on a uniform reception-time
+/// grid for one (track, observer).
 struct RatioGrid {
     t0: f64,
     dt: f64,

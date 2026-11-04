@@ -434,7 +434,8 @@ impl TrackModel {
                 let t = t_r.clamp(t0, t1);
                 *hint = self.seg_near(t, *hint);
                 let (p, _) = self.pv_in(*hint, t);
-                (t_r - norm(sub(p, x)) / m.c).clamp(t0, t1)
+                let rv = sub(p, x);
+                (t_r - m.travel(rv, norm(rv))).clamp(t0, t1)
             }
         };
         for _ in 0..30 {
@@ -442,9 +443,13 @@ impl TrackModel {
             let (p, v) = self.pv_in(*hint, te);
             let rv = sub(p, x);
             let r = norm(rv);
-            let vr = dot(rv, v) / r;
-            let g = te + m.travel(rv, r) - t_r;
-            let te_new = (te - g / (1.0 + vr / m.c)).clamp(t0, t1);
+            let (travel, rate) = m.travel_and_rate(rv, r, v);
+            let g = te + travel - t_r;
+            let received_rate = 1.0 + rate;
+            if !g.is_finite() || !received_rate.is_finite() || received_rate <= 0.0 {
+                return None;
+            }
+            let te_new = (te - g / received_rate).clamp(t0, t1);
             let done = (te_new - te).abs() < tol;
             te = te_new;
             if done {
@@ -455,8 +460,11 @@ impl TrackModel {
         let (p, v) = self.pv_in(*hint, te);
         let rv = sub(p, x);
         let r = norm(rv);
-        let g = te + m.travel(rv, r) - t_r;
-        (g.abs() < 1e-3 && te > t0 && te < t1).then(|| (te, r, m.ratio(rv, r, v)))
+        let (travel, rate) = m.travel_and_rate(rv, r, v);
+        let g = te + travel - t_r;
+        let ratio = 1.0 / (1.0 + rate);
+        (g.abs() < 1e-3 && te > t0 && te < t1 && ratio.is_finite() && ratio > 0.0)
+            .then_some((te, r, ratio))
     }
 
     /// Closest approach to `x` near `t_guess` (emission time): (t_e, d, speed, interior).
@@ -543,8 +551,9 @@ impl Cpa {
     }
 }
 
-/// Propagation medium in ECEF: path-averaged sound speed and wind (see
-/// `fdop_types::atmo` for the model).
+/// Homogeneous propagation medium in ECEF, using path-averaged sound speed and wind
+/// (see `fdop_types::atmo` for the averaging model). Requires positive sound speed and
+/// subsonic wind; it does not model ray bending through a varying atmosphere.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Prop {
     pub c: f64,
@@ -563,19 +572,49 @@ impl Prop {
         }
     }
     /// Travel time for source-minus-observer vector `rv` of length `r`.
+    /// Returns NaN for a nonpositive sound speed or wind at/above the sound speed.
     #[inline]
     pub fn travel(&self, rv: V3, r: f64) -> f64 {
-        r / (self.c - dot(self.w, rv) / r)
+        self.travel_root(rv, r).0
     }
     /// Received/emitted frequency ratio for source velocity `v`.
     #[inline]
     pub fn ratio(&self, rv: V3, r: f64, v: V3) -> f64 {
-        let vr = dot(rv, v) / r;
-        self.c / (self.c + vr + dot(v, self.w) / self.c)
+        1.0 / (1.0 + self.travel_and_rate(rv, r, v).1)
     }
-    /// Factor that converts speeds and distances fitted with sound speed `c_fit` (still air)
-    /// into true ones for a source moving with `v`: the Doppler curve is invariant under
-    /// (c, v, d) -> lambda (c, v, d), and the wind adds v.w/c to the effective c.
+    /// Positive root T of |rv + w T| = c T, and q = (c² - w²) T - w.rv.
+    /// The wavefront is carried by the wind; projecting wind only onto `rv` misses the
+    /// crosswind displacement. Rationalise the root for negative w.rv to avoid cancellation.
+    #[inline]
+    fn travel_root(&self, rv: V3, r: f64) -> (f64, f64) {
+        let a = self.c * self.c - dot(self.w, self.w);
+        if !(self.c > 0.0 && a > 0.0 && a.is_finite() && r >= 0.0 && r.is_finite()) {
+            return (f64::NAN, f64::NAN);
+        }
+        if self.w == [0.0; 3] {
+            return (r / self.c, self.c * r);
+        }
+        let b = dot(self.w, rv);
+        let q = (b * b + a * r * r).sqrt();
+        let travel = if b >= 0.0 {
+            (b + q) / a
+        } else {
+            r * r / (q - b)
+        };
+        (travel, q)
+    }
+    /// Travel time and its derivative with respect to source emission time. Differentiating
+    /// the same wavefront equation keeps the Newton step and the Doppler ratio consistent,
+    /// and shares the root between them. At coincident source/observer the derivative is undefined.
+    #[inline]
+    fn travel_and_rate(&self, rv: V3, r: f64, v: V3) -> (f64, f64) {
+        let (travel, q) = self.travel_root(rv, r);
+        (travel, (dot(rv, v) + dot(self.w, v) * travel) / q)
+    }
+    /// First-order scale for the coarse gates on speeds/distances fitted in still air at
+    /// `c_fit`: (c, v, d) -> lambda (c, v, d) leaves a still-air curve invariant, and the
+    /// leading wind correction adds v.w/c to the effective c. This is an approximation;
+    /// the scored predictions use the full homogeneous-wind travel time and Doppler ratio.
     #[inline]
     pub fn fit_scale(&self, v: V3, c_fit: f64) -> f64 {
         (self.c + dot(v, self.w) / self.c) / c_fit
@@ -623,6 +662,175 @@ pub fn straight_track(
 mod tests {
     use super::*;
     use crate::physics::cv_curve;
+
+    // Independent oracle: advance the spherical wavefront, whose centre moves at the wind
+    // velocity, until it reaches the observer. No quadratic root or Doppler formula is used.
+    fn wavefront_travel(rv: V3, w: V3, c: f64) -> f64 {
+        let (mut lo, mut hi) = (0.0, norm(rv) / (c - norm(w)));
+        for _ in 0..80 {
+            let t = 0.5 * (lo + hi);
+            if norm(add(rv, scale(w, t))) > c * t {
+                lo = t;
+            } else {
+                hi = t;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    #[test]
+    fn moving_medium_travel_reaches_the_advected_wavefront() {
+        let rotate = |v: V3| [v[2], v[0], v[1]];
+        for c in [300.0, 343.0, 360.0] {
+            for rv in [
+                [4000.0, 0.0, 1200.0],
+                [-4000.0, 0.0, 1200.0],
+                [0.0, 5000.0, 1200.0],
+                [0.0, 0.0, 3000.0],
+            ] {
+                for w in [
+                    [0.0, 0.0, 0.0],
+                    [25.0, 0.0, 0.0],
+                    [-25.0, 0.0, 0.0],
+                    [0.0, 35.0, 0.0],
+                    [10.0, -20.0, 5.0],
+                ] {
+                    let m = Prop { c, w };
+                    let r = norm(rv);
+                    let travel = m.travel(rv, r);
+                    assert!((travel - wavefront_travel(rv, w, c)).abs() < 1e-11);
+                    assert!((norm(add(rv, scale(w, travel))) - c * travel).abs() < 1e-8);
+                    assert!(
+                        (Prop { c, w: rotate(w) }.travel(rotate(rv), r) - travel).abs() < 1e-11
+                    );
+                }
+            }
+        }
+        // Nearly sonic following wind stresses cancellation in the positive quadratic root.
+        let c = 343.0;
+        let w = c * (1.0 - 1e-12);
+        let travel = Prop {
+            c,
+            w: [w, 0.0, 0.0],
+        }
+        .travel([-3000.0, 0.0, 0.0], 3000.0);
+        assert!((travel - 3000.0 / (c + w)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn moving_medium_doppler_matches_the_one_dimensional_solution() {
+        let c = 343.0;
+        for side in [-1.0, 1.0] {
+            for wind in [-30.0, 0.0, 30.0] {
+                let m = Prop {
+                    c,
+                    w: [wind, 0.0, 0.0],
+                };
+                // A pulse towards the observer travels at c - side*wind in the ground frame.
+                let pulse_speed = c - side * wind;
+                let rv = [side * 3000.0, 0.0, 0.0];
+                assert!((m.travel(rv, 3000.0) - 3000.0 / pulse_speed).abs() < 1e-12);
+                for speed in [-140.0, 0.0, 140.0] {
+                    let expected = pulse_speed / (pulse_speed + side * speed);
+                    assert!(
+                        (m.ratio(rv, 3000.0, [speed, 0.0, 0.0]) - expected).abs() < 1e-14,
+                        "side={side} wind={wind} speed={speed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moving_medium_doppler_is_the_reception_time_derivative() {
+        let c = 343.0;
+        let v = [140.0, -35.0, 3.0];
+        let dt = 1e-3;
+        for rv in [
+            [4000.0, 0.0, 1200.0],
+            [-4000.0, 0.0, 1200.0],
+            [0.0, 5000.0, 1200.0],
+        ] {
+            for w in [[0.0; 3], [25.0, 0.0, 0.0], [-20.0, 30.0, 5.0]] {
+                let travel_before = wavefront_travel(sub(rv, scale(v, dt)), w, c);
+                let travel_after = wavefront_travel(add(rv, scale(v, dt)), w, c);
+                let received_rate = 1.0 + (travel_after - travel_before) / (2.0 * dt);
+                let ratio = Prop { c, w }.ratio(rv, norm(rv), v);
+                assert!(
+                    (ratio - 1.0 / received_rate).abs() < 1e-8,
+                    "rv={rv:?} w={w:?}: ratio={ratio} received_rate={received_rate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moving_medium_emission_solves_recover_known_emission_times() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let v = [140.0, 0.0, 0.0];
+        let tr = straight_track(&enu, [0.0, 2000.0, 1200.0], v, 1000.0, 800.0, 1200.0, 20.0);
+        let x = enu.to_ecef([0.0; 3]);
+        let c = 343.0;
+        for w in [[0.0; 3], [25.0, -15.0, 5.0], [-60.0, 25.0, 0.0]] {
+            let m = Prop {
+                c,
+                w: enu.vec_to_ecef(w),
+            };
+            for te in [850.0, 900.0, 975.0, 1000.0, 1050.0, 1150.0] {
+                let rv = [v[0] * (te - 1000.0), 2000.0, 1200.0];
+                let t_r = te + wavefront_travel(rv, w, c);
+                let dt = 1e-3;
+                let expected_ratio = 1.0
+                    / (1.0
+                        + (wavefront_travel(add(rv, scale(v, dt)), w, c)
+                            - wavefront_travel(sub(rv, scale(v, dt)), w, c))
+                            / (2.0 * dt));
+                for warm in [None, Some(tr.t0()), Some(tr.t1()), Some(te + 20.0)] {
+                    let (solved, r, ratio) = tr.solve_emission_p(t_r, x, &m, warm).unwrap();
+                    assert!((solved - te).abs() < 1e-7, "{solved} vs {te}, wind={w:?}");
+                    assert!((r - norm(rv)).abs() < 1e-5);
+                    assert!((ratio - expected_ratio).abs() < 1e-8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_propagation_media_cannot_produce_an_emission_match() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let tr = straight_track(
+            &enu,
+            [0.0, 2000.0, 1200.0],
+            [140.0, 0.0, 0.0],
+            1000.0,
+            800.0,
+            1200.0,
+            20.0,
+        );
+        let x = enu.to_ecef([0.0; 3]);
+        let rv = sub(tr.pos_at(1000.0), x);
+        for m in [
+            Prop::still(0.0),
+            Prop::still(-343.0),
+            Prop::still(f64::NAN),
+            Prop {
+                c: 343.0,
+                w: [343.0, 0.0, 0.0],
+            },
+            Prop {
+                c: 343.0,
+                w: [400.0, 0.0, 0.0],
+            },
+            Prop {
+                c: 343.0,
+                w: [f64::NAN, 0.0, 0.0],
+            },
+        ] {
+            assert!(m.travel(rv, norm(rv)).is_nan(), "{m:?}");
+            assert!(m.ratio(rv, norm(rv), tr.vel[0]).is_nan(), "{m:?}");
+            assert!(tr.solve_emission_p(1010.0, x, &m, None).is_none(), "{m:?}");
+        }
+    }
 
     // Analytic, level circular motion in one tangent plane. Reported velocities are rotated
     // into each sample's own ENU frame, just as actual ADS-B ground tracks are defined.
@@ -828,7 +1036,7 @@ mod tests {
         let models = build(&turning_leg(&enu, &times, omega), &BuildParams::default());
         assert_eq!(models.len(), 1);
         let tr = &models[0];
-        // close under the turn, in a crosswind, so the Newton steps converge at their slowest
+        // Close under a turn in a crosswind, exercising changing geometry and the wind derivative.
         let x = enu.to_ecef([0.0, 0.0, 0.0]);
         let m = Prop {
             c: 343.0,

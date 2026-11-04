@@ -24,18 +24,25 @@ pub fn cv_radial(tau: f64, v: f64, d: f64) -> (f64, f64) {
 /// Received frequency for a constant-velocity straight pass (retarded model).
 #[inline]
 pub fn cv_curve(t_r: f64, f0: f64, v: f64, d: f64, t0e: f64, c: f64) -> f64 {
-    let tau = retarded_tau(t_r, t0e, v, d, c);
-    let (_, vr) = cv_radial(tau, v, d);
-    f0 * c / (c + vr)
+    f0 * cv_ratio(t_r - t0e, v, d, c)
 }
 
 /// Frequency ratio f/f0 at reception offset `u_r` from the delayed CPA t0r.
 #[inline]
 pub fn cv_ratio_rel_t0r(u_r: f64, v: f64, d: f64, c: f64) -> f64 {
     // t_r = t0r + u_r, t0e = t0r - d/c
-    let tau = retarded_tau(u_r + d / c, 0.0, v, d, c);
-    let (_, vr) = cv_radial(tau, v, d);
-    c / (c + vr)
+    cv_ratio(u_r + d / c, v, d, c)
+}
+
+/// f/f0 = d(t_e)/d(t_r): differentiate the retarded root directly instead of
+/// reconstructing range with a second square root. As in `retarded_tau`, the source
+/// is subsonic; the fit bounds keep v <= 0.95 c, away from the singular v = c limit.
+#[inline]
+fn cv_ratio(u: f64, v: f64, d: f64, c: f64) -> f64 {
+    let (c2, v2) = (c * c, v * v);
+    let a = c2 - v2;
+    let q = (c2 * v2 * u * u + d * d * a).sqrt();
+    (c2 / a) * (1.0 - v2 * u / q)
 }
 
 /// Readouts of the reference fit tool: approach/recede asymptotes and |df/dt| at CPA.
@@ -109,5 +116,73 @@ mod tests {
         // at the delayed CPA the received frequency equals f0
         assert!((cv_curve(d / C, f0, v, d, 0.0, C) - f0).abs() < 1e-9);
         assert!((cv_ratio_rel_t0r(0.0, v, d, C) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn direct_frequency_agrees_with_retarded_radial_reconstruction() {
+        let reconstructed = |u, v, d, c| {
+            let tau = retarded_tau(u, 0.0, v, d, c);
+            let (_, vr) = cv_radial(tau, v, d);
+            c / (c + vr)
+        };
+        for c in [280.0, 343.0, 365.0] {
+            for d in [1e-3, 5.0, 4000.0, 200_000.0, 1e8] {
+                for beta in [0.0, 1e-6, 0.01, 0.1, 0.35, 0.7, 0.95] {
+                    let v = beta * c;
+                    let scale = d / if v > 0.0 { v } else { c };
+                    for t0e in [0.0, 10_000.0] {
+                        for k in -128..=128 {
+                            let u_r = k as f64 * 0.25 * scale;
+                            let expected = reconstructed(u_r + d / c, v, d, c);
+                            assert!(
+                                (cv_ratio_rel_t0r(u_r, v, d, c) - expected).abs()
+                                    < 2e-13 * expected,
+                                "relative CPA: c={c} d={d} v={v} k={k}"
+                            );
+                            let t_r = t0e + d / c + u_r;
+                            let expected = 113.7 * reconstructed(t_r - t0e, v, d, c);
+                            assert!(
+                                (cv_curve(t_r, 113.7, v, d, t0e, c) - expected).abs()
+                                    < 2e-13 * expected,
+                                "emission CPA: c={c} d={d} v={v} t0e={t0e} k={k}"
+                            );
+                        }
+                    }
+                    assert!((cv_ratio_rel_t0r(0.0, v, d, c) - 1.0).abs() < 1e-12);
+                    for side in [-1.0, 1.0] {
+                        let expected = c / (c + side * v);
+                        assert!(
+                            (cv_ratio_rel_t0r(side * 1e7 * scale, v, d, c) - expected).abs()
+                                < 1e-11 * expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frequency_matches_received_pulse_spacing() {
+        // Emit two nearby pulses on a known straight trajectory, then advance each through
+        // still air. Their arrival-time separation independently determines the heard pitch.
+        for c in [280.0, 343.0, 365.0] {
+            for d in [1e-3, 5.0, 4000.0, 200_000.0, 1e8] {
+                for beta in [0.0, 0.01, 0.35, 0.7, 0.95] {
+                    let v = beta * c;
+                    let scale = d / if v > 0.0 { v } else { c };
+                    let dt = 1e-4 * scale;
+                    let received = |te: f64| te + (d * d + v * v * te * te).sqrt() / c;
+                    for phase in [-20.0, -3.0, -1.0, -0.1, 0.0, 0.1, 1.0, 3.0, 20.0] {
+                        let te = phase * scale;
+                        let ratio = 2.0 * dt / (received(te + dt) - received(te - dt));
+                        assert!(
+                            (cv_curve(received(te), 1.0, v, d, 0.0, c) - ratio).abs()
+                                < 1e-8 * ratio,
+                            "c={c} d={d} v={v} phase={phase}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

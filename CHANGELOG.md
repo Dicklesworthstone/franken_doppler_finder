@@ -19,6 +19,39 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Consistent moving-medium physics and a faster frequency kernel
+
+- The wind-aware propagation model now solves the advected acoustic wavefront
+  `|r + w T| = c T`, including crosswind displacement, and differentiates that same travel time
+  for both the Doppler ratio and Newton emission-time steps. Previously travel time, predicted
+  frequency and Newton updates used different approximations. The stable positive root avoids
+  cancellation for downwind propagation; invalid media cannot yield an emission-time match.
+  Sound speed and wind are still path averages, treated as a homogeneous medium: this is not
+  refractive ray tracing. First-order coarse-gate rescaling and all confidence thresholds stay as before.
+- Constant-velocity frequency evaluation now differentiates the retarded-time root directly.
+  It needs one square root instead of two, retaining the same subsonic model. Two regressions
+  cover 53,970 comparisons against the previous reconstruction and 675 independent pulse pairs.
+  Five wind regressions cover a bisection wavefront oracle, analytic one-dimensional propagation,
+  reception-time derivatives, rotation invariance, near-sonic cancellation, 72 cold/warm solves,
+  and invalid media. They passed on the pinned nightly.
+- Optimized component probes on a shared AMD EPYC 9V74 host measured a 1.78× median speed ratio
+  for 16,777,216 frequency calls. The earlier detector changes measured 3.57× and 8.67× median
+  ratios on 3,600- and 10,800-frame synthetic spectrograms, respectively; all six full outputs
+  agree exactly with the baseline. Clean two-event point scoring was 1.17× faster, with no
+  material improvement for the changing-tone or quick probes. These are isolated measurements
+  with scheduling noise, not real-recording or end-to-end speedups; details are in README.
+- **Real-recording limit.** Reference, wrong-date and field replays with the corrected wind model
+  remain unrun: the reference media download returned a “Site Unavailable” HTML page. README
+  now explicitly labels the existing real-recording errors and grades as `7e5cf3e` baseline
+  evidence. No real-world accuracy improvement is claimed from the synthetic checks alone.
+- **Checks.** All 70 default core tests and 13 shared-type tests pass, with two opt-in media tests ignored. Core/shared-type
+  Clippy passes for all targets with warnings denied, and workspace formatting passes. The actual
+  unchanged selftest, invoked through an external launcher using a fresh optimized current-core
+  build, passes with 0.417 m error, 75 m radius, +0.192 s clock error and both intended flights.
+  Two full workspace test attempts, including a one-job/lower-memory retry, were killed while
+  compiling the unchanged `asupersync 0.6.2` dependency, before tests ran. The standalone selftest
+  covers the real core pipeline but not the full CLI, ledger or reporting build.
+
 ### Reuse trace-fit buffers throughout the search
 
 - Clock scans reuse model-ratio, robust-deviation and tone-change prefix buffers instead of
@@ -48,7 +81,7 @@ at that commit, not per-change commits.
   duplicate templates, masked evidence and one versus three worker threads. The existing
   noisy-audio detection, cap, overlap and measurement regressions also passed on the working tree.
 - A standalone comparison against `695f952` produced identical serialized full detection results
-  in three runs of a synthetic 240-row, 3,600-frame log spectrogram. This is synthetic equivalence
+  in three runs each of synthetic 240-row, 3,600- and 10,800-frame log spectrograms. This is synthetic equivalence
   evidence; the historical reference-recording results and timings below have not been remeasured.
 
 ### Low answers say they are unconfirmed; `fdop detect` warns on high-passed audio

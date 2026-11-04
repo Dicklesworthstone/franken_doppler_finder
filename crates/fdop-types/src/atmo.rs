@@ -1,24 +1,26 @@
 //! Atmosphere for acoustic propagation: speed of sound and wind as functions of height,
 //! interpolated in space and time.
 //!
-//! Why it matters: a propeller tone heard from an aircraft at altitude H travels through air
-//! whose temperature falls about 6.5 K per km, so the sound speed that governs both the
-//! travel time and the Doppler factor is the *harmonic mean* of c(z) along the ray, not the
-//! surface value. For a turboprop at 5.5 km on a 26 C afternoon that is ~336 m/s instead of
-//! ~347 m/s, which bends the predicted Doppler curve by ~0.6 Hz at 113 Hz: far more than the
-//! 0.1 Hz precision of a clean trace. Wind enters at first order as the constant term
-//! v_s . w / c in the Doppler denominator and as w . u in the travel time.
+//! A sound path crosses air at different temperatures and winds. This module reduces the
+//! height interval between source and observer to a harmonic-mean sound speed c and mean
+//! horizontal wind w. `fdop-core` treats those averages as one homogeneous moving medium
+//! during each emission-time solve; it does not trace refracted rays through the layers.
 //!
-//! The Doppler model for a stationary observer and a source with ground velocity v_s in a
-//! layered, moving medium (path-averaged sound speed c, wind w; r = source - observer):
+//! For a stationary observer and source with ground velocity v_s, let rv = source - observer
+//! and R = |rv|. In this homogeneous approximation, the emitted spherical wavefront moves
+//! with the wind, so its travel time T satisfies |rv + w T| = c T. For c > |w|:
 //!
 //! ```text
-//!   f / f0 = c / (c + v_r + v_s . w / c),     v_r = (r . v_s) / |r|
-//!   travel time = |r| / (c - w . r / |r|)
+//!   a = c^2 - w.w,  b = w.rv,  q = sqrt(b^2 + a R^2)
+//!   T = (b + q) / a                 (or R^2 / (q - b) when b < 0)
+//!   dT/dt_e = (rv.v_s + T w.v_s) / q
+//!   t_r = t_e + T,  f / f0 = 1 / (1 + dT/dt_e)
 //! ```
 //!
-//! (the horizontal slowness of the ray is conserved, and its value at the source is
-//! u/c - w/c^2 to first order in |w|/c).
+//! The rationalized root avoids cancellation for following wind. Travel time, Doppler ratio
+//! and the Newton derivative in `fdop-core::track::Prop` use this same wavefront equation,
+//! including crosswind displacement. Exactness is limited to the homogeneous medium: path
+//! averaging does not account for ray bending or spatial gradients of the medium.
 
 use serde::{Deserialize, Serialize};
 
