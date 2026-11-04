@@ -897,8 +897,9 @@ audio or video recorded somewhere sensitive:
   `f_osprey_1102b_s7b` against a throwaway build, `f_osprey_1102b_cap60`. Its missing event was a 568 m pass at
   detection rank 45. On the reference recording the same build keeps the county and state-wide answers and grades
   (margins 12.77 to 11.06 and 5.01 to 4.72), and both wrong dates stay low (2.37 to 0.25 and 5.49 to 1.89), for 43–69 %
-  more time. Its one new usable event there joins the best rival on all four runs, with no archived pass near it. The
-  three-day run and the other three wrong-date runs have not been run on it. Explicitly truncated
+  more time. Its one new usable event there joins the best rival on all four runs; no archived flight fits it out
+  to 40 km, and whether it is a real sound is unresolved. The three-day run and the other three wrong-date runs have
+  not been run on it. Explicitly truncated
   comparisons now fail the margin gate whether a rival was found or not; that correction does not calibrate
   the larger event search. Events omitted from pair seeding by driver or hypothesis limits can still leave
   unexplored explanations, even when no pair/fine/confirmation cut was recorded.

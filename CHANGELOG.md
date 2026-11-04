@@ -138,9 +138,9 @@ at that commit, not per-change commits.
 | `n_ref_on_0907_cap60` | low, 138 km, core 2 of 2, margin 2.37 | low, 138 km, core 2 of 2, margin 0.25 | 359 → 513 s |
 | `n_ref_on_0909_cap60` | low, 73 km, core 1 of 2, margin 5.49 | low, 73 km, core 1 of 2, margin 1.89 | 124 → 210 s |
 
-  Only one new event passes quality on this recording (at 958 s, 534.5 Hz). It joins the best rival on all four runs
-  and has no archived pass near it, so the larger cap adds nothing real here and lowers margins on right and wrong dates
-  alike. The three-day run and the other three wrong-date runs have not been run on it, so the effect on false grades
+  Only one new event passes quality on this recording (at 958 s, 534.5 Hz). No archived flight fits it out to 40 km, and
+  whether it is a real sound is unresolved: its ridge is faint and intermittent, and the fit could be joining separate
+  sounds. It joins the best rival on all four runs, so margins fall on right and wrong dates alike. The three-day run and the other three wrong-date runs have not been run on it, so the effect on false grades
   is only partly measured, and AGENTS wants the medium grade's scaling fixed first.
 - **Checks.** On `7e5cf3e`, whose code is that of `4b88d7c`: `cargo test --workspace --locked -j 2` passed 139 with
   0 failed and 2 ignored, and clippy with warnings denied passed. A release build passed `fdop selftest`: 0.4 m
