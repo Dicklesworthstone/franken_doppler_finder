@@ -279,6 +279,13 @@ elapsed time across silent gaps. Duplicate samples and denser resampling do not 
 and the count cannot exceed the points retained for scoring. Six seconds remains an assumed correlation
 length; these counts are not an empirical covariance or coverage calibration.
 
+Fit intervals profile each reported coordinate directly: speed, distance, emitted tone and the heard
+closest-approach time. The heard-time profile fixes received CPA time, refits speed and distance, and
+solves the emitted tone analytically. It keeps the original emission-time bounds through the corresponding
+distance constraints. This prevents a valid recording clock from being discarded because timing uncertainty
+was inferred only from the nuisance fits along the speed and distance profiles. The F cutoff and generous
+floors are unchanged; the extra profiles run once on the final retained trace.
+
 **High** confidence needs every gate. **Medium** needs two core matches, clock lock, and a margin of at least
 3 nats (or no rival), also with no recorded comparison cut. Everything else is **low**. The full gate details
 are in `result.json` and `report.html`. An incomplete comparison still reports its observed numerical gap,
@@ -756,6 +763,39 @@ the configured fallback allowance after the preferred request has been tried.
 ---
 
 ## Testing
+
+### Current calibration validation
+
+The final pinned-nightly run passes **97 core tests and 13 shared-type tests: 110 total**, with zero failures
+or ignored tests, including both FFmpeg/FFprobe integration tests. It includes eight added regressions for
+robust tone fitting, fractional prediction accuracy, close-pass refinement and independently checked profile
+intervals. The command is
+`cargo test -p fdop-core -p fdop-types --locked -- --include-ignored --test-threads=2`, using one build job,
+two Rayon workers, workspace optimization level 1, the existing level 2 dependency profile and no debug info.
+`cargo clippy -p fdop-core -p fdop-types --all-targets --locked -- -D warnings` and workspace formatting pass.
+
+The unchanged 1,300 s `src/selftest.rs`, linked through the external entry point to fresh core libraries,
+passes the full synthesis → FFmpeg decode → detection → measurement → search → refinement path with
+**2.365 m** position error, **75 m** radius and **+0.0249 s** clock error, four events and both intended
+aircraft. These agree with the preceding `b8c0819` core run; this fixture shows no position or clock gain
+from the new changes. It does not verify the release CLI, ledger or report integration. Earlier workspace-wide
+Clippy attempts stopped while checking the unchanged `asupersync 0.6.2` dependency with host out-of-memory
+kills; full-workspace tests and the normal release CLI selftest remain unverified here.
+
+### Direct tone and received-time profiles
+
+The three new fit regressions use independent emitted-wave traces and independently optimized nuisance
+fits to test interval membership. They cover two-sided and one-sided recordings, original physical bounds,
+and timestamp shifts of ±10,000.25 s. The five existing fit tests also pass.
+
+For the 80 Hz, 60 m/s, 8 km fixture in
+`reported_tone_and_heard_time_ranges_profile_their_own_coordinates`, the old timing interval was
+1022.542478–1024.586037 s; the corrected interval is 1018.326404–1028.824827 s. Independently refitted
+clocks four seconds before and after the best time have costs 3.590266 and 3.529333, both below the unchanged
+3.785475 threshold. The original generous timing interval excluded both; the corrected profile retains them.
+The emitted-tone interval changes from 79.886360–80.068367 Hz to 79.499727–80.460123 Hz. Points 2% beyond
+every corrected endpoint exceed the same threshold, so the change follows the fitted model's accepted region
+rather than a larger uncertainty floor. This is conditional profile calibration, not empirical 95% coverage.
 
 ### Trace scoring and prediction interpolation
 

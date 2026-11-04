@@ -214,6 +214,64 @@ fn ls(
     (p, cost, res)
 }
 
+/// Profile a fixed heard CPA while refitting range, speed and emitted tone. The source
+/// model's original emission-time box implies a range box at this received time:
+/// t0e = t0r - d/c. Solve the linear tone exactly at each geometry to avoid making its
+/// correlation with timing an extra numerical optimization direction.
+fn ls_at_heard_cpa(t: &[f64], f: &[f64], c: f64, warm: [f64; 4], t0r: f64) -> ([f64; 4], f64) {
+    let (tmin, tmax) = t.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, &v| {
+        (a.0.min(v), a.1.max(v))
+    });
+    let (lo, hi) = bounds(tmin, tmax, c);
+    let (time_lo, time_hi) = (lo[3] + lo[2] / c, hi[3] + hi[2] / c);
+    if !(time_lo..=time_hi).contains(&t0r) {
+        return (warm, f64::INFINITY);
+    }
+    let (d_lo, d_hi) = if t0r == time_lo {
+        (lo[2], lo[2])
+    } else if t0r == time_hi {
+        (hi[2], hi[2])
+    } else {
+        (lo[2].max(c * (t0r - hi[3])), hi[2].min(c * (t0r - lo[3])))
+    };
+    if d_lo > d_hi {
+        return (warm, f64::INFINITY);
+    }
+    let distance_free = d_hi > d_lo;
+    let (mut lower, mut upper, mut initial) =
+        (vec![lo[1]], vec![hi[1]], vec![warm[1].clamp(lo[1], hi[1])]);
+    if distance_free {
+        lower.push(d_lo);
+        upper.push(d_hi);
+        initial.push(warm[2].clamp(d_lo, d_hi));
+    }
+    // Relative recording times make this profile independent of the timestamp origin.
+    let relative: Vec<f64> = t.iter().map(|&tt| tt - t0r).collect();
+    let model = |x: &[f64]| {
+        let (v, d) = (x[0], if distance_free { x[1] } else { d_lo });
+        let ratios: Vec<f64> = relative
+            .iter()
+            .map(|&tt| crate::physics::cv_ratio_rel_t0r(tt, v, d, c))
+            .collect();
+        let fr: f64 = f.iter().zip(&ratios).map(|(&ff, &r)| ff * r).sum();
+        let rr: f64 = ratios.iter().map(|r| r * r).sum();
+        let f0 = (fr / rr).clamp(lo[0], hi[0]);
+        let residual: Vec<f64> = ratios.iter().zip(f).map(|(&r, &ff)| f0 * r - ff).collect();
+        ([f0, v, d, t0r - d / c], residual)
+    };
+    let opts = LeastSquaresOptions {
+        method: Some(LeastSquaresMethod::Trf),
+        x_scale_jac: true,
+        max_nfev: Some(4000),
+        ..Default::default()
+    };
+    let solution = least_squares_bounded(|x| model(x).1, &initial, &lower, &upper, opts)
+        .map(|r| r.x)
+        .unwrap_or(initial);
+    let (p, residual) = model(&solution);
+    (p, residual.iter().map(|r| r * r).sum())
+}
+
 fn median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
     crate::spectro::median_f64(&mut s)
@@ -575,17 +633,109 @@ fn finish_fit(prepared: PreparedFit) -> FitResult {
         }
         rng[j] = [lo_v, hi_v];
     }
-    let f0r = accepted
+    let mut f0r = accepted
         .iter()
         .fold([f64::INFINITY, f64::NEG_INFINITY], |a, p| {
             [a[0].min(p[0]), a[1].max(p[0])]
         });
-    let t0rr = accepted
+    let mut t0rr = accepted
         .iter()
         .fold([f64::INFINITY, f64::NEG_INFINITY], |a, p| {
             let x = p[3] + p[2] / c;
             [a[0].min(x), a[1].max(x)]
         });
+    // The nuisance fits encountered while profiling v and d only trace two slices of
+    // the accepted parameter region. Their extrema cannot stand in for profiles of
+    // f0 or heard CPA time; either coordinate can vary farther along another direction.
+    let coordinate_bound = |k: usize,
+                            sign: f64,
+                            center: f64,
+                            domain: [f64; 2],
+                            initial_step: f64,
+                            acc: &mut Vec<[f64; 4]>|
+     -> (f64, bool) {
+        let profile_at = |value: f64, warm: [f64; 4]| {
+            if k == 0 {
+                let (p, cost, _) = ls(
+                    &t_i,
+                    &f_i,
+                    c,
+                    warm,
+                    &[1, 2, 3],
+                    &[(0, value)],
+                    LossKind::Linear,
+                );
+                (p, cost)
+            } else {
+                ls_at_heard_cpa(&t_i, &f_i, c, warm, value)
+            }
+        };
+        let limit = domain[usize::from(sign > 0.0)];
+        let mut warm = p_best;
+        let mut step = initial_step;
+        let mut inside = center;
+        let mut outside;
+        loop {
+            let value = (center + sign * step).clamp(domain[0], domain[1]);
+            let (p, cost) = profile_at(value, warm);
+            if !cost.is_finite() || cost > thr {
+                outside = value;
+                break;
+            }
+            acc.push(p);
+            inside = value;
+            warm = p;
+            if value == limit {
+                return (value, true);
+            }
+            step *= 1.6;
+        }
+        for _ in 0..8 {
+            let value = 0.5 * (inside + outside);
+            let (p, cost) = profile_at(value, warm);
+            if cost.is_finite() && cost <= thr {
+                inside = value;
+                warm = p;
+                acc.push(p);
+            } else {
+                outside = value;
+            }
+        }
+        (inside, false)
+    };
+    let t0r_best = p_best[3] + p_best[2] / c;
+    for (k, name, center, domain, interval, scale) in [
+        (0, "f0", p_best[0], [lo_b[0], hi_b[0]], &mut f0r, p_best[0]),
+        (
+            3,
+            "t0r",
+            t0r_best,
+            [lo_b[3] + lo_b[2] / c, hi_b[3] + hi_b[2] / c],
+            &mut t0rr,
+            p_best[2] / p_best[1],
+        ),
+    ] {
+        for (side, sign) in [(0, -1.0), (1, 1.0)] {
+            let step = (interval[side] - center).abs().max(0.002 * scale);
+            let (value, open) = coordinate_bound(k, sign, center, domain, step, &mut accepted);
+            interval[side] = if side == 0 {
+                interval[side].min(value)
+            } else {
+                interval[side].max(value)
+            };
+            if open {
+                edge_notes.push(format!(
+                    "{name}_{} unbounded-within-search: trace does not constrain this side",
+                    if side == 0 { "lo" } else { "hi" }
+                ));
+            }
+        }
+    }
+    for p in &accepted {
+        f0r = [f0r[0].min(p[0]), f0r[1].max(p[0])];
+        let time = p[3] + p[2] / c;
+        t0rr = [t0rr[0].min(time), t0rr[1].max(time)];
+    }
     let ranges = Ranges {
         v: rng[0],
         d: rng[1],
@@ -776,6 +926,253 @@ fn corrcoef(a: &[f64], b: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn emitted_trace(f0: f64, v: f64, d: f64, half: i32, phase: f64) -> (Vec<f64>, Vec<f64>) {
+        let c = 343.0;
+        (-half..=half)
+            .map(|k| {
+                let tau = k as f64;
+                let range = (d * d + v * v * tau * tau).sqrt();
+                (
+                    1000.0 + tau + range / c,
+                    f0 * c / (c + v * v * tau / range) + 0.2 * (1.731 * k as f64 + phase).sin(),
+                )
+            })
+            .unzip()
+    }
+
+    fn profile_oracle(
+        t: &[f64],
+        f: &[f64],
+        c: f64,
+        best: [f64; 4],
+        coordinate: usize,
+        value: f64,
+    ) -> ([f64; 4], f64) {
+        if coordinate == 0 {
+            let (p, cost, _) = ls(t, f, c, best, &[1, 2, 3], &[(0, value)], LossKind::Linear);
+            return (p, cost);
+        }
+        // Optimize the three nuisance parameters while the heard CPA stays fixed.
+        // Generate frequencies from emission range/radial velocity, independently of
+        // the profile's eventual coordinate transformation.
+        let resid = |x: &[f64]| -> Vec<f64> {
+            t.iter()
+                .zip(f)
+                .map(|(&tt, &ff)| {
+                    let te = value - x[2] / c;
+                    let tau = crate::physics::retarded_tau(tt, te, x[1], x[2], c);
+                    let (range, vr) = crate::physics::cv_radial(tau, x[1], x[2]);
+                    assert!(range > 0.0);
+                    x[0] * c / (c + vr) - ff
+                })
+                .collect()
+        };
+        let opts = LeastSquaresOptions {
+            method: Some(LeastSquaresMethod::Trf),
+            x_scale_jac: true,
+            max_nfev: Some(4000),
+            ..Default::default()
+        };
+        let solution = least_squares_bounded(
+            resid,
+            &best[..3],
+            &[1.0, 1.0, 5.0],
+            &[20_000.0, 0.95 * c, 2.0e5],
+            opts,
+        )
+        .unwrap();
+        let x = solution.x;
+        (
+            [x[0], x[1], x[2], value - x[2] / c],
+            resid(&x).iter().map(|r| r * r).sum(),
+        )
+    }
+
+    #[test]
+    fn reported_tone_and_heard_time_ranges_profile_their_own_coordinates() {
+        let c = 343.0;
+        let mut undercovered = Vec::new();
+        for (f0, v, d, half) in [(112.7, 140.0, 6100.0, 150), (80.0, 60.0, 8000.0, 80)] {
+            let (t, f) = emitted_trace(f0, v, d, half, 0.37);
+            let prepared = prepare_constant_velocity(&t, &f, c, Side::Both).unwrap();
+            let (ti, fi, best, minimum) = (
+                prepared.t_i.clone(),
+                prepared.f_i.clone(),
+                prepared.p_best,
+                prepared.cmin,
+            );
+            let result = prepared.complete();
+            let threshold = minimum * (1.0 + result.diagnostics.delta);
+            for (coordinate, center, interval) in [
+                (0, result.best.f0, result.ranges.f0),
+                (3, result.best.t0r, result.ranges.t0r),
+            ] {
+                for endpoint in interval {
+                    let (inside, inside_cost) =
+                        profile_oracle(&ti, &fi, c, best, coordinate, endpoint);
+                    assert!(
+                        inside_cost <= threshold,
+                        "reported endpoint must be accepted"
+                    );
+                    for (k, geometry) in [(1, result.ranges.v), (2, result.ranges.d)] {
+                        assert!(
+                            (geometry[0]..=geometry[1]).contains(&inside[k]),
+                            "profile {coordinate} endpoint {endpoint}: accepted parameter {k}={} outside {geometry:?}",
+                            inside[k]
+                        );
+                    }
+                    let outside = center + 1.02 * (endpoint - center);
+                    let (_, cost) = profile_oracle(&ti, &fi, c, best, coordinate, outside);
+                    eprintln!(
+                        "profile d={d} coordinate {coordinate}: center {center:.9}, endpoint {endpoint:.9}, outside {outside:.9}, cost {cost:.9}, threshold {threshold:.9}"
+                    );
+                    if cost <= threshold {
+                        undercovered.push((coordinate, outside, cost));
+                    }
+                }
+            }
+            if half == 80 {
+                for offset in [-4.0, 4.0] {
+                    let time = result.best.t0r + offset;
+                    let (_, cost) = profile_oracle(&ti, &fi, c, best, 3, time);
+                    assert!(
+                        cost < threshold,
+                        "independent clock witness must be accepted"
+                    );
+                    if !(result.ranges_generous.t0r[0]..=result.ranges_generous.t0r[1])
+                        .contains(&time)
+                    {
+                        undercovered.push((3, time, cost));
+                    }
+                }
+            }
+        }
+        assert!(
+            undercovered.is_empty(),
+            "accepted nuisance fits lie outside the reported profile ranges: {undercovered:?}"
+        );
+    }
+
+    #[test]
+    fn heard_time_profile_preserves_emission_bounds_and_timestamp_translation() {
+        let c = 343.0;
+        let (t, f) = emitted_trace(80.0, 60.0, 8000.0, 80, 0.61);
+        let prepared = prepare_constant_velocity(&t, &f, c, Side::Both).unwrap();
+        let center = prepared.best().t0r;
+        let (lo, hi) = bounds(t[0], *t.last().unwrap(), c);
+        for time in [
+            center - 4.0,
+            center + 4.0,
+            lo[3] + lo[2] / c,
+            hi[3] + hi[2] / c,
+        ] {
+            let (p, cost) = ls_at_heard_cpa(&t, &f, c, prepared.p_best, time);
+            assert!(cost.is_finite());
+            for k in 0..4 {
+                let roundoff = 32.0 * f64::EPSILON * p[k].abs().max(hi[k].abs());
+                assert!(
+                    p[k] >= lo[k] - roundoff && p[k] <= hi[k] + roundoff,
+                    "received CPA {time}: parameter {k}={} outside [{}, {}]",
+                    p[k],
+                    lo[k],
+                    hi[k]
+                );
+            }
+            assert!((p[3] + p[2] / c - time).abs() < 1e-9);
+        }
+        assert!(
+            !ls_at_heard_cpa(&t, &f, c, prepared.p_best, lo[3] + lo[2] / c - 1.0)
+                .1
+                .is_finite()
+        );
+        let shifted = |offset: f64| {
+            let mut p_best = prepared.p_best;
+            p_best[3] += offset;
+            PreparedFit {
+                t: prepared.t.iter().map(|&tt| tt + offset).collect(),
+                f: prepared.f.clone(),
+                c,
+                p_best,
+                inl: prepared.inl.clone(),
+                cmin: prepared.cmin,
+                res_i: prepared.res_i.clone(),
+                t_i: prepared.t_i.iter().map(|&tt| tt + offset).collect(),
+                f_i: prepared.f_i.clone(),
+                side_check: false,
+            }
+        };
+        // Hold the fitted physical solution fixed: only the arbitrary recording-clock
+        // origin changes, so every profile must represent the same accepted region.
+        let reference = shifted(0.0).complete();
+        for offset in [-10_000.25, 10_000.25] {
+            let translated = shifted(offset).complete();
+            for (expected, actual, coordinate_offset) in [
+                (reference.ranges.f0, translated.ranges.f0, 0.0),
+                (reference.ranges.t0r, translated.ranges.t0r, offset),
+            ] {
+                // Each endpoint uses eight bisections; one interval/256 bounds the
+                // combined bracket discretization when the nuisance solve is repeated.
+                let tolerance = (expected[1] - expected[0]) / 256.0;
+                for k in 0..2 {
+                    assert!(
+                        (actual[k] - coordinate_offset - expected[k]).abs() < tolerance,
+                        "offset {offset}: {actual:?} vs {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_sided_profiles_retain_accepted_tone_and_clock_solutions() {
+        let c = 343.0;
+        let (t, f) = emitted_trace(112.7, 140.0, 6100.0, 150, 1.13);
+        for side in [Side::Approach, Side::Recede] {
+            let prepared = prepare_constant_velocity(&t, &f, c, side).unwrap();
+            let (ti, fi, best, minimum) = (
+                prepared.t_i.clone(),
+                prepared.f_i.clone(),
+                prepared.p_best,
+                prepared.cmin,
+            );
+            let result = prepared.complete();
+            let threshold = minimum * (1.0 + result.diagnostics.delta);
+            let mut accepted = 0;
+            for (coordinate, center, interval, offsets) in [
+                (0, result.best.f0, result.ranges.f0, [-0.2, -0.1, 0.1, 0.2]),
+                (
+                    3,
+                    result.best.t0r,
+                    result.ranges.t0r,
+                    [-4.0, -1.0, 1.0, 4.0],
+                ),
+            ] {
+                for offset in offsets {
+                    let value = center + offset;
+                    let (point, cost) = profile_oracle(&ti, &fi, c, best, coordinate, value);
+                    if cost <= threshold {
+                        accepted += 1;
+                        assert!(
+                            (interval[0]..=interval[1]).contains(&value),
+                            "{side:?} coordinate {coordinate}: accepted {value} outside {interval:?}"
+                        );
+                        for (k, geometry) in [(1, result.ranges.v), (2, result.ranges.d)] {
+                            assert!(
+                                (geometry[0]..=geometry[1]).contains(&point[k]),
+                                "{side:?} profile {coordinate}: accepted parameter {k}={} outside {geometry:?}",
+                                point[k]
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(
+                accepted >= 4,
+                "fixture must exercise uncertain one-sided fits"
+            );
+        }
+    }
 
     #[test]
     fn effective_information_depends_on_observed_support_not_gaps_or_density() {

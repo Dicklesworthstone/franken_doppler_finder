@@ -19,6 +19,37 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Profile tone and received CPA directly instead of borrowing speed/range slices
+
+- The fit previously reported tone and received-CPA extrema encountered while profiling speed and distance.
+  Those nuisance paths cover only two slices of the accepted parameter region and can exclude valid timing
+  solutions before they reach the shared-clock search. Both coordinates now have dedicated lower/upper
+  profile searches under the existing F cutoff and model bounds. Previously accepted extrema are retained.
+- The received-time profile fixes `t0r`, refits speed and distance, and solves emitted tone analytically.
+  Centered times make it independent of the recording's timestamp origin. The original emission-time box
+  becomes a distance constraint through `t0e = t0r - d/c`; boundary cases keep that constraint too. Four
+  extra profile sides run only in final `PreparedFit::complete`, after iterative ridge fitting has finished.
+  Point fitting, generous floors, dependencies and output fields are unchanged. A profile that reaches
+  the model box uses the existing `unbounded-within-search` warning form for `f0` or `t0r`.
+- `reported_tone_and_heard_time_ranges_profile_their_own_coordinates` independently refits nuisance
+  parameters inside and beyond each interval. On its 80 Hz / 60 m/s / 8 km fixture, the timing interval
+  changes from 1022.542478–1024.586037 s to 1018.326404–1028.824827 s. Two accepted clock witnesses at
+  the best time ±4 s (costs 3.590266 / 3.529333, threshold 3.785475) no longer fall outside the generous
+  timing gate. The tone interval changes from 79.886360–80.068367 Hz to 79.499727–80.460123 Hz.
+  Independently optimized points 2% beyond every corrected endpoint exceed the unchanged threshold.
+- `heard_time_profile_preserves_emission_bounds_and_timestamp_translation` checks the original parameter
+  box, including extreme allowed received times, and shifts of ±10,000.25 s. The one-sided profile test
+  retains independently accepted tone/time witnesses on both sides of CPA. These are conditional synthetic
+  calibration checks; real-recording/wrong-date replays and empirical confidence coverage remain pending.
+- Final integrated validation passes all 97 core and 13 shared-type tests (110 total, none failed or ignored),
+  including FFmpeg/FFprobe integration and the added checks that accepted tone/time nuisance solutions remain
+  inside the reported speed/distance ranges. Core/shared-type all-target Clippy passes with warnings denied;
+  workspace formatting and diff checks pass. The unchanged 1,300 s synthetic selftest, linked to fresh core
+  libraries through an external entry point, again gives 2.365 m error, 75 m radius, +0.0249 s clock error,
+  four events and both intended aircraft. Its position and clock results match the preceding `b8c0819` run.
+  Full-workspace/release CLI validation remains incomplete after the previously observed `asupersync 0.6.2`
+  build memory failures; the entry-point selftest does not exercise ledger/report integration.
+
 ### Robust emitted-tone fitting and accurate fractional Doppler predictions
 
 - Search trace scoring adds a median-frequency-ratio tone candidate, followed by the existing trimming
