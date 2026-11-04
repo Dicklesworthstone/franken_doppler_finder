@@ -109,8 +109,8 @@ const MIN_MAIN_WIN_S: f64 = 0.5;
 
 /// Time error (s) the guided trace allows for in a steep frame. With it a steep pass is followed
 /// when its detection rates the chirp half as steep, about as far as real detections were seen to
-/// be off on passes traced well. Four times too gentle usually loses the CPA frames, and the event
-/// is refused.
+/// be off on passes traced well. A detection four times too gentle can lose the CPA frames and be
+/// refused, and at eight times most are.
 const STEEP_TIME_ERROR_S: f64 = 0.25;
 
 /// Share of a fit's frequency drop that the trace travels through. A pass's ridge moves from the
@@ -131,9 +131,11 @@ fn drop_traversed(
     /// A longer silence ends a stretch: the fall across it was not observed.
     const MAX_GAP_S: f64 = 3.0;
     /// A step this far from the model's own step is a move to another ridge, and ends a stretch.
-    /// The trace takes the peak nearest the model in each frame with no limit on continuity, so at
-    /// the 1 Hz band of a clean fit it cannot step further than this. A wider band can, and then a
-    /// real ridge reads low; on synthetic passes this limit changed none.
+    /// The trace takes the peak nearest the model in each frame with no limit on continuity, so
+    /// neighbouring peaks can differ from the model's step by up to twice the band. That is this
+    /// limit at the 1 Hz band of a clean main-window fit. A wider band can step further, as can any
+    /// steep frame (0.25 s of chirp is 5 Hz at 20 Hz/s), and then a real ridge reads low; on
+    /// synthetic passes this limit changed none.
     const MAX_STEP_OFF_MODEL_HZ: f64 = 2.0;
     const MIN_STRETCH_POINTS: usize = 5;
     let net_fall = |stretch: &[f64]| {

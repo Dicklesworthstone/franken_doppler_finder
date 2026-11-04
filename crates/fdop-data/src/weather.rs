@@ -467,6 +467,15 @@ fn parse_raob(profile: &serde_json::Value) -> Vec<Level> {
     out
 }
 
+fn raob_url(t: f64, station: &str) -> String {
+    let (y, m, d) = utc_date(t);
+    let hh = ((t.rem_euclid(86400.0)) / 3600.0).round() as u32;
+    format!(
+        "{IEM_RAOB}?ts={y:04}{m:02}{d:02}{hh:02}00&station={}",
+        &station[1..]
+    )
+}
+
 fn raob_atmosphere(
     b: &BBox,
     t_start: f64,
@@ -500,18 +509,13 @@ fn raob_atmosphere(
     let t0 = (t_start / 43200.0).floor() * 43200.0;
     let t1 = (t_end / 43200.0).ceil() * 43200.0;
     let mut stations = Vec::new();
-    let mut n_ok = 0;
+    let (mut n_ok, mut n_tried) = (0, 0);
     for (id, la, lo, _) in &chosen {
         let mut series = Vec::new();
         let mut t = t0;
         while t <= t1 + 1.0 {
-            let (y, m, d) = utc_date(t);
-            let hh = ((t.rem_euclid(86400.0)) / 3600.0).round() as u32;
-            let url = format!(
-                "{IEM_RAOB}?ts={y:04}{m:02}{d:02}{hh:02}00&station={}",
-                &id[1..]
-            );
-            if let Ok(v) = get_cached(&url, cache, offline, 20, None, 1)
+            n_tried += 1;
+            if let Ok(v) = get_cached(&raob_url(t, id), cache, offline, 20, None, 1)
                 && let Some(p) = v
                     .get("profiles")
                     .and_then(|p| p.as_array())
@@ -534,7 +538,7 @@ fn raob_atmosphere(
     ScatteredAtmosphere::new(
         stations,
         format!(
-            "NWS radiosondes {} (IEM RAOB archive, {n_ok} soundings)",
+            "NWS radiosondes {} (IEM RAOB archive, {n_ok} of {n_tried} soundings usable)",
             names.join(", ")
         ),
     )
@@ -924,6 +928,46 @@ mod tests {
             lv.iter().all(|l| (l.wind_e - 20.0 * KT).abs() < 0.01),
             "{lv:?}"
         );
+    }
+
+    #[test]
+    fn radiosonde_source_counts_the_soundings_it_could_not_use() {
+        let dir = std::env::temp_dir().join(format!("fdop-raob-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("weather")).unwrap();
+        let put = |url: &str, v: serde_json::Value| {
+            let path = dir.join("weather").join(format!("{:016x}.json", fnv(url)));
+            std::fs::write(path, v.to_string()).unwrap();
+        };
+        put(
+            IEM_RAOB_NETWORK,
+            serde_json::json!({"features": [{
+                "id": "KAAA",
+                "properties": {},
+                "geometry": {"coordinates": [-73.0, 40.0]},
+            }]}),
+        );
+        let sounding = |wind: bool| {
+            let profile: Vec<_> = (0..6)
+                .map(|i| {
+                    serde_json::json!({
+                        "hght": 100.0 + 1200.0 * f64::from(i),
+                        "tmpc": 20.0 - 7.0 * f64::from(i),
+                        "dwpc": 5.0 - 7.0 * f64::from(i),
+                        "drct": wind.then_some(270.0),
+                        "sknt": wind.then_some(20.0),
+                    })
+                })
+                .collect();
+            serde_json::json!({"profiles": [{"profile": profile}]})
+        };
+        // the window needs 00Z, 12Z and the next 00Z: one good, one with no wind, one missing
+        let day = 20_000.0 * 86_400.0;
+        put(&raob_url(day, "KAAA"), sounding(true));
+        put(&raob_url(day + 43_200.0, "KAAA"), sounding(false));
+        let b = BBox::new(39.5, -73.5, 40.5, -72.5);
+        let a = raob_atmosphere(&b, day + 3_600.0, day + 46_800.0, &dir, true).unwrap();
+        let described = a.describe();
+        assert!(described.contains("1 of 3 soundings usable"), "{described}");
     }
 
     #[test]

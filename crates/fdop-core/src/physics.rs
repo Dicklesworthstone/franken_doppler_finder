@@ -50,7 +50,8 @@ fn cv_ratio(u: f64, v: f64, d: f64, c: f64) -> f64 {
 pub struct Readouts {
     pub f_pre: f64,
     pub f_post: f64,
-    /// Rate of fall at the CPA. The steepest comes just after it, faster by (1 - M^2)^(-3/2).
+    /// |df/dt| at the CPA as heard (`t0r`). Despite the name this is not the maximum: the curve is
+    /// steepest a full `d / c` earlier, at `t0e`, and faster there by (1 - M^2)^(-3/2).
     pub max_roc: f64,
 }
 
@@ -117,6 +118,24 @@ mod tests {
         // at the delayed CPA the received frequency equals f0
         assert!((cv_curve(d / C, f0, v, d, 0.0, C) - f0).abs() < 1e-9);
         assert!((cv_ratio_rel_t0r(0.0, v, d, C) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn max_roc_is_the_rate_at_the_heard_cpa_and_the_steepest_comes_earlier() {
+        let (f0, t0e) = (100.0, 1000.0);
+        for (v, d) in [(60.0, 300.0), (80.0, 500.0), (120.0, 1500.0)] {
+            let fall = |t: f64| {
+                let h = 1e-3;
+                (cv_curve(t - h, f0, v, d, t0e, C) - cv_curve(t + h, f0, v, d, t0e, C)) / (2.0 * h)
+            };
+            let max_roc = readouts(f0, v, d, C).max_roc;
+            let steepest = max_roc * (1.0 - (v / C) * (v / C)).powf(-1.5);
+            assert!((fall(t0e + d / C) / max_roc - 1.0).abs() < 1e-6);
+            assert!((fall(t0e) / steepest - 1.0).abs() < 1e-6);
+            for i in -2000..=2000 {
+                assert!(fall(t0e + f64::from(i) * 0.01) <= steepest * (1.0 + 1e-6));
+            }
+        }
     }
 
     #[test]

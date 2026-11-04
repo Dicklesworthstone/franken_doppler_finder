@@ -181,22 +181,46 @@ at that commit, not per-change commits.
 
 - **`search.json` keeps the best 10,000 candidates, with a new field `candidates_total`.** A complete comparison had
   made it 521 MB on the busy osprey run and 290 MB on the osprey cam's 10-31 recording, built in memory and written
-  before `result.json`, so a run short of memory or disk could fail at the very end. The answer sits at the front and
-  `margin` names the rival wherever it ranks, so neither is lost. `result.json` does not change.
+  before `result.json`, so a run short of memory or disk could fail at the very end. The answer sits at the front.
+  `margin` keeps the rival's score, distance and flights wherever it ranks, but a rival past the cap loses its place
+  and clock from this file. `result.json` does not change.
   `search_json_keeps_the_best_candidates_and_counts_the_rest` fails without this.
-- **Winds aloft are no longer invented.** A pressure-level response with no upper winds at some hour copied the 10 m
-  wind to every height, and a radiosonde with no winds read as calm air. Both still reported `winds_aloft: true`,
-  which keeps the speed gates narrow. Such a response now fails with `open-meteo: no winds aloft`, which falls back
-  to radiosondes with the usual warning, and a sounding with no wind above its lowest level is skipped. None of the recordings here hit this.
-  `pressure_levels_without_winds_aloft_are_refused` and `a_sounding_without_wind_is_not_calm_air` fail without this.
+- **A forecast with no winds aloft is refused instead of copied from the surface.** A pressure-level response with
+  no upper winds at some hour copied the 10 m wind to every height, and a radiosonde with no winds read as calm air.
+  Both still reported `winds_aloft: true`, which keeps the speed gates narrow. Such a response now fails with
+  `open-meteo: no winds aloft`, which falls back to radiosondes with the usual warning, and a sounding with no wind
+  above its lowest level is skipped. This covers only the all-missing case: wind at one upper level is still spread to
+  the others, and a missing 10 m wind still reads calm. One such hour at one grid point refuses the whole grid, and the
+  refused response stays cached, so it replays until its file under `<cache>/weather/` is removed. In the cached
+  weather of the recordings here, 0 of 40 pressure-level responses (235 locations) are refused and at most 1 of 106
+  soundings is skipped. `pressure_levels_without_winds_aloft_are_refused` and `a_sounding_without_wind_is_not_calm_air`
+  fail without this.
+- **The radiosonde source now reads `N of M soundings usable`.** A sounding that could not be fetched, or was too short
+  or too low, was dropped silently, and the source counted only those kept. This changes the atmosphere's description
+  in `result.json` on any radiosonde run. `radiosonde_source_counts_the_soundings_it_could_not_use` fails without this.
 - **The ridge check's refusal now says what it measures:** `trace follows only N % of the central frequency drop`,
   in `quality` and in `reasons`. The check is unchanged. It compares against the central 80 % of the fitted drop,
   so the 15 % line is 12 % of the whole drop, and a tone that keeps falling can read above 1.
 - **Correction to the message of `4b88d7c`.** It says the 2 Hz step limit comes from the guided trace because "its
   band floors at 1 Hz, so a clean fit cannot step further than that". A floor is not a ceiling: the band reaches
-  4.5 Hz at a passing RMS, and a wider band can step further, which makes a real ridge read low. Removing the limit
+  4.5 Hz at a passing RMS, a steep frame allows the larger of that and 0.25 s of chirp, and a wider band can step
+  further, which makes a real ridge read low. Removing the limit
   changed none of the synthetic passes, and the comment now says this.
-- **Replays on this code.** On `630bba5` with these changes, the county and state-wide reference searches match exact `630bba5` on answer, radius, margin, rival, funnel, gates, warnings and every candidate's score, and `fdop selftest` gives the same 7.1 m. The three-day run and the wrong dates were not replayed, because the only search-path change is what `search.json` keeps. `b8c0819`, which this lands on, has no real-recording replay of its own yet.
+- **Replays on this code.** On `630bba5` with these changes, the county and state-wide reference searches match exact `630bba5` on answer, radius, margin, rival, funnel, gates, warnings and every candidate's score, and `fdop selftest` gives the same 7.1 m. The three-day run and the wrong dates were not replayed. The weather change does feed the search, and what stands in for those replays is the scan above: no cached pressure-level response is refused, so these recordings' atmosphere does not change. `b8c0819`, which this lands on, has no real-recording replay of its own yet.
+
+- **Corrections to `42677a4`, all in text or comments except the radiosonde source above.**
+  - `max_roc` is the rate at the CPA as heard, `t0r`. Its comment said the steepest fall comes just after that, and the
+    README called it the steepest slope. The steepest fall comes a full `d / c` earlier, at `t0e`, faster by
+    `(1 - M^2)^(-3/2)`. `max_roc_is_the_rate_at_the_heard_cpa_and_the_steepest_comes_earlier` checks this numerically.
+  - The README said a rough `--start` would rule out the wrong field answers, "so give one". That advice could exclude
+    the true clock: `--start` means the exact start, the default `--clock-tol` is 180 s, and nothing widens past it.
+  - "Twice, one of them graded low" overstated the recordings not developed on. One right answer is at the reference
+    site, and both recordings informed the ridge check's line.
+  - The Lee County "about 4 km" was stated as chance without a test. Now it has one, and reads "probably". With the
+    events of `s_swfl_lee_s7a` and archived passes within 8 km of the site, the stream's clock lines up one usable event
+    with a flight, in gates (dt 0.2 s). The two answers' clocks (+53 to +56 min) and eight control offsets from −90 to
+    +120 min line up none. That is one event, and why the state and county answers' clocks agree within about 2 minutes
+    is unexplained.
 
 ### Frequency calibration through the full Doppler curve
 
@@ -458,10 +482,12 @@ at that commit, not per-change commits.
 
 - **The clock each field answer implies, against the stream's.** Osprey cam on 11-01 +0.1 s; eagle cam at Duke Farms
   −6.4 s; osprey cam on 10-31 −3.8 h and on 11-02 +1.1 h; bird-feeder cam +7.0 h; Rochelle +9.3 h; eagle-nest cam in Lee
-  County, FL +53 min searched by state and +55 min by county. So the county search's "about 4 km" is chance, and the
+  County, FL +53 min searched by state and +55 min by county. So the county search's "about 4 km" is probably chance, and the
   Duke Farms answer is a real match despite its low grade: it searched the whole day and its 0.11-nat rival is 140 m
-  away. Without `--start` the search cannot make this check. With a rough one, every wrong answer here would be ruled
-  out; what it answers instead has not been measured.
+  away. Without a known start the search cannot make this check. `--start` means the exact start, the default `--clock-tol`
+  is 180 s and nothing widens past it, so a start 10 minutes off excludes the true clock too. A start known to within
+  25 minutes with `--clock-tol 1500` would keep the true clock and exclude all of these wrong ones; what the search
+  answers instead has not been measured.
 - **What got worse.** Against `d55ef79` the reference answers are 47–85 m further from the published location, the
   state-wide search falls from high to medium and the three-day window from medium to low. The reference recording
   has 4 usable events of 24 where `d55ef79` had 19, 3 of them searched. One refused event, at 13 %, was a confirmer

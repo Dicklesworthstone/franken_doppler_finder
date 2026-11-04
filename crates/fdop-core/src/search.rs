@@ -1048,8 +1048,9 @@ pub struct SearchResult {
 }
 
 /// How many candidates `search.json` keeps. A complete comparison of a busy recording passes
-/// hundreds of thousands, over 500 MB of JSON built in memory, and the answer sits at the front;
-/// the rival behind the margin is named in `margin` wherever it ranks.
+/// hundreds of thousands, over 500 MB of JSON built in memory, and the answer sits at the front.
+/// `margin` keeps the rival's score, distance and flights wherever it ranks; past this cap its
+/// place and clock are not written.
 const DUMP_CANDIDATES: usize = 10_000;
 
 /// What `search.json` holds: a result with only its best candidates, and how many there were.
