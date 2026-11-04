@@ -695,16 +695,37 @@ impl RatioGrid {
     #[inline]
     fn at(&self, tu: f64) -> f64 {
         let u = (tu - self.t0) / self.dt;
-        // also rejects NaN
-        if u.partial_cmp(&0.0).is_none_or(|o| o.is_lt()) {
+        if !u.is_finite() || u < 0.0 {
             return f64::NAN;
         }
         let i = u.floor() as usize;
-        if i + 1 >= self.r.len() {
+        if i >= self.r.len().saturating_sub(1) {
             return f64::NAN;
         }
         let w = u - i as f64;
-        self.r[i] * (1.0 - w) + self.r[i + 1] * w
+        let (b, c) = (self.r[i], self.r[i + 1]);
+        let linear = b * (1.0 - w) + c * w;
+        // Linear interpolation systematically flattens a close pass's rapid Doppler
+        // curvature. Use the four-point interpolating cubic on a continuous monotone
+        // stretch, without extra emission solves or a denser grid. Newton differences
+        // avoid cancellation between large polynomial terms on nearly flat tails.
+        if i > 0 && i + 2 < self.r.len() && linear.is_finite() {
+            let (a, d) = (self.r[i - 1], self.r[i + 2]);
+            let (left, middle, right) = (b - a, c - b, d - c);
+            if a.is_finite() && d.is_finite() && left * middle >= 0.0 && middle * right >= 0.0 {
+                let second = middle - left;
+                let third = right - 2.0 * middle + left;
+                let cubic =
+                    b + w * middle + w * (w - 1.0) * (0.5 * second + (w + 1.0) * third / 6.0);
+                // A turn, a plateau or sparse samples must not invent a new extremum.
+                // The original linear path remains at boundaries and beside gaps; a
+                // missing bracketing endpoint remains missing even at an exact node.
+                if cubic.is_finite() && cubic >= b.min(c) && cubic <= b.max(c) {
+                    return cubic;
+                }
+            }
+        }
+        linear
     }
 }
 
@@ -827,6 +848,46 @@ fn trace_chi(
         cov: m as f64 / n as f64,
         brk: None,
     };
+    if robust {
+        // A minority of off-ridge points can shift least squares far enough that the
+        // ensuing MAD trim accepts them. Seed a second fit from the median emitted
+        // tone instead. Keep the original fit and its change-point proposal below;
+        // the alternative must improve the same capped objective, with the same
+        // tone bounds, trimming rule and missing-coverage penalties.
+        ad.clear();
+        ad.extend((0..n).filter_map(|k| {
+            let tone = ff[k] / rr[k];
+            (rr[k].is_finite() && rr[k] > 0.0 && tone.is_finite()).then_some(tone)
+        }));
+        if ad.len() == cov {
+            let median_f0 = clamp_f0(crate::spectro::median_f64(ad));
+            ad.clear();
+            ad.extend(
+                (0..n)
+                    .filter(|&k| rr[k].is_finite())
+                    .map(|k| (ff[k] - median_f0 * rr[k]).abs()),
+            );
+            let median_mad = 1.4826 * crate::spectro::median_f64(ad);
+            let median_lim = (4.0 * median_mad).max(3.0 * sigma);
+            let (mut a, mut b) = (0.0, 0.0);
+            for k in 0..n {
+                if rr[k].is_finite() && (ff[k] - median_f0 * rr[k]).abs() <= median_lim {
+                    a += ff[k] * rr[k];
+                    b += rr[k] * rr[k];
+                }
+            }
+            if b > 0.0 {
+                let alternative_f0 = clamp_f0(a / b);
+                let (alternative_chi, alternative_rms, _) =
+                    score(alternative_f0, alternative_f0, n);
+                if alternative_chi < out.chi {
+                    out.chi = alternative_chi;
+                    out.f0 = alternative_f0;
+                    out.rms = alternative_rms;
+                }
+            }
+        }
+    }
     if robust && ev.misfit && n >= 40 {
         // prefix sums over inliers of the single-tone fit; split with the least squared error
         for sums in prefix.iter_mut() {
@@ -3006,6 +3067,109 @@ mod tests {
     }
 
     #[test]
+    fn robust_tone_recovers_doppler_curve_despite_masked_contaminants() {
+        // A second tone contaminates three points in every twenty. Least squares first
+        // shifts the fitted tone, then measures MAD around that biased prediction: enough
+        // contaminants survive its single trim to spoil every clean point as well.
+        let tt: Vec<f64> = (0..200).map(|k| -60.0 + 120.0 * k as f64 / 199.0).collect();
+        let ratio = |t| cv_curve(t, 1.0, 110.0, 2500.0, 0.0, 343.0);
+        let mut scratch = TraceScratch::default();
+        for shift in [-4.0, 4.0] {
+            let ff: Vec<f64> = tt
+                .iter()
+                .enumerate()
+                .map(|(k, &t)| (100.0 + if k % 20 < 3 { shift } else { 0.0 }) * ratio(t))
+                .collect();
+            let fit = trace_chi(
+                &tt,
+                &ff,
+                &ratio,
+                0.0,
+                &plain_event(100.0, false),
+                0.2,
+                5.0,
+                true,
+                &mut scratch,
+            );
+            assert!((fit.f0 - 100.0).abs() < 1e-10, "shift={shift}: {fit:?}");
+            assert!((fit.chi - 3.75).abs() < 1e-10, "shift={shift}: {fit:?}");
+            assert!(fit.chi <= 4.0, "the existing core-fit gate must pass");
+            assert_eq!(fit.cov, 1.0);
+            assert!(fit.rms > 1.0, "raw RMS must still reveal the contamination");
+            assert!(fit.brk.is_none());
+        }
+    }
+
+    #[test]
+    fn robust_tone_keeps_bounds_coverage_and_wrong_curve_penalties() {
+        let tt: Vec<f64> = (0..200).map(|k| -60.0 + 120.0 * k as f64 / 199.0).collect();
+        let ratio = |t| cv_curve(t, 1.0, 110.0, 2500.0, 0.0, 343.0);
+        let ff: Vec<f64> = tt.iter().map(|&t| 100.0 * ratio(t)).collect();
+        let mut scratch = TraceScratch::default();
+        let event = plain_event(100.0, false);
+        let wrong = trace_chi(
+            &tt,
+            &ff,
+            &|_| 1.0,
+            0.0,
+            &event,
+            0.2,
+            5.0,
+            true,
+            &mut scratch,
+        );
+        assert!(
+            wrong.chi > 12.0,
+            "a constant tone cannot explain the curve: {wrong:?}"
+        );
+        let out_of_bounds: Vec<f64> = tt.iter().map(|&t| 120.0 * ratio(t)).collect();
+        let bounded = trace_chi(
+            &tt,
+            &out_of_bounds,
+            &ratio,
+            0.0,
+            &event,
+            0.2,
+            5.0,
+            true,
+            &mut scratch,
+        );
+        assert_eq!(bounded.f0, 105.0);
+        assert_eq!(bounded.chi, 25.0);
+        for available in [0usize, 4, 5, 100] {
+            let partial_ratio = |t| {
+                if t <= tt[available.max(1) - 1] && available > 0 {
+                    ratio(t)
+                } else {
+                    f64::NAN
+                }
+            };
+            let partial = trace_chi(
+                &tt,
+                &ff,
+                &partial_ratio,
+                0.0,
+                &event,
+                0.2,
+                5.0,
+                true,
+                &mut scratch,
+            );
+            assert_eq!(partial.cov, available as f64 / tt.len() as f64);
+            if available < 5 {
+                assert!(!partial.chi.is_finite());
+            } else {
+                let missing_penalty = 25.0 * (1.0 - partial.cov);
+                assert!((partial.chi - missing_penalty).abs() < 1e-10, "{partial:?}");
+                assert!(
+                    partial.chi > 12.0,
+                    "unsupported trace must not pass: {partial:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reused_trace_scratch_preserves_fit_results() {
         // Recorded from the allocating implementation at 695f952. Binary-fraction inputs
         // avoid platform-dependent transcendental functions in this arithmetic oracle.
@@ -3878,6 +4042,126 @@ mod tests {
             ],
             "another place, clock or flight is not a duplicate, and the order holds"
         );
+    }
+
+    #[test]
+    fn ratio_grid_interpolation_resolves_close_passes_between_samples() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, 0.0]);
+        let c = 343.0;
+        let mut maxima = [[0.0_f64; 2]; 2];
+        for (v, d, f0) in [
+            (175.0, 200.0, 1100.0),
+            (175.0, 250.0, 500.0),
+            (130.0, 300.0, 100.0),
+            (175.0, 800.0, 1100.0),
+            (60.0, 250.0, 100.0),
+            (137.0, 5000.0, 112.7),
+        ] {
+            // The independent oracle solves the analytic retarded quadratic, then uses
+            // the radial velocity. It never calls TrackModel or the production CV kernel.
+            let oracle = |u: f64| {
+                let tau = (c * c * u - (c * c * v * v * u * u + d * d * (c * c - v * v)).sqrt())
+                    / (c * c - v * v);
+                let radial = v * v * tau / d.hypot(v * tau);
+                f0 * c / (c + radial)
+            };
+            for t0e in [1000.0, 1_789_574_400.0] {
+                let tr = straight_track(
+                    &enu,
+                    [0.0, d * 0.8, d * 0.6],
+                    [v, 0.0, 0.0],
+                    t0e,
+                    t0e - 120.0,
+                    t0e + 120.0,
+                    5.0,
+                );
+                for (grid_kind, dt) in [0.2, 0.5].into_iter().enumerate() {
+                    for phase in [0.07, 0.29, 0.61] {
+                        let lo = t0e - 16.0 + phase * dt;
+                        let g = RatioGrid::build(&tr, x, &Prop::still(c), lo, lo + 32.0, dt, 60.0);
+                        let (mut error, mut linear_error) = (0.0_f64, 0.0_f64);
+                        for k in 1..g.r.len() - 2 {
+                            for fraction in [0.13, 0.37, 0.5, 0.83] {
+                                let t = lo + (k as f64 + fraction) * dt;
+                                let u = (t - lo) / dt;
+                                let w = u - k as f64;
+                                let linear = g.r[k] * (1.0 - w) + g.r[k + 1] * w;
+                                let expected = oracle(t - t0e);
+                                error = error.max((f0 * g.at(t) - expected).abs());
+                                linear_error = linear_error.max((f0 * linear - expected).abs());
+                            }
+                        }
+                        maxima[grid_kind][0] = maxima[grid_kind][0].max(linear_error);
+                        maxima[grid_kind][1] = maxima[grid_kind][1].max(error);
+                        let fraction = if grid_kind == 0 { 0.1 } else { 0.4 };
+                        assert!(
+                            error < fraction * linear_error + 2e-5,
+                            "v={v} d={d} f0={f0} dt={dt} phase={phase} t0={t0e}: interpolation {error:.6} Hz, linear {linear_error:.6} Hz"
+                        );
+                    }
+                }
+            }
+        }
+        // Even at the top of the tone bank, the full-grid numerical error stays below
+        // one eighth of the existing 0.2%-of-carrier model-error floor.
+        assert!(maxima[0][1] < 0.275, "{maxima:?}");
+        eprintln!(
+            "fractional Doppler grids [linear, interpolated] Hz: fine {:?}, quick {:?}",
+            maxima[0], maxima[1]
+        );
+    }
+
+    #[test]
+    fn ratio_grid_interpolation_preserves_support_and_local_bounds() {
+        let polynomial = |t: f64| 1.2 - 0.02 * t + 0.0004 * t * t * t;
+        let g = RatioGrid {
+            t0: -2.0,
+            dt: 1.0,
+            r: (-2..=4).map(|k| polynomial(k as f64)).collect(),
+        };
+        for t in [-0.87, -0.33, 0.15, 0.72, 1.63] {
+            assert!((g.at(t) - polynomial(t)).abs() < 1e-13);
+        }
+        for values in [
+            [f64::NAN, 1.2, 1.0, 0.9],
+            [1.3, 1.2, 1.0, f64::NAN],
+            [1.3, 1.2, 1.0, 8.0],
+            [0.2, 1.2, 1.0, 0.9],
+            [1.3, 1.2, 1.2, 0.9],
+        ] {
+            let g = RatioGrid {
+                t0: 0.0,
+                dt: 1.0,
+                r: values.to_vec(),
+            };
+            for k in 0..100 {
+                let t = 1.0 + k as f64 / 100.0;
+                let r = g.at(t);
+                assert!(r >= values[1].min(values[2]) && r <= values[1].max(values[2]));
+            }
+        }
+        let hole = RatioGrid {
+            t0: 0.0,
+            dt: 1.0,
+            r: vec![1.3, 1.2, f64::NAN, 1.0, 0.9],
+        };
+        for t in [
+            1.0,
+            1.3,
+            1.9,
+            2.0,
+            2.4,
+            2.9,
+            -0.1,
+            4.0,
+            f64::NAN,
+            f64::INFINITY,
+            1e300,
+        ] {
+            assert!(hole.at(t).is_nan(), "unsupported t={t}");
+        }
+        assert_eq!(hole.at(3.5), 0.95);
     }
 
     #[test]
@@ -5018,6 +5302,73 @@ mod tests {
             (ev.q_t, ev.q_f) = subsample(&ev.tr_t, &ev.tr_f, 40);
         }
         (case, assign)
+    }
+
+    #[test]
+    fn close_pass_refinement_is_stable_across_prediction_grid_phases() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let mut maximum_error = 0.0_f64;
+        for phase in [0.07, 0.29, 0.61] {
+            let (mut case, assign) = analytic_two_flyover_case();
+            let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+            for (k, (position, velocity, f0)) in [
+                ([0.0, 160.0, 120.0 + MIC_HEIGHT_M], [175.0, 0.0, 0.0], 500.0),
+                ([180.0, 0.0, 140.0 + MIC_HEIGHT_M], [0.0, 130.0, 0.0], 450.0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let relative = sub(position, [0.0, 0.0, MIC_HEIGHT_M]);
+                let (d, v, te) = (norm(relative), norm(velocity), assign[k].2);
+                case.tracks[k] =
+                    straight_track(&enu, position, velocity, te, te - 120.0, te + 120.0, 5.0);
+                let event = &mut case.events[k];
+                event.t_rec = te + d / 343.0 - case.t_s;
+                event.v_gate = [0.9 * v, 1.1 * v];
+                event.d_gate = [0.8 * d, 1.25 * d];
+                event.f0 = f0;
+                event.f0_tol = 0.04 * f0;
+                event.sigma_hz = 0.002 * f0;
+                event.n_eff = 7.0;
+                event.tr_t = (0..=180)
+                    .map(|i| event.t_rec - 18.0 + (i as f64 + phase) * 0.2)
+                    .collect();
+                // Known reception-time curve, independent of the interpolated ADS-B path.
+                event.tr_f = event
+                    .tr_t
+                    .iter()
+                    .map(|&t| cv_curve(t, f0, v, d, te - case.t_s, 343.0))
+                    .collect();
+                (event.q_t, event.q_f) = subsample(&event.tr_t, &event.tr_f, 40);
+            }
+            case.p.refine_half_m = 75.0;
+            case.p.refine_step_m = 25.0;
+            let (lat, lon, _) = enu.to_geodetic([13.4, -9.2, 0.0]);
+            let refined = refine_on(
+                lat,
+                lon,
+                &assign,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &dem,
+                &atmo,
+                &mut None,
+            )
+            .unwrap();
+            let error = haversine_m(refined.lat, refined.lon, case.obs.0, case.obs.1);
+            maximum_error = maximum_error.max(error);
+            assert!(
+                error < 0.5,
+                "phase {phase}: close-pass observer error {error:.6} m"
+            );
+            assert!((refined.t_start_utc - case.t_s).abs() < 0.01);
+            assert!(refined.radius_m >= 75.0);
+        }
+        eprintln!(
+            "close-pass interpolation calibration: maximum observer error {maximum_error:.6} m"
+        );
     }
 
     #[test]

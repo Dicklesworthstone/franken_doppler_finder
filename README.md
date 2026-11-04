@@ -257,6 +257,17 @@ same weighted trace objective. This prevents a noisy pass from pulling the repor
 weighting while the radius describes another. The radius remains conditional on the flight assignments and
 propagation model; this numerical consistency does not calibrate the search-wide confidence grade.
 
+Trace scoring retains the original least-squares tone fit and also tries a robust emitted-tone estimate
+from the median of observed frequency divided by predicted Doppler ratio. The alternative is used only
+when it improves the same capped residual objective. This prevents a minority of stray ridge points from
+shifting the fitted tone enough to escape the existing outlier trim. Tone bounds, missing-coverage penalties,
+the raw RMS diagnostic and the core-match thresholds remain in force.
+
+Between stored Doppler predictions, the search uses a four-point cubic on a finite, monotone stretch,
+bounded by the two bracketing predictions. This reduces curvature bias for close, fast passes without
+additional emission-time solves or a denser table. Boundaries, turns, plateaus and gaps retain the linear
+fallback; missing bracketing samples remain missing.
+
 The reported candidate is regenerated at the refined position and its fitted recording clock: terrain
 elevation, trace fits, independent clock checks, core matches, unheard close passes, evidence and the final
 margin all refer to that same solution. If a locating match fails reevaluation, the coherent coarse candidate
@@ -746,7 +757,30 @@ the configured fallback allowance after the preferred request has been tried.
 
 ## Testing
 
-### Spatial and frequency calibration
+### Trace scoring and prediction interpolation
+
+All **43 search tests pass**, including the existing exact trace-buffer oracle, tone-change regression,
+candidate/refinement coherence, negative controls and the still-air/wind localization cases.
+
+`robust_tone_recovers_doppler_curve_despite_masked_contaminants` puts stray emitted tones in 15% of a
+synthetic Doppler trace. The original tone fit gives chi 7.596113 and a 0.372711 Hz tone error; the additional
+robust candidate recovers the known tone and gives chi 3.75 under the unchanged residual cap. The core-fit
+limit remains chi 4. Negative controls retain wrong-curve rejection, tone bounds and missing-data penalties;
+raw RMS continues to expose the contaminated samples.
+
+`ratio_grid_interpolation_resolves_close_passes_between_samples` checks fractional queries against an
+independent retarded-time/radial-velocity oracle, across six speed/range/tone combinations, three sample
+phases, two timestamp origins and both prediction-grid spacings. Maximum frequency error falls from
+3.352338 to 0.228055 Hz on the 0.2 s full grid, and from 20.252859 to 6.355502 Hz on the 0.5 s quick grid.
+Support and local-extremum tests check the fallback beside gaps, at boundaries and around reversals.
+`close_pass_refinement_is_stable_across_prediction_grid_phases` follows two close, fast passes through the
+actual position/clock refinement; its three phases recover the synthetic observer within 0.212 m while
+retaining the 75 m radius floor. Its linear-interpolation baseline has the same maximum position error:
+that test checks integration stability, while the fractional-query test establishes the frequency improvement.
+These are conditional numerical calibration cases, not field accuracy or
+empirical confidence coverage. Reference and wrong-date replays remain pending for these changes.
+
+### Prior spatial and frequency calibration (`b8c0819`)
 
 The combined pinned-nightly run passes **88 core tests and 13 shared-type tests: 101 total**, with
 zero failures or ignored tests. This includes the two FFmpeg/FFprobe integration tests. The new coverage

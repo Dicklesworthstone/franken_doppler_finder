@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Robust emitted-tone fitting and accurate fractional Doppler predictions
+
+- Search trace scoring adds a median-frequency-ratio tone candidate, followed by the existing trimming
+  and bounded tone refit. The original single-tone and tone-change proposals remain available; the new
+  candidate replaces the result only when its existing capped residual score is strictly lower. It reuses
+  the trace scratch buffer. No residual cap, tone bound, coverage penalty or evidence threshold changes.
+  `robust_tone_recovers_doppler_curve_despite_masked_contaminants` reproduces the old fit's chi 7.596113
+  and 0.372711 Hz tone error with 15% stray tone points; the new fit recovers the known tone and chi 3.75,
+  passing the unchanged core-fit limit of 4. Raw RMS still reports contamination. The paired negative
+  controls cover wrong curves, out-of-bounds tones and incomplete coverage.
+- `RatioGrid` interpolates finite monotone stretches with a four-point cubic, constrained to the two
+  bracketing values, with the existing linear fallback at boundaries, reversals and gaps. Invalid or huge
+  query times return an unavailable prediction rather than overflowing an index. The grid density and
+  number of physical emission-time solves do not increase.
+- `ratio_grid_interpolation_resolves_close_passes_between_samples` checks an independent analytic
+  retarded-time/radial-velocity oracle across six physical passes, three grid phases, two timestamp
+  origins and both grid spacings. Full-grid maximum error falls from 3.352338 to 0.228055 Hz; quick-grid
+  maximum error falls from 20.252859 to 6.355502 Hz. `ratio_grid_interpolation_preserves_support_and_local_bounds`
+  checks cubic exactness, gaps, boundaries, plateaus and reversal bounds.
+- `close_pass_refinement_is_stable_across_prediction_grid_phases` exercises actual spatial and shared-clock
+  refinement with 200 m and 228 m slant-distance passes. All three phases recover the synthetic observer
+  within 0.212 m, retaining the 75 m radius floor and strict 0.5 m position / 0.01 s clock test limits.
+  The old linear interpolation also gives 0.211475 m maximum error on this fixture: it checks integration
+  stability, not a measured position improvement. The fractional-query test establishes the frequency gain.
+  These are conditional numerical tests, not empirical coverage or field accuracy; real-recording and
+  wrong-date replays remain pending.
+- All 43 search tests pass with the pinned nightly, including unchanged exact trace-buffer and tone-change
+  regressions, candidate/refinement coherence, wrong-curve controls, and still-air/wind localization.
+  Workspace formatting and `git diff --check` pass.
+
 ### `search.json` no longer grows with the search; missing winds aloft fall back
 
 - **`search.json` keeps the best 10,000 candidates, with a new field `candidates_total`.** A complete comparison had
