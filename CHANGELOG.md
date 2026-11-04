@@ -19,7 +19,7 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
-### Search driver selection
+### Search driver selection ([`b2a6906`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/b2a69069876e5d25f319305ffc7f46ca9ffd6ba0))
 
 - Events with no eligible ADS-B hypotheses no longer consume `--max-events` driver slots or form empty
   event pairs. Previously, a stronger unmatched flyover could occupy a slot and exclude a weaker, genuinely
@@ -44,6 +44,12 @@ at that commit, not per-change commits.
 
 ### Changes
 
+- The deferred-measurement regression now also exercises first-round and later-round fitting failures on
+  synthetic audio. It checks that a failed later round retains the last successful trace and its own complete
+  fit, reports the failure, and rejects the event. A failed first round retains its trace for inspection and
+  returns no fit. The concurrent `PreparedFit` implementation and its eager/deferred equivalence tests are
+  preserved. All 25 core tests pass on the integrated code, including curved-track and search-driver recovery.
+  Core all-target Clippy with warnings denied, workspace formatting and the Rust bug scan also pass.
 - Successful Open-Meteo pressure-level weather no longer waits for or requests unused radiosonde and surface
   fallbacks. If the preferred source fails, the two fallbacks still load concurrently with the same selection
   order and warning behavior. Five offline tests cover the preferred source and every fallback combination.
@@ -53,9 +59,10 @@ at that commit, not per-change commits.
   accepted ridge trace. All refinement rounds keep the same robust point fits and model/band updates; the
   public fitting API still returns complete diagnostics. A failed later round retains the last successful
   trace with its own fit. Two synthetic regressions compare exact point estimates, trace arrays and all
-  serialized fit fields against eager refinement. The diagnostic arithmetic is unchanged. Formatting and
-  source review passed, but Cargo execution was blocked by dependency OOM failures and environment loss;
-  these new tests and real-recording timings remain unverified.
+  serialized fit fields against eager refinement. The diagnostic arithmetic is unchanged. These equivalence
+  tests now pass as part of the 25-test core suite after recovery from the earlier dependency OOM and
+  environment loss. The run used the pinned nightly with one build job and unoptimised dependencies;
+  real-recording timings remain unverified.
 - An explicit `locate --start` now limits archive-availability checks, weather retrieval and ADS-B downloads
   as well as the search. A broader `--dates` range no longer requires unrelated UTC-day archives, so a known
   recording clock can run with only its required days cached. Track padding and recordings crossing UTC

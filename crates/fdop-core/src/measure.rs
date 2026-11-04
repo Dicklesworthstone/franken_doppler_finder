@@ -136,6 +136,17 @@ pub fn guided_trace(
 
 /// Measure one detection. `x` is the whole recording at `sr`; times are recording seconds.
 pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams) -> MeasuredEvent {
+    measure_with_fit(x, sr, det, id, p, prepare_constant_velocity)
+}
+
+fn measure_with_fit(
+    x: &[f32],
+    sr: u32,
+    det: &Detection,
+    id: &str,
+    p: &MeasureParams,
+    mut fit_trace: impl FnMut(&[f64], &[f64], f64, Side) -> Result<PreparedFit, String>,
+) -> MeasuredEvent {
     let c = p.c;
     let dur = x.len() as f64 / sr as f64;
     let tau = det.d / det.v.max(10.0);
@@ -190,7 +201,7 @@ pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams)
             }
             break;
         }
-        match prepare_constant_velocity(&tr.t, &tr.f, c, Side::Both) {
+        match fit_trace(&tr.t, &tr.f, c, Side::Both) {
             Ok(fr) => {
                 let b = fr.best();
                 model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
@@ -378,5 +389,78 @@ mod tests {
         assert!((fr.best.f0 - f0).abs() < 0.3, "f0 {}", fr.best.f0);
         assert!((fr.best.v - v).abs() < 4.0, "v {}", fr.best.v);
         assert!((fr.best.d / d - 1.0).abs() < 0.08, "d {}", fr.best.d);
+    }
+
+    #[test]
+    fn failed_later_round_retains_successful_trace_and_fit() {
+        let sr = 1000;
+        let (f0, v, d, t0r) = (118.0, 120.0, 3000.0, 100.0);
+        let mut phase = 0.0;
+        let mut seed = 99u64;
+        let x: Vec<f32> = (0..180 * sr)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr as f64;
+                phase += std::f64::consts::TAU * cv_curve(t, f0, v, d, t0r - d / 343.0, 343.0)
+                    / sr as f64;
+                (0.15 * phase.sin() + 0.9 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0)) as f32
+            })
+            .collect();
+        let det = Detection {
+            id: 1,
+            t0r,
+            f0: f0 + 1.0,
+            v: v - 2.0,
+            d: d + 300.0,
+            score: 8.0,
+            score_approach: 8.0,
+            score_recede: 8.0,
+            half_s: 75.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+        };
+        let mut p = MeasureParams {
+            hop_s: 0.25,
+            rounds: 1,
+            ..Default::default()
+        };
+        let first = measure(&x, sr, &det, "e1", &p);
+        assert!(first.quality.ok, "{:?}", first.quality.reasons);
+        p.rounds = 3;
+        let mut rounds = 0;
+        let interrupted = measure_with_fit(&x, sr, &det, "e1", &p, |t, f, c, side| {
+            rounds += 1;
+            if rounds == 1 {
+                prepare_constant_velocity(t, f, c, side)
+            } else {
+                assert_ne!(f, first.trace.f);
+                Err("injected fit failure".into())
+            }
+        });
+        assert_eq!(rounds, 2);
+        assert_eq!(
+            serde_json::to_value(&interrupted.trace).unwrap(),
+            serde_json::to_value(&first.trace).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&interrupted.fit).unwrap(),
+            serde_json::to_value(&first.fit).unwrap()
+        );
+        assert_eq!(interrupted.quality.n_points, first.trace.len());
+        assert!(!interrupted.quality.ok);
+        assert_eq!(interrupted.quality.reasons, ["fit: injected fit failure"]);
+
+        // If the first fit fails, keep that trace for inspection and report no fit.
+        let failed = measure_with_fit(&x, sr, &det, "e1", &p, |_, _, _, _| {
+            Err("injected fit failure".into())
+        });
+        assert!(failed.fit.is_none());
+        assert!(!failed.quality.ok);
+        assert_eq!(
+            serde_json::to_value(failed.trace).unwrap(),
+            serde_json::to_value(first.trace).unwrap()
+        );
     }
 }
