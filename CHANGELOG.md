@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Resumable archive completion
+
+- A successful partial response no longer implies that the whole archive is complete. Its range-body length
+  stays separate from the object's total length, including `Content-Range: bytes 10-49/*`. Downloads continue
+  through successive capped ranges and require an explicit matching total, a complete full response, or an
+  exact `416 bytes */N` completion proof. Successful progress does not consume the no-progress retry budget.
+- Each response's end offset is checked before forwarding bytes, including chunked responses without
+  `Content-Length`. Invalid or changed totals, reversed or overflowing ranges, and premature EOF are rejected.
+  Servers that ignore `Range` still use the existing prefix-skip recovery without duplicating bytes.
+- Three tests of the exact production byte-extent helper passed, with the previous unknown-total inference
+  reproducing a failure. Standalone Clippy with warnings denied, pinned formatting and the Rust bug scan passed.
+  Three additional loopback regressions are present but unrun because the execution environment disconnected.
+  The recovered source's Git blob matches the tested/formatted source exactly. Object identity/ETag handling
+  is unchanged; these checks establish byte accounting and completion, not cryptographic identity.
+
 ### Close-flyover search coverage
 
 - Close flyovers can now seed the search when their allowed distances fall entirely between the

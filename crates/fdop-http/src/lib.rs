@@ -91,9 +91,9 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     let rest = value.trim().strip_prefix("bytes ")?;
     let (range, total) = rest.split_once('/')?;
     let (start, end) = range.split_once('-')?;
-    let start = start.parse().ok()?;
-    let end = end.parse().ok()?;
-    if end < start {
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    if end < start || end.checked_add(1).is_none() {
         return None;
     }
     let total = if total == "*" {
@@ -101,7 +101,107 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     } else {
         Some(total.parse().ok()?)
     };
+    if total.is_some_and(|n| end >= n) {
+        return None;
+    }
     Some((start, end, total))
+}
+
+/// Exclusive byte offsets in the representation, not HTTP message-body lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamExtent {
+    end: Option<u64>,
+    total: Option<u64>,
+    partial: bool,
+}
+
+impl StreamExtent {
+    fn from_response(
+        status: u16,
+        headers: &[(String, String)],
+        start_at: u64,
+        previous_total: Option<u64>,
+    ) -> Result<Self, String> {
+        if status == 416 && start_at > 0 {
+            let total = header_of(headers, "content-range")
+                .and_then(|v| v.trim().strip_prefix("bytes */"))
+                .and_then(|n| n.parse::<u64>().ok());
+            if total != Some(start_at) || previous_total.is_some_and(|old| total != Some(old)) {
+                return Err("unsatisfied range does not prove the downloaded length".into());
+            }
+            return Ok(Self {
+                end: total,
+                total,
+                partial: false,
+            });
+        }
+        if start_at > 0 && !matches!(status, 200 | 206) {
+            return Err("resume refused".into());
+        }
+        if !(200..300).contains(&status) {
+            return Err("unexpected status".into());
+        }
+        let content_length =
+            header_of(headers, "content-length").and_then(|v| v.trim().parse::<u64>().ok());
+        let (end, total) = if status == 206 {
+            let raw = header_of(headers, "content-range")
+                .ok_or("partial response missing Content-Range")?;
+            let (start, end, total) =
+                parse_content_range(raw).ok_or_else(|| format!("invalid Content-Range: {raw}"))?;
+            if start != start_at {
+                return Err(format!(
+                    "resume started at byte {start}, expected {start_at}"
+                ));
+            }
+            let range_len = end - start + 1;
+            if let Some(cl) = content_length
+                && cl != range_len
+            {
+                return Err(format!(
+                    "partial Content-Length {cl} disagrees with Content-Range length {range_len}"
+                ));
+            }
+            // Content-Length describes this range only. Even an open-ended
+            // request may be fulfilled in smaller pieces (RFC 9110, 15.3.7).
+            (Some(end + 1), total)
+        } else {
+            (content_length, content_length)
+        };
+        if let (Some(old), Some(new)) = (previous_total, total)
+            && old != new
+        {
+            return Err(format!("response total changed from {old} to {new} bytes"));
+        }
+        let total = total.or(previous_total);
+        let end = if status == 206 { end } else { total };
+        if end.is_some_and(|n| n < start_at || total.is_some_and(|t| n > t)) {
+            return Err("response byte range lies outside the declared object length".into());
+        }
+        Ok(Self {
+            end,
+            total,
+            partial: status == 206,
+        })
+    }
+
+    fn check_position(self, next: u64) -> Result<(), String> {
+        if let Some(end) = self.end
+            && next > end
+        {
+            return Err(format!("response body exceeds declared end at byte {end}"));
+        }
+        Ok(())
+    }
+
+    fn complete(self, delivered: u64, skip: u64) -> Result<bool, String> {
+        self.check_position(delivered)?;
+        if skip > 0 || self.end.is_some_and(|end| delivered < end) {
+            return Err(format!("truncated response at byte {delivered}"));
+        }
+        // A clean partial-response EOF proves only that this range ended. An
+        // unknown total needs another range, or a matching 416 bytes */N response.
+        Ok(!self.partial || self.total == Some(delivered))
+    }
 }
 
 /// One asupersync runtime + one pooled HTTP client.
@@ -264,7 +364,7 @@ impl Net {
             let idle = self.body_idle;
             let mut got_this_attempt: u64 = 0;
             let mut skip: u64 = 0;
-            let outcome: Result<(), HttpError> = self.rt.block_on(async {
+            let outcome: Result<bool, HttpError> = self.rt.block_on(async {
                 let cx = Cx::current()
                     .ok_or_else(|| HttpError::new(&u, None, "no asupersync context"))?;
                 let mut resp = client
@@ -272,63 +372,19 @@ impl Net {
                     .await
                     .map_err(|e| HttpError::new(&u, None, format!("{e:?}")))?;
                 let status = resp.head.status;
-                if start_at > 0 {
-                    match status {
-                        206 => {}
-                        200 => skip = start_at, // server ignored Range: discard what we already have
-                        s => return Err(HttpError::new(&u, Some(s), "resume refused")),
-                    }
-                } else if !(200..300).contains(&status) {
-                    return Err(HttpError::new(&u, Some(status), "unexpected status"));
+                let extent = StreamExtent::from_response(
+                    status,
+                    &resp.head.headers,
+                    start_at,
+                    expected_total,
+                )
+                .map_err(|m| HttpError::new(&u, Some(status), m))?;
+                expected_total = extent.total;
+                if status == 416 {
+                    return Ok(true); // validated bytes */N proves that the prefix is complete
                 }
-                let content_length = header_of(&resp.head.headers, "content-length")
-                    .and_then(|v| v.trim().parse::<u64>().ok());
-                if status == 206 {
-                    let raw = header_of(&resp.head.headers, "content-range").ok_or_else(|| {
-                        HttpError::new(&u, Some(status), "partial response missing Content-Range")
-                    })?;
-                    let (range_start, range_end, range_total) =
-                        parse_content_range(raw).ok_or_else(|| {
-                            HttpError::new(
-                                &u,
-                                Some(status),
-                                format!("invalid Content-Range: {raw}"),
-                            )
-                        })?;
-                    if range_start != start_at {
-                        return Err(HttpError::new(
-                            &u,
-                            Some(status),
-                            format!("resume started at byte {range_start}, expected {start_at}"),
-                        ));
-                    }
-                    let range_len = range_end - range_start + 1;
-                    if let Some(cl) = content_length
-                        && cl != range_len
-                    {
-                        return Err(HttpError::new(
-                            &u,
-                            Some(status),
-                            format!(
-                                "partial Content-Length {cl} disagrees with Content-Range length {range_len}"
-                            ),
-                        ));
-                    }
-                    let total = range_total.or_else(|| content_length.map(|cl| start_at + cl));
-                    if let (Some(old), Some(new)) = (expected_total, total)
-                        && old != new
-                    {
-                        return Err(HttpError::new(
-                            &u,
-                            Some(status),
-                            format!("partial response total changed from {old} to {new} bytes"),
-                        ));
-                    }
-                    if expected_total.is_none() {
-                        expected_total = total;
-                    }
-                } else if expected_total.is_none() {
-                    expected_total = content_length;
+                if status == 200 {
+                    skip = start_at; // server ignored Range: discard what we already have
                 }
                 loop {
                     if cancel.load(Ordering::Relaxed) {
@@ -339,27 +395,31 @@ impl Net {
                         .await
                         .map_err(|_| HttpError::new(&u, None, format!("body idle for {idle:?}")))?;
                     match frame {
-                        None => return Ok(()),
+                        None => {
+                            return extent
+                                .complete(start_at + got_this_attempt, skip)
+                                .map_err(|m| HttpError::new(&u, None, m));
+                        }
                         Some(Ok(Frame::Data(mut data))) => {
                             while data.has_remaining() {
                                 let chunk = data.chunk();
                                 let n = chunk.len();
                                 let mut piece = chunk;
                                 if skip > 0 {
-                                    let k = (skip as usize).min(piece.len());
+                                    let k = skip.min(piece.len() as u64) as usize;
                                     piece = &piece[k..];
                                     skip -= k as u64;
                                 }
                                 if !piece.is_empty() {
-                                    if let Some(total) = expected_total
-                                        && start_at + got_this_attempt + piece.len() as u64 > total
-                                    {
-                                        return Err(HttpError::new(
-                                            &u,
-                                            Some(status),
-                                            format!("response body exceeds declared total of {total} bytes"),
-                                        ));
-                                    }
+                                    let next = start_at
+                                        .checked_add(got_this_attempt)
+                                        .and_then(|n| n.checked_add(piece.len() as u64))
+                                        .ok_or_else(|| {
+                                            HttpError::new(&u, Some(status), "body offset overflow")
+                                        })?;
+                                    extent
+                                        .check_position(next)
+                                        .map_err(|m| HttpError::new(&u, Some(status), m))?;
                                     sink(piece).map_err(|m| {
                                         HttpError::new(&u, Some(499), format!("sink: {m}"))
                                     })?;
@@ -376,33 +436,19 @@ impl Net {
                 }
             });
             delivered += got_this_attempt;
+            if got_this_attempt > 0 {
+                attempt = 0;
+            }
             match outcome {
-                Ok(()) => {
-                    if let Some(t) = expected_total
-                        && delivered < t
-                    {
-                        // Clean EOF before Content-Length: treat as a dropped connection.
-                        attempt += 1;
-                        if attempt > self.retries + 4 {
-                            return Err(HttpError::new(
-                                url,
-                                None,
-                                format!("truncated at {delivered}/{t} bytes"),
-                            ));
-                        }
-                        std::thread::sleep(Duration::from_secs(2));
-                        continue;
-                    }
-                    return Ok(delivered);
-                }
+                Ok(true) => return Ok(delivered),
+                Ok(false) => continue, // a complete range, with more of the object still to fetch
                 Err(e) if e.status == Some(499) => return Err(e),
                 Err(e) if e.transient() => {
-                    attempt += 1;
+                    if got_this_attempt == 0 {
+                        attempt += 1;
+                    }
                     if attempt > self.retries + 4 {
                         return Err(e);
-                    }
-                    if got_this_attempt > 0 {
-                        attempt = attempt.saturating_sub(1); // progress resets the budget
                     }
                     std::thread::sleep(Duration::from_millis(500 * (1 << attempt.min(5))));
                 }
@@ -555,6 +601,90 @@ mod tests {
         assert!(!HttpError::new("u", Some(404), "").transient());
     }
 
+    fn extent_headers(range: &str, length: Option<u64>) -> Vec<(String, String)> {
+        let mut headers = vec![("Content-Range".into(), range.into())];
+        if let Some(n) = length {
+            headers.push(("Content-Length".into(), n.to_string()));
+        }
+        headers
+    }
+
+    #[test]
+    fn partial_ranges_keep_object_length_separate_from_body_length() {
+        for previous in [None, Some(100)] {
+            let extent = StreamExtent::from_response(
+                206,
+                &extent_headers("bytes 10-49/*", Some(40)),
+                10,
+                previous,
+            )
+            .unwrap();
+            assert_eq!(extent.total, previous);
+            assert_eq!(extent.end, Some(50));
+            assert!(!extent.complete(50, 0).unwrap());
+        }
+    }
+
+    #[test]
+    fn stream_extents_enforce_declared_response_boundaries() {
+        for range in [
+            "bytes 10-9/100",
+            "bytes 10-100/100",
+            "bytes 0-0/0",
+            "bytes 0-18446744073709551615/*",
+        ] {
+            assert!(parse_content_range(range).is_none(), "{range}");
+        }
+        let extent = StreamExtent::from_response(
+            206,
+            &extent_headers("bytes 10-19/100", None),
+            10,
+            Some(100),
+        )
+        .unwrap();
+        assert!(extent.check_position(20).is_ok());
+        assert!(extent.check_position(21).is_err());
+        assert!(extent.complete(19, 0).is_err());
+        assert!(!extent.complete(20, 0).unwrap());
+        assert!(
+            StreamExtent::from_response(200, &extent_headers("", Some(101)), 10, Some(100))
+                .is_err()
+        );
+        let full = StreamExtent::from_response(200, &[], 10, None).unwrap();
+        assert!(full.complete(10, 1).is_err()); // ignored Range ended before the skipped prefix
+        assert!(full.complete(100, 0).unwrap()); // a complete 200 body does prove EOF
+    }
+
+    #[test]
+    fn range_eof_requires_a_matching_object_total() {
+        let headers = extent_headers("bytes */100", Some(0));
+        for previous in [None, Some(100)] {
+            let extent = StreamExtent::from_response(416, &headers, 100, previous).unwrap();
+            assert!(extent.complete(100, 0).unwrap());
+        }
+        for (range, start, previous) in [
+            ("bytes */99", 100, None),
+            ("bytes */101", 100, None),
+            ("bytes */100", 100, Some(101)),
+            ("bytes */*", 100, None),
+            ("bytes */0", 0, None),
+        ] {
+            assert!(
+                StreamExtent::from_response(416, &extent_headers(range, Some(0)), start, previous)
+                    .is_err(),
+                "{range} at {start} with previous {previous:?}"
+            );
+        }
+        let extent = StreamExtent::from_response(
+            206,
+            &extent_headers("bytes 90-99/100", Some(10)),
+            90,
+            None,
+        )
+        .unwrap();
+        assert!(extent.complete(100, 0).unwrap());
+    }
+
     /// Read one request head; return it lower-cased.
     fn read_head(sock: &mut std::net::TcpStream) -> String {
         let mut head = Vec::new();
@@ -638,6 +768,123 @@ mod tests {
             "{err}"
         );
         assert_eq!(got, (0u8..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resume_rejects_chunked_body_beyond_content_range() {
+        let mut body = b"b\r\n".to_vec();
+        body.extend(10u8..21);
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (err, got) = serve_truncated_then_partial(
+            b"HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nContent-Range: bytes 10-19/100\r\nConnection: close\r\n\r\n",
+            body,
+        );
+        assert!(err.contains("exceeds declared end at byte 20"), "{err}");
+        // A frame may contain some or all of the valid range before the overrun.
+        // No byte outside that range may reach the sink.
+        assert!((10..=20).contains(&got.len()), "{} bytes", got.len());
+        assert_eq!(got, (0u8..got.len() as u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resumes_capped_ranges_until_the_whole_object_is_proven_complete() {
+        for known_length in [true, false] {
+            let body: Vec<u8> = (0..100).collect();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let served = body.clone();
+            let server = std::thread::spawn(move || {
+                let (mut first, _) = listener.accept().expect("accept first");
+                let _ = read_head(&mut first);
+                if known_length {
+                    first
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+                        )
+                        .expect("head first");
+                } else {
+                    first.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\na\r\n").expect("head first");
+                }
+                first.write_all(&served[..10]).expect("first bytes");
+                if !known_length {
+                    first.write_all(b"\r\n").expect("chunk end");
+                }
+                drop(first); // incomplete body, including missing final chunk when length is unknown
+                // More successful ranges than the no-progress retry budget. Their
+                // message lengths must neither become object lengths nor use up retries.
+                for start in (10..100).step_by(10) {
+                    let (mut sock, _) = listener.accept().expect("accept range");
+                    let request = read_head(&mut sock);
+                    assert!(
+                        request.contains(&format!("range: bytes={start}-")),
+                        "{request}"
+                    );
+                    write!(sock, "HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\nContent-Range: bytes {start}-{}/*\r\nConnection: close\r\n\r\n", start + 9).expect("range head");
+                    sock.write_all(&served[start..start + 10])
+                        .expect("range bytes");
+                }
+                if !known_length {
+                    let (mut sock, _) = listener.accept().expect("accept final probe");
+                    let request = read_head(&mut sock);
+                    assert!(request.contains("range: bytes=100-"), "{request}");
+                    sock.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */100\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("complete length");
+                }
+            });
+            let net = Net::new().expect("net").with_retries(0);
+            let mut got = Vec::new();
+            let n = net
+                .stream(
+                    &format!("http://{addr}/blob"),
+                    &[],
+                    &AtomicBool::new(false),
+                    &mut |c| {
+                        got.extend_from_slice(c);
+                        Ok(())
+                    },
+                )
+                .expect("segmented download");
+            assert_eq!(n, 100);
+            assert_eq!(got, body);
+            server.join().expect("server");
+        }
+    }
+
+    #[test]
+    fn ignored_range_resumes_without_duplicating_the_prefix() {
+        let body: Vec<u8> = (0..100).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let served = body.clone();
+        let server = std::thread::spawn(move || {
+            for n in [10, 100] {
+                let (mut sock, _) = listener.accept().expect("accept");
+                let request = read_head(&mut sock);
+                if n == 100 {
+                    assert!(request.contains("range: bytes=10-"), "{request}");
+                }
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+                )
+                .expect("head");
+                sock.write_all(&served[..n]).expect("bytes");
+            }
+        });
+        let mut got = Vec::new();
+        let n = Net::new()
+            .expect("net")
+            .stream(
+                &format!("http://{addr}/blob"),
+                &[],
+                &AtomicBool::new(false),
+                &mut |c| {
+                    got.extend_from_slice(c);
+                    Ok(())
+                },
+            )
+            .expect("ignored Range download");
+        assert_eq!(n, 100);
+        assert_eq!(got, body);
+        server.join().expect("server");
     }
 
     #[test]
