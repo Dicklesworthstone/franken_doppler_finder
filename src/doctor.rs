@@ -42,7 +42,7 @@ pub fn run(network: bool, cache: &std::path::Path) -> i32 {
             w.err().map(|e| e.to_string()).unwrap_or_default()
         ),
     );
-    // dependency smoke (FFT, least squares, k-d tree, frankenpandas, fsqlite)
+    // dependency smoke: FFT and k-d tree here, fsqlite below
     let x = vec![1.0, 0.0, -1.0, 0.0];
     let fft = fsci_fft::rfft(&x, &fsci_fft::FftOptions::default()).map(|v| v.len());
     line(fft.is_ok(), "fsci-fft", &format!("{fft:?}"));

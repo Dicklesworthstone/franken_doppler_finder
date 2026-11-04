@@ -1709,7 +1709,6 @@ dependencies = [
  "fdop-geo",
  "fdop-http",
  "fdop-types",
- "frankenpandas",
  "fsci-fft",
  "fsci-spatial",
  "fsqlite",
