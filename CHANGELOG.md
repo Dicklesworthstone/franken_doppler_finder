@@ -19,6 +19,133 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Complete comparisons, and refusing fits with no ridge through their drop
+
+- **Why.** `9620d2e` fails the margin gate on any recorded comparison cut, and `fine: N -> 4000` fired on every real
+  search with candidates, so every real recording graded low. The cut also hid real answers: on the county search
+  with `3f00c61`'s events, the best explanation sat at position 40,145 of 48,347 in the fine queue.
+-
+  [`2605b0d`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/2605b0dbe97c9ff81145fc79da48226f7e7b6d81)
+  **Budgets.** `max_quick` 3 M → 20 M, `max_fine` 4,000 → 2 M, `max_confirm` 2,000 → 2 M, above the largest searches
+  estimated from real runs (about 11 M joined points, 1 M fine cells). A cut is still recorded and warned, and it
+  still fails the gate. There is no flag for them. `dedupe` compares a candidate only with kept candidates that have
+  the same matches, with the same result, and the fine grid logs its progress on stderr.
+-
+  [`f390c60`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/f390c6039bbe02fde6b5c554cd809c9d1c94005c)
+  **Speed.** Each solve in a ratio grid's time sweep starts from the last solve's interval, and Newton stops at a
+  1e-4 s step there, which makes these grids 2.54 times faster on 806 cells of a real run. Chi moved by at most
+  0.024 and no best point changed. Extrapolating the start reached 3.57 times but changed 2 best points, and a
+  coarser ratio table lost best points in 21–37 % of cells, so neither is used.
+-
+  [`4b88d7c`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/4b88d7c1708cd85b33826ace03562ead48828029)
+  **False events.** A complete comparison reached fits that join two steady tones across an empty stretch. With the
+  budgets alone the state-wide reference search went 34.8 km off, low, resting on one. `events.json` now has
+  `quality.drop_traversed`, the share of the central 10–90 % of the fitted drop that the trace travels, and an event
+  under 0.15 is refused. The 0.15 line was picked with these recordings in view; synthetic tests justify its two
+  sides, and the replays can show harm, not validate it. This is a new field in `events.json`. `result.json` keeps
+  its fields, and a refused event's `quality` text there gives the reason.
+-
+  [`4b88d7c`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/4b88d7c1708cd85b33826ace03562ead48828029)
+  **Steep passes.** A first version of that check exempted chirps above 4 Hz/s, because real passes read 0 traversal
+  there too. An exempt false event (805 Hz, about 30 nats at chi 0.18) then put the state-wide search 15.6 km off,
+  so the exemption is gone and the tracer follows those passes. The limit came from `window_for_roc(roc).clamp(0.5,
+  2.0)`: a 0.5 s window stops holding a chirp at 1/win² = 4 Hz/s. Frames steeper than the main window holds read a
+  second spectrogram with a window matched to the latest fit. The first hypothesis, that the tangent integration was
+  the cause, was wrong: integrating along the curve alone left traversal at 0 from about 13 Hz/s.
+- **Synthetic evidence**, through `measure()` with the gate off, 81 passes at three tone strengths: silent crossings
+  over 0.15 went from 5 rows (3 accepted) to 1 (at 4.00 Hz/s, rejected by another gate). Real passes at or below 4
+  Hz/s are unchanged; median traversal above 10 Hz/s went from 0.00 to about 0.8; 6 of 81 stay under the line, all
+  at the weakest strength and at least 20 Hz/s. A detection half as steep as the pass still reads at least 0.42; a
+  quarter leaves 8 of 12 under the line, so the event is refused.
+- **Replays**, a local build of `7e5cf3e` whose code is that of `4b88d7c`, on an Apple M4 with 32 GiB, two runs at a
+  time (so the times are not clean). Each is read from its own `result.json`. No run recorded a pair, fine or
+  confirmation cut. The detection and measurement caps cut on most of them, with warnings: the reference runs kept
+  60 of 82 curves and measured 24 of 42, and the busiest recordings measured 24 of up to 59. Hypothesis-budget
+  demotions, also with warnings: four on the osprey run, five on its wrong-date run, one on `f_osprey_1031` and one
+  on each bird-feeder run.
+
+| Configuration | Run | Off by | Radius | Grade | Margin (nats) | Fine cells | Time |
+|---|---|---:|---:|---|---:|---:|---:|
+| county | `r_nassau_s7b` | 306 m | 316 m | high | 12.77 | 755 | 58 s |
+| state-wide | `r_ny_s7b` | 271 m | 304 m | medium | 5.01 | 12,119 | 226 s |
+| three-day | `r_md_s7b` | 271 m | 304 m | low | 2.92 | 50,751 | 509 s |
+| wrong date 09-07 | `n_ref_on_0907_s7a` | 138 km | 539 m | low | 2.37 | 30,171 | 359 s |
+| wrong date 09-09 | `n_ref_on_0909_s7a` | 73 km | 412 m | low | 5.49 | 8,456 | 124 s |
+| wrong date, bird-feeder cam | `n_feeder_on_1101_s7b` | 56 km | 1,619 m | low | 1.31 | 53,514 | 534 s |
+| wrong date, osprey cam | `n_osprey1101_on_1031_s7a` | 40 km | 665 m | low | 0.07 | 627,310 | 6,685 s |
+| wrong date, eagle cam | `n_duke_on_1102_s7a` | 106 km | 269 m | low | 2.07 | 233,794 | 1,489 s |
+| osprey cam, right date | `f_osprey_1101_s7b` | 223 m | 214 m | high | 24.93 | 893,697 | 9,602 s |
+| osprey cam, 10-31 | `f_osprey_1031_s7a` | 152 km | 403 m | low | 0.51 | 553,311 | 7,382 s |
+| osprey cam, 11-02 | `f_osprey_1102b_s7b` | 365 km | 193 m | low | 0.47 | 125,677 | 1,142 s |
+| eagle cam, Hillsborough, NJ | `f_duke_s7a` | about 2.3 km from the town | 214 m | low | 0.11 | 282,170 | 1,950 s |
+| bird-feeder cam, Ithaca, NY | `f_feederwatch_s7a` | 338 km | 818 m | low | 2.89 | 41,012 | 434 s |
+| railcam, Rochelle, IL | `f_rochelle_s7b` | 36 km | 474 m | low | 0.49 | 1,170 | 81 s |
+| railcam, Tucson, AZ | `f_tucson_s7a` | no location | | | | 0 | 80 s |
+| railcam, Plant City, FL | `f_plantcity_s7a` | no location | | | | 0 | 52 s |
+| railcam, Fullerton, CA | `f_fullerton_s7b` | no location | | | | 0 | 54 s |
+| eagle-nest cam, Lee County, FL, state search | `s_swfl_fl_s7b` | 135 km | 75 m | low | 0.20 | 408 | 219 s |
+| same recording, county search | `s_swfl_lee_s7a` | about 4 km | 92 m | low | no rival | 20 | 237 s |
+
+- **What got worse.** Against `d55ef79` the reference answers are 47–85 m further from the published location, the
+  state-wide search falls from high to medium and the three-day window from medium to low. The reference recording
+  has 4 usable events of 24 where `d55ef79` had 19, 3 of them searched. One refused event, at 13 %, was a confirmer
+  in a correct county answer, and whether it was a real pass is not settled. The osprey run's time went from 584 s
+  to 9,602 s for a margin of 24.93 nats against 23.29, and four of its events dropped to confirmer-only on the 32
+  GiB hypothesis budget (one on the bird-feeder run). The osprey cam on 11-02 went from 39 km to 365 km off, low on
+  both builds: a site check found no refused event that was a real pass, and a 25 km box round the site does not
+  locate it on either build. Usable events also fell on the osprey cam's other days (17 to 9, 13 to 5), the
+  bird-feeder cam (19 to 9) and Rochelle (15 to 5). Fullerton's one usable event is refused at 3 %, with no location
+  on both builds. Tucson's wrong answer (238 km) became no location because every event went, and nobody has checked
+  whether any of them was real.
+- **What got better.** The county search returns to high with no comparison cut. The state-wide answer is no longer
+  low. A wrong bird-feeder answer `d55ef79` graded medium is low, by 0.11 nats, which is a narrow miss and not a
+  fix.
+- **Margin does not separate right from wrong here**: true 2.92 (low) against false 2.89 (low), and true 5.01
+  (medium) below a wrong-date 5.49 (low on one core match). Core passes on three wrong answers, leaving margin alone
+  to keep them low: the bird-feeder cam (2.89), the reference recording on 09-07 (2.37) and the osprey cam on 11-02
+  (0.47). A small margin can also mean other flights at one place: the eagle cam's 0.11 is against a rival 140 m
+  away, and the bird-feeder's against one 1.1 km away. With no rival the gate passes: the Lee County search found
+  none on 20 fine cells, and is low on its other gates. These gates do not scale with the size of the search (README
+  "Known issues").
+- **A lead, not landed.** On one recording, measuring all detections instead of the strongest 24 moved a wrong low
+  answer (365 km) to the right place (0.61 km, still low, radius 338 m): `f_osprey_1102b_s7b` against a throwaway
+  build with `MAX_MEASURED` at 60, `f_osprey_1102b_cap60`. Its new event is a 568 m pass at detection rank 45, 99 %
+  traversed. Wrong-date and reference effects are not yet measured, and AGENTS wants the medium grade's scaling
+  fixed first.
+- **Checks.** On `7e5cf3e`, whose code is that of `4b88d7c`: `cargo test --workspace --locked -j 2` passed 139 with
+  0 failed and 2 ignored, and clippy with warnings denied passed. A release build passed `fdop selftest`: 0.4 m
+  error, 75 m radius, +0.20 s clock error, 4 events (known answer, not evidence about real recordings).
+
+### Track, weather and feed fixes
+
+-
+  [`a4df296`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/a4df296c3209d46371b8c77d6beab8ce8e3628cb)
+  The turn check added in `f717f6f` no longer excuses half of a wrong heading. It built its expected chord from the
+  heading under test, so a wrong heading moved its own prediction: at 100 m/s on straight flight it accepted heading
+  errors up to 28.8°, against 14.3° for the finite-difference check it backs up. The tangent at a knot is now
+  predicted from the chord and the neighbour's reported heading, and the whole reported vector is compared, so wrong
+  speeds and vertical rates are still rejected. Exact 3°/s turns sampled every 24–29 s keep their reported tangents.
+  One chord that agrees is enough: a turn that starts or ends between samples breaks the constant-rate assumption on
+  that side only. In a planar simulation of 4,000 sparsely sampled flights, requiring both chords kept 76 % of the
+  correct reports that fail the finite difference, with a 349 m worst interpolation error; one chord keeps 99 %, at
+  205 m, against 100 % and 155 m for the old check. At the knot where a turn starts or ends, a wrong heading
+  matching the other side's arc can still pass.
+-
+  [`a306fb1`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/a306fb1d5bb66e60f6bed1fadff2b74b3f4b4a27)
+  The binary crate no longer lists frankenpandas; only `fdop-geo` uses it.
+-
+  [`42d659f`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/42d659f3c46d3b9ee6839e8466ccbd12129e3a31)
+  Radiosondes without hourly surface temperatures no longer count as "no wind data". The pipeline read an empty
+  weather-warning list as "winds modelled", so that fallback's one warning widened the speed gates by 10 m/s and put
+  "No wind data" in the report, although soundings carry wind profiles. `fetch_atmosphere` now says whether winds
+  aloft are modelled. Falling back from Open-Meteo to radiosondes also warns now; with hourly surface data it used
+  to leave no trace.
+-
+  [`4df0133`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/4df013301a3b0a15b42c9843d63d0e5020638130)
+  A UTC day built without its mlatonly release, or from staging in place of prod, is now a report warning; it used
+  to reach only the log. Without mlatonly, aircraft located only by multilateration (transponders without ADS-B Out)
+  are missing: they can neither match an event nor count as an unheard close pass.
+
 ### A guided peak must clear any stronger bin; reference and field reruns
 
 - `9aeeb9a`'s nearest-peak rule (next section) also accepted ripple on a ridge's top. The nearest ripple hugs

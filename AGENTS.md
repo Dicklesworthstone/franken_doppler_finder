@@ -165,8 +165,9 @@ run (`result.json`) or the test that produced it.
    Every fallback adds a warning to the report: the standard atmosphere, a default geoid, terrain tiles read as
    0 m, a failed terrain prefetch and a missing basemap. A new fallback must do the same.
 3. **Report truncation.** The detection cap (60 candidate curves) and the measurement cap (24 events) put a
-   warning in the report when they cut. Pair-join and fine-stage cuts appear in `funnel.truncated` and the
-   warnings. An event demoted to confirmer-only by its hypothesis budget gets a warning. Events beyond
+   warning in the report when they cut. Pair-join, fine-stage and confirmation cuts appear in `funnel.truncated`
+   and the warnings, and any of them fails the margin gate. Their default budgets (20 M, 2 M, 2 M) sit above the
+   largest searches estimated from real runs. An event demoted to confirmer-only by its hypothesis budget gets a warning. Events beyond
    `--max-events` only confirm by design (shown in `funnel.hypotheses`). Do not add a silent cut.
 4. **Do not overfit the reference case.** There is one reference recording and a handful of field tests. A
    change to a threshold or constant needs a synthetic or metamorphic test that justifies it on its own terms.
@@ -267,23 +268,25 @@ results in the commit message.
   The upload is the recorder's 1:00:00–2:00:00 window. The published answer is 40.876466, −73.524951. Report the
   distance, the radius, the confidence, the gates and the funnel for each configuration:
 
-  | Configuration | Last recorded result (2026-11-04, `18d8476`: the production code of `8b4bea3`) |
+  | Configuration | Last recorded result (2026-11-04, `7e5cf3e`: the code of `4b88d7c`) |
   |---|---|
-  | `--dates 2026-09-08 --near NY` (`r_ny_18d8476`) | 267 m off, radius 316 m, **low**, margin gate failed on its recorded cuts (7.7 nats, provisional) |
-  | `--dates 2026-09-08 --near "Nassau County, NY"` (`r_nassau_18d8476`) | 306 m off, radius 316 m, **low**, margin gate failed on its recorded cut (11.5 nats, provisional) |
-  | `--dates 2026-09-07..2026-09-09 --near NY` (`r_md_18d8476`) | 267 m off, radius 316 m, **low**, margin gate failed on its recorded cut (6.6 nats, provisional) |
+  | `--dates 2026-09-08 --near NY` (`r_ny_s7b`) | 271 m off, radius 304 m, **medium**, margin 5.01 nats, no comparison cut |
+  | `--dates 2026-09-08 --near "Nassau County, NY"` (`r_nassau_s7b`) | 306 m off, radius 316 m, **high**, margin 12.77 nats, no comparison cut |
+  | `--dates 2026-09-07..2026-09-09 --near NY` (`r_md_s7b`) | 271 m off, radius 304 m, **low**, margin 2.92 nats against a rival 138 km away, no comparison cut |
 
-  All three matched N22NY (PC-12) and N501EX (C208) as the core pair and passed the other four gates. An R44
-  confirmed where N93CQ (B350) used to; the county search also matched N93CQ, at chi 8.79. The grade comes from
-  `9620d2e`: any recorded pair, fine or confirmation cut fails the margin gate, and the fine stage cut on all
-  three at its default 4,000 cells. So low here does not mean the point is wrong. No flag raises that budget.
+  All three kept 60 of 82 candidate curves and measured 24 of 42 flyovers, the detection and measurement caps, with
+  warnings. All three matched N22NY (PC-12) and N501EX (C208) as the core pair and N93CQ (B350) as confirmer, at
+  chi 8.79 in the county search. Only the margin gate failed on the state-wide and three-day runs, so the wrong dates are the
+  other half of this check: the same file with `--dates 2026-09-07 --near NY` gives low, 138 km off, core 2 of 2,
+  margin 2.37, and `--dates 2026-09-09 --near NY` gives low, 73 km off, core 1 of 2, margin 5.49. A wrong-date
+  medium or high is a regression.
 
   The first high results were `ny9` (224 m off, margin 8.5 nats), `nassau3` (221 m, 6.8 nats) and `md2` (224 m,
   7.9 nats), all radius 292 m with N93CQ as the confirmer, on the import commit plus the 5-line
   evidence-calibration change described in CHANGELOG section 11. `ny10` repeated the first on `1f321cb`: high,
   224 m off, radius 292 m, margin 7.7 nats, the same flights. Other builds got these configurations wrong or low
-  (CHANGELOG reference-case table and Unreleased), so re-run all three after any change to detection,
-  measurement, search or grading, and update this table and README "Honest status" with the result.
+  (CHANGELOG reference-case table and Unreleased), so re-run all three and the two wrong dates after any change to
+  detection, measurement, search or grading, and update this table and README "Honest status" with the result.
 
 ---
 
@@ -396,15 +399,15 @@ fdop runs --json                                         # the run ledger
 The pipeline runs end to end. It has offline unit tests, a selftest and one validated reference case (above).
 Field tests on public live-cam recordings are summarised in README "Honest status": the reference site was
 located again from a recording on another day, and four sparse-traffic sites failed, graded low or with no
-location. On the current code every real recording replayed so far grades low, because each records a fine
-cut (the reference table above). The open issues are listed in README "Known issues".
+location. On the current code the reference recording grades high, medium or low by configuration, and margin
+does not separate right from wrong (README "Known issues"), so read any grade with the wrong-date runs beside it.
 
 Known fixes not landed. Each one changes answers, so it waits until the reference configurations and the
 quoted field tests can be re-run, which needs a Mac build:
-- The medium grade does not allow for how many events were searched (README "Known issues"). Fix it before
-  raising the detection or measurement caps.
+- The medium grade and the margin do not allow for how many events or how large a region were searched (README
+  "Known issues"). Fix it before raising the detection or measurement caps.
 
-Landed before any re-run: `f717f6f` keeps reported ADS-B velocities on sparsely sampled turns, by checking
-the position chords against the arc implied by neighbouring headings at the same 25 m/s limit. Synthetic
-turning-track tests cover it. The reference configurations and two field recordings have since been replayed
-on a build containing it; the other seven field recordings have not (README "Honest status").
+`f717f6f` keeps reported ADS-B velocities on sparsely sampled turns, by checking position chords against the arc
+implied by neighbouring headings at the same 25 m/s limit, and `a4df296` stops a wrong heading from moving its own
+prediction. Synthetic turning-track tests cover them. The reference configurations and all nine field recordings
+have since been replayed on a build containing them (README "Honest status").
