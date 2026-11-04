@@ -540,15 +540,24 @@ fn join_weather<T>(h: std::thread::JoinHandle<Result<T, DataError>>) -> Result<T
         .unwrap_or_else(|_| Err(DataError::new("weather thread panicked")))
 }
 
-/// Best available atmosphere over `bbox` for UTC `[t_start, t_end]`, and warnings about the
-/// fallbacks taken (empty = pressure-level winds and temperatures are modelled).
+/// The atmosphere a run uses, with what it lacks.
+pub struct Weather {
+    pub atmo: Arc<dyn Atmosphere>,
+    /// Every fallback taken; empty only when Open-Meteo pressure levels answered.
+    pub warnings: Vec<String>,
+    /// Winds aloft are modelled, from pressure levels or radiosondes. Without them fitted speeds
+    /// are not corrected for wind, so callers widen their speed gates.
+    pub winds_aloft: bool,
+}
+
+/// Best available atmosphere over `bbox` for UTC `[t_start, t_end]`.
 pub fn fetch_atmosphere(
     bbox: &BBox,
     t_start: f64,
     t_end: f64,
     cache: &Path,
     offline: bool,
-) -> (Arc<dyn Atmosphere>, Vec<String>) {
+) -> Weather {
     let (b, c1) = (*bbox, cache.to_path_buf());
     let h_om = std::thread::spawn(move || {
         om_grid(OM_HIST_FORECAST, &b, t_start, t_end, &c1, offline, true)
@@ -572,10 +581,15 @@ fn choose_atmosphere(
         Result<GriddedAtmosphere, DataError>,
         Result<ScatteredAtmosphere, DataError>,
     ),
-) -> (Arc<dyn Atmosphere>, Vec<String>) {
+) -> Weather {
+    let weather = |atmo: Arc<dyn Atmosphere>, warnings: Vec<String>, winds_aloft: bool| Weather {
+        atmo,
+        warnings,
+        winds_aloft,
+    };
     let mut warn = Vec::new();
     match om {
-        Ok(a) => return (Arc::new(a), warn),
+        Ok(a) => return weather(Arc::new(a), warn, true),
         Err(e) => warn.push(format!("Open-Meteo pressure levels unavailable ({e})")),
     }
     let (surface, raob) = fallbacks();
@@ -584,20 +598,21 @@ fn choose_atmosphere(
             // radiosondes give real temperature and wind profiles; with hourly surface
             // temperatures the boundary layer follows the diurnal cycle too
             return match surface {
-                Ok(s) => (
+                Ok(s) => weather(
                     Arc::new(AdjustedAtmosphere {
                         base: Box::new(r),
                         surface: Box::new(s),
                         depth: 1500.0,
                     }),
-                    Vec::new(),
+                    warn,
+                    true,
                 ),
-                Err(e) => (
-                    Arc::new(r),
-                    vec![format!(
+                Err(e) => {
+                    warn.push(format!(
                         "hourly surface temperatures unavailable ({e}); boundary layer from the 12-hourly soundings"
-                    )],
-                ),
+                    ));
+                    weather(Arc::new(r), warn, true)
+                }
             };
         }
         Err(e) => warn.push(format!("radiosondes unavailable ({e})")),
@@ -607,7 +622,7 @@ fn choose_atmosphere(
             warn.push(
                 "no upper-air data: standard lapse above the surface and no winds aloft".into(),
             );
-            return (Arc::new(a), warn);
+            return weather(Arc::new(a), warn, false);
         }
         Err(e) => warn.push(format!("surface weather unavailable ({e})")),
     }
@@ -615,7 +630,11 @@ fn choose_atmosphere(
         "using a 15 C standard atmosphere: Doppler curves of high aircraft will fit less tightly"
             .into(),
     );
-    (Arc::new(StandardAtmosphere::new(15.0, 0.0, 0.5)), warn)
+    weather(
+        Arc::new(StandardAtmosphere::new(15.0, 0.0, 0.5)),
+        warn,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -669,7 +688,11 @@ mod tests {
     #[test]
     fn pressure_levels_skip_all_fallback_requests() {
         let expected = test_grid("test pressure levels", 25.0);
-        let (a, warn) = choose_atmosphere(Ok(test_grid("test pressure levels", 25.0)), || {
+        let Weather {
+            atmo: a,
+            warnings: warn,
+            winds_aloft,
+        } = choose_atmosphere(Ok(test_grid("test pressure levels", 25.0)), || {
             panic!("a successful pressure-level profile must not load fallback weather")
         });
         assert_eq!(a.describe(), expected.describe());
@@ -678,6 +701,7 @@ mod tests {
             expected.medium(0.0, 0.0, 0.0, 0.0, 2000.0)
         );
         assert!(warn.is_empty());
+        assert!(winds_aloft);
     }
 
     #[test]
@@ -687,7 +711,11 @@ mod tests {
             surface: Box::new(test_grid("test surface", 26.0)),
             depth: 1500.0,
         };
-        let (a, warn) = choose_atmosphere(Err(DataError::new("pressure failed")), || {
+        let Weather {
+            atmo: a,
+            warnings: warn,
+            winds_aloft,
+        } = choose_atmosphere(Err(DataError::new("pressure failed")), || {
             (Ok(test_grid("test surface", 26.0)), Ok(test_soundings()))
         });
         assert_eq!(a.describe(), expected.describe());
@@ -697,13 +725,21 @@ mod tests {
                 expected.medium(0.0, 0.0, 0.0, 0.0, z)
             );
         }
-        assert!(warn.is_empty());
+        assert_eq!(
+            warn,
+            ["Open-Meteo pressure levels unavailable (pressure failed)"]
+        );
+        assert!(winds_aloft);
     }
 
     #[test]
-    fn sounding_fallback_keeps_surface_failure_warning() {
+    fn sounding_fallback_keeps_both_failure_warnings() {
         let expected = test_soundings();
-        let (a, warn) = choose_atmosphere(Err(DataError::new("pressure failed")), || {
+        let Weather {
+            atmo: a,
+            warnings: warn,
+            winds_aloft,
+        } = choose_atmosphere(Err(DataError::new("pressure failed")), || {
             (Err(DataError::new("surface failed")), Ok(test_soundings()))
         });
         assert_eq!(a.describe(), expected.describe());
@@ -714,15 +750,21 @@ mod tests {
         assert_eq!(
             warn,
             [
-                "hourly surface temperatures unavailable (surface failed); boundary layer from the 12-hourly soundings"
+                "Open-Meteo pressure levels unavailable (pressure failed)",
+                "hourly surface temperatures unavailable (surface failed); boundary layer from the 12-hourly soundings",
             ]
         );
+        assert!(winds_aloft);
     }
 
     #[test]
     fn surface_fallback_keeps_upper_air_failure_warnings() {
         let expected = test_grid("test surface", 26.0);
-        let (a, warn) = choose_atmosphere(Err(DataError::new("pressure failed")), || {
+        let Weather {
+            atmo: a,
+            warnings: warn,
+            winds_aloft,
+        } = choose_atmosphere(Err(DataError::new("pressure failed")), || {
             (
                 Ok(test_grid("test surface", 26.0)),
                 Err(DataError::new("soundings failed")),
@@ -741,12 +783,17 @@ mod tests {
                 "no upper-air data: standard lapse above the surface and no winds aloft",
             ]
         );
+        assert!(!winds_aloft);
     }
 
     #[test]
     fn standard_fallback_keeps_all_failure_warnings() {
         let expected = StandardAtmosphere::new(15.0, 0.0, 0.5);
-        let (a, warn) = choose_atmosphere(Err(DataError::new("pressure failed")), || {
+        let Weather {
+            atmo: a,
+            warnings: warn,
+            winds_aloft,
+        } = choose_atmosphere(Err(DataError::new("pressure failed")), || {
             (
                 Err(DataError::new("surface failed")),
                 Err(DataError::new("soundings failed")),
@@ -766,6 +813,7 @@ mod tests {
                 "using a 15 C standard atmosphere: Doppler curves of high aircraft will fit less tightly",
             ]
         );
+        assert!(!winds_aloft);
     }
 
     #[test]

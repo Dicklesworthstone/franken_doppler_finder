@@ -604,17 +604,23 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     }
     // ---- atmosphere (sound speed and wind profiles) ----------------------------------------
     let t = Instant::now();
-    let ((atmo, wwarn), weather_fetch_s): ((Arc<dyn fdop_types::atmo::Atmosphere>, Vec<String>), f64) = match weather_rx.recv_timeout(fdop_data::weather::FETCH_WAIT_TIMEOUT) {
-        Ok(r) => r,
-        Err(_) => (
-            (
-                Arc::new(fdop_types::atmo::StandardAtmosphere::new(15.0, 0.0, 0.5)),
-                vec!["weather services did not answer in time; using a 15 C standard atmosphere (rerun to use the cached profiles once they arrive)".into()],
+    let (wx, weather_fetch_s) =
+        match weather_rx.recv_timeout(fdop_data::weather::FETCH_WAIT_TIMEOUT) {
+            Ok(r) => r,
+            Err(_) => (
+                fdop_data::Weather {
+                    atmo: Arc::new(fdop_types::atmo::StandardAtmosphere::new(15.0, 0.0, 0.5)),
+                    warnings: vec!["weather services did not answer in time; using a 15 C standard atmosphere (rerun to use the cached profiles once they arrive)".into()],
+                    winds_aloft: false,
+                },
+                f64::NAN,
             ),
-            f64::NAN,
-        ),
-    };
-    let has_wind = wwarn.is_empty();
+        };
+    let fdop_data::Weather {
+        atmo,
+        warnings: wwarn,
+        winds_aloft: has_wind,
+    } = wx;
     for w in &wwarn {
         log.say(&format!("weather: {w}"));
     }

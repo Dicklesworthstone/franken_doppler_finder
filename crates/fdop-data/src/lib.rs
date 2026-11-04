@@ -25,7 +25,7 @@ pub use ingest::{
     IngestProgress, IngestSpec, IngestStats, RawAircraft, RawPoint, ingest_path, ingest_reader,
 };
 pub use terrain::TerrariumDem;
-pub use weather::fetch_atmosphere;
+pub use weather::{Weather, fetch_atmosphere};
 
 use std::fmt;
 
