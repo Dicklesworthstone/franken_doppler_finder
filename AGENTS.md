@@ -402,8 +402,3 @@ quoted field tests can be re-run, which needs a Mac build:
   falls short by about v(ωh)²/6. In a standard-rate turn with reports 25–30 s apart, a 100 m/s aircraft's
   exact report is therefore rejected and the worse estimate kept. Proposed tolerance: 25 + gs·(ωh)²/6, with ω
   the turn rate of the reported track and h the larger adjacent gap.
-
-Loose ends, kept pending a decision (RULE 1):
-- `src/probe_deps.rs` is an unreferenced dependency probe, not declared in `src/lib.rs`.
-- `data/icao_engine_class.tsv` at the repository root is an unused, byte-identical copy of
-  `crates/fdop-types/data/icao_engine_class.tsv`, which is the one compiled in.
