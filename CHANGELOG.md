@@ -19,6 +19,51 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Frequency calibration through the full Doppler curve
+
+- Ordinary-window ridge integration now follows the complete model curve, as the steep branch already
+  did. A local tangent had biased an averaged peak even with the correct physical guide. The analytic
+  ridge test failed at 0.172154 Hz in its first case on the old path; the final maximum across six
+  cases is 0.004141 Hz, below the unchanged 0.01 Hz bound. The guide is deliberately offset by 0.37 Hz
+  so copying the guide cannot pass the test.
+- The ordinary noise exclusion accounts for the Hann main-lobe half-width (`2 / win`) and half of
+  the within-window chirp smear. Its reference extends beyond that signal support. This keeps a real
+  ridge from entering its own noise estimate when the iterative frequency tolerance shrinks. The
+  frequency tolerance and SNR/z thresholds remain unchanged; the reference bins change deliberately.
+- Row normalization can tilt the local log-spectrum and bias sub-bin frequency interpolation.
+  Measurement now retains transient per-row offsets, uses the normalized profile for every peak
+  qualification/clearance check, then restores the three local interpolation bins along the curved
+  path. A finite, concave vertex must remain within that same three-bin neighborhood. Otherwise the
+  normalized estimate is retained. The final original frequency-band check still applies. Public
+  `normalize_rows`/`guided_trace` signatures and the stored `Spec` format are unchanged, with no new
+  dependency or full production spectrogram clone.
+- `curved_integration_limits_distance_bias_across_audio_phases` synthesizes six 180 s recordings from
+  retarded emission phase, physical `1/r` amplitude and seeded noise, with perturbed detection seeds.
+  All pass the original 0.5% distance, 0.5 m/s speed and 0.1 s CPA-time limits plus the quality gates.
+  Maximum final distance error is 2.339 m (0.2924%), speed error 0.0270 m/s, and CPA-time error
+  0.00721 s. The traced drop covers 98.3–99.1% of the expected drop. Distance errors before and after
+  restoring the local background shape are:
+
+  | True slant distance | Before, phases 0.13 / 1.27 | Final, phases 0.13 / 1.27 |
+  |---|---|---|
+  | 800 m | 7.310 / 6.951 m | 1.580 / 2.339 m |
+  | 2,000 m | 4.155 / 6.125 m | 0.663 / 0.508 m |
+  | 1,500 m | 1.638 / 1.703 m | 0.465 / 0.297 m |
+
+- Five trace tests pass, including 27 combinations of frequency phase, background slope and offset;
+  frequency invariance below 20 microhertz for a known parabolic log-spectrum; identical normalized
+  SNR/z values during restoration; a fractional-frequency curved-path oracle; and rejection of
+  unqualified shoulders, invalid curvature and remote vertices. Both new measurement tests pass.
+  These are synthetic frequency/range calibration results, not real-recording location accuracy or
+  empirical confidence-coverage claims. Reference and field replays remain pending.
+- Integrated validation passes all 88 core tests, including both FFmpeg/FFprobe cases, and all 13
+  shared-type tests (101 total, none ignored). The unchanged `src/selftest.rs` also passes when linked
+  through an external entry point to the fresh core libraries: 2.365 m position error, 75 m radius,
+  +0.0249 s clock error, four events and both intended flights. The archived prior selftest reported
+  0.417 m and +0.192 s: position error is larger on this one fixture while clock error is smaller.
+  This verifies the full synthetic core path, not the CLI release/ledger/report integration.
+  Core/shared-type all-target Clippy passes with warnings denied, and workspace formatting passes.
+
 ### Continuous spatial refinement with coherent reported evidence
 
 - The observer is now polished below the contour grid spacing with bounded physical-model evaluations.

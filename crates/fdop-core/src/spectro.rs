@@ -85,21 +85,37 @@ impl Spec {
     /// Subtract each row's median over frames `[a, b)` (whole row when `None`): stationary hum
     /// and the noise floor go to ~0 dB.
     pub fn normalize_rows(&mut self, frames: Option<(usize, usize)>) {
+        let _ = self.normalize_rows_with_offsets(frames);
+    }
+
+    /// Retain the removed frequency-dependent background for sub-bin metrology. Ridge
+    /// qualification still uses the normalised spectrum; restoring these offsets locally
+    /// prevents a sloping row background from moving a measured spectral peak.
+    pub(crate) fn normalize_rows_with_offsets(
+        &mut self,
+        frames: Option<(usize, usize)>,
+    ) -> Vec<f32> {
         let nt = self.t.len();
         let (a, b) = frames.unwrap_or((0, nt));
         let (a, b) = (a.min(nt), b.min(nt).max(a.min(nt) + 1).min(nt));
-        self.db.par_chunks_mut(nt).for_each(|row| {
-            let mut tmp: Vec<f32> = row[a..b].to_vec();
-            let m = median_f32(&mut tmp);
-            for v in row.iter_mut() {
-                *v -= m;
-            }
-        });
+        let offsets = self
+            .db
+            .par_chunks_mut(nt)
+            .map(|row| {
+                let mut tmp: Vec<f32> = row[a..b].to_vec();
+                let m = median_f32(&mut tmp);
+                for v in row.iter_mut() {
+                    *v -= m;
+                }
+                m
+            })
+            .collect();
         self.meta.norm = format!(
             "row-median over t=[{:.1},{:.1}]",
             self.t[a],
             self.t[b.saturating_sub(1)]
         );
+        offsets
     }
 
     /// Sub-spectrogram over frames `[a, b)` and bins `[fa, fb)`.

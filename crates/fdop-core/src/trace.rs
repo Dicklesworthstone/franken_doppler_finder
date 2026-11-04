@@ -87,6 +87,7 @@ pub(crate) fn ridge_peak(
         noise_band,
         half,
         PeakChoice::Strongest,
+        None,
     )
 }
 
@@ -96,6 +97,8 @@ pub(crate) fn ridge_peak(
 /// ridge is not taken for a ridge of its own. `along(t)` is the curve's frequency at time `t`
 /// relative to `f_pred`: near the CPA of a close pass the ridge leaves any straight line within
 /// the integration length, and a tangent would smear it away where it is steepest.
+/// If provided, `background` contains the row offsets removed from `spec`; they restore the
+/// local spectral shape for frequency interpolation only, after normalised peak qualification.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn guided_ridge_peak(
     spec: &Spec,
@@ -107,6 +110,7 @@ pub(crate) fn guided_ridge_peak(
     half: usize,
     min_snr: f64,
     min_z: f64,
+    background: Option<&[f32]>,
 ) -> Option<(f64, f64, f64)> {
     profile_peak(
         spec,
@@ -117,6 +121,7 @@ pub(crate) fn guided_ridge_peak(
         noise_band,
         half,
         PeakChoice::NearestQualified { min_snr, min_z },
+        background,
     )
 }
 
@@ -153,6 +158,7 @@ fn profile_peak(
     noise_band: f64,
     half: usize,
     choice: PeakChoice,
+    background: Option<&[f32]>,
 ) -> Option<(f64, f64, f64)> {
     let df = spec.df();
     let n_off = ((2.0 * noise_band + 0.5 * df) / df).floor() as usize + 1;
@@ -243,7 +249,41 @@ fn profile_peak(
             })?,
     };
     let snr = prof[k] - med;
-    Some((peak_frequency(k), snr, snr / mad))
+    let mut fhat = peak_frequency(k);
+    if let Some(background) = background.filter(|offsets| offsets.len() == spec.nf())
+        && k > 0
+        && k + 1 < n_off
+    {
+        // Normalisation is essential for selecting a real ridge above persistent hum,
+        // but its frequency-dependent subtraction tilts the local peak. Restore only
+        // the three bins used for metrology, after every normalised qualification gate.
+        let raw = |o: usize| {
+            let (mut sum, mut count) = (0.0, 0usize);
+            for &(tk, shift) in &path {
+                let fq = f_pred + offs[o] + shift;
+                if let Some(value) = spec.bilinear(tk, fq) {
+                    let fi = ((fq - spec.f[0]) / df).min(spec.nf() as f64 - 1.000_001);
+                    let row = fi as usize;
+                    let weight = fi - row as f64;
+                    let offset = background[row] as f64 * (1.0 - weight)
+                        + background[row + 1] as f64 * weight;
+                    sum += value as f64 + offset;
+                    count += 1;
+                }
+            }
+            (count >= need).then_some(sum / count as f64)
+        };
+        if let (Some(a), Some(b), Some(c)) = (raw(k - 1), raw(k), raw(k + 1)) {
+            let curvature = a - 2.0 * b + c;
+            let offset = 0.5 * (a - c) / curvature;
+            // A concave vertex inside this same three-bin neighbourhood is a local
+            // correction. Never use background restoration to jump to another ridge.
+            if curvature < 0.0 && offset.is_finite() && offset.abs() <= 1.0 {
+                fhat = f_pred + offs[k] + offset * df;
+            }
+        }
+    }
+    Some((fhat, snr, snr / mad))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,9 +452,19 @@ mod tests {
             let spec = profile_spec(&[(100.0, near_height), (104.0, 12.0)]);
             let strongest = ridge_peak(&spec, 1, 100.1, 0.0, 5.0, 12.0, 1).unwrap();
             assert!((strongest.0 - 104.0).abs() < 0.1, "{strongest:?}");
-            let guided =
-                guided_ridge_peak(&spec, 1, 100.1, |_| 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z)
-                    .unwrap();
+            let guided = guided_ridge_peak(
+                &spec,
+                1,
+                100.1,
+                |_| 0.0,
+                5.0,
+                12.0,
+                1,
+                p.min_snr,
+                p.min_z,
+                None,
+            )
+            .unwrap();
             // A qualified nearer ridge wins despite being weaker. A nearer noise bump
             // below the unchanged SNR gate must not hide a valid, more distant ridge.
             assert!((guided.0 - expected).abs() < 0.1, "{guided:?}");
@@ -422,7 +472,19 @@ mod tests {
         let edge = profile_spec(&[(105.5, 16.0)]);
         assert!(edge.bilinear(1.0, 105.0).unwrap() as f64 > p.min_snr);
         assert!(
-            guided_ridge_peak(&edge, 1, 100.0, |_| 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).is_none(),
+            guided_ridge_peak(
+                &edge,
+                1,
+                100.0,
+                |_| 0.0,
+                5.0,
+                12.0,
+                1,
+                p.min_snr,
+                p.min_z,
+                None
+            )
+            .is_none(),
             "a strong band-edge shoulder is not a local maximum"
         );
     }
@@ -437,8 +499,160 @@ mod tests {
             12.0 * (-0.5 * ((f - 102.0) / 3.0).powi(2)).exp()
                 + 0.5 * (std::f64::consts::TAU * f).sin()
         });
-        let guided =
-            guided_ridge_peak(&spec, 1, 100.0, |_| 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).unwrap();
+        let guided = guided_ridge_peak(
+            &spec,
+            1,
+            100.0,
+            |_| 0.0,
+            5.0,
+            12.0,
+            1,
+            p.min_snr,
+            p.min_z,
+            None,
+        )
+        .unwrap();
         assert!((guided.0 - 102.25).abs() < 0.15, "{guided:?}");
+    }
+
+    #[test]
+    fn guided_frequency_is_invariant_to_sloping_row_normalisation() {
+        let p = TraceParams::default();
+        for center in [100.04, 100.13, 100.22] {
+            for slope in [-0.4, 0.0, 0.4] {
+                for baseline in [-65.0, 0.0, 35.0] {
+                    // A concave log-spectrum has an independently known sub-bin vertex.
+                    // Subtracting a linear row background moves that vertex by slope / 8.
+                    let mut spec =
+                        spec_from_profile(|f| (40.0 - 4.0 * (f - center).powi(2)).max(0.0));
+                    let background: Vec<f32> = spec
+                        .f
+                        .iter()
+                        .map(|f| (baseline + slope * (f - 100.0)) as f32)
+                        .collect();
+                    let nt = spec.nt();
+                    for (row, offset) in spec.db.chunks_mut(nt).zip(&background) {
+                        for value in row {
+                            *value -= offset;
+                        }
+                    }
+                    let peak = |offsets| {
+                        guided_ridge_peak(
+                            &spec,
+                            1,
+                            100.0,
+                            |_| 0.0,
+                            5.0,
+                            12.0,
+                            1,
+                            p.min_snr,
+                            p.min_z,
+                            offsets,
+                        )
+                        .unwrap()
+                    };
+                    let normalized = peak(None);
+                    let calibrated = peak(Some(background.as_slice()));
+                    assert!(
+                        (calibrated.0 - center).abs() < 2e-5,
+                        "center={center}, slope={slope}, baseline={baseline}: {calibrated:?}"
+                    );
+                    assert_eq!((calibrated.1, calibrated.2), (normalized.1, normalized.2));
+                    if slope != 0.0 {
+                        assert!((normalized.0 - center).abs() > 0.045, "{normalized:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn background_restoration_follows_the_curve_at_fractional_frequencies() {
+        let center = 100.13;
+        let along = |t: f64| 0.37 * (t - 1.0) + 0.19 * (t - 1.0).powi(2);
+        let mut raw = spec_from_profile(|_| 0.0);
+        let nt = raw.nt();
+        for (row, &frequency) in raw.db.chunks_mut(nt).zip(&raw.f) {
+            for (value, &time) in row.iter_mut().zip(&raw.t) {
+                *value = (40.0 - 4.0 * (frequency - center - along(time)).powi(2)).max(0.0) as f32;
+            }
+        }
+        let background: Vec<f32> = raw
+            .f
+            .iter()
+            .map(|f| (-60.0 + 0.4 * (f - 100.0) + 0.01 * (f - 100.0).powi(2)) as f32)
+            .collect();
+        let mut normalized = raw.clone();
+        for (row, offset) in normalized.db.chunks_mut(nt).zip(&background) {
+            for value in row {
+                *value -= offset;
+            }
+        }
+        // Neither the guide nor the path lands on FFT bins. Reconstruction must restore
+        // the background at each sampled frequency, including the curved path endpoints.
+        let expected =
+            guided_ridge_peak(&raw, 1, 100.07, along, 5.0, 12.0, 1, 3.0, 4.0, None).unwrap();
+        let restored = guided_ridge_peak(
+            &normalized,
+            1,
+            100.07,
+            along,
+            5.0,
+            12.0,
+            1,
+            3.0,
+            4.0,
+            Some(&background),
+        )
+        .unwrap();
+        assert!((expected.0 - center).abs() < 2e-5, "{expected:?}");
+        assert!(
+            (restored.0 - expected.0).abs() < 2e-5,
+            "{restored:?} vs {expected:?}"
+        );
+    }
+
+    #[test]
+    fn restored_background_cannot_create_or_relocate_a_qualified_ridge() {
+        fn peak(spec: &Spec, offsets: Option<&[f32]>) -> Option<(f64, f64, f64)> {
+            let p = TraceParams::default();
+            guided_ridge_peak(
+                spec,
+                1,
+                100.0,
+                |_| 0.0,
+                5.0,
+                12.0,
+                1,
+                p.min_snr,
+                p.min_z,
+                offsets,
+            )
+        }
+        let shoulder = profile_spec(&[(105.5, 16.0)]);
+        let background: Vec<f32> = shoulder
+            .f
+            .iter()
+            .map(|f| (100.0 * (-0.5 * ((f - 100.0) / 0.5).powi(2)).exp()) as f32)
+            .collect();
+        assert!(peak(&shoulder, None).is_none());
+        assert!(peak(&shoulder, Some(background.as_slice())).is_none());
+
+        let spec = profile_spec(&[(100.0, 12.0)]);
+        let normalized = peak(&spec, None).unwrap();
+        for background in [
+            // Positive raw curvature has no peak to interpolate.
+            spec.f
+                .iter()
+                .map(|f| (100.0 * (f - 100.0).powi(2)) as f32)
+                .collect::<Vec<_>>(),
+            // A remote vertex cannot move the selected peak outside its own neighbourhood.
+            spec.f
+                .iter()
+                .map(|f| (100.0 * (f - 100.0)) as f32)
+                .collect::<Vec<_>>(),
+        ] {
+            assert_eq!(peak(&spec, Some(background.as_slice())), Some(normalized));
+        }
     }
 }

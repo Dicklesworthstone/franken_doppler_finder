@@ -181,6 +181,31 @@ pub fn guided_trace(
     min_snr: f64,
     min_z: f64,
 ) -> Trace {
+    guided_trace_with_background(
+        spec,
+        None,
+        steep.map(|short| (short, None)),
+        model,
+        ta,
+        tb,
+        band,
+        min_snr,
+        min_z,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guided_trace_with_background(
+    spec: &Spec,
+    background: Option<&[f32]>,
+    steep: Option<(&Spec, Option<&[f32]>)>,
+    model: &(dyn Fn(f64) -> f64 + Sync),
+    ta: f64,
+    tb: f64,
+    band: f64,
+    min_snr: f64,
+    min_z: f64,
+) -> Trace {
     let nt = spec.nt();
     let hop = spec.dt();
     let half = ((1.5 / hop).round() as usize).max(1);
@@ -198,7 +223,7 @@ pub fn guided_trace(
                 let fp = model(t);
                 let chirp = (model(t + 0.125) - model(t - 0.125)).abs() / 0.25;
                 let (peak, allowed) = match steep.filter(|_| chirp > held_chirp) {
-                    Some(short) => {
+                    Some((short, short_background)) => {
                         // A fit made without these frames can be off here, by a time error that
                         // this slope turns into frequency.
                         let band = band.max(STEEP_TIME_ERROR_S * chirp);
@@ -209,15 +234,33 @@ pub fn guided_trace(
                         let along = |tk: f64| model(tk) - fp;
                         let j = short.frame_index(t);
                         let peak = guided_ridge_peak(
-                            short, j, fp, along, band, reference, half, min_snr, min_z,
+                            short,
+                            j,
+                            fp,
+                            along,
+                            band,
+                            reference,
+                            half,
+                            min_snr,
+                            min_z,
+                            short_background,
                         );
                         (peak, band)
                     }
                     None => {
-                        let slope = (model(t + 0.5) - model(t - 0.5)) / 1.0;
-                        let along = |tk: f64| slope * (tk - t);
+                        // Curvature shifts a peak averaged along its tangent even when the
+                        // local chirp fits inside the STFT window. Follow the full curve here too.
+                        let along = |tk: f64| model(tk) - fp;
+                        // A narrow position tolerance is not a noise exclusion band: a Hann
+                        // main lobe extends 2 / win Hz on each side, plus half the chirp smear.
+                        // Exclude that signal from the noise estimate while the final distance
+                        // check below retains the original frequency tolerance.
+                        let win = spec.meta.win_s;
+                        let peak_band = band.max(2.0 / win + 0.5 * chirp * win);
+                        let reference = noise_band.max(4.0 * peak_band);
                         let peak = guided_ridge_peak(
-                            spec, j, fp, along, band, noise_band, half, min_snr, min_z,
+                            spec, j, fp, along, peak_band, reference, half, min_snr, min_z,
+                            background,
                         );
                         (peak, band)
                     }
@@ -290,7 +333,7 @@ fn measure_with_fit(
             };
         }
     };
-    spec.normalize_rows(None);
+    let background = spec.normalize_rows_with_offsets(None);
     let mut model: Box<dyn Fn(f64) -> f64 + Sync> =
         Box::new(model_fn(det.f0, det.v, det.d, det.t0r, c));
     let mut band = (0.04 * det.f0).clamp(3.0, 12.0);
@@ -306,12 +349,15 @@ fn measure_with_fit(
             })
             .flatten()
             .map(|mut short| {
-                short.normalize_rows(None);
-                short
+                let background = short.normalize_rows_with_offsets(None);
+                (short, background)
             });
-        let tr = guided_trace(
+        let tr = guided_trace_with_background(
             &spec,
-            steep.as_ref(),
+            Some(&background),
+            steep
+                .as_ref()
+                .map(|(short, offsets)| (short, Some(offsets.as_slice()))),
             &*model,
             ta,
             tb,
@@ -491,6 +537,141 @@ mod tests {
             })
             .collect();
         measure(&x, sr, &det, "e1", p)
+    }
+
+    #[test]
+    fn curved_ridge_recovers_sub_bin_frequencies_without_tangent_bias() {
+        use crate::spectro::SpecMeta;
+
+        // An independently sampled, symmetric spectral peak follows the physical curve.
+        // A perfect curve has no offset to calibrate away; a tangent averages different
+        // frequencies on either side of the frame and biases even moderate-chirp passes.
+        let (c, df, hop) = (343.0, 0.25, 0.2);
+        for (base_f0, v, d) in [
+            (80.0, 100.0, 800.0),
+            (120.0, 130.0, 2000.0),
+            (180.0, 100.0, 1500.0),
+        ] {
+            for phase in [0.03, 0.17] {
+                let (f0, t0r) = (base_f0 + phase, 40.0 + phase);
+                let truth = model_fn(f0, v, d, t0r, c);
+                let t: Vec<f64> = (0..401).map(|i| i as f64 * hop).collect();
+                let fmin = ((truth(80.0) - 15.0) / df).floor() * df;
+                let nf = ((truth(0.0) + 15.0 - fmin) / df).ceil() as usize + 1;
+                let f: Vec<f64> = (0..nf).map(|i| fmin + i as f64 * df).collect();
+                let db = f
+                    .iter()
+                    .flat_map(|&freq| {
+                        let curve = &truth;
+                        t.iter().map(move |&time| {
+                            (20.0 * (-0.5 * ((freq - curve(time)) / 0.55).powi(2)).exp()) as f32
+                        })
+                    })
+                    .collect();
+                let spec = Spec {
+                    t,
+                    f,
+                    db,
+                    meta: SpecMeta {
+                        sr: 4000,
+                        win_s: 0.5,
+                        hop_s: hop,
+                        nfft: 16000,
+                        df,
+                        fmin,
+                        fmax: fmin + (nf - 1) as f64 * df,
+                        norm: "synthetic curved ridge".into(),
+                    },
+                };
+                // Deliberately offset the guide: measuring must find the actual ridge,
+                // rather than simply echo its model. Vary both frequency-bin and CPA phase.
+                let guide = |time: f64| truth(time) + 0.37;
+                let trace = guided_trace(&spec, None, &guide, 0.0, 80.0, 3.0, 3.0, 4.0);
+                assert_eq!(trace.len(), spec.nt());
+                let max_error = trace
+                    .t
+                    .iter()
+                    .zip(&trace.f)
+                    .map(|(&time, &freq)| (freq - truth(time)).abs())
+                    .fold(0.0, f64::max);
+                eprintln!(
+                    "curved ridge f0={f0} v={v} d={d}: maximum frequency error {max_error:.6} Hz"
+                );
+                assert!(max_error < 0.01, "f0={f0} v={v} d={d}: {max_error} Hz");
+            }
+        }
+    }
+
+    #[test]
+    fn curved_integration_limits_distance_bias_across_audio_phases() {
+        use crate::physics::retarded_tau;
+
+        let (sr, c) = (4000u32, 343.0);
+        let p = MeasureParams::default();
+        let mut max_distance_fraction = 0.0f64;
+        for (f0, v, d) in [
+            (80.0, 100.0, 800.0),
+            (120.0, 130.0, 2000.0),
+            (180.0, 100.0, 1500.0),
+        ] {
+            for phase in [0.13, 1.27] {
+                let t0r = 90.0 + phase * 0.1;
+                let t0e = t0r - d / c;
+                let mut seed = 1777u64;
+                let x: Vec<f32> = (0..sr as usize * 180)
+                    .map(|i| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        // Generate the received phase from emission time, rather than
+                        // numerically integrating the frequency curve used by the fitter.
+                        let te = retarded_tau(i as f64 / sr as f64, t0e, v, d, c);
+                        // Spherical spreading gives the received tone its physical 1/r envelope.
+                        let amplitude = 0.2 * d / d.hypot(v * te);
+                        let signal = amplitude * (std::f64::consts::TAU * f0 * te + phase).sin();
+                        (signal + 0.05 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0)) as f32
+                    })
+                    .collect();
+                let det = Detection {
+                    id: 0,
+                    t0r: t0r + 0.3,
+                    f0: f0 + 0.11,
+                    v: v * 1.03,
+                    d: d * 1.08,
+                    score: 10.0,
+                    score_approach: 10.0,
+                    score_recede: 10.0,
+                    half_s: 60.0,
+                    harmonic_of: None,
+                    harmonics: Vec::new(),
+                };
+                let event = measure(&x, sr, &det, "sub_bin", &p);
+                eprintln!(
+                    "curved audio f0={f0} v={v} d={d} phase={phase}: fit {:?}, {} points, drop {}, side spans {}/{} s",
+                    event.fit.as_ref().map(|f| f.best),
+                    event.trace.len(),
+                    event.quality.drop_traversed,
+                    event.quality.span_approach_s,
+                    event.quality.span_recede_s
+                );
+                assert!(
+                    event.quality.ok,
+                    "f0={f0} v={v} d={d} phase={phase}: {:?}",
+                    event.quality.reasons
+                );
+                let b = event.fit.as_ref().unwrap().best;
+                let distance_error = (b.d - d).abs();
+                eprintln!(
+                    "curved audio f0={f0} v={v} d={d} phase={phase}: distance error {distance_error:.3} m, speed error {:.4} m/s, CPA error {:.5} s",
+                    b.v - v,
+                    b.t0r - t0r
+                );
+                max_distance_fraction = max_distance_fraction.max(distance_error / d);
+                assert!((b.v - v).abs() < 0.5, "f0={f0} v={v}: {}", b.v);
+                assert!((b.t0r - t0r).abs() < 0.1, "f0={f0} t0r={t0r}: {}", b.t0r);
+            }
+        }
+        assert!(max_distance_fraction < 0.005, "{max_distance_fraction}");
     }
 
     #[test]
@@ -717,6 +898,19 @@ mod tests {
         // spectrogram is the same one used by every refinement round, without cropping.
         let spec = event.spec.as_ref().unwrap();
         assert!(spec.t[0] < 1.0 && spec.t[spec.nt() - 1] > 119.0);
+        let mut raw = stft_band_db(
+            &x,
+            sr,
+            event.win_s,
+            p.hop_s,
+            spec.meta.fmin,
+            spec.meta.fmax,
+            p.df_max,
+            0.0,
+        )
+        .unwrap();
+        let background = raw.normalize_rows_with_offsets(None);
+        assert_eq!(raw.db, spec.db);
         let mut model: Box<dyn Fn(f64) -> f64 + Sync> = Box::new(tone);
         let mut band = (0.04 * det.f0).clamp(3.0, 12.0);
         let mut eager_trace = Trace::default();
@@ -724,7 +918,17 @@ mod tests {
         // The previous measurement path completed full uncertainty diagnostics in each
         // round. Use that public API as the oracle for all three model/band updates.
         for _ in 0..p.rounds {
-            let trace = guided_trace(spec, None, &*model, 0.0, 120.0, band, p.min_snr, p.min_z);
+            let trace = guided_trace_with_background(
+                spec,
+                Some(&background),
+                None,
+                &*model,
+                0.0,
+                120.0,
+                band,
+                p.min_snr,
+                p.min_z,
+            );
             assert!(trace.len() >= 20);
             let fit = fit_constant_velocity(&trace.t, &trace.f, c, Side::Both).unwrap();
             let b = fit.best;

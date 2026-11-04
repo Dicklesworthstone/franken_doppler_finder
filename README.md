@@ -41,8 +41,8 @@ finding the faint curves in a spectrogram to naming the town.
 ## Honest status
 
 **Real-recording validation baseline:** the location errors and confidence grades below come from
-the archived `7e5cf3e` replays. The latest moving-medium propagation correction and spatial refinement
-calibration change scored predictions and have synthetic regression coverage; fresh reference,
+the archived `7e5cf3e` replays. The latest moving-medium propagation correction, spatial refinement and
+frequency calibration change scored predictions and have synthetic regression coverage; fresh reference,
 wrong-date and field replays are still pending. The reference media endpoint returned a “Site
 Unavailable” page during the propagation update, and no recording/archive cache is available for the
 refinement update. These historical numbers are not measured accuracy claims for the new code.
@@ -622,10 +622,17 @@ Design notes:
   The peak must also stand the SNR requirement above the valley separating it from any stronger bin, so
   ripple on a stronger ridge's top does not qualify, while a separate aircraft's ridge still does.
   Standalone unguided ridge tracing retains its strongest-peak rule.
+- **Frequency estimates preserve the spectral peak's shape.** Ordinary and short windows integrate
+  along the full Doppler curve. Noise exclusion accounts for the Hann main lobe and chirp smear, so
+  narrowing the frequency tolerance does not count the signal as its own noise. Normalized spectra
+  still select and qualify peaks. Only after qualification, local frequency interpolation restores
+  the removed row background; its slope must not shift the measured tone. The restored parabola
+  must be concave and remain inside the same three-bin neighborhood, and the original frequency
+  tolerance and SNR/z thresholds stay in force. No extra full spectrogram is retained.
 - **Steep passes get a matched window.** A 0.5 s main window stops holding a chirp at 1/win² = 4 Hz/s. Frames
   steeper than that read a second spectrogram, with the window that matches the latest fit's chirp. There the
   peak integrates along the model's curve, the band is at least 0.25 s of chirp to allow for detection's error,
-  and the noise reference clears the chirp's own smear. Other frames read as before.
+  and the noise reference clears the chirp's own smear.
 - **A fit needs a ridge through its drop.** Two steady tones at different pitches fit a Doppler curve with nothing
   between them, at an excellent RMS. `drop_traversed` in `events.json` is the share of the central 10–90 % of the
   fitted drop that the trace travels: each continuous stretch adds its net fall, and a stretch ends at a time gap
@@ -737,7 +744,34 @@ the configured fallback allowance after the preferred request has been tried.
 
 ## Testing
 
-### Latest detector, search and propagation changes
+### Spatial and frequency calibration
+
+The combined pinned-nightly run passes **88 core tests and 13 shared-type tests: 101 total**, with
+zero failures or ignored tests. This includes the two FFmpeg/FFprobe integration tests. The new coverage
+checks missing-data information counts, weighted recording clocks, grid-phase-independent position
+refinement, rotated positional ambiguity, consistent reported evidence, spectral curvature, background
+normalization and actual audio range recovery. The commands use one build job, two Rayon workers,
+optimization level 1 for workspace crates, the repository's level 2 dependency profile, and no debug info.
+Core/shared-type Clippy passes for all targets with warnings denied, and workspace formatting passes.
+The combined test command was
+`cargo test -p fdop-core -p fdop-types --locked -- --include-ignored --test-threads=2`.
+
+`subgrid_polish_recovers_analytic_observers_across_grid_phases` covers nine independent observer cases
+with a maximum grid-only error of 68.809 m and a maximum polished error of 0.265 m.
+`curved_integration_limits_distance_bias_across_audio_phases` covers six physical emission-phase audio
+cases meeting the unchanged 0.5% closest-distance,
+0.5 m/s speed and 0.1 s CPA-time bounds; their maximum errors are 2.339 m (0.2924%), 0.0270 m/s and
+0.00721 s. These isolate numerical and measurement errors under known synthetic assumptions.
+
+The unchanged `src/selftest.rs`, linked through an external entry point to fresh core libraries, also
+passes the complete 1,300 s synthesis → FFmpeg decode → detection → measurement → search → refinement
+path: **2.365 m** position error, **75 m** radius, **+0.0249 s** clock error, four events, and both intended
+aircraft. The archived prior run below reported 0.417 m position error and +0.192 s clock error; the current
+run improves its clock error but has a larger position error on that one fixture. The grid-phase and audio
+calibrations are not a claim that every recording improves. This entry-point run exercises the actual core
+pipeline, without substituting for a full CLI release build or validating ledger/report integration.
+
+### Prior detector, search and propagation validation (`b26c059`)
 
 The detector oracle compares every score bit and template index across edges, partial residual masks,
 duplicate templates and one versus three workers. Trace-buffer reuse is checked against golden outputs
@@ -860,6 +894,9 @@ The unit tests check:
   rejects unqualified noise, non-peak shoulders and ripple on a stronger ridge;
 - deferred fit diagnostics match eager refinement, and failed refinement keeps its trace and fit consistent;
 - fit recovery and range coverage;
+- physical emission-phase audio at six geometry/phase combinations, recovering closest distance within
+  0.5%, speed within 0.5 m/s and heard CPA time within 0.1 s; analytic curved ridges and normalization
+  slope/offset invariance, with the original peak-rejection controls still enforced;
 - gap-aware effective information, including duplicate/density invariance and unchanged support across
   longer silent gaps; a weighted shared-clock oracle and a noisy third-pass regression with nonnegative
   confidence deltas;
