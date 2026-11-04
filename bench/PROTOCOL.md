@@ -156,3 +156,77 @@ above.
 offsets, not taken from `dopplerprint`'s fit. The dataset does not publish each audio file's start time, so time of
 closest approach is scored only if it can be recovered from the dataset's own timestamps. Otherwise that column is
 dropped and this file says so.
+
+## Addendum 2, 2026-11-04, after the reproduction check and before any scored run
+
+### What the reproduction check found
+
+| Claim | Run | Result |
+|---|---|---|
+| `dopplertrack` 43 m, with its published events | `search`, then `refine` | Reproduced: the same coordinate to the last digit, 43 m |
+| `dopplerprint` nationwide ±5 s, 116 m in its notes | `locate` on the WAV its own case uses | Reproduced: found, high, 116 m, both true flights, decoy margin 29.94 (its notes: 29.9) |
+| `dopplerprint` nationwide ±2 min, 86 m in its notes | `locate` on that WAV, `prod` feed | Not reproduced: it declines, with the right spot ranked first (40 m off) by a margin of 0.5, under its limit of 3. A run on the `staging` feed its case uses is pending and goes in a later section |
+| `dopplerprint` regional ±5 s, 79 m | Cannot be run through `locate` | This figure has its flyover positions supplied (`oracle_events = true`), as its README says. `locate` gives 648 m on our file and 646 m on its WAV, from one of the two flights |
+
+So the harness reproduces both tools where a reproduction is possible. "Regional ±5 s (claims 79 m)" in the section
+above was this file's mistake: that number is not what `locate` does. The first attempt at `dopplertrack`'s check was a
+harness fault of ours and says nothing about it: `extract-region` found 0 traces because the archive we gave it is split
+into tar parts, which it does not read. It was rerun with `fetch-day`, as its README does.
+
+### Input encoding changes `dopplerprint`'s answer
+
+The same upload, with no `--near`, in three encodings:
+
+| Audio | ±5 s | ±2 min |
+|---|---|---|
+| Opus-sourced 48 kHz WAV (its own case) | found, high, 116 m | declined, right spot first (40 m), margin 0.5 |
+| AAC 44.1 kHz (our file, and how every B and E capture is encoded) | declined; candidates 3,880 km and 282 km off | **found, high, 314 km off** |
+| The same AAC resampled to 48 kHz | not run | declined, right spot first (610 m), margin 0.2 |
+
+The third row is what matters here: resampling alone moves it from a confident wrong answer to a narrow decline, so
+some of this is sample rate rather than codec. A 44.1 kHz file is a normal input, and its README's own example is an
+`.m4a`, so the runs fixed above stand and the claim below is tested on them. But a tool should not lose a benchmark over
+something one resample would fix without that being visible, so two more sets of runs go beside them:
+
+- `dopplerprint` runs R2 a second time on every recording resampled to 48 kHz, with nothing else changed. If `fdop`'s
+  result against it differs between the two, the report says so and gives both.
+- All three tools run R2 on the reference in its own WAV as well (`a_ref_opus`), reported beside `a_ref` and not counted.
+
+### Other changes
+
+- **Fullerton is dropped.** RailStream's terms license personal use "and not to download (other than page caching) or
+  modify it, or any portion of it, except with expressed written consent." They are about its site and the capture came
+  from its YouTube stream, but the wording is close enough to Virtual Railfan's to be treated the same way. Set B3 is now
+  Duke Farms and Sapsucker Woods.
+- **Case ids**, which set the bearings: `a_ref`, `b1_osprey_1031`, `b1_osprey_1101`, `b1_osprey_1102b`, `b2_eagle`,
+  `b3_duke`, `b3_sapsucker`, wrong dates `c_ref_0907`, `c_ref_0909`, `c_osprey_1031`, `c_sapsucker_1101`, `c_duke_1102`, and
+  set E as listed. Wrong dates and `a_ref_opus` use their parent's circle.
+- **Truth.** Each named site is an OpenStreetMap feature, or the operator's published street address geocoded by
+  OpenStreetMap, fixed from those alone. `e_fortmadison` has no building: its operator gives a railroad milepost in town. Its
+  limit becomes 5 km, like set B3.
+- **Outages.** A capture with a stream outage is cut at the first one, where its clock stops holding. If under 30 minutes
+  remain, that window counts as not captured and the second window is used. This was set before any audio was heard.
+- **Set E as captured.** Eight recordings, all from the first window. Six run the full 2 h; `e_fortmadison` is cut to
+  49.7 min and `e_oxnard` to 53.1 min. **`e_colchester` is not captured**: its clock holds for 27.9 min at the first window
+  and 23.6 min at the second.
+- **Medians** leave out set C, where a distance from the true place means nothing, and any run where a tool declined.
+- **R1.** A state is not an area `dopplerprint` accepts (`--radius` is at most 50 km), so it gets the day and no area.
+- **Flags that are not settings.** `dopplerprint` also gets `--keep-raw --max-cache-gb 200` (its default of 20 GB would
+  refuse the downloads) and `fdop` also gets `--json`. Neither changes a search.
+
+### Set D, fixed before its runs
+
+- **Recorder position.** Recomputed from the dataset's tracks and published ground offsets alone. 37 passages fit one
+  position with a residual RMS of 2.1 m. The other 3 fit a second position at 31 m, from 3 distances and 2 unknowns, so
+  that one is weak and the report marks it.
+- **Clock.** Recoverable. Sliding each clip's UTC-stamped frequency curve over its own spectrogram puts clip time zero
+  5.0 s before `received_start_utc` (median of 40). The time column is scored on the 37 passages with the well-fitted
+  position. The 3 others put closest approach outside some clips, so they have no time truth.
+- **Finding a pass.** A tool finds a passage when one of its events has its received closest approach within 15 s of the
+  truth. That event's speed and distance are compared with the dataset's ADS-B values. Also reported: how often its
+  top-ranked event is the match, and its events per clip, because more events find more by chance. On the 3 passages with
+  no time truth, the top-ranked event stands for the tool.
+- **`dopplertrack`'s band.** It runs at 60-300 Hz as in R2, and also at 40-450 Hz, its spectrogram's whole range, because these
+  aircraft go above 300 Hz.
+- **Location.** `dopplerprint` and `fdop` both run R2 inputs on each clip, limit 1 km. The section above predicts 0 of
+  40 located for `fdop`; running it tests that. `dopplertrack` needs two flyovers in a recording and has no run here.
