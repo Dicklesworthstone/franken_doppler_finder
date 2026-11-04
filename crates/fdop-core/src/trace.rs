@@ -90,7 +90,9 @@ pub(crate) fn ridge_peak(
 }
 
 /// A model-guided trace follows the nearest qualifying local peak, so a louder nearby
-/// aircraft does not take over the trace merely by entering the same search band.
+/// aircraft does not take over the trace merely by entering the same search band. A peak
+/// qualifies only if it also stands `min_snr` clear of any stronger bin, so ripple on a smeared
+/// ridge is not taken for a ridge of its own.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn guided_ridge_peak(
     spec: &Spec,
@@ -118,6 +120,24 @@ pub(crate) fn guided_ridge_peak(
 enum PeakChoice {
     Strongest,
     NearestQualified { min_snr: f64, min_z: f64 },
+}
+
+/// How far `prof[k]` stands above the shallower valley between it and a stronger bin. The
+/// strongest bin has no such valley, so it is unlimited. Non-finite bins are skipped.
+fn clearance(prof: &[f64], k: usize) -> f64 {
+    let drop_to_stronger = |bins: &mut dyn Iterator<Item = &f64>| {
+        let mut low = prof[k];
+        for &v in bins {
+            if v > prof[k] {
+                return prof[k] - low;
+            }
+            if v < low {
+                low = v;
+            }
+        }
+        f64::INFINITY
+    };
+    drop_to_stronger(&mut prof[..k].iter().rev()).min(drop_to_stronger(&mut prof[k + 1..].iter()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -207,6 +227,7 @@ fn profile_peak(
                     && prof[k] - med >= min_snr
                     && (prof[k] - med) / mad >= min_z
                     && (peak_frequency(k) - f_pred).abs() <= band
+                    && clearance(&prof, k) >= min_snr
             })
             .min_by(|&a, &b| {
                 (peak_frequency(a) - f_pred)
@@ -350,20 +371,18 @@ mod tests {
     use crate::spectro::SpecMeta;
 
     fn profile_spec(peaks: &[(f64, f64)]) -> Spec {
+        spec_from_profile(|f| {
+            0.2 * (1.7 * f).sin()
+                + peaks
+                    .iter()
+                    .map(|&(center, height)| height * (-0.5 * ((f - center) / 0.5).powi(2)).exp())
+                    .sum::<f64>()
+        })
+    }
+
+    fn spec_from_profile(profile: impl Fn(f64) -> f64) -> Spec {
         let f: Vec<f64> = (0..=160).map(|i| 80.0 + 0.25 * i as f64).collect();
-        let db = f
-            .iter()
-            .flat_map(|&f| {
-                let profile = 0.2 * (1.7 * f).sin()
-                    + peaks
-                        .iter()
-                        .map(|&(center, height)| {
-                            height * (-0.5 * ((f - center) / 0.5).powi(2)).exp()
-                        })
-                        .sum::<f64>();
-                [profile as f32; 3]
-            })
-            .collect();
+        let db = f.iter().flat_map(|&f| [profile(f) as f32; 3]).collect();
         Spec {
             t: vec![0.0, 1.0, 2.0],
             f,
@@ -400,5 +419,20 @@ mod tests {
             guided_ridge_peak(&edge, 1, 100.0, 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).is_none(),
             "a strong band-edge shoulder is not a local maximum"
         );
+    }
+
+    /// A slope error smears a ridge into a broad hump, and ripple on the hump makes local
+    /// maxima next to the model. Taking one would make the trace confirm its own model:
+    /// on a real recording this lowered the fit RMS and took v and d far from the truth.
+    #[test]
+    fn guided_peak_ignores_ripple_on_a_stronger_ridge() {
+        let p = TraceParams::default();
+        let spec = spec_from_profile(|f| {
+            12.0 * (-0.5 * ((f - 102.0) / 3.0).powi(2)).exp()
+                + 0.5 * (std::f64::consts::TAU * f).sin()
+        });
+        let guided =
+            guided_ridge_peak(&spec, 1, 100.0, 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).unwrap();
+        assert!((guided.0 - 102.25).abs() < 0.15, "{guided:?}");
     }
 }
