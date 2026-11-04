@@ -698,9 +698,9 @@ mod tests {
         String::from_utf8_lossy(&head).to_ascii_lowercase()
     }
 
-    /// A server that sends 10 of 100 bytes and then goes silent with the socket open
-    /// (the hang seen on a GitHub release download) must not hang `stream`: the idle
-    /// timeout fires and the download resumes with `Range`.
+    /// Serve 10 of 100 bytes and drop, then answer the resume (`Range: bytes=10-`) with
+    /// `second_head` and `second_body`. Returns the stream's error text and the bytes the
+    /// sink accepted.
     fn serve_truncated_then_partial(
         second_head: &'static [u8],
         second_body: Vec<u8>,
@@ -887,6 +887,9 @@ mod tests {
         server.join().expect("server");
     }
 
+    /// A server that sends 10 of 100 bytes and then goes silent with the socket open
+    /// (the hang seen on a GitHub release download) must not hang `stream`: the idle
+    /// timeout fires and the download resumes with `Range`.
     #[test]
     fn stalled_body_resumes_after_idle_timeout() {
         let body: Vec<u8> = (0..100u8).collect();
@@ -937,5 +940,65 @@ mod tests {
         assert!(!h1.contains("range:"), "first request: {h1}");
         assert!(h2.contains("range: bytes=10-"), "resume request: {h2}");
         assert!(t0.elapsed() < Duration::from_secs(20), "{:?}", t0.elapsed());
+    }
+
+    /// `bytes=N-` from a lower-cased request head.
+    fn range_start(head: &str) -> u64 {
+        head.split("range: bytes=")
+            .nth(1)
+            .and_then(|r| r.split('-').next())
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A server that drops every connection after 15 bytes needs 7 connections for 100
+    /// bytes. Each drop delivered bytes, so the retry budget must not run out (with
+    /// `retries = 0` the 5th counted drop ends the stream): only drops without progress count.
+    #[test]
+    fn drops_with_progress_do_not_exhaust_the_retry_budget() {
+        let body: Vec<u8> = (0..100u8).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let served = body.clone();
+        let server = std::thread::spawn(move || {
+            let mut conns = 0;
+            loop {
+                let (mut s, _) = listener.accept().expect("accept");
+                conns += 1;
+                let from = range_start(&read_head(&mut s)) as usize;
+                let head = if from == 0 {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+                         Content-Range: bytes {from}-99/100\r\n\r\n",
+                        100 - from
+                    )
+                };
+                s.write_all(head.as_bytes()).expect("head");
+                let to = (from + 15).min(100);
+                s.write_all(&served[from..to]).expect("part");
+                s.flush().expect("flush");
+                if to == 100 {
+                    return conns;
+                }
+            }
+        });
+        let net = Net::new().expect("net").with_retries(0);
+        let mut got = Vec::new();
+        let n = net
+            .stream(
+                &format!("http://{addr}/blob"),
+                &[],
+                &AtomicBool::new(false),
+                &mut |c| {
+                    got.extend_from_slice(c);
+                    Ok(())
+                },
+            )
+            .expect("stream");
+        assert_eq!(server.join().expect("server"), 7);
+        assert_eq!(n, 100);
+        assert_eq!(got, body);
     }
 }
