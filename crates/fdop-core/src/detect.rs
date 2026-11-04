@@ -186,6 +186,76 @@ struct Template {
     n_r: usize,
 }
 
+/// Score each row independently so a worker keeps only one row's sums in cache. Coverage
+/// comes from intervals of valid frames, rather than summing a full padded mask per sample.
+/// The evidence additions retain path order, including when scoring the residual pass.
+fn score_bank(ls: &LogSpec, tmpls: &[Template], evidence: &[f32]) -> (Vec<f32>, Vec<u16>) {
+    let (nt, nr) = (ls.nt(), ls.nr());
+    let mut best = vec![f32::NEG_INFINITY; nr * nt];
+    let mut indices = vec![0u16; nr * nt];
+    let max_count = tmpls.iter().map(|t| t.n_a.max(t.n_r)).max().unwrap_or(0);
+    let roots: Vec<f32> = (0..=max_count).map(|n| (n as f32).sqrt()).collect();
+    best.par_chunks_mut(nt)
+        .zip(indices.par_chunks_mut(nt))
+        .enumerate()
+        .for_each_init(
+            || {
+                (
+                    vec![0f32; nt],
+                    vec![0f32; nt],
+                    vec![0i32; nt + 1],
+                    vec![0i32; nt + 1],
+                )
+            },
+            |(sa, sr, ca, cr), (r, (bs, bi))| {
+                for (ti, tm) in tmpls.iter().enumerate() {
+                    sa.fill(0.0);
+                    sr.fill(0.0);
+                    ca.fill(0);
+                    cr.fill(0);
+                    for &(dt, dr, app) in &tm.path {
+                        let source_row = r as i64 + dr as i64;
+                        if source_row < 0 || source_row >= nr as i64 {
+                            continue;
+                        }
+                        let a = (-(dt as i64)).clamp(0, nt as i64) as usize;
+                        let b = (nt as i64 - dt as i64).clamp(0, nt as i64) as usize;
+                        if a >= b {
+                            continue;
+                        }
+                        let (s, counts) = if app {
+                            (&mut *sa, &mut *ca)
+                        } else {
+                            (&mut *sr, &mut *cr)
+                        };
+                        let src = source_row as usize * nt + (a as i64 + dt as i64) as usize;
+                        for (sum, &z) in s[a..b].iter_mut().zip(&evidence[src..src + b - a]) {
+                            *sum += z;
+                        }
+                        counts[a] += 1;
+                        counts[b] -= 1;
+                    }
+                    let (mut na, mut nrr) = (0i32, 0i32);
+                    for k in 0..nt {
+                        na += ca[k];
+                        nrr += cr[k];
+                        if (na as f32) < 0.6 * tm.n_a as f32 || (nrr as f32) < 0.6 * tm.n_r as f32 {
+                            continue;
+                        }
+                        // Keep sum/sqrt(n), including zeroed known samples in n: removing
+                        // those samples from coverage would inflate residual detections.
+                        let s = (sa[k] / roots[na as usize]).min(sr[k] / roots[nrr as usize]);
+                        if s > bs[k] || (s == bs[k] && ti < bi[k] as usize) {
+                            bs[k] = s;
+                            bi[k] = ti as u16;
+                        }
+                    }
+                }
+            },
+        );
+    (best, indices)
+}
+
 fn build_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
     let b = p.bins_per_octave as f64;
     let mut out = Vec::new();
@@ -263,91 +333,7 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
         return (Vec::new(), 0);
     }
     let tmpls = build_templates(p, ls.hop_s);
-    // Padded copies: margin rows/frames so every shifted read stays in bounds; a parallel mask
-    // counts how many path samples actually fell on data.
-    let (mr_up, mr_dn) = tmpls
-        .iter()
-        .flat_map(|t| t.path.iter())
-        .fold((0i32, 0i32), |a, x| (a.0.max(x.1), a.1.min(x.1)));
-    let mt = tmpls
-        .iter()
-        .flat_map(|t| t.path.iter())
-        .map(|x| x.0.abs())
-        .max()
-        .unwrap_or(0);
-    let (pad_r0, pad_t) = ((-mr_dn) as usize, mt as usize);
-    let pr = nr + pad_r0 + mr_up as usize;
-    let pt = nt + 2 * pad_t;
-    let mut lp = vec![0f32; pr * pt];
-    let mut mp = vec![0f32; pr * pt];
-    for r in 0..nr {
-        let dst = (r + pad_r0) * pt + pad_t;
-        lp[dst..dst + nt].copy_from_slice(&ls.data[r * nt..(r + 1) * nt]);
-        for v in &mut mp[dst..dst + nt] {
-            *v = 1.0;
-        }
-    }
-    // Only score + template index are retained; half scores are recomputed for accepted
-    // seeds below. One map uses 6 bytes/cell, versus 14 with stored half scores.
-    let score_bank = |evidence: &[f32]| {
-        tmpls
-            .par_iter()
-            .enumerate()
-            .fold(
-                || (vec![f32::NEG_INFINITY; nr * nt], vec![0u16; nr * nt]),
-                |(mut bs, mut bi), (ti, tm)| {
-                    let mut sa = vec![0f32; nr * nt];
-                    let mut sr = vec![0f32; nr * nt];
-                    let mut ca = vec![0f32; nr * nt];
-                    let mut cr = vec![0f32; nr * nt];
-                    for &(dt, dr, app) in &tm.path {
-                        let (s, c) = if app {
-                            (&mut sa, &mut ca)
-                        } else {
-                            (&mut sr, &mut cr)
-                        };
-                        for r in 0..nr {
-                            let src = (r as i64 + pad_r0 as i64 + dr as i64) as usize * pt
-                                + (pad_t as i64 + dt as i64) as usize;
-                            let srow = &evidence[src..src + nt];
-                            let mrow = &mp[src..src + nt];
-                            let drow = &mut s[r * nt..(r + 1) * nt];
-                            let crow = &mut c[r * nt..(r + 1) * nt];
-                            for i in 0..nt {
-                                drow[i] += srow[i];
-                                crow[i] += mrow[i];
-                            }
-                        }
-                    }
-                    let (na, nrr) = (tm.n_a as f32, tm.n_r as f32);
-                    for k in 0..nr * nt {
-                        if ca[k] < 0.6 * na || cr[k] < 0.6 * nrr {
-                            continue;
-                        }
-                        // Matched-filter sum/sqrt(n) is ~N(0,1) per half under noise and
-                        // grows as mean_z * sqrt(n) along a real ridge.
-                        let s = (sa[k] / ca[k].sqrt()).min(sr[k] / cr[k].sqrt());
-                        if s > bs[k] || (s == bs[k] && ti < bi[k] as usize) {
-                            bs[k] = s;
-                            bi[k] = ti as u16;
-                        }
-                    }
-                    (bs, bi)
-                },
-            )
-            .reduce(
-                || (vec![f32::NEG_INFINITY; nr * nt], vec![0u16; nr * nt]),
-                |mut x, y| {
-                    for k in 0..nr * nt {
-                        if y.0[k] > x.0[k] || (y.0[k] == x.0[k] && y.1[k] < x.1[k]) {
-                            x.0[k] = y.0[k];
-                            x.1[k] = y.1[k];
-                        }
-                    }
-                    x
-                },
-            )
-    };
+    let mut lp = ls.data.clone();
     // Greedy non-maximum suppression in (t0r, log f0) plus residual evidence: `known` marks
     // the cells (+-3 log-rows) along every accepted curve; a later candidate is re-scored with
     // those cells counted as zero, so a template that merely rides an already detected ridge
@@ -357,7 +343,7 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
     let mut out: Vec<Detection> = Vec::new();
     let mut remaining_candidates = 400_000usize;
     for pass in 0..2 {
-        let (bs, bi) = score_bank(&lp);
+        let (bs, bi) = score_bank(ls, &tmpls, &lp);
         // Weak detections excuse unheard passes; they must not erase a measurable curve
         // before its template gets a chance to win. Accept strong curves first, then search
         // their residual for both strong and weak curves. A weak-only recording keeps the
@@ -441,12 +427,9 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
         // Search the residual evidence once so its template can become a cell winner.
         // Keep the original coverage mask and denominator: known samples contribute zero,
         // exactly as in residual_halves, rather than making short fragments look stronger.
-        for r in 0..nr {
-            let dst = (r + pad_r0) * pt + pad_t;
-            for i in 0..nt {
-                if known[r * nt + i] {
-                    lp[dst + i] = 0.0;
-                }
+        for (z, &seen) in lp.iter_mut().zip(&known) {
+            if seen {
+                *z = 0.0;
             }
         }
     }
@@ -635,6 +618,94 @@ pub fn refine(spec: &Spec, det: &Detection, c: f64) -> Detection {
 mod tests {
     use super::*;
     use crate::physics::cv_curve;
+
+    #[test]
+    fn template_bank_matches_scalar_with_edges_and_residuals() {
+        let p = DetectParams {
+            // Duplicate templates exercise the earliest-template tie break.
+            v_grid: vec![40.0, 100.0, 175.0, 100.0],
+            d_grid: vec![250.0, 1000.0, 12_000.0],
+            ..DetectParams::default()
+        };
+        for nt in [8, 61, 251] {
+            let nr = 37;
+            let ls = LogSpec {
+                t: (0..nt).map(|i| i as f64).collect(),
+                freqs: (0..nr).map(|r| 35.0 * 2f64.powf(r as f64 / 48.0)).collect(),
+                data: (0..nr * nt)
+                    .map(|k| (((k * 37 + 11) % 101) as f32 - 50.0) / 17.0)
+                    .collect(),
+                bins_per_octave: 48,
+                hop_s: 1.0,
+            };
+            let tmpls = build_templates(&p, ls.hop_s);
+            for residual in [false, true] {
+                let known: Vec<bool> = (0..nr * nt)
+                    .map(|k| residual && (k % 7 == 0 || (k / nt) % 5 == 0))
+                    .collect();
+                let evidence: Vec<f32> = ls
+                    .data
+                    .iter()
+                    .zip(&known)
+                    .map(|(&z, &seen)| if seen { 0.0 } else { z })
+                    .collect();
+                let mut expected = (vec![f32::NEG_INFINITY; nr * nt], vec![0u16; nr * nt]);
+                for r in 0..nr {
+                    for i in 0..nt {
+                        let k = r * nt + i;
+                        for (ti, tm) in tmpls.iter().enumerate() {
+                            // Direct per-cell oracle for the original padded bank. Its
+                            // coverage comparison is f32 (residual_halves uses f64, which
+                            // rounds the 60% boundary differently for e.g. 25 samples).
+                            let (mut a, mut b, mut na, mut nb) = (0f32, 0f32, 0f32, 0f32);
+                            for &(dt, dr, approach) in &tm.path {
+                                let row = r as i64 + dr as i64;
+                                let frame = i as i64 + dt as i64;
+                                if row < 0 || row >= nr as i64 || frame < 0 || frame >= nt as i64 {
+                                    continue;
+                                }
+                                let z = evidence[row as usize * nt + frame as usize];
+                                if approach {
+                                    a += z;
+                                    na += 1.0;
+                                } else {
+                                    b += z;
+                                    nb += 1.0;
+                                }
+                            }
+                            let score = if na < 0.6 * tm.n_a as f32 || nb < 0.6 * tm.n_r as f32 {
+                                f32::NEG_INFINITY
+                            } else {
+                                (a / na.sqrt()).min(b / nb.sqrt())
+                            };
+                            if score > expected.0[k] {
+                                expected.0[k] = score;
+                                expected.1[k] = ti as u16;
+                            }
+                        }
+                    }
+                }
+                for threads in [1, 3] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let actual = pool.install(|| score_bank(&ls, &tmpls, &evidence));
+                    for (k, (&a, &b)) in actual.0.iter().zip(&expected.0).enumerate() {
+                        assert_eq!(
+                            actual.1[k], expected.1[k],
+                            "nt={nt} cell={k} residual={residual}"
+                        );
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "nt={nt} cell={k} residual={residual}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn harmonic_detection(id: usize, f0: f64, d: f64) -> Detection {
         Detection {

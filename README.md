@@ -660,6 +660,10 @@ not typical of a busy recording. Search time follows the fine cells, at 50–60 
 a second replay running and so not a clean timing, a 3 h osprey-cam recording searched across its state scored
 893,697 cells in 9,602 s (45,474 CPU-seconds, 8.8 GiB). It took 584 s when the fine stage stopped at 4,000 cells.
 
+Detector scoring now reuses one row of scratch per worker instead of full temporary spectrograms for every
+template. Scalar-oracle and before/after synthetic comparisons preserve the scores and detections. The real
+recording timings above predate this optimization; they have not been remeasured.
+
 Weather retrieval overlaps audio analysis. After audio analysis, the pipeline waits up to 190 s for weather:
 the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. This retains
 the configured fallback allowance after the preferred request has been tried.

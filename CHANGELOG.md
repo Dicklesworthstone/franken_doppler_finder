@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Detector scoring with bounded per-worker scratch
+
+- The matched-filter bank now scores independent frequency rows with reusable row buffers. It
+  removes the padded coverage mask, four full work matrices per template, and per-worker copies
+  of the winning-score map. Scratch per worker scales with the number of time frames instead of
+  frames times frequency rows. Valid-frame intervals provide the same sample counts without
+  adding a mask value for every template sample.
+- The templates, evidence addition order, float32 coverage boundary, template-index tie break,
+  residual denominators, thresholds and detection caps are unchanged.
+  `template_bank_matches_scalar_with_edges_and_residuals` checks every score bit and winning
+  template against a direct scalar oracle, including short recordings, both grid edges,
+  duplicate templates, masked evidence and one versus three worker threads. The existing
+  noisy-audio detection, cap, overlap and measurement regressions also passed on the working tree.
+- A standalone comparison against `695f952` produced identical serialized full detection results
+  in three runs of a synthetic 240-row, 3,600-frame log spectrogram. This is synthetic equivalence
+  evidence; the historical reference-recording results and timings below have not been remeasured.
+
 ### Low answers say they are unconfirmed; `fdop detect` warns on high-passed audio
 
 - **The text of `verdict` in `result.json` changes** for answers below high, and so does the same line in the CLI
