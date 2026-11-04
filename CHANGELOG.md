@@ -52,6 +52,29 @@ at that commit, not per-change commits.
   recovers a complete contour around the known observer. The reference configurations and field
   recordings have not been rerun; their historical distances and grades do not validate this change.
 
+### Search recovery and memory use
+
+- Hypothesis generation now follows the full cross-track reach across varying terrain. A valley point outside
+  the slant-distance gate no longer suppresses valid observers on a later hillside. The synthetic regression
+  covers both sides of a flight and a flat-ground negative control; the old loop produces no eligible cloud.
+- Clock pruning now removes candidates that no longer explain two distinct events, and checks newly promoted
+  leaders until the leading set is finalized. A strong one-event coincidence can no longer block a valid weaker
+  pair, and the former eight-round cutoff cannot leave a promoted winner unchecked. Synthetic regressions use
+  180 rejected candidates and an actual trace/track case whose incompatible pair collapses to one event.
+- Hypothesis budgets now respect the intended tenth of detected RAM on smaller machines instead of imposing
+  a 4 GB minimum. Generation accounts for retained hypotheses in batches, before completing an entire track;
+  over-budget and confirmer-only events still keep exact counts and the unchanged deterministic chance sample.
+  Regressions compare retained clouds and samples with the former algorithm and bound retained elements across
+  interleaved workers. This is a payload allowance, not an exact process-memory ceiling.
+- All 30 core tests pass on these search changes before integration of the concurrent close-flyover, confidence-radius
+  and multi-track audio fixes. The terrain regression fails with the former early exit. The combined tree has not
+  been rerun since the execution environment disconnected.
+  Cargo used the pinned nightly, one build job and unoptimised dependencies under the shared host's memory limit.
+  Core Clippy was attempted but its `simba` dependency received SIGKILL before project checking completed;
+  workspace formatting and the targeted Rust bug scan passed.
+- Detection and measurement caps, scoring formulas and confidence thresholds are unchanged. Reference recordings
+  and field cases have not been rerun, so these changes establish synthetic recovery and memory behavior only.
+
 ### Search driver selection ([`b2a6906`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/b2a69069876e5d25f319305ffc7f46ca9ffd6ba0))
 
 - Events with no eligible ADS-B hypotheses no longer consume `--max-events` driver slots or form empty

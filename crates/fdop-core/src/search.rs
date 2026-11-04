@@ -197,12 +197,12 @@ impl SearchParams {
 }
 
 /// Hypothesis budgets (per event, total) from physical memory: a tenth of RAM for stored
-/// clouds (20 bytes each), at least the 30 M / 200 M defaults, at most 2 G in total.
+/// clouds (20 bytes each), at most 2 G in total. Unknown memory uses the 200 M default.
 pub fn hyp_budget(mem_bytes: Option<u64>) -> (usize, usize) {
-    let total = mem_bytes
-        .map_or(200_000_000, |m| ((m / 10) / 20) as usize)
-        .clamp(200_000_000, 2_000_000_000);
-    ((total / 3).max(30_000_000), total)
+    let total = mem_bytes.map_or(200_000_000, |m| {
+        ((m / 10) / 20).clamp(1, 2_000_000_000) as usize
+    });
+    ((total / 3).max(1), total)
 }
 
 /// Physical memory in bytes (Linux: MemTotal or a smaller cgroup limit; macOS: hw.memsize).
@@ -309,6 +309,55 @@ struct HypSet {
     sample: Vec<Hyp>,
 }
 
+/// Account for generated hypotheses in small batches, before a whole track is materialised.
+/// Once the event exceeds its cap it is confirmer-only, but its exact count and deterministic
+/// chance sample are still needed. At most one unaccounted batch per worker is retained.
+struct HypBuilder {
+    stored: Vec<Hyp>,
+    sample: Vec<Hyp>,
+    count: usize,
+    retaining: bool,
+}
+
+impl HypBuilder {
+    const BATCH: usize = 1024;
+
+    fn new(cap: usize) -> Self {
+        Self {
+            stored: Vec::new(),
+            sample: Vec::new(),
+            count: 0,
+            retaining: cap > 0,
+        }
+    }
+
+    fn account(&mut self, n: usize, cap: usize, total: &AtomicUsize) {
+        let before = total.fetch_add(n, Ordering::Relaxed);
+        if before.saturating_add(n) > cap {
+            self.stored = Vec::new();
+            self.retaining = false;
+        }
+    }
+
+    fn push(&mut self, h: Hyp, track: usize, cap: usize, total: &AtomicUsize) {
+        if mix(track as u64, self.count as u64).is_multiple_of(1024) {
+            self.sample.push(h);
+        }
+        self.count += 1;
+        if self.retaining {
+            self.stored.push(h);
+        }
+        if self.count.is_multiple_of(Self::BATCH) {
+            self.account(Self::BATCH, cap, total);
+        }
+    }
+
+    fn finish(mut self, cap: usize, total: &AtomicUsize) -> (Vec<Hyp>, usize, Vec<Hyp>) {
+        self.account(self.count % Self::BATCH, cap, total);
+        (self.stored, self.count, self.sample)
+    }
+}
+
 #[inline]
 fn mix(a: u64, b: u64) -> u64 {
     let mut x = a.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ b.wrapping_add(0x632b_e59b_d9b4_e019);
@@ -373,7 +422,7 @@ fn hypotheses(
         .par_iter()
         .enumerate()
         .map(|(ti, tr)| {
-            let mut out = Vec::new();
+            let mut out = HypBuilder::new(cap);
             let te_lo = t_lo_all.max(tr.t0());
             let te_hi = (p.start_hi + ev.t_rec + ev.t_tol + 5.0).min(tr.t1());
             let mut t = te_lo;
@@ -447,12 +496,11 @@ fn hypotheses(
                                 cross_point(side, b)
                             };
                             let (_, _, hh, d) = point;
-                            if d > d_hi * 1.02 && b > 0.0 {
-                                break;
-                            }
+                            // Rising terrain can bring a later point back inside the distance
+                            // gate. Only the horizontal reach bounds this cross-track ray.
                             regular_geometry |= hh >= p.min_agl_m && d >= d_lo && d <= d_hi;
                             if let Some(hyp) = to_hyp(point) {
-                                out.push(hyp);
+                                out.push(hyp, ti, cap, &count);
                             }
                             b += p.cross_step_m;
                         }
@@ -469,24 +517,13 @@ fn hypotheses(
                             })
                             && let Some(hyp) = to_hyp(cross_point(side, b))
                         {
-                            out.push(hyp);
+                            out.push(hyp, ti, cap, &count);
                         }
                     }
                 }
                 t += dt;
             }
-            let n = out.len();
-            let sample: Vec<Hyp> = out
-                .iter()
-                .enumerate()
-                .filter(|(k, _)| mix(ti as u64, *k as u64).is_multiple_of(1024))
-                .map(|(_, h)| *h)
-                .collect();
-            let before = count.fetch_add(n, Ordering::Relaxed);
-            if before + n > cap {
-                out = Vec::new();
-            }
-            (out, n, sample)
+            out.finish(cap, &count)
         })
         .collect::<Vec<(Vec<Hyp>, usize, Vec<Hyp>)>>();
     let total: usize = parts.iter().map(|x| x.1).sum();
@@ -1801,33 +1838,16 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             .total_cmp(&a.score)
             .then(a.pair_chi.total_cmp(&b.pair_chi))
     });
-    // lock check: every event's own preferred clock must agree with the joint clock. An event
-    // that disagrees (paired or confirming) is a coincidence: drop it, refit the clock on the
-    // rest and repeat. Pruning reorders the list, so iterate until the leaders are all checked.
-    for _ in 0..8 {
-        let n_lock = cands.len().min(20);
-        if cands[..n_lock].iter().all(|c| c.lock_checked) {
-            break;
-        }
-        cands[..n_lock]
-            .par_iter_mut()
-            .filter(|c| !c.lock_checked)
-            .for_each(|cand| {
-                lock_prune(cand, &evs, tracks, p, atmo, inp.fine_dem);
-                let o = observer(cand.lat, cand.lon, inp.fine_dem);
-                cand.fit_score = fit_score(&cand.events, &evs, p.kappa);
-                cand.unheard_close_passes = unheard_passes(cand, &o, tracks, &tix, heard, p);
-                let nu = cand.unheard_close_passes.len();
-                cand.score = evidence(&mut cand.events, &nulls, nu);
-                cand.lock_checked = true;
-            });
-        cands.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then(a.pair_chi.total_cmp(&b.pair_chi))
-        });
-        cands = dedupe(cands);
-    }
+    // A coincidence can lose a match at the clock check. Remove candidates that no longer
+    // explain two distinct events and check every newly promoted leader before choosing it.
+    cands = finalize_candidates(cands, &|cand| {
+        lock_prune(cand, &evs, tracks, p, atmo, inp.fine_dem);
+        let o = observer(cand.lat, cand.lon, inp.fine_dem);
+        cand.fit_score = fit_score(&cand.events, &evs, p.kappa);
+        cand.unheard_close_passes = unheard_passes(cand, &o, tracks, &tix, heard, p);
+        let nu = cand.unheard_close_passes.len();
+        cand.score = evidence(&mut cand.events, &nulls, nu);
+    });
     // margin against the best *different explanation*: a place more than 5 km away, or one
     // that explains the events differently (no shared event-flight match, or a shared event
     // matched to another flight). The same flights at a nearby worse optimum are positional
@@ -1869,6 +1889,42 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
         refine,
         margin,
         warnings,
+    }
+}
+
+/// Finalize the leaders until pruning and reranking promote no unchecked candidate into
+/// the leading 20. Every pass checks at least one previously unchecked candidate, so work
+/// is bounded by the supplied candidate count rather than an arbitrary number of rounds.
+/// A single event cannot locate the observer, even if its chance-match evidence is large.
+fn finalize_candidates(
+    mut cands: Vec<Candidate>,
+    check: &(dyn Fn(&mut Candidate) + Sync),
+) -> Vec<Candidate> {
+    let locates = |c: &Candidate| {
+        c.events
+            .first()
+            .is_some_and(|first| c.events.iter().any(|m| m.event != first.event))
+    };
+    cands.retain(locates);
+    loop {
+        let n_lock = cands.len().min(20);
+        if cands[..n_lock].iter().all(|c| c.lock_checked) {
+            return cands;
+        }
+        cands[..n_lock]
+            .par_iter_mut()
+            .filter(|c| !c.lock_checked)
+            .for_each(|cand| {
+                check(cand);
+                cand.lock_checked = true;
+            });
+        cands.retain(locates);
+        cands.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then(a.pair_chi.total_cmp(&b.pair_chi))
+        });
+        cands = dedupe(cands);
     }
 }
 
@@ -2436,6 +2492,140 @@ mod tests {
     }
 
     #[test]
+    fn finalization_checks_every_promoted_leader() {
+        let m = |event: &str, flight: String| EventMatch {
+            event: event.into(),
+            flight,
+            ..Default::default()
+        };
+        let mut cands: Vec<Candidate> = (0..180)
+            .map(|i| Candidate {
+                events: vec![m("e1", "A".into()), m("e2", format!("coincidence{i}"))],
+                n_explained: 2,
+                score: 1000.0 - i as f64,
+                ..Default::default()
+            })
+            .collect();
+        // Two separate passes by the same aircraft are permitted; independence is between
+        // events, not aircraft identifiers. Both events still have to survive clock checks.
+        cands.push(Candidate {
+            events: vec![m("e3", "B".into()), m("e4", "B".into())],
+            n_explained: 2,
+            score: 1.0,
+            ..Default::default()
+        });
+        let checked = AtomicUsize::new(0);
+        let out = finalize_candidates(cands, &|cand| {
+            checked.fetch_add(1, Ordering::Relaxed);
+            if cand.events[0].event == "e1" {
+                cand.events.pop();
+                cand.n_explained = 1;
+            }
+        });
+        assert_eq!(checked.load(Ordering::Relaxed), 181);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].lock_checked);
+        assert_eq!(out[0].events[0].event, "e3");
+        assert_eq!(out[0].n_explained, 2);
+    }
+
+    #[test]
+    fn single_event_impostor_cannot_block_clock_consistent_pair() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let prop = Prop::from_medium(&med, &enu);
+        let true_clock = case.t_s + 8.0;
+        // This weak event has an uncertain CPA time but its full trace prefers a clock 8 s
+        // later than A. It can pass pair gates with A, then fails the independent clock check.
+        let b = &mut case.events[1];
+        b.t_tol = 12.0;
+        b.sigma_hz = 3.0;
+        for t in b.tr_t.iter_mut().chain(&mut b.q_t) {
+            *t -= 8.0;
+        }
+        let mut c = straight_track(
+            &enu,
+            [-3000.0, 0.0, 1200.0],
+            [0.0, -112.0, 0.0],
+            case.t_s + 2400.0,
+            case.t_s + 1800.0,
+            case.t_s + 3000.0,
+            5.0,
+        );
+        c.key = "C".into();
+        case.events.push(synth_event(
+            "e3",
+            &c,
+            enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]),
+            true_clock,
+            120.0,
+            343.0,
+            case.t_s + 2400.0,
+            &prop,
+        ));
+        case.tracks.push(c);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let inp = SearchInputs {
+            events: case.events.clone(),
+            tracks: &case.tracks,
+            heard_times: vec![],
+            coarse_dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let explain = |pairs: &[(&str, &str)], clock| {
+            explain_at(
+                &inp,
+                &case.p,
+                case.obs.0,
+                case.obs.1,
+                clock,
+                20.0,
+                &pairs
+                    .iter()
+                    .map(|(e, f)| (e.to_string(), f.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let mut impostor = explain(&[("e1", "A"), ("e2", "B")], case.t_s);
+        let mut valid = explain(&[("e2", "B"), ("e3", "C")], true_clock);
+        assert!(impostor.events.iter().all(|m| m.chi <= case.p.kappa));
+        // Controlled evidence values make the single excellent coincidence outrank the two
+        // weaker real matches unless invalid candidates are removed after the clock check.
+        let nulls: Vec<EventNull> = [("e1", 10.0), ("e2", 2.0), ("e3", 2.0)]
+            .into_iter()
+            .map(|(event, gate_nats)| EventNull {
+                event: event.into(),
+                gate_nats,
+                ..Default::default()
+            })
+            .collect();
+        impostor.score = evidence(&mut impostor.events, &nulls, 0);
+        valid.score = evidence(&mut valid.events, &nulls, 0);
+        let check = |cand: &mut Candidate| {
+            lock_prune(cand, &case.events, &case.tracks, &case.p, &atmo, &dem);
+            cand.score = evidence(&mut cand.events, &nulls, 0);
+        };
+        let mut pruned = impostor.clone();
+        check(&mut pruned);
+        assert_eq!(pruned.events.len(), 1);
+        assert_eq!(pruned.events[0].event, "e1");
+        assert!(pruned.score > valid.score);
+        let out = finalize_candidates(vec![impostor, valid], &check);
+        assert_eq!(out.len(), 1);
+        let top = &out[0];
+        assert!(top.lock_checked);
+        assert_eq!(top.n_explained, 2);
+        assert_eq!(top.events[0].event, "e2");
+        assert_eq!(top.events[1].event, "e3");
+        assert!(top.events.iter().all(|m| m.core));
+        assert!((top.t_start_utc - true_clock).abs() < 1.0);
+    }
+
+    #[test]
     fn explanations_and_duplicates() {
         let m = |e: &str, f: &str| EventMatch {
             event: e.into(),
@@ -2479,7 +2669,104 @@ mod tests {
         assert_eq!(hyp_budget(None), (66_666_666, 200_000_000));
         let (per, tot) = hyp_budget(Some(256 << 30));
         assert!(tot > 1_300_000_000 && per == tot / 3, "{per} {tot}");
-        assert_eq!(hyp_budget(Some(8 << 30)).1, 200_000_000);
+        assert_eq!(std::mem::size_of::<Hyp>(), 20);
+        for bytes in [512 << 20, 2 << 30, 8 << 30, 32 << 30] {
+            let (per, total) = hyp_budget(Some(bytes));
+            assert!(per > 0 && per <= total);
+            assert!(
+                total as u64 * 20 <= bytes / 10,
+                "{bytes} bytes: {total} hypotheses"
+            );
+        }
+        assert_eq!(hyp_budget(Some(u64::MAX)), (666_666_666, 2_000_000_000));
+        assert_eq!(hyp_budget(Some(0)), (1, 1));
+    }
+
+    #[test]
+    fn hypothesis_builder_preserves_cloud_and_chance_sample() {
+        let sizes = [(0, 1023), (3, 2049), (17, 3077)];
+        let cap = sizes.iter().map(|&(_, n)| n).sum();
+        let total = AtomicUsize::new(0);
+        for (track, n) in sizes {
+            let expected: Vec<Hyp> = (0..n)
+                .map(|k| Hyp {
+                    trk: track as u32,
+                    t_e: k as f32,
+                    e: 2.0 * k as f32,
+                    n: -(k as f32),
+                    t_s: 0.5 * k as f32,
+                })
+                .collect();
+            let mut builder = HypBuilder::new(cap);
+            for &h in &expected {
+                builder.push(h, track, cap, &total);
+            }
+            let (stored, count, sample) = builder.finish(cap, &total);
+            let bits = |h: &Hyp| {
+                (
+                    h.trk,
+                    h.t_e.to_bits(),
+                    h.e.to_bits(),
+                    h.n.to_bits(),
+                    h.t_s.to_bits(),
+                )
+            };
+            assert_eq!(count, n);
+            assert_eq!(
+                stored.iter().map(bits).collect::<Vec<_>>(),
+                expected.iter().map(bits).collect::<Vec<_>>()
+            );
+            let old_sample: Vec<_> = expected
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| mix(track as u64, *k as u64).is_multiple_of(1024))
+                .map(|(_, h)| bits(h))
+                .collect();
+            assert_eq!(sample.iter().map(bits).collect::<Vec<_>>(), old_sample);
+        }
+        assert_eq!(total.load(Ordering::Relaxed), cap);
+    }
+
+    #[test]
+    fn hypothesis_builder_drops_large_clouds_before_track_completion() {
+        for cap in [0, 1500, 3000] {
+            let total = AtomicUsize::new(0);
+            let mut builders = [HypBuilder::new(cap), HypBuilder::new(cap)];
+            // Interleave workers to exercise the shared event budget, including
+            // a zero-budget confirmer. The exact count and chance sample survive.
+            for k in 0..20_000 {
+                for (track, builder) in builders.iter_mut().enumerate() {
+                    builder.push(
+                        Hyp {
+                            trk: track as u32,
+                            t_e: k as f32,
+                            e: 0.0,
+                            n: 0.0,
+                            t_s: 0.0,
+                        },
+                        track,
+                        cap,
+                        &total,
+                    );
+                }
+                let retained: usize = builders.iter().map(|b| b.stored.len()).sum();
+                assert!(retained <= cap + builders.len() * (HypBuilder::BATCH - 1));
+                if cap == 0 || k > cap + 2 * HypBuilder::BATCH {
+                    assert!(builders.iter().all(|b| b.stored.capacity() == 0));
+                }
+            }
+            for (track, builder) in builders.into_iter().enumerate() {
+                let (stored, count, sample) = builder.finish(cap, &total);
+                assert!(stored.is_empty());
+                assert_eq!(count, 20_000);
+                let expected: Vec<f32> = (0..20_000)
+                    .filter(|&k| mix(track as u64, k).is_multiple_of(1024))
+                    .map(|k| k as f32)
+                    .collect();
+                assert_eq!(sample.iter().map(|h| h.t_e).collect::<Vec<_>>(), expected);
+            }
+            assert_eq!(total.load(Ordering::Relaxed), 40_000);
+        }
     }
 
     #[test]
@@ -2609,6 +2896,94 @@ mod tests {
                 "{:?}",
                 res.warnings
             );
+        }
+    }
+
+    #[test]
+    fn rising_terrain_can_reenter_the_distance_gate() {
+        struct Hillside {
+            lat: f64,
+            side: f64,
+        }
+        impl Elevation for Hillside {
+            fn elev_m(&self, lat: f64, _lon: f64) -> f64 {
+                let across = self.side * (lat - self.lat) * fdop_types::geo::m_per_deg(self.lat).0;
+                1000.0 * ((across - 400.0) / 400.0).clamp(0.0, 1.0)
+            }
+            fn describe(&self) -> String {
+                "synthetic hillside".into()
+            }
+        }
+
+        let (lat, lon) = (40.8765, -73.5250);
+        let enu = Enu::new(lat, lon, 0.0);
+        let track = straight_track(
+            &enu,
+            [0.0, 0.0, 2000.0],
+            [100.0, 0.0, 0.0],
+            1000.0,
+            900.0,
+            1100.0,
+            5.0,
+        );
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let p = SearchParams::new(
+            498.0,
+            502.0,
+            1000.0,
+            BBox::new(lat - 0.03, lon - 0.03, lat + 0.03, lon + 0.03),
+        );
+        let frame = Frame::new(&p.region);
+        let t_base = p.start_lo - 86_400.0;
+        for side in [-1.0, 1.0] {
+            let dem = Hillside { lat, side };
+            let obs_lat = lat + side * 1050.0 / fdop_types::geo::m_per_deg(lat).0;
+            let o = observer(obs_lat, lon, &dem);
+            let ev = synth_event(
+                "hill",
+                &track,
+                o.x,
+                500.0,
+                118.0,
+                343.0,
+                1000.0,
+                &Prop::from_medium(&med, &enu),
+            );
+            // Near the flight, the valley floor is outside the slant-distance gate.
+            // Farther across the ray, rising ground brings the observer back inside it.
+            assert!(ev.d_gate[1] < 2000.0 - MIC_HEIGHT_M);
+            let flat = hypotheses(
+                &ev,
+                std::slice::from_ref(&track),
+                &p,
+                &frame,
+                &FlatElevation(0.0),
+                &atmo,
+                t_base,
+                100_000,
+            );
+            assert_eq!(flat.count, 0, "the valley floor remains outside the gate");
+            let cloud = hypotheses(
+                &ev,
+                std::slice::from_ref(&track),
+                &p,
+                &frame,
+                &dem,
+                &atmo,
+                t_base,
+                100_000,
+            );
+            let closest = cloud
+                .stored
+                .unwrap()
+                .iter()
+                .map(|h| {
+                    let (la, lo) = frame.latlon(h.e as f64, h.n as f64);
+                    haversine_m(la, lo, obs_lat, lon)
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(closest < p.cross_step_m / 2.0, "side {side}: {closest} m");
         }
     }
 

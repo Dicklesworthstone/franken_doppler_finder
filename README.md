@@ -45,7 +45,7 @@ finding the faint curves in a spectrogram to naming the town.
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
 | Has it located a real recording? | **One recording, three ways, one answer.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three pass every gate at **high** confidence and give the same spot: a 292 m radius about **224 m** from the location published in the video (221 m for the county search). Each matched the same three flyovers: a Pilatus PC-12, a Cessna 208 and a King Air 350 |
 | Has it been wrong? | **Yes, and so far every committed build has graded its wrong answers low.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off). In the field tests below, five answers were wrong. A low grade does not mean wrong, though: one build put the state-wide answer 129 m off at high confidence but graded the county search low. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points. A working-tree experiment that measured more of a 3 h recording's flyovers graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer either |
-| Is it tested? | **93 unit tests,** all offline: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording and recovers the observer to under 1 m |
+| Is it tested? | **101 unit tests,** all offline: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording and recovers the observer to under 1 m |
 | Has it located a recording it was not developed on? | **Once, at the same site.** Nine recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: about 150 m from the cam's geocoded street address, just outside its 147 m radius (an address geocode only approximates where a camera is), with the recording start off by only 0.33 s. The same cam on two other days gave wrong answers graded **low**. An eagle cam at Duke Farms (Hillsborough, NJ) came out in the right township, about 2.2 km from the property's entrance address, graded **low** (the nest position is not published, so a smaller error cannot be scored). At five other sites (railcams in Rochelle, IL, Tucson, AZ, Plant City, FL and Fullerton, CA, and a bird-feeder cam in Ithaca, NY), three answers were wrong and graded **low**, and Plant City and Fullerton gave no location. All but Fullerton held only 0–3 non-jet passes within reach. Fullerton (13 within 3 km) and Duke Farms (16) had more traffic but poor audio. Fullerton's is high-pass filtered at about 125 Hz, which removes or weakens the propeller fundamentals, under broadband wind and road noise; Duke Farms has a wind-saturated microphone. No wrong answer from a committed build was graded above low |
 | What is not validated? | Any site other than the reference one; low-traffic or rural sites (all four tried failed); CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
 | Which code produced these results? | The reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
@@ -549,12 +549,20 @@ Design notes:
   terrain-clearance gates, the search tries an interior point using the terrain height at every probe.
   The distance, clearance, region and recording-clock gates still apply.
 - **Hypotheses are compact.** Each is 20 bytes (a `u32` track index and four `f32`). The budgets are sized from
-  physical memory: a tenth of RAM, clamped to 200 M–2 G hypotheses in total (4–40 GB), so on machines with less
-  than 40 GB the floor is more than a tenth.
+  physical memory: a tenth of RAM, capped at 2 G hypotheses (40 GB). Smaller machines no longer receive a
+  mandatory 4 GB allowance; an 8 GiB machine budgets about 819 MiB. If memory cannot be detected, the fallback
+  is 200 M hypotheses (4 GB). Generation checks the budget while building a track's cloud, and a confirmer-only
+  event keeps its exact hypothesis count and chance sample without materialising the full cloud. Vector
+  capacity, temporary collections, audio, tracks and pair joins require additional memory.
   A pair-join or fine-stage cut is reported in `funnel.truncated` and the warnings. An event that exceeds its
   hypothesis budget, or falls beyond `--max-events`, drops to confirmer-only, which `funnel.hypotheses` shows;
   a budget demotion is also a warning. An event with no eligible flight hypotheses is reported with a zero
   count and does not consume a driver slot: later matchable flyovers can still seed the search.
+- **Terrain is checked across the full cross-track reach.** A hillside can bring a later observer point back
+  inside the slant-distance gate after a valley falls outside it. One failed point no longer cuts off that side.
+- **A location still needs two events after clock checks.** A candidate pruned to one flyover is removed.
+  Newly promoted leaders receive the same clock checks before the winner is chosen, even when many higher
+  scoring coincidences fail first. Separate passes by the same aircraft remain supported.
 - **Parallel, and repeatable up to exact ties.** rayon runs the STFT frames, the template bank, tracing and
   every search stage. Each FFT is pinned to one worker so it does not nest inside rayon. Null sampling uses a
   fixed hash. Candidates with exactly equal scores can come out in a different order from run to run.
@@ -581,8 +589,9 @@ Three runs of the reference case, on one machine. Treat them as an order of magn
 
 The state-wide run searched 10,550 track models. All three ran on an Apple M5 Ultra with the ADS-B days already
 cached. A first run adds the archive download (about 4 GB per UTC day) and the store build. One local date
-usually spans two UTC days. Worst-case search memory is set by the hypothesis budget: a tenth of RAM, clamped to
-4–40 GB. A 3 h field recording took 509 s, 205 s of it in measurement.
+usually spans two UTC days. Stored hypothesis payload is budgeted to a tenth of RAM, capped at 40 GB; temporary
+collections and the rest of the pipeline add to process memory. A 3 h field recording took 509 s, 205 s of it
+in measurement.
 
 Weather retrieval overlaps audio analysis. After audio analysis, the pipeline waits up to 190 s for weather:
 the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. This retains
@@ -592,10 +601,13 @@ the configured fallback allowance after the preferred request has been tried.
 
 ## Testing
 
-All 25 `fdop-core` tests passed after integrating the curved-track, search-driver and deferred-measurement
-changes, including exact eager/deferred fit comparisons and the failed-refinement regression. Core Clippy
-passed for all targets with warnings denied, and workspace formatting passed. The Cargo checks used the
-pinned nightly, one build job and unoptimised dependencies to fit the shared host's memory limit.
+All 30 `fdop-core` tests passed after integrating terrain-aware hypothesis coverage, candidate recovery after
+clock pruning and bounded hypothesis accumulation, together with the earlier curved-track, search-driver and
+deferred-measurement changes. The terrain regression fails with the former early exit and passes with the
+correction. These 30 checks preceded integration of the concurrent close-flyover, confidence-radius and audio
+changes; the combined tree has not been rerun since the execution environment disconnected. The Cargo checks
+use the pinned nightly, one build job and unoptimised dependencies to fit the shared host's memory limit. The new core Clippy attempt was killed while checking its `simba` dependency;
+workspace formatting and the targeted Rust bug scan passed.
 Eight tests of the exact clock helpers and time module also passed in an earlier isolated Rust build.
 The weather-deadline scheduling regression passed in an isolated Rust build of the exact test and constants;
 it fails with the former 150 s wait. A fresh full-workspace Clippy attempt with the same memory settings was
@@ -604,7 +616,7 @@ killed while compiling `asupersync`. The full workspace test suite, the five new
 on these changes.
 
 ```bash
-cargo test --workspace --locked                               # 93 unit tests, no network
+cargo test --workspace --locked                               # 101 unit tests, no network
 cargo test -p fdop-core multistream_decode_matches_the_probed_audio -- --ignored  # needs ffmpeg/ffprobe
 cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
@@ -627,6 +639,9 @@ The unit tests check:
 - two close flyovers whose distance gates fall between cross-track grid lines, recovering the synthetic
   observer within 60 m and the recording clock within 1 s;
 - a stronger unmatched flyover does not prevent two archived flyovers from seeding a search with two driver slots;
+- hillside observers are retained after a valley leaves the slant-distance gate;
+- single-event survivors and a long queue of clock-incompatible candidates do not hide a valid pair;
+- hypothesis storage respects small-host budgets while preserving exact counts and chance samples;
 - junk positions inside an ADS-B leg are dropped before track models are built;
 - trailing UTC days that adsb.lol has not published yet are recognised;
 - the store format, ADS-B parsing and leg building, weather payloads, terrain decoding, region parsing,
