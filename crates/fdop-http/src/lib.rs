@@ -571,7 +571,10 @@ mod tests {
     /// A server that sends 10 of 100 bytes and then goes silent with the socket open
     /// (the hang seen on a GitHub release download) must not hang `stream`: the idle
     /// timeout fires and the download resumes with `Range`.
-    fn serve_truncated_then_partial(second_head: &'static [u8], second_body: Vec<u8>) -> (String, Vec<u8>) {
+    fn serve_truncated_then_partial(
+        second_head: &'static [u8],
+        second_body: Vec<u8>,
+    ) -> (String, Vec<u8>) {
         let body: Vec<u8> = (0..100u8).collect();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -579,7 +582,9 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut first, _) = listener.accept().expect("accept 1");
             let _ = read_head(&mut first);
-            first.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").expect("head 1");
+            first
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+                .expect("head 1");
             first.write_all(&served[..10]).expect("part 1");
             first.flush().expect("flush 1");
             drop(first);
@@ -590,9 +595,22 @@ mod tests {
             second.flush().expect("flush 2");
             h2
         });
-        let net = Net::new().expect("net").with_retries(0).with_body_idle(Duration::from_millis(300));
+        let net = Net::new()
+            .expect("net")
+            .with_retries(0)
+            .with_body_idle(Duration::from_millis(300));
         let mut got = Vec::new();
-        let err = net.stream(&format!("http://{addr}/blob"), &[], &AtomicBool::new(false), &mut |c| { got.extend_from_slice(c); Ok(()) }).expect_err("invalid resume must fail");
+        let err = net
+            .stream(
+                &format!("http://{addr}/blob"),
+                &[],
+                &AtomicBool::new(false),
+                &mut |c| {
+                    got.extend_from_slice(c);
+                    Ok(())
+                },
+            )
+            .expect_err("invalid resume must fail");
         let h2 = server.join().expect("server");
         assert!(h2.contains("range: bytes=10-"), "resume request: {h2}");
         (err.to_string(), got)
@@ -615,7 +633,10 @@ mod tests {
     #[test]
     fn resume_rejects_partial_length_mismatch() {
         let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 89\r\nContent-Range: bytes 10-99/100\r\nConnection: close\r\n\r\n", (10u8..99).collect());
-        assert!(err.contains("disagrees with Content-Range length 90"), "{err}");
+        assert!(
+            err.contains("disagrees with Content-Range length 90"),
+            "{err}"
+        );
         assert_eq!(got, (0u8..10).collect::<Vec<_>>());
     }
 

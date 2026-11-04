@@ -30,6 +30,11 @@ pub const IEM_RAOB_NETWORK: &str =
 const LEVELS_HPA: [u32; 5] = [925, 850, 700, 500, 300];
 const RD_OVER_G: f64 = 287.05 / 9.80665;
 const KT: f64 = 0.514444;
+const PRESSURE_LEVEL_TIMEOUT_S: u64 = 40;
+
+/// Allow the preferred request plus the original fallback wait after audio analysis.
+/// Fallback services start only after the preferred source fails.
+pub const FETCH_WAIT_TIMEOUT: Duration = Duration::from_secs(150 + PRESSURE_LEVEL_TIMEOUT_S);
 
 /// Weather grid points over a bbox: ascending lats and lons.
 pub fn grid_axes(b: &BBox, max_step_deg: f64, max_n: usize) -> (Vec<f64>, Vec<f64>) {
@@ -294,7 +299,7 @@ fn om_grid(
         &url,
         cache,
         offline,
-        if levels { 40 } else { 45 },
+        if levels { PRESSURE_LEVEL_TIMEOUT_S } else { 45 },
         None,
         if levels { 0 } else { 1 },
     )?;
@@ -616,6 +621,26 @@ fn choose_atmosphere(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_fallbacks_keep_previous_wait_budget() {
+        // Previously all sources started together. A fallback that could arrive
+        // before the old pipeline deadline must still have that opportunity now
+        // that it starts after the preferred attempt. Model the schedule without
+        // network requests or wall-clock sleeps.
+        for audio_s in [0, 10, 149, 600] {
+            for preferred_s in [0, 1, PRESSURE_LEVEL_TIMEOUT_S] {
+                for fallback_s in [0, 1, 91, 140, audio_s + 150] {
+                    if preferred_s.max(fallback_s) <= audio_s + 150 {
+                        assert!(
+                            preferred_s + fallback_s <= audio_s + FETCH_WAIT_TIMEOUT.as_secs(),
+                            "audio={audio_s}s preferred={preferred_s}s fallback={fallback_s}s"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn test_grid(source: &str, t_c: f64) -> GriddedAtmosphere {
         GriddedAtmosphere::new(

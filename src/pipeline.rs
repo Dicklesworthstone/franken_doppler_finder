@@ -565,7 +565,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     }
     // ---- atmosphere (sound speed and wind profiles) ----------------------------------------
     let t = Instant::now();
-    let ((atmo, wwarn), weather_fetch_s): ((Arc<dyn fdop_types::atmo::Atmosphere>, Vec<String>), f64) = match weather_rx.recv_timeout(std::time::Duration::from_secs(150)) {
+    let ((atmo, wwarn), weather_fetch_s): ((Arc<dyn fdop_types::atmo::Atmosphere>, Vec<String>), f64) = match weather_rx.recv_timeout(fdop_data::weather::FETCH_WAIT_TIMEOUT) {
         Ok(r) => r,
         Err(_) => (
             (
