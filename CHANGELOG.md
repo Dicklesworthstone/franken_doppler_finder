@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Consistent spatial calibration and shared-clock refinement
+
+- Fit diagnostics count the observed union of six-second correlation supports, capped by the samples
+  actually observed and retained for search. A long silent gap no longer earns independent information;
+  repeated or more densely sampled points do not increase the count. Two 24 s stretches separated by
+  156 s previously earned 34 effective points and now earn 10. This retains the existing six-second
+  correlation assumption, not a covariance-derived or empirically validated effective sample size. An
+  uninterrupted span now earns `1 + span / 6`, rather than `span / 6` with an artificial floor of eight.
+  The F-distribution's separate minimum residual-degree guard remains a numerical safeguard.
+- Refinement previously chose its location and recording clock with the raw trace objective, then reported
+  a confidence region using per-event excess-noise scales and misfit weights. The selected point could fail
+  to minimize that reported surface, producing negative delta-chi-square cells. Refinement now estimates
+  noise scales from a pilot fit, freezes them across window expansions, and uses the same calibrated objective
+  for the joint clock, spatial minimum and confidence deltas. The broad search and its ranking retain their
+  existing objective.
+- Focused synthetic regressions compare the shared clock against direct emission-time solves, check exact
+  equivalence with unit weights and invariance to assignment order, and exercise a noisy third flyover with
+  an off-grid observer. The third-pass fixture explicitly reproduces the old negative-delta inconsistency.
+  The existing four-edge expansion test also checks that widening retains the original calibration.
+  Additional tests check sampling-density and duplicate invariance, sparse traces, gap-length invariance,
+  and the actual fitted uncertainty ranges of a gapped physical Doppler curve.
+- Reference and field replays are not available in this environment: there is no recording/archive cache
+  or `yt-dlp`. No new real-recording accuracy or confidence-coverage claim is made. The 75 m radius floor,
+  5.99 contour threshold, detection caps and confidence-grade thresholds are unchanged.
+- Validation: both `search::tests::calibrated_` regressions, all five `fit::tests`, and all 13
+  `fdop-types` tests pass. In `calibrated_refinement_recovers_clean_pair_and_has_nonnegative_deltas`,
+  the noisy third pass has an 80 m transverse bias: pilot position error is 52.0 m and calibrated
+  grid position error is 17.5 m. The previous mixed objective gives a minimum delta of -27.80 in
+  this fixture; the calibrated surface has no negative deltas. These are synthetic results.
+
 ### Consistent moving-medium physics and a faster frequency kernel
 
 - The wind-aware propagation model now solves the advected acoustic wavefront

@@ -38,6 +38,8 @@ pub struct Diagnostics {
     pub n: usize,
     pub n_inliers: usize,
     pub span_s: f64,
+    /// Observed temporal support in correlation-length units, never exceeding the number
+    /// of distinct samples. Empty gaps and repeated samples provide no extra information.
     pub n_eff: f64,
     pub delta: f64,
     pub rms_approach: f64,
@@ -463,6 +465,19 @@ fn prepare_fit(
     })
 }
 
+/// Union length of correlation-width intervals centered on the sorted observation times,
+/// divided by that width. Overlapping samples share information; an isolated sample can
+/// contribute at most one. Unlike elapsed span, this cannot count silence as observations.
+fn effective_trace_points(sorted_t: &[f64], correlation_s: f64) -> f64 {
+    if sorted_t.is_empty() {
+        return 0.0;
+    }
+    1.0 + sorted_t
+        .windows(2)
+        .map(|w| ((w[1] - w[0]) / correlation_s).clamp(0.0, 1.0))
+        .sum::<f64>()
+}
+
 fn finish_fit(prepared: PreparedFit) -> FitResult {
     const CORR_S: f64 = 6.0;
     const ASYM_FLOOR_HZ: f64 = 0.25;
@@ -485,7 +500,12 @@ fn finish_fit(prepared: PreparedFit) -> FitResult {
             (a.0.min(v), a.1.max(v))
         });
     let span = tmax - tmin;
-    let n_eff = (span / CORR_S).max(8.0);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| t_i[a].total_cmp(&t_i[b]));
+    let ts_sorted: Vec<f64> = order.iter().map(|&i| t_i[i]).collect();
+    let n_eff = effective_trace_points(&ts_sorted, CORR_S);
+    // The distribution needs positive degrees of freedom. Keep that numerical guard
+    // separate from the observed effective count, which also weights spatial refinement.
     let dof = (n_eff - 4.0).max(2.0);
     let delta = FDistribution::new(1.0, dof).ppf(0.95) / dof;
     let thr = cmin * (1.0 + delta);
@@ -597,9 +617,6 @@ fn finish_fit(prepared: PreparedFit) -> FitResult {
     let rms_pre = rms(&|x| x < t0r);
     let rms_post = rms(&|x| x >= t0r);
     // residual autocorrelation at ~2 correlation lengths
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| t_i[a].total_cmp(&t_i[b]));
-    let ts_sorted: Vec<f64> = order.iter().map(|&i| t_i[i]).collect();
     let mut dts: Vec<f64> = ts_sorted.windows(2).map(|w| w[1] - w[0]).collect();
     let hop = if dts.is_empty() {
         1.0
@@ -759,6 +776,56 @@ fn corrcoef(a: &[f64], b: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_information_depends_on_observed_support_not_gaps_or_density() {
+        let dense: Vec<f64> = (0..=600).map(|k| k as f64 * 0.1).collect();
+        let oversampled: Vec<f64> = (0..=3000).map(|k| k as f64 * 0.02).collect();
+        let duplicated: Vec<f64> = dense.iter().flat_map(|&t| [t, t, t]).collect();
+        for times in [&dense, &oversampled, &duplicated] {
+            assert!((effective_trace_points(times, 6.0) - 11.0).abs() < 1e-10);
+        }
+        for gap in [60.0, 600.0, 60_000.0] {
+            let times: Vec<f64> = (0..=96)
+                .map(|k| k as f64 * 0.25)
+                .chain((0..=96).map(|k| gap + k as f64 * 0.25))
+                .collect();
+            // Two 24 s observed stretches: each covers five independent supports.
+            assert!((effective_trace_points(&times, 6.0) - 10.0).abs() < 1e-10);
+        }
+        let sparse: Vec<f64> = (0..12).map(|k| k as f64 * 60.0).collect();
+        assert_eq!(effective_trace_points(&sparse, 6.0), 12.0);
+        assert_eq!(effective_trace_points(&[10.0; 100], 6.0), 1.0);
+        assert_eq!(effective_trace_points(&[], 6.0), 0.0);
+    }
+
+    #[test]
+    fn gapped_fit_reports_only_observed_independent_information() {
+        let c = 343.0;
+        let t: Vec<f64> = (0..=96)
+            .map(|k| 900.0 + k as f64 * 0.25)
+            .chain((0..=96).map(|k| 1080.0 + k as f64 * 0.25))
+            .collect();
+        let f: Vec<f64> = t
+            .iter()
+            .enumerate()
+            .map(|(k, &tt)| {
+                cv_curve(tt, 112.7, 140.0, 6100.0, 1000.0, c) + 0.03 * (k as f64 * 1.731).sin()
+            })
+            .collect();
+        let fit = fit_constant_velocity(&t, &f, c, Side::Both).unwrap();
+        let n_eff = fit.diagnostics.n_eff;
+        assert!(
+            n_eff <= 10.0 + 1e-10,
+            "unobserved gap earned information: {n_eff}"
+        );
+        assert!(n_eff > 8.0, "fixture must retain both observed stretches");
+        assert!(fit.diagnostics.span_s / 6.0 > 3.0 * n_eff);
+        assert!(fit.ranges_generous.v[0] <= 140.0 && fit.ranges_generous.v[1] >= 140.0);
+        assert!(fit.ranges_generous.d[0] <= 6100.0 && fit.ranges_generous.d[1] >= 6100.0);
+        let expected_delta = FDistribution::new(1.0, n_eff - 4.0).ppf(0.95) / (n_eff - 4.0);
+        assert_eq!(fit.diagnostics.delta, expected_delta);
+    }
 
     #[test]
     fn prepared_fit_keeps_its_trace_and_matches_eager_diagnostics() {

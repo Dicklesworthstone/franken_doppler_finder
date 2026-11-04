@@ -103,6 +103,9 @@ impl SearchEvent {
         }
         let (tr_t, tr_f) = subsample(&tt, &ff, 360);
         let (q_t, q_f) = subsample(&tt, &ff, 40);
+        // Resampling must not create independent observations or restore information
+        // removed by gaps in the measured trace.
+        let n_eff = fr.diagnostics.n_eff.max(1.0).min(tr_t.len() as f64);
         Some(Self {
             id: m.id.clone(),
             t_rec: b.t0r,
@@ -114,7 +117,7 @@ impl SearchEvent {
             // trace noise plus a model-error floor (ADS-B position/velocity error, residual
             // atmosphere error): 0.2 % of f0
             sigma_hz: (b.rmse * b.rmse + (0.002 * b.f0).powi(2)).sqrt().max(0.12),
-            n_eff: fr.diagnostics.n_eff.max(3.0),
+            n_eff,
             quality: m.quality.score,
             misfit,
             c_fit: fr.diagnostics.c,
@@ -1025,6 +1028,27 @@ fn eval_point(
     gates: bool,
     quick: bool,
 ) -> Option<PointEval> {
+    eval_point_weighted(
+        o, assign, evs, tracks, p, atmo, region_ok, gates, quick, None,
+    )
+}
+
+/// Profile the shared recording clock with the same fixed event weights used to compare
+/// observer positions. `None` preserves the uncalibrated search objective exactly.
+#[allow(clippy::too_many_arguments)]
+fn eval_point_weighted(
+    o: &Obs,
+    assign: &[(usize, u32, f64)],
+    evs: &[SearchEvent],
+    tracks: &[TrackModel],
+    p: &SearchParams,
+    atmo: &dyn Atmosphere,
+    region_ok: bool,
+    gates: bool,
+    quick: bool,
+    weights: Option<&[f64]>,
+) -> Option<PointEval> {
+    debug_assert!(weights.is_none_or(|w| w.len() == assign.len()));
     if !region_ok {
         return None;
     }
@@ -1118,7 +1142,7 @@ fn eval_point(
                     &mut scratch,
                 )
             };
-            tot += ev.n_eff * r.chi;
+            tot += ev.n_eff * r.chi * weights.map_or(1.0, |w| w[k]);
             chis.push(r);
         }
         tot
@@ -2373,8 +2397,9 @@ pub fn explain_at(
 }
 
 /// Re-score the winner's (event, flight) assignment on a fine grid; the confidence region is
-/// where the total chi-square (each event's chi rescaled so its best value is 1, times n_eff)
-/// is within 5.99 (2 dof, 95 %) of the minimum.
+/// where the calibrated total chi-square is within 5.99 (2 dof, 95 %) of its minimum.
+/// Event noise scales come from an initial uncalibrated fit and stay fixed for the spatial
+/// search, shared-clock profiling and any subsequent window expansions.
 fn refine_winner(
     top: &Candidate,
     evs: &[SearchEvent],
@@ -2404,8 +2429,19 @@ fn refine_winner(
     let mut q = p.clone();
     let (mut lat0, mut lon0) = (top.lat, top.lon);
     let mut out = None;
+    let mut weights = None;
     for _ in 0..3 {
-        let r = refine_on(lat0, lon0, &assign, evs, tracks, &q, dem, atmo)?;
+        let r = refine_on(
+            lat0,
+            lon0,
+            &assign,
+            evs,
+            tracks,
+            &q,
+            dem,
+            atmo,
+            &mut weights,
+        )?;
         let done = !r.radius_lower_bound;
         (lat0, lon0) = (r.lat, r.lon);
         out = Some(r);
@@ -2419,6 +2455,7 @@ fn refine_winner(
 }
 
 /// One refinement grid of `p.refine_half_m` / `p.refine_step_m` around (lat0, lon0).
+/// The first window estimates fixed event weights; later windows reuse that calibration.
 #[allow(clippy::too_many_arguments)]
 fn refine_on(
     lat0: f64,
@@ -2429,46 +2466,56 @@ fn refine_on(
     p: &SearchParams,
     dem: &dyn Elevation,
     atmo: &dyn Atmosphere,
+    weights: &mut Option<Vec<f64>>,
 ) -> Option<RefineResult> {
     let grid = local_grid(lat0, lon0, p.refine_half_m, p.refine_step_m);
-    let evals: Vec<Option<PointEval>> = grid
-        .par_iter()
-        .map(|&(la, lo, _, _)| {
-            let o = observer(la, lo, dem);
-            eval_point(
-                &o,
-                assign,
-                evs,
-                tracks,
-                p,
-                atmo,
-                p.region.contains(la, lo),
-                false,
-                false,
-            )
-        })
-        .collect();
-    let k_best = (0..grid.len())
-        .filter(|&k| evals[k].is_some())
-        .min_by(|&a, &b| {
-            evals[a]
-                .as_ref()
-                .unwrap()
-                .total
-                .total_cmp(&evals[b].as_ref().unwrap().total)
-        })?;
-    let best = evals[k_best].as_ref()?;
-    // per-event rescale: chi_e(best) -> 1 when the model fits worse than the trace noise
-    let scale: Vec<f64> = best.chis.iter().map(|c| c.chi.max(1.0)).collect();
-    let tot = |pe: &PointEval| -> f64 {
-        pe.chis
+    let evaluate = |w: Option<&[f64]>| -> Vec<Option<PointEval>> {
+        grid.par_iter()
+            .map(|&(la, lo, _, _)| {
+                let o = observer(la, lo, dem);
+                eval_point_weighted(
+                    &o,
+                    assign,
+                    evs,
+                    tracks,
+                    p,
+                    atmo,
+                    p.region.contains(la, lo),
+                    false,
+                    false,
+                    w,
+                )
+            })
+            .collect()
+    };
+    let best_index = |evals: &[Option<PointEval>]| {
+        evals
+            .iter()
+            .enumerate()
+            .filter_map(|(k, e)| e.as_ref().map(|pe| (k, pe.total)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(k, _)| k)
+    };
+    let mut evals = evaluate(weights.as_deref());
+    let mut k_best = best_index(&evals)?;
+    if weights.is_none() {
+        let pilot = evals[k_best].as_ref()?;
+        let calibrated: Vec<f64> = pilot
+            .chis
             .iter()
             .zip(assign)
-            .zip(&scale)
-            .map(|((c, a), s)| ev_weight(&evs[a.0]) * evs[a.0].n_eff * c.chi / s)
-            .sum()
-    };
-    let t_best = tot(best);
+            .map(|(c, a)| ev_weight(&evs[a.0]) / c.chi.max(1.0))
+            .collect();
+        let reprofile = calibrated.iter().any(|&w| w != 1.0);
+        *weights = Some(calibrated);
+        if reprofile {
+            // Reweighting cached cell scores alone would leave each shared clock fitted
+            // to the wrong objective and can put the reported center off its own minimum.
+            evals = evaluate(weights.as_deref());
+            k_best = best_index(&evals)?;
+        }
+    }
+    let t_best = evals[k_best].as_ref()?.total;
     let n = (p.refine_half_m / p.refine_step_m).round() as usize * 2 + 1;
     let mut dchi = vec![vec![f64::NAN; n]; n];
     let (bla, blo, _, _) = grid[k_best];
@@ -2478,7 +2525,7 @@ fn refine_on(
     for (k, e) in evals.iter().enumerate() {
         let (iy, ix) = (k / n, k % n);
         if let Some(pe) = e {
-            let dc = tot(pe) - t_best;
+            let dc = pe.total - t_best;
             dchi[iy][ix] = dc;
             if dc <= 5.99 {
                 cells += 1;
@@ -2500,7 +2547,7 @@ fn refine_on(
         lon: blo,
         radius_m: radius,
         radius_basis: format!(
-            "95% chi-square region (2 dof) of the joint trace fit over {} events ({}) on a {:.0} m grid; max extent {:.0} m, equal-area radius {:.0} m, floor {:.0} m{}",
+            "95% chi-square region (2 dof) of the joint trace fit over {} events ({}) on a {:.0} m grid, with shared clock profiled using fixed pilot-fit event noise scales; max extent {:.0} m, equal-area radius {:.0} m, floor {:.0} m{}",
             assign.len(),
             assign
                 .iter()
@@ -4133,6 +4180,236 @@ mod tests {
     }
 
     #[test]
+    fn calibrated_point_profiles_the_shared_clock_with_its_event_weights() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        // The second event prefers a recording start 2 s late. Give it less weight,
+        // as refinement does when its residuals exceed the assumed trace noise.
+        case.events[1].t_rec -= 2.0;
+        for t in case.events[1].tr_t.iter_mut() {
+            *t -= 2.0;
+        }
+        for t in case.events[1].q_t.iter_mut() {
+            *t -= 2.0;
+        }
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let o = observer(case.obs.0, case.obs.1, &dem);
+        let assign = [(0, 0, case.t_s + 1000.0), (1, 1, case.t_s + 1900.0)];
+        let evaluate = |assign: &[(usize, u32, f64)], weights| {
+            eval_point_weighted(
+                &o,
+                assign,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                true,
+                false,
+                false,
+                weights,
+            )
+            .unwrap()
+        };
+        let baseline = eval_point(
+            &o,
+            &assign,
+            &case.events,
+            &case.tracks,
+            &case.p,
+            &atmo,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        let ones = evaluate(&assign, Some(&[1.0, 1.0][..]));
+        assert_eq!(ones.t_s, baseline.t_s);
+        assert_eq!(ones.total, baseline.total);
+        for (a, b) in ones.chis.iter().zip(&baseline.chis) {
+            assert_eq!(
+                (a.chi, a.f0, a.rms, a.cov, a.brk),
+                (b.chi, b.f0, b.rms, b.cov, b.brk)
+            );
+        }
+
+        let weights = [1.0, 0.02];
+        let weighted = evaluate(&assign, Some(&weights[..]));
+        assert!((baseline.t_s - case.t_s).abs() > 0.5);
+        assert!((weighted.t_s - case.t_s).abs() < 0.15);
+        let cost_at_old_clock: f64 = baseline
+            .chis
+            .iter()
+            .zip(&assign)
+            .zip(weights)
+            .map(|((fit, a), w)| w * case.events[a.0].n_eff * fit.chi)
+            .sum();
+        assert!(weighted.total < cost_at_old_clock);
+
+        // Independent clock oracle: solve emission time directly for every trace point,
+        // without the interpolated RatioGrid or the optimizer used by eval_point.
+        let exact_cost = |offset: f64| -> f64 {
+            let mut scratch = TraceScratch::default();
+            assign
+                .iter()
+                .enumerate()
+                .map(|(k, &(ei, ti, te))| {
+                    let tr = &case.tracks[ti as usize];
+                    let ev = &case.events[ei];
+                    let prop = prop_for(&atmo, &o, tr, te);
+                    let fit = trace_chi(
+                        &ev.tr_t,
+                        &ev.tr_f,
+                        &|tu| tr.solve_emission_p(tu, o.x, &prop, None).unwrap().2,
+                        case.t_s + offset,
+                        ev,
+                        ev.sigma_hz,
+                        case.p.cap_sigma,
+                        true,
+                        &mut scratch,
+                    );
+                    weights[k] * ev.n_eff * fit.chi
+                })
+                .sum()
+        };
+        let oracle = (0..=200)
+            .map(|i| -1.0 + 0.02 * i as f64)
+            .min_by(|a, b| exact_cost(*a).total_cmp(&exact_cost(*b)))
+            .unwrap();
+        assert!((weighted.t_s - case.t_s - oracle).abs() < 0.025);
+        let reversed = evaluate(&[assign[1], assign[0]], Some(&[weights[1], weights[0]][..]));
+        assert_eq!(weighted.t_s, reversed.t_s);
+        assert_eq!(weighted.total, reversed.total);
+    }
+
+    #[test]
+    fn calibrated_refinement_recovers_clean_pair_and_has_nonnegative_deltas() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        case.p.refine_half_m = 200.0;
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let third = straight_track(
+            &enu,
+            [0.0, 3000.0, 1200.0],
+            [120.0, 0.0, 0.0],
+            case.t_s + 2600.0,
+            case.t_s + 2000.0,
+            case.t_s + 3200.0,
+            5.0,
+        );
+        // A third, noisier pass has a systematic 80 m transverse position error.
+        // Alternating trace noise makes its extra variance identifiable at the pilot fit.
+        let mut dirty = synth_event(
+            "noisy",
+            &third,
+            enu.to_ecef([0.0, 80.0, MIC_HEIGHT_M]),
+            case.t_s,
+            160.0,
+            343.0,
+            case.t_s + 2600.0,
+            &Prop::from_medium(&med, &enu),
+        );
+        for (k, f) in dirty.tr_f.iter_mut().enumerate() {
+            *f += if k % 2 == 0 { 0.3 } else { -0.3 };
+        }
+        (dirty.q_t, dirty.q_f) = subsample(&dirty.tr_t, &dirty.tr_f, 40);
+        case.events.push(dirty);
+        case.tracks.push(third);
+        let assign = [
+            (0, 0, case.t_s + 1000.0),
+            (1, 1, case.t_s + 1900.0),
+            (2, 3, case.t_s + 2600.0),
+        ];
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        // Keep the true observer off grid, so recovery cannot rely on a central fixture cell.
+        let (lat, lon, _) = enu.to_geodetic([7.0, -9.0, 0.0]);
+        let grid = local_grid(lat, lon, case.p.refine_half_m, case.p.refine_step_m);
+        let pilot: Vec<PointEval> = grid
+            .par_iter()
+            .map(|&(la, lo, _, _)| {
+                eval_point(
+                    &observer(la, lo, &dem),
+                    &assign,
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &atmo,
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap()
+            })
+            .collect();
+        let k_pilot = (0..pilot.len())
+            .min_by(|&a, &b| pilot[a].total.total_cmp(&pilot[b].total))
+            .unwrap();
+        let old_objective = |pe: &PointEval| -> f64 {
+            pe.chis
+                .iter()
+                .zip(&pilot[k_pilot].chis)
+                .zip(&assign)
+                .map(|((fit, scale), a)| case.events[a.0].n_eff * fit.chi / scale.chi.max(1.0))
+                .sum()
+        };
+        let old_min = pilot
+            .iter()
+            .map(old_objective)
+            .fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "pilot index {k_pilot} ENU {:?}, raw total {}, chis {:?}; mixed minimum {old_min}, mixed at pilot {}",
+            (grid[k_pilot].2, grid[k_pilot].3),
+            pilot[k_pilot].total,
+            pilot[k_pilot]
+                .chis
+                .iter()
+                .map(|c| c.chi)
+                .collect::<Vec<_>>(),
+            old_objective(&pilot[k_pilot]),
+        );
+        assert!(
+            old_min < old_objective(&pilot[k_pilot]) - 0.1,
+            "fixture must expose the old negative-delta surface"
+        );
+
+        let mut weights = None;
+        let refined = refine_on(
+            lat,
+            lon,
+            &assign,
+            &case.events,
+            &case.tracks,
+            &case.p,
+            &dem,
+            &atmo,
+            &mut weights,
+        )
+        .unwrap();
+        let delta: Vec<f64> = refined.dchi2.iter().flatten().copied().collect();
+        assert!(delta.iter().all(|&dc| dc.is_finite() && dc >= 0.0));
+        let minimum = delta.iter().position(|&dc| dc == 0.0).unwrap();
+        assert_eq!(
+            (refined.lat, refined.lon),
+            (grid[minimum].0, grid[minimum].1)
+        );
+        assert!(weights.as_ref().unwrap()[2] < 0.25);
+        let pilot_error = haversine_m(grid[k_pilot].0, grid[k_pilot].1, case.obs.0, case.obs.1);
+        let refined_error = haversine_m(refined.lat, refined.lon, case.obs.0, case.obs.1);
+        assert!(
+            refined_error < 30.0,
+            "calibrated error {refined_error:.1} m"
+        );
+        assert!(
+            refined_error < 0.5 * pilot_error,
+            "pilot {pilot_error:.1} m, calibrated {refined_error:.1} m"
+        );
+        eprintln!(
+            "noisy third pass: pilot error {pilot_error:.1} m, calibrated {refined_error:.1} m, weights {weights:?}"
+        );
+    }
+
+    #[test]
     fn refinement_expands_when_the_contour_reaches_an_offset_grid_edge() {
         let med = fdop_types::atmo::Medium::still(343.0);
         let mut case = two_flyover_case(med);
@@ -4147,6 +4424,7 @@ mod tests {
         for (east, north) in [(100.0, 0.0), (-100.0, 0.0), (0.0, 100.0), (0.0, -100.0)] {
             let lat = case.obs.0 + north / mlat;
             let lon = case.obs.1 + east / mlon;
+            let mut weights = None;
             let r = refine_on(
                 lat,
                 lon,
@@ -4156,6 +4434,7 @@ mod tests {
                 &case.p,
                 &dem,
                 &atmo,
+                &mut weights,
             )
             .unwrap();
             let last = r.dchi2.len() - 1;
@@ -4177,6 +4456,7 @@ mod tests {
             let mut wide = case.p.clone();
             wide.refine_half_m *= 2.0;
             wide.refine_step_m *= 2.0;
+            let first_weights = weights.clone();
             let complete = refine_on(
                 r.lat,
                 r.lon,
@@ -4186,8 +4466,13 @@ mod tests {
                 &wide,
                 &dem,
                 &atmo,
+                &mut weights,
             )
             .unwrap();
+            assert_eq!(
+                weights, first_weights,
+                "expansion must not recalibrate the objective"
+            );
             assert!(!complete.radius_lower_bound, "{complete:?}");
             assert!(
                 haversine_m(complete.lat, complete.lon, case.obs.0, case.obs.1) < 35.0,

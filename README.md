@@ -41,9 +41,11 @@ finding the faint curves in a spectrogram to naming the town.
 ## Honest status
 
 **Real-recording validation baseline:** the location errors and confidence grades below come from
-the archived `7e5cf3e` replays. The latest moving-medium propagation correction changes scored
-predictions and has synthetic physics coverage; fresh reference, wrong-date and field replays are
-still pending. The reference media endpoint returned a “Site Unavailable” page during this update.
+the archived `7e5cf3e` replays. The latest moving-medium propagation correction and spatial refinement
+calibration change scored predictions and have synthetic regression coverage; fresh reference,
+wrong-date and field replays are still pending. The reference media endpoint returned a “Site
+Unavailable” page during the propagation update, and no recording/archive cache is available for the
+refinement update. These historical numbers are not measured accuracy claims for the new code.
 
 | Question | Answer |
 |---|---|
@@ -239,6 +241,17 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
 Refinement widens and recenters its grid when any accepted confidence-contour cell touches a grid edge,
 including when the best point lies off center. If the contour still reaches an edge after the available
 expansions, the radius remains a lower bound.
+
+Refinement estimates each event's excess noise once from a pilot fit and holds those scales fixed, including
+when the window expands. The shared recording clock, best location and confidence contour all minimize the
+same weighted trace objective. This prevents a noisy pass from pulling the reported position under one
+weighting while the radius describes another. The radius remains conditional on the flight assignments and
+propagation model; this numerical consistency does not calibrate the search-wide confidence grade.
+
+Effective trace counts use the observed union of six-second correlation supports, rather than counting the
+elapsed time across silent gaps. Duplicate samples and denser resampling do not add independent information,
+and the count cannot exceed the points retained for scoring. Six seconds remains an assumed correlation
+length; these counts are not an empirical covariance or coverage calibration.
 
 **High** confidence needs every gate. **Medium** needs two core matches, clock lock, and a margin of at least
 3 nats (or no rival), also with no recorded comparison cut. Everything else is **low**. The full gate details
