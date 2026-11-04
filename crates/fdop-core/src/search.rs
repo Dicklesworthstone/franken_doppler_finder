@@ -484,10 +484,10 @@ fn hypotheses(
                         }
                     };
                     let center = cross_point(1.0, 0.0);
-                    let center_ok = center.2 >= p.min_agl_m && center.3 >= d_lo && center.3 <= d_hi;
+                    let center_ok = to_hyp(center).is_some();
                     for side in [1.0f64, -1.0] {
                         // The central grid point is shared by both sides.
-                        let mut regular_geometry = center_ok;
+                        let mut has_hypothesis = center_ok;
                         let mut b = if side > 0.0 { 0.0 } else { p.cross_step_m };
                         while b <= d_hi {
                             let point = if b == 0.0 {
@@ -495,19 +495,18 @@ fn hypotheses(
                             } else {
                                 cross_point(side, b)
                             };
-                            let (_, _, hh, d) = point;
                             // Rising terrain can bring a later point back inside the distance
                             // gate. Only the horizontal reach bounds this cross-track ray.
-                            regular_geometry |= hh >= p.min_agl_m && d >= d_lo && d <= d_hi;
                             if let Some(hyp) = to_hyp(point) {
+                                has_hypothesis = true;
                                 out.push(hyp, ti, cap, &count);
                             }
                             b += p.cross_step_m;
                         }
                         // A close pass can have its whole allowed annulus between grid lines.
-                        // Keep the ordinary cloud, adding one checked interior point only on
-                        // a side with no distance/AGL-valid sample.
-                        if !regular_geometry
+                        // Only an accepted hypothesis replaces the interior sample: a point
+                        // outside the region or clock window cannot cover this side.
+                        if !has_hypothesis
                             && let Some(b) = interior_cross_track_offset(d_lo, d_hi, |b| {
                                 if b == 0.0 {
                                     center.3
@@ -3131,6 +3130,117 @@ mod tests {
                 .iter()
                 .map(|h| {
                     let (la, lo) = frame.latlon(h.e as f64, h.n as f64);
+                    haversine_m(la, lo, obs_lat, lon)
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(closest < p.cross_step_m / 2.0, "side {side}: {closest} m");
+        }
+    }
+
+    #[test]
+    fn outside_region_grid_points_do_not_suppress_interior_hypotheses() {
+        struct Ravine {
+            lat: f64,
+            side: f64,
+            center_elev: f64,
+        }
+        impl Elevation for Ravine {
+            fn elev_m(&self, lat: f64, _lon: f64) -> f64 {
+                let b = self.side * (lat - self.lat) * fdop_types::geo::m_per_deg(self.lat).0;
+                if b <= 350.0 {
+                    self.center_elev - (self.center_elev - 350.0) * (b / 350.0).clamp(0.0, 1.0)
+                } else if b <= 400.0 {
+                    350.0 + 250.0 * (b - 350.0) / 50.0
+                } else {
+                    600.0 + (b - 400.0).clamp(0.0, 300.0)
+                }
+            }
+            fn describe(&self) -> String {
+                "synthetic ravine".into()
+            }
+        }
+
+        let (lat, lon) = (40.8765, -73.5250);
+        let mlat = fdop_types::geo::m_per_deg(lat).0;
+        let enu = Enu::new(lat, lon, 0.0);
+        let track = straight_track(
+            &enu,
+            [0.0, 0.0, 1100.0 + MIC_HEIGHT_M],
+            [100.0, 0.0, 0.0],
+            1000.0,
+            900.0,
+            1100.0,
+            5.0,
+        );
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        for (side, center_elev) in [(-1.0, 1000.0), (1.0, 1000.0), (-1.0, 500.0), (1.0, 500.0)] {
+            let dem = Ravine {
+                lat,
+                side,
+                center_elev,
+            };
+            let (edge_a, edge_b) = (lat + side * 100.0 / mlat, lat + side * 500.0 / mlat);
+            let p = SearchParams::new(
+                498.0,
+                502.0,
+                1000.0,
+                BBox::new(
+                    edge_a.min(edge_b),
+                    lon - 0.02,
+                    edge_a.max(edge_b),
+                    lon + 0.02,
+                ),
+            );
+            let obs_lat = lat + side * 400.0 / mlat;
+            let o = observer(obs_lat, lon, &dem);
+            let ev = synth_event(
+                "ravine",
+                &track,
+                o.x,
+                500.0,
+                118.0,
+                343.0,
+                1000.0,
+                &Prop::from_medium(&med, &enu),
+            );
+            let distance_at = |b| {
+                let x = observer(lat + side * b / mlat, lon, &dem).x;
+                norm(sub(track.pos_at(1000.0), x))
+            };
+            // Continuing beyond the too-distant 350 m sample reaches valid terrain at
+            // 700 m, outside the requested region. That rejected point cannot replace the
+            // interior sample near the actual observer, 400 m across and 500 m below.
+            assert!(distance_at(350.0) > 1.02 * ev.d_gate[1]);
+            assert!((ev.d_gate[0]..=ev.d_gate[1]).contains(&distance_at(700.0)));
+            assert!(!p.region.contains(lat + side * 700.0 / mlat, lon));
+            if center_elev == 500.0 {
+                // The shared center also needs all gates, even when its distance fits.
+                assert!((ev.d_gate[0]..=ev.d_gate[1]).contains(&distance_at(0.0)));
+                assert!(!p.region.contains(lat, lon));
+            }
+            let frame = Frame::new(&p.region);
+            let cloud = hypotheses(
+                &ev,
+                std::slice::from_ref(&track),
+                &p,
+                &frame,
+                &dem,
+                &atmo,
+                p.start_lo - 86_400.0,
+                100_000,
+            );
+            assert!(
+                cloud.count > 0,
+                "side {side}: the observer lost every hypothesis"
+            );
+            let closest = cloud
+                .stored
+                .unwrap()
+                .iter()
+                .map(|h| {
+                    let (la, lo) = frame.latlon(h.e as f64, h.n as f64);
+                    assert!(p.region.contains(la, lo));
                     haversine_m(la, lo, obs_lat, lon)
                 })
                 .fold(f64::INFINITY, f64::min);

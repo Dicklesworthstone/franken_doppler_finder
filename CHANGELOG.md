@@ -19,6 +19,31 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Interior hypotheses inside the requested region
+
+- A cross-track side now skips its interior sample only when an ordinary grid point passed all
+  hypothesis acceptance checks. A terrain/distance-valid point outside the requested region or clock
+  window cannot replace a usable interior point. The shared central point follows the same rule.
+  This resolves an interaction between the close-pass fallback and the expanded hillside scan;
+  the original distance, terrain-clearance, region and clock predicates are retained.
+- The actual hypothesis-generation regression `outside_region_grid_points_do_not_suppress_interior_hypotheses`
+  reproduced a valid observer losing every hypothesis when the scan continued to an out-of-region
+  hillside point. It covers both flight sides and an otherwise valid shared center outside the region.
+  The regression failed before the flag correction; all 21 search tests passed on the combined code,
+  including the concurrent confidence-margin correction. The other
+  core and shared-type tests passed in the preceding integrated run (39 default core tests and 13
+  shared-type tests), and the explicit multi-track media test passed too. The reference configurations
+  and field recordings have not been rerun.
+- The unchanged `src/selftest.rs`, invoked through an external entry point linked to the final core
+  libraries, passed the real FFmpeg decode/detect/measure/search/refine chain on its full 1,300 s
+  synthetic recording: 0.4 m error, 75 m radius, +0.20 s clock error and both intended aircraft matched.
+  This was not a full CLI or default release-profile build; workspace compilation was blocked by the
+  host killing the `asupersync` compiler process.
+- Core and shared-type Clippy passed for all targets with warnings denied, and workspace formatting
+  passed, using the pinned nightly and the same one-job, unoptimised-dependency settings as the tests.
+  The final workspace-wide Clippy attempt also ended in SIGKILL, while checking `asupersync 0.5.0`
+  metadata before reaching project crates. Neither workspace-wide check is reported as a pass.
+
 ### Confidence after incomplete rival comparisons
 
 - An absent distinct rival no longer automatically passes either confidence margin threshold when pair,
@@ -28,8 +53,9 @@ at that commit, not per-change commits.
 - The new policy regression covers both threshold boundaries, absent/malformed margins, empty candidates,
   and all three recorded comparison cuts. It passes in an isolated Rust build of the production helper and
   data fields using the pinned `serde_json` dependency. Both changed Rust files pass pinned rustfmt, and
-  targeted UBS reports no critical issues. The full latest search/CLI integration, workspace checks, release
-  selftest and real-recording replays remain unverified under the host's resource limits.
+  targeted UBS reports no critical issues. Core integration subsequently passed in the 21-test search
+  suite above. Full CLI integration, workspace checks, release selftest and real-recording replays
+  remain unverified under the host's resource limits.
 - This does not establish search-wide calibration or resolve the documented expanded-cap false-medium case;
   detection and measurement caps stay unchanged. The concurrent Doppler-shape harmonic fix is preserved.
 
