@@ -1457,7 +1457,9 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     let mut nulls: Vec<EventNull> = Vec::with_capacity(evs.len());
     let mut total = 0usize;
     for e in &evs {
-        let full = hyps.iter().filter(|h| h.is_some()).count() >= p.max_events;
+        // An empty cloud cannot seed a join. Let a later event with eligible flights use
+        // that driver slot instead, while keeping the empty cloud in the reported funnel.
+        let full = hyps.iter().flatten().filter(|h| !h.is_empty()).count() >= p.max_events;
         let cap = if full {
             0
         } else {
@@ -1498,7 +1500,9 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
         .zip(&hyps)
         .map(|(e, h)| (e.id.clone(), h.as_ref().map(|v| v.len())))
         .collect();
-    let pairable: Vec<usize> = (0..evs.len()).filter(|&i| hyps[i].is_some()).collect();
+    let pairable: Vec<usize> = (0..evs.len())
+        .filter(|&i| hyps[i].as_ref().is_some_and(|h| !h.is_empty()))
+        .collect();
     // pair joins: clean-clean first, then by expected join size
     let rho = 0.5 * p.along_step_m.hypot(p.cross_step_m);
     let r_join = 2.0 * rho + 120.0;
@@ -2528,6 +2532,57 @@ mod tests {
                     .any(|w| w.starts_with(&format!("{id}: ")) && w.contains("only confirms")),
                 "{:?}",
                 res.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn unmatched_events_do_not_consume_pair_driver_slots() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        case.p.max_events = 2;
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        // A stronger synthetic flyover from an aircraft absent from the archive. None of the
+        // archived flights passes its speed gate, so it cannot help seed a pair join.
+        let absent = straight_track(
+            &enu,
+            [0.0, -3500.0, 1000.0],
+            [55.0, 0.0, 0.0],
+            case.t_s + 400.0,
+            case.t_s,
+            case.t_s + 800.0,
+            5.0,
+        );
+        let mut unmatched = synth_event(
+            "unarchived",
+            &absent,
+            enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]),
+            case.t_s,
+            95.0,
+            343.0,
+            case.t_s + 400.0,
+            &Prop::from_medium(&med, &enu),
+        );
+        unmatched.quality = 200.0;
+        case.events.insert(0, unmatched);
+
+        let res = run_case(&case, med);
+        assert_eq!(res.funnel.events_used, 3);
+        assert_eq!(res.funnel.hypotheses[0], ("unarchived".into(), Some(0)));
+        assert!(!res.candidates.is_empty(), "funnel {:?}", res.funnel);
+        assert_eq!(res.funnel.event_pairs, 1);
+        let top = &res.candidates[0];
+        let r = res.refine.as_ref().unwrap();
+        let err = haversine_m(r.lat, r.lon, case.obs.0, case.obs.1);
+        assert!(err < 60.0, "observer error {err:.1} m");
+        assert!((top.t_start_utc - case.t_s).abs() < 1.0);
+        for (event, flight) in [("e1", "A"), ("e2", "B")] {
+            assert!(
+                top.events
+                    .iter()
+                    .any(|m| m.event == event && m.flight == flight && m.role == "pair"),
+                "matches {:?}",
+                top.events
             );
         }
     }

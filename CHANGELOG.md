@@ -19,6 +19,18 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Search driver selection
+
+- Events with no eligible ADS-B hypotheses no longer consume `--max-events` driver slots or form empty
+  event pairs. Previously, a stronger unmatched flyover could occupy a slot and exclude a weaker, genuinely
+  matchable flyover, leaving no location even when the necessary pair was present. Zero hypothesis counts
+  remain visible in the funnel. Detection caps, measurement caps, memory budgets and confidence rules stay
+  the same.
+- The synthetic regression `unmatched_events_do_not_consume_pair_driver_slots` reproduced that failure with
+  two driver slots: one empty cloud, one retained real cloud, and the second real cloud demoted to confirmer.
+  With the correction, both archived flyovers seed the answer and recover the observer within 60 m and the
+  recording clock within 1 s. The reference configurations and field recordings have not been rerun.
+
 ### Curved-track reconstruction ([`f717f6f`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/f717f6faec84803d360207884e91c8b830e3578c))
 
 - Correct reported ADS-B velocities are retained on sparsely sampled turns. The old comparison treated a
