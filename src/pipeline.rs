@@ -883,25 +883,39 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             (
                 "margin".to_string(),
                 res.margin_passes(6.0),
-                match (margin_nats, alt_km) {
-                    (Some(m), Some(k)) => format!(
-                        "evidence {:.1} nats vs {:.1} for the best different explanation ({}, {:.1} km away): {:.1} nats (likelihood ratio ~{:.0}:1)",
-                        top.score,
-                        top.score - m,
-                        res.margin
+                match margin_nats {
+                    Some(m) => {
+                        let flights = res
+                            .margin
                             .get("next_distinct_flights")
                             .and_then(|v| v.as_array())
-                            .map(|a| a
-                                .iter()
-                                .filter_map(|x| x.as_str())
-                                .collect::<Vec<_>>()
-                                .join(" + "))
-                            .unwrap_or_default(),
-                        k,
-                        m,
-                        m.min(700.0).exp()
-                    ),
-                    (None, _) if !res.margin_passes(6.0) => format!(
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" + ")
+                            })
+                            .unwrap_or_default();
+                        let rival = match alt_km {
+                            Some(k) => format!(" ({flights}, {k:.1} km away)"),
+                            None if !flights.is_empty() => format!(" ({flights})"),
+                            None => String::new(),
+                        };
+                        let qualifier = if res.funnel.truncated.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "; provisional, comparison truncated ({})",
+                                res.funnel.truncated.join("; ")
+                            )
+                        };
+                        format!(
+                            "evidence {:.1} nats vs {:.1} for the best evaluated different explanation{rival}: {m:.1} nats{qualifier}",
+                            top.score,
+                            top.score - m,
+                        )
+                    }
+                    None if !res.margin_passes(6.0) => format!(
                         "evidence {:.1} nats; no verified margin: {}",
                         top.score,
                         if res.funnel.truncated.is_empty() {
@@ -910,7 +924,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                             format!("comparison truncated ({})", res.funnel.truncated.join("; "))
                         }
                     ),
-                    _ => format!(
+                    None => format!(
                         "evidence {:.1} nats; no distinct alternative survived",
                         top.score
                     ),

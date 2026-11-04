@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Provisional numerical margins after comparison cuts
+
+- Both numerical and absent-rival margins now fail the confidence gate after a recorded pair, fine or
+  confirmation comparison cut. An observed gap against partially evaluated rivals is an upper bound on
+  the completed gap, so it cannot establish either minimum-margin threshold. Candidate ranking and the
+  existing 3/6-nat thresholds are unchanged. Reports preserve the numerical gap, label it provisional and
+  identify the cut; they no longer describe an exponentiated evidence difference as a likelihood ratio.
+- Both margin tests pass. `margin_from_incomplete_confirmer_scores_cannot_certify_a_winner` uses the actual
+  evidence calculation to reproduce an 8.79-nat apparent lead whose rival wins once two unchecked confirmers
+  are included, with just a 0.0245-nat final separation. The new test and updated boundary test failed before
+  the correction. Pipeline formatting passed; full CLI compilation and real-recording replays remain
+  unverified. Historical truncated reference runs may receive lower confidence under this gate.
+- This completes the explicitly truncated-comparison correction below. It does not establish search-wide
+  calibration: driver and hypothesis limits can also leave unseeded explanations. Detection and measurement
+  caps remain unchanged.
+
 ### Track recovery across dense corrupt reports
 
 - Track cleaning now considers every possible predecessor within the configured time gap, replacing its

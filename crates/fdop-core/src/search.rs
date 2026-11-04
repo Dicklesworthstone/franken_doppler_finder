@@ -938,15 +938,15 @@ pub struct SearchResult {
 }
 
 impl SearchResult {
-    /// Test the reported gap against a confidence threshold. A missing rival passes only
-    /// when no comparison-budget cut was recorded. Measured gaps keep their existing
-    /// threshold semantics; this is not a correction for searching many events.
+    /// Test the reported gap against a confidence threshold only when no comparison-budget
+    /// cut was recorded. An unchecked rival can increase its score, so an incomplete search's
+    /// measured gap is only an upper bound. This does not calibrate searching many events.
     pub fn margin_passes(&self, minimum_nats: f64) -> bool {
-        if self.candidates.is_empty() {
+        if self.candidates.is_empty() || !self.funnel.truncated.is_empty() {
             return false;
         }
         match self.margin.get("margin_nats") {
-            Some(serde_json::Value::Null) => self.funnel.truncated.is_empty(),
+            Some(serde_json::Value::Null) => true,
             Some(value) => value.as_f64().is_some_and(|margin| margin >= minimum_nats),
             None => false,
         }
@@ -2584,7 +2584,7 @@ mod tests {
     }
 
     #[test]
-    fn margin_requires_a_candidate_and_complete_missing_rival_comparison() {
+    fn margin_requires_a_candidate_and_complete_comparison() {
         let mut result = SearchResult {
             funnel: Funnel::default(),
             nulls: vec![],
@@ -2601,7 +2601,7 @@ mod tests {
             assert!(!result.margin_passes(6.0), "{stage}");
         }
 
-        // Numerical margins retain the 3/6-nat thresholds. Only the no-rival shortcut changes.
+        // The same 3/6-nat thresholds apply once the comparison is complete.
         for truncated in [false, true] {
             result.funnel.truncated = if truncated {
                 vec!["fine: 2 -> 1".into()]
@@ -2615,8 +2615,8 @@ mod tests {
                 (6.0, true, true),
             ] {
                 result.margin = serde_json::json!({"margin_nats": nats});
-                assert_eq!(result.margin_passes(3.0), medium);
-                assert_eq!(result.margin_passes(6.0), high);
+                assert_eq!(result.margin_passes(3.0), medium && !truncated);
+                assert_eq!(result.margin_passes(6.0), high && !truncated);
             }
         }
 
@@ -2639,6 +2639,81 @@ mod tests {
             assert!(!result.margin_passes(3.0));
             assert!(!result.margin_passes(6.0));
         }
+    }
+
+    #[test]
+    fn margin_from_incomplete_confirmer_scores_cannot_certify_a_winner() {
+        // The first candidate has two strong matches. Its rival's two initial matches are
+        // weak, but two unchecked confirmers will make the rival competitive. Use the actual
+        // empirical evidence calculation, without the extrapolated tail or thin-null fallback.
+        let nulls: Vec<EventNull> = ["e1", "e2", "e3", "e4"]
+            .into_iter()
+            .map(|event| EventNull {
+                event: event.into(),
+                chi_null: vec![1.0; 40],
+                n_null: 40,
+                chi_null_p05: 1.0,
+                chi_null_median: 1.0,
+                ..Default::default()
+            })
+            .collect();
+        let candidate = |flight: &str, fits: &[(&str, f64)]| {
+            let mut events: Vec<EventMatch> = fits
+                .iter()
+                .map(|&(event, chi)| EventMatch {
+                    event: event.into(),
+                    flight: format!("{flight}-{event}"),
+                    chi,
+                    dt_free: Some(0.0),
+                    ..Default::default()
+                })
+                .collect();
+            let score = evidence(&mut events, &nulls, 0);
+            Candidate {
+                n_explained: events.len(),
+                events,
+                score,
+                ..Default::default()
+            }
+        };
+        let winner = candidate("winner", &[("e1", 0.5), ("e2", 0.5)]);
+        let partial_rival = candidate("rival", &[("e1", 2.0), ("e2", 2.0)]);
+        let complete_rival = candidate(
+            "rival",
+            &[("e1", 2.0), ("e2", 2.0), ("e3", 0.5), ("e4", 0.5)],
+        );
+        assert!(winner.events.iter().all(|m| m.core));
+        assert!(!same_explanation(&winner, &partial_rival));
+        let observed_margin = winner.score - partial_rival.score;
+        assert!(observed_margin >= 6.0, "{observed_margin}");
+        assert!(complete_rival.score > winner.score);
+        let complete_margin = complete_rival.score - winner.score;
+        assert!(complete_margin < 3.0, "{complete_margin}");
+
+        let mut result = SearchResult {
+            funnel: Funnel {
+                truncated: vec!["confirmers: 2 -> 1".into()],
+                ..Default::default()
+            },
+            nulls,
+            candidates: vec![winner.clone(), partial_rival],
+            refine: None,
+            margin: serde_json::json!({"margin_nats": observed_margin}),
+            warnings: vec![],
+        };
+        for threshold in [3.0, 6.0] {
+            assert!(
+                !result.margin_passes(threshold),
+                "the provisional {observed_margin:.2}-nat gap hides a rival that overtakes the winner"
+            );
+        }
+
+        // Completing the comparison both changes the winner and reveals the small true gap.
+        result.funnel.truncated.clear();
+        result.candidates = vec![complete_rival, winner];
+        result.margin = serde_json::json!({"margin_nats": complete_margin});
+        assert!(!result.margin_passes(3.0));
+        assert!(!result.margin_passes(6.0));
     }
 
     #[test]
