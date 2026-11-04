@@ -178,6 +178,8 @@ fn run(cli: Cli) -> Result<i32, String> {
             let out = match pipeline::locate(&args, &log) {
                 Ok(o) => o,
                 Err(e) => {
+                    // the directory counts only if the run got far enough to write into it
+                    let wrote = std::fs::read_dir(&run_dir).is_ok_and(|mut d| d.next().is_some());
                     // runs that stop with an error are recorded too, so `fdop runs` lists every attempt
                     record_run(
                         &cache,
@@ -188,7 +190,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                             region: l.near.clone(),
                             confidence: "error".into(),
                             headline: e.clone(),
-                            run_dir: if run_dir.is_dir() {
+                            run_dir: if wrote {
                                 run_dir.display().to_string()
                             } else {
                                 String::new()
@@ -197,7 +199,12 @@ fn run(cli: Cli) -> Result<i32, String> {
                             ..Default::default()
                         },
                     );
-                    return Err(e);
+                    // without -o the directory name has a timestamp the user never saw
+                    return Err(if l.out.is_none() && wrote {
+                        format!("{e} (partial outputs in {})", run_dir.display())
+                    } else {
+                        e
+                    });
                 }
             };
             let a = &out.report.answer;

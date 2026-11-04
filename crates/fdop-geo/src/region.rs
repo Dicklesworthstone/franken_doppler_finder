@@ -44,10 +44,11 @@ pub struct Region {
 
 impl Region {
     /// A warning when a state search's answer lies in another state. `state_abbr` comes from the
-    /// reverse geocode; `contained` says it is a Census containment result rather than the
-    /// offline estimate (nearest gazetteer place or state box), which can be wrong near a
-    /// border. A state search covers the state's bounding box, which takes in parts of its
-    /// neighbours; other region kinds are boxes or circles by design.
+    /// reverse geocode; `contained` says it is a Census containment result. Otherwise (offline,
+    /// or the Census Geocoder failed) it is the gazetteer's estimate, the nearest place's state or
+    /// a state box, which can be wrong near a border. A state search covers the state's bounding
+    /// box, which takes in parts of its neighbours; other region kinds are boxes or circles by
+    /// design.
     pub fn outside_states_warning(
         &self,
         state_abbr: Option<&str>,
@@ -72,7 +73,7 @@ impl Region {
             format!("the answer lies in {st}, outside the searched {searched}: {why}")
         } else {
             format!(
-                "the answer appears to lie in {st} (an offline estimate from the gazetteer, not a containment test), outside the searched {searched}: {why}"
+                "the answer appears to lie in {st} (estimated from the gazetteer, not a containment test), outside the searched {searched}: {why}"
             )
         })
     }

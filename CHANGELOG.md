@@ -89,9 +89,10 @@ at that commit, not per-change commits.
   with the number of events searched; raising the caps waits on that.
 - [`532fb15`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/532fb15ab0d4daf2c6b7303d4ad89e78465d6384) `fdop doctor` prints an `[info]` line naming the Census gazetteer tables that are not cached yet. `--offline`
   needs them for place, county and ZIP regions and for the report's place names.
-- [`77529e3`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/77529e368ec5c6b54508676b1352e918315d2892) Offline, the outside-state
-  warning says the state is an estimate from the gazetteer, since only the Census lookup tests containment. A
-  `locate` that fails without `-o` now records the default run directory holding its partial outputs.
+- [`77529e3`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/77529e368ec5c6b54508676b1352e918315d2892) When the answer's state comes
+  from the gazetteer (offline, or when the Census Geocoder fails), the outside-state warning says it is an
+  estimate, since only the Census lookup tests containment. A `locate` that fails without `-o` now records the
+  default run directory holding its partial outputs.
 
 ---
 

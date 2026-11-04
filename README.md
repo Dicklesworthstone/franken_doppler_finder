@@ -383,8 +383,9 @@ fdop runs --cache DIR     # the ledger of runs made with locate --cache DIR
 
 Each `locate` run is recorded in FrankenSQLite at `<cache>/runs.sqlite`: time, input, dates, region, lat/lon,
 radius, confidence, headline, run directory and total time. A run that stops with an error is recorded with
-confidence `error`, the error message as its headline, and the run directory if one exists by then (it holds
-whatever the run wrote before failing). If the ledger cannot be written, `locate` warns and carries on.
+confidence `error`, the error message as its headline, and the run directory if the run wrote anything there
+before failing. Without `-o`, the error message also names that directory. If the ledger cannot be written,
+`locate` warns and carries on.
 
 ### `fdop doctor [--network] [--cache DIR]`
 
@@ -628,6 +629,9 @@ audio or video recorded somewhere sensitive:
 | `no location: ...; no ADS-B flight pair explains two events at one place and clock (...)` | Wrong date or region, or the aircraft had no ADS-B | Check `--dates` (local dates) and widen `--near`; try `--ignore-metadata-time` if the file's `creation_time` is wrong |
 | `ambiguous location: 'Springfield' matches places in K states` | Bare place name | Add the state: `"Springfield, IL"` |
 | `date range ... spans more than 15 days; narrow it` | Range too long | Split it into several runs |
+| `unrecognised date '09/08/2026': put the four-digit year first` | The year is not first. `09/08/2026` is 8 September in the US and 9 August in most other countries | Write it year first: `2026-09-08` |
+| Warning `detection kept the 60 strongest of N candidate curves` or `measured the 24 strongest of N flyover detections` | A long or busy recording hit a fixed cap (see [Known issues](#known-issues)) | Nothing to change: the weaker flyovers are not used |
+| Warning `the answer lies in CT, outside the searched state NY` (or `appears to lie in`, when the state is a gazetteer estimate) | A state search covers the state's bounding box, which takes in parts of its neighbours | If you know the recording was made in the searched state, distrust the answer whatever its grade, unless its radius reaches back across the border. A narrower `--near`, such as a county, takes in less of the neighbours |
 | `needs network or a cached file: Census gazetteer ...` | `--offline` before the gazetteer was cached | Run once online, or use a state, point or box region |
 | `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days are cached. A day missing from adsb.lol cannot be searched |
 | A download pauses for a minute, then carries on | The server stopped sending with the connection still open. After 60 s with no data, `fdop` reconnects and resumes with an HTTP `Range` request | Nothing. After 9 failed tries that brought no new data it stops with an error ending `body idle for 60s`; rerun, finished days are kept |
