@@ -230,3 +230,53 @@ something one resample would fix without that being visible, so two more sets of
   aircraft go above 300 Hz.
 - **Location.** `dopplerprint` and `fdop` both run R2 inputs on each clip, limit 1 km. The section above predicts 0 of
   40 located for `fdop`; running it tests that. `dopplertrack` needs two flyovers in a recording and has no run here.
+
+## Addendum 3, 2026-11-04, with R2 and set D detection running
+
+The only scored result read before this was written is `dopplerprint`'s `a_ref` in R2: declined. Everything below adds
+runs for `dopplerprint` or makes a claim against it harder, so that result cannot have helped `fdop` here.
+
+### Correction: the 86 m reproduces
+
+Addendum 2 said `dopplerprint`'s nationwide ±2 min figure of 86 m was not reproduced. That check had left out the last
+input its notes depend on, the national ground model.
+
+| Its WAV, ±2 min, no `--near` | Result |
+|---|---|
+| `prod` feed, no ground model | declined, right spot first (40 m), margin 0.5 |
+| `staging` feed, no ground model | declined, right spot first (40 m), margin 0.5 |
+| `staging` feed, national ground model | **found, high, 86 m, both true flights, decoy margin 40.89** (its notes: 86 m, 40.9) |
+
+So the harness reproduces this figure too, and the ground model is what moves it. `locate` neither downloads nor builds
+that file. Its `USAGE.md` documents it as optional: `<cache>/dem/5070/conus_1000m.u16`, made by a separate command that
+needs the `prep` extra. Without a ground model it takes the ground as flat at the local geoid height, and says so.
+
+### `dopplerprint` also runs with a ground model
+
+`fdop` and `dopplertrack` fetch terrain themselves by default. `dopplerprint` as installed does not, so every `dopplerprint`
+run fixed so far is on flat ground. That is what a new user gets and those runs stand, but beating only them would say
+little. So its strongest configuration found so far also runs, on every case:
+
+| Runs | Audio | Ground model |
+|---|---|---|
+| `r2_dpdem` | 48 kHz, as in `dp48`; `a_ref_opus` in its own WAV | 30 m over the bounding box of the case's circle, passed with `--dem` |
+| `r3_dpdem`, `r1_dpdem` | The same | `conus_1000m` in its cache, built by the command in its docs |
+| `sd_dpdem` | The clips, already 48 kHz | 30 m over a box holding all 40 circles, passed with `--dem` |
+
+- All are built with `dopplerprint.prep.dem` from Terrarium tiles, the elevation source `fdop` and `dopplertrack` read.
+- The 30 m step is that tool's default. A ground model that fails to build leaves its case pending, not an error of
+  `dopplerprint`'s.
+- `a_ref_opus` in `r3_dpdem` is its WAV with the national model on the `prod` feed `locate` downloads, which shows
+  whether the feed matters to the 86 m.
+- The national file goes into the scored cache only after `r3_dp` and `r1_dp` finish, because the nationwide path reads it
+  by itself. The jobs refuse to run in the wrong order. `--near` runs do not read that path, so R2 and set D are unaffected.
+
+**The claim gets harder.** On R2, `fdop` is more accurate than `dopplerprint` only if the rule under Scoring holds against
+each of `dp`, `dp48` and `dpdem`, over sets A, B and C and again on set E alone. A win over only some of them is reported
+as exactly that. Addendum 2 asked only for a difference between `dp` and `dp48` to be shown.
+
+### Reruns so far
+
+- `dopplertrack`, R2: our script overwrote its own variable and passed a run name as the box's north bound, so `fetch-day`
+  exited 2 and no `search` ran. No answer existed. The chain was stopped, its directory kept as `r2_dt_fault_n_clobbered`,
+  and it restarts from the first case.
