@@ -19,6 +19,15 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Multi-track media decoding
+
+- Audio decoding explicitly selects the first audio stream, matching the stream inspected by the probe.
+  Previously FFmpeg could automatically prefer a different default or higher-channel-count track, so the
+  detector could analyse an alternate mix instead of the probed recording.
+- An opt-in media integration test synthesises a two-track file with distinct tones and a preferred stereo
+  alternate, then verifies that the actual probe/decode path reads the first mono track. It passed with
+  FFmpeg and FFprobe installed; it is ignored by the default offline unit suite because it needs those tools.
+
 ### Confidence-radius refinement
 
 - Refinement checks whether the accepted 95% contour reaches any edge of its actual grid before

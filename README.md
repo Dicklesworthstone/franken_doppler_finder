@@ -319,6 +319,9 @@ fdop selftest           # offline end-to-end known-answer run
 `--offline` and `-q/--quiet` belong to `locate` and `fetch`, and go after the subcommand. `detect` needs no data
 and takes only `-o` and `-q`. `runs` and `doctor` take `--cache` too.
 
+For media with multiple audio tracks, `locate` and `detect` analyse the first audio track, matching the
+stream described by the media probe. A preferred or higher-channel-count alternate track does not replace it.
+
 | Shared option | Meaning |
 |---|---|
 | `--cache <PATH>` | Cache root for ADS-B day stores, terrain, gazetteer and map tiles. Default: see [Configuration](#configuration) |
@@ -598,6 +601,7 @@ on these changes.
 
 ```bash
 cargo test --workspace --locked                               # 93 unit tests, no network
+cargo test -p fdop-core multistream_decode_matches_the_probed_audio -- --ignored  # needs ffmpeg/ffprobe
 cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings  # warnings are errors

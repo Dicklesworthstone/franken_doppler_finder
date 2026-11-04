@@ -125,7 +125,8 @@ pub fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
     ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
 }
 
-/// Decode `[start, start+dur)` seconds (whole file when `dur` is None) to mono f32 at `sr` Hz.
+/// Decode the first audio stream, matching [`probe`], to mono f32 at `sr` Hz.
+/// Takes `[start, start+dur)` seconds (whole file when `dur` is None).
 pub fn decode(path: &Path, start: f64, dur: Option<f64>, sr: u32) -> Result<Vec<f32>, String> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
@@ -137,6 +138,8 @@ pub fn decode(path: &Path, start: f64, dur: Option<f64>, sr: u32) -> Result<Vec<
     }
     cmd.arg("-i").arg(path);
     cmd.args([
+        "-map",
+        "0:a:0",
         "-vn",
         "-ac",
         "1",
@@ -170,5 +173,75 @@ mod tests {
             Some((40.8765, -73.525))
         );
         assert_eq!(parse_iso6709("garbage"), None);
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn multistream_decode_matches_the_probed_audio() {
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-audio-stream-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("two_tracks.mka");
+        // A first, mono ambient track and a preferred stereo alternative. Automatic FFmpeg
+        // selection picks the alternative, even though probe() describes the first stream.
+        let made = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=220:duration=1:sample_rate=4000",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:duration=1:sample_rate=4000",
+                "-map",
+                "0:a:0",
+                "-map",
+                "1:a:0",
+                "-ac:a:1",
+                "2",
+                "-disposition:a:0",
+                "0",
+                "-disposition:a:1",
+                "default",
+                "-c:a",
+                "pcm_f32le",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg must be installed to run the media integration test");
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let info = probe(&path).unwrap();
+        assert_eq!(info.channels, 1);
+        assert_eq!(info.sample_rate, 4000);
+        let pcm = decode(&path, 0.0, None, 4000).unwrap();
+        assert!(!pcm.is_empty());
+        let energy = |hz: f64| {
+            let (mut re, mut im) = (0.0, 0.0);
+            for (k, &x) in pcm.iter().enumerate() {
+                let phase = std::f64::consts::TAU * hz * k as f64 / 4000.0;
+                re += x as f64 * phase.cos();
+                im += x as f64 * phase.sin();
+            }
+            re * re + im * im
+        };
+        assert!(
+            energy(220.0) > 1000.0 * energy(880.0),
+            "decode selected the alternate track instead of the probed first track"
+        );
     }
 }
