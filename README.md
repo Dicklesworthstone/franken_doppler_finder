@@ -54,8 +54,8 @@ finding the faint curves in a spectrogram to naming the town.
 [`f717f6f`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/f717f6faec84803d360207884e91c8b830e3578c), which changed how ADS-B tracks are interpolated through turns,
 came after every run above. Its synthetic tests pass, but the reference and field recordings have not been rerun
 on it, so the distances and grades above do not validate it. The later correction that prevents empty hypothesis
-clouds from consuming search-driver slots and the correction to refinement-window boundary detection also have
-synthetic regression coverage only.
+clouds from consuming search-driver slots, the correction to refinement-window boundary detection, and the
+recovery of close passes between cross-track grid lines also have synthetic regression coverage only.
 
 ---
 
@@ -544,6 +544,10 @@ Design notes:
   moment of the flight is a candidate CPA: the recorder then sits on the perpendicular to the path through that
   point, at a distance that fits the measured CPA distance, and the moment fixes the recording start. A hash join
   on (east, north, recording start) finds the places two events share in O(N) time.
+- **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
+  between the default 350 m cross-track samples. When a side has no point satisfying the distance and
+  terrain-clearance gates, the search tries an interior point using the terrain height at every probe.
+  The distance, clearance, region and recording-clock gates still apply.
 - **Hypotheses are compact.** Each is 20 bytes (a `u32` track index and four `f32`). The budgets are sized from
   physical memory: a tenth of RAM, clamped to 200 M–2 G hypotheses in total (4–40 GB), so on machines with less
   than 40 GB the floor is more than a tenth.
@@ -620,6 +624,8 @@ The unit tests check:
 - Hermite track models against closed forms;
 - sparse turning tracks, including unequal sample spacing and heading wraparound, against an analytic circle;
 - a two-flyover search, with and without wind, that locates the observer within 60 m and the clock within 1 s;
+- two close flyovers whose distance gates fall between cross-track grid lines, recovering the synthetic
+  observer within 60 m and the recording clock within 1 s;
 - a stronger unmatched flyover does not prevent two archived flyovers from seeding a search with two driver slots;
 - junk positions inside an ADS-B leg are dropped before track models are built;
 - trailing UTC days that adsb.lol has not published yet are recognised;

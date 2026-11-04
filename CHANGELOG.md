@@ -19,6 +19,19 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Close-flyover search coverage
+
+- Close flyovers can now seed the search when their allowed distances fall entirely between the
+  regular 350 m cross-track samples. On a side with no sample satisfying the distance and
+  terrain-clearance gates, the search tries an interior offset using the actual terrain at
+  every probe. The ordinary grid and all acceptance gates are retained.
+- The synthetic regression `close_flyovers_between_cross_track_grid_lines_locate_the_observer`
+  reproduced two valid event/flight combinations with zero hypotheses. With the correction,
+  both correct flights seed the answer, recovering the observer within 60 m and the recording
+  clock within 1 s. Additional checks cover rising and falling terrain, impossible altitude,
+  missing or discontinuous terrain, and minimum-clearance rejection. Both new tests passed.
+  The reference configurations and field recordings have not been rerun.
+
 ### Multi-track media decoding
 
 - Audio decoding explicitly selects the first audio stream, matching the stream inspected by the probe.

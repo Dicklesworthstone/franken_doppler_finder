@@ -317,6 +317,42 @@ fn mix(a: u64, b: u64) -> u64 {
     x ^ (x >> 29)
 }
 
+/// Find an interior cross-track offset when the regular grid misses the distance gate.
+/// Each probe uses the terrain-dependent slant distance; a discontinuity that jumps over
+/// the gate must not fabricate a valid sample. Twenty-four bisections resolve millimetres
+/// over the detector's distance envelope while bounding work on discontinuous terrain.
+fn interior_cross_track_offset(d_lo: f64, d_hi: f64, distance: impl Fn(f64) -> f64) -> Option<f64> {
+    if !d_lo.is_finite() || !d_hi.is_finite() || d_lo < 0.0 || d_hi <= d_lo {
+        return None;
+    }
+    let target = 0.5 * (d_lo + d_hi);
+    let d0 = distance(0.0);
+    if !d0.is_finite() || d0 >= target {
+        return None;
+    }
+    let d1 = distance(d_hi);
+    if !d1.is_finite() || d1 <= target {
+        return None;
+    }
+    let (mut lo, mut hi) = (0.0, d_hi);
+    for _ in 0..24 {
+        let b = 0.5 * (lo + hi);
+        let d = distance(b);
+        if !d.is_finite() {
+            return None;
+        }
+        if d >= d_lo && d <= d_hi {
+            return Some(b);
+        }
+        if d < target {
+            lo = b;
+        } else {
+            hi = b;
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hypotheses(
     ev: &SearchEvent,
@@ -367,36 +403,73 @@ fn hypotheses(
                     let (nx, ny) = (-uy, ux);
                     let (mlat, mlon) = fdop_types::geo::m_per_deg(la);
                     let a0 = (h - z0 - MIC_HEIGHT_M) * ve[2] / vh;
+                    let cross_point = |side: f64, b: f64| {
+                        let (oe, on) = (a0 * ux + side * b * nx, a0 * uy + side * b * ny);
+                        let (ola, olo) = (la + on / mlat, lo + oe / mlon);
+                        let z = dem.elev_m(ola, olo);
+                        let hh = h - z - MIC_HEIGHT_M;
+                        let a = hh * ve[2] / vh;
+                        let d = (a * a + b * b + hh * hh).sqrt();
+                        (ola, olo, hh, d)
+                    };
+                    let to_hyp = |(ola, olo, hh, d): (f64, f64, f64, f64)| {
+                        if !(hh >= p.min_agl_m
+                            && d >= d_lo
+                            && d <= d_hi
+                            && p.region.contains(ola, olo))
+                        {
+                            return None;
+                        }
+                        let t_s = t + d / c - ev.t_rec;
+                        if t_s >= p.start_lo - ev.t_tol && t_s <= p.start_hi + ev.t_tol {
+                            let (e, n) = frame.en(ola, olo);
+                            Some(Hyp {
+                                trk: ti as u32,
+                                t_e: (t - t_base) as f32,
+                                e: e as f32,
+                                n: n as f32,
+                                t_s: (t_s - t_base) as f32,
+                            })
+                        } else {
+                            None
+                        }
+                    };
+                    let center = cross_point(1.0, 0.0);
+                    let center_ok = center.2 >= p.min_agl_m && center.3 >= d_lo && center.3 <= d_hi;
                     for side in [1.0f64, -1.0] {
+                        // The central grid point is shared by both sides.
+                        let mut regular_geometry = center_ok;
                         let mut b = if side > 0.0 { 0.0 } else { p.cross_step_m };
                         while b <= d_hi {
-                            let (oe, on) = (a0 * ux + side * b * nx, a0 * uy + side * b * ny);
-                            let (ola, olo) = (la + on / mlat, lo + oe / mlon);
-                            let z = dem.elev_m(ola, olo);
-                            let hh = h - z - MIC_HEIGHT_M;
-                            let a = hh * ve[2] / vh;
-                            let d = (a * a + b * b + hh * hh).sqrt();
+                            let point = if b == 0.0 {
+                                center
+                            } else {
+                                cross_point(side, b)
+                            };
+                            let (_, _, hh, d) = point;
                             if d > d_hi * 1.02 && b > 0.0 {
                                 break;
                             }
-                            if hh >= p.min_agl_m
-                                && d >= d_lo
-                                && d <= d_hi
-                                && p.region.contains(ola, olo)
-                            {
-                                let t_s = t + d / c - ev.t_rec;
-                                if t_s >= p.start_lo - ev.t_tol && t_s <= p.start_hi + ev.t_tol {
-                                    let (e, n) = frame.en(ola, olo);
-                                    out.push(Hyp {
-                                        trk: ti as u32,
-                                        t_e: (t - t_base) as f32,
-                                        e: e as f32,
-                                        n: n as f32,
-                                        t_s: (t_s - t_base) as f32,
-                                    });
-                                }
+                            regular_geometry |= hh >= p.min_agl_m && d >= d_lo && d <= d_hi;
+                            if let Some(hyp) = to_hyp(point) {
+                                out.push(hyp);
                             }
                             b += p.cross_step_m;
+                        }
+                        // A close pass can have its whole allowed annulus between grid lines.
+                        // Keep the ordinary cloud, adding one checked interior point only on
+                        // a side with no distance/AGL-valid sample.
+                        if !regular_geometry
+                            && let Some(b) = interior_cross_track_offset(d_lo, d_hi, |b| {
+                                if b == 0.0 {
+                                    center.3
+                                } else {
+                                    cross_point(side, b).3
+                                }
+                            })
+                            && let Some(hyp) = to_hyp(cross_point(side, b))
+                        {
+                            out.push(hyp);
                         }
                     }
                 }
@@ -2588,6 +2661,112 @@ mod tests {
                 top.events
             );
         }
+    }
+
+    #[test]
+    fn cross_track_gap_samples_obey_terrain_distance_gates() {
+        for slope in [-0.2, 0.0, 0.2] {
+            // The ground rises or falls across the gap; use its height at every probe.
+            let distance = |b: f64| b.hypot(100.0 + slope * b);
+            let b = interior_cross_track_offset(215.0, 336.0, distance).unwrap();
+            assert!(b > 0.0 && b < 350.0);
+            assert!((215.0..=336.0).contains(&distance(b)));
+        }
+        assert!(
+            interior_cross_track_offset(215.0, 336.0, |b| b.hypot(400.0)).is_none(),
+            "aircraft above the distance gate cannot produce a hypothesis"
+        );
+        assert!(
+            interior_cross_track_offset(215.0, 336.0, |b| if b < 150.0 { 100.0 } else { 500.0 })
+                .is_none(),
+            "a terrain discontinuity must not manufacture an in-gate point"
+        );
+        assert!(interior_cross_track_offset(215.0, 336.0, |_| f64::NAN).is_none());
+    }
+
+    #[test]
+    fn close_flyovers_between_cross_track_grid_lines_locate_the_observer() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let (lat0, lon0) = (40.8765, -73.5250);
+        let enu = Enu::new(lat0, lon0, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let t_s = 1_788_895_000.0;
+        let prop = Prop::from_medium(&med, &enu);
+        // Both passes lie within the detector's >=250 m distance envelope. Their generous
+        // distance gates fit between the b=0 and b=350 m cross-track samples: neither grid
+        // line intersects the allowed annulus, on either side of the aircraft.
+        let mut a = straight_track(
+            &enu,
+            [0.0, 250.0, 100.0],
+            [55.0, 0.0, 0.0],
+            t_s + 400.0,
+            t_s + 200.0,
+            t_s + 600.0,
+            2.0,
+        );
+        a.key = "A".into();
+        let mut b = straight_track(
+            &enu,
+            [250.0, 0.0, 100.0],
+            [0.0, 70.0, 0.0],
+            t_s + 900.0,
+            t_s + 700.0,
+            t_s + 1100.0,
+            2.0,
+        );
+        b.key = "B".into();
+        let e1 = synth_event("e1", &a, x, t_s, 112.7, 343.0, t_s + 400.0, &prop);
+        let e2 = synth_event("e2", &b, x, t_s, 129.5, 343.0, t_s + 900.0, &prop);
+        let region = BBox::new(lat0 - 0.01, lon0 - 0.015, lat0 + 0.01, lon0 + 0.015);
+        let mut p = SearchParams::new(t_s - 3600.0, t_s + 3600.0, 1300.0, region);
+        p.refine_half_m = 200.0;
+        let case = TwoCase {
+            tracks: vec![a, b],
+            events: vec![e1, e2],
+            p,
+            t_s,
+            obs: (lat0, lon0),
+        };
+
+        let res = run_case(&case, med);
+        assert!(
+            res.funnel
+                .hypotheses
+                .iter()
+                .all(|(_, n)| n.is_some_and(|n| n > 0)),
+            "real close flyovers must have hypotheses: {:?}",
+            res.funnel
+        );
+        assert!(!res.candidates.is_empty(), "funnel {:?}", res.funnel);
+        let top = &res.candidates[0];
+        let r = res.refine.as_ref().unwrap();
+        let err = haversine_m(r.lat, r.lon, lat0, lon0);
+        assert!(err < 60.0, "observer error {err:.1} m");
+        assert!((top.t_start_utc - t_s).abs() < 1.0);
+        for (event, flight) in [("e1", "A"), ("e2", "B")] {
+            assert!(
+                top.events
+                    .iter()
+                    .any(|m| m.event == event && m.flight == flight && m.role == "pair"),
+                "matches {:?}",
+                top.events
+            );
+        }
+        // An interior point still needs the original terrain clearance. Raising the ground
+        // under these same tracks must not let the fallback invent a low-AGL hypothesis.
+        let raised_ground = FlatElevation(90.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let cloud = hypotheses(
+            &case.events[0],
+            &case.tracks,
+            &case.p,
+            &Frame::new(&case.p.region),
+            &raised_ground,
+            &atmo,
+            case.p.start_lo - 86_400.0,
+            10_000,
+        );
+        assert_eq!(cloud.count, 0, "minimum AGL still applies to gap samples");
     }
 
     #[test]
