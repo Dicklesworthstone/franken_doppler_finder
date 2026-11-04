@@ -165,12 +165,13 @@ mostly trains, idling locomotives, wind and traffic.
 
 The last three:
 - **Fullerton** had 13 non-jet passes within 3 km in its 3 h window, training traffic from an airport about 5 km
-  away, but none was audible. The audio is high-pass filtered: −3 dB at about 125 Hz, falling 24 dB per octave,
-  so 45–95 Hz is 20–40 dB down and 100–120 Hz 8–13 dB down: the fundamentals of slower propellers are gone, and
-  turboprop fundamentals (95–132 Hz in the reference recording) are weakened. Broadband wind and road noise fills
-  120–300 Hz, where the harmonics sit. Either could have hidden the passes; the audio cannot say which. Its 4 detections
-  were trains and vehicles (one with a 42 m closest approach). An earlier version of this entry blamed wind and
-  road noise across 50–300 Hz alone, but such noise raises the low band, and here it is 26 dB down.
+  away, but none was audible. The audio is high-pass filtered, −3 dB at about 125 Hz and falling 24 dB per
+  octave. Relative to 200–300 Hz, 45–95 Hz is 20–40 dB down and 100–120 Hz is 8–13 dB down, so the
+  fundamentals of slower propellers are gone and turboprop fundamentals (95–132 Hz in the reference recording)
+  are weakened. Broadband wind and road noise fills 120–300 Hz, where the harmonics sit. Either could have
+  hidden the passes; the audio cannot say which. Its 4 detections were trains and vehicles (one with a 42 m
+  closest approach). An earlier version of this entry blamed wind and road noise across 50–300 Hz alone, but
+  such noise raises the low band, and here 45–95 Hz is 26 dB below 150–600 Hz.
 - **Duke Farms** had 16 passes within 3 km, but a wind-saturated microphone. All four matched aircraft (two core,
   two confirming) were real passes over the property, so the search found the right flights and clock and
   placed them loosely. Only 1 of 4 traces fit cleanly (chi 1.2; the others 10–12), and a C172 passed 604 m from
