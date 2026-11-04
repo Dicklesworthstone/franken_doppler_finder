@@ -120,3 +120,39 @@ same way. That is a loss in coverage for `fdop`, and is reported as one.
   hurts `fdop`.
 - `fdop` fixes made after this file do not change these results. A better `fdop` is a new run beside them, and it faces
   set E recordings it has not seen.
+
+## Addendum, 2026-11-04, before any scored run and before any set E audio was downloaded
+
+**Recordings dropped for their operator's terms.** Virtual Railfan's published policy says recording its content is
+"strictly prohibited" without prior consent. Rochelle, Plant City and Tucson in set B3 are its streams, and they are
+not run for this benchmark unless consent is obtained. This was decided from the policy, with no competitor run on
+them, and they are listed as not run. Set B3 is now Duke Farms, Sapsucker Woods and Fullerton.
+
+**Set E, fixed here.** The search was YouTube's live filter on five queries (train camera, Virtual Railfan, airport,
+harbor, marina). A cam qualifies if it is in the US, has an audio track, is at a named public site, is new to all three
+projects, and states no ban on recording. Private residences are out, and so are Virtual Railfan, LIVE Trains and
+Duluth Harbor Cam, for their stated terms. "Exact published coordinate" in the rule above is relaxed to a named site:
+only one of these publishes a coordinate. The limit stays 1 km, because each site is a single building, station or
+marina. No audio was heard, and no ADS-B or aircraft data was consulted, to make this list.
+
+| Case | Site | Video |
+|---|---|---|
+| `e_olympia` | Olympia-Lacey Centennial Station, WA | `PftkGaoFl_0` |
+| `e_fortmadison` | Spring Creek Model Trains, Fort Madison, IA | `mexGMd6-8ik` |
+| `e_oxnard` | Axis Air FBO, Oxnard Airport, CA | `MfqAgiqY4-0` |
+| `e_fridayharbor` | Port of Friday Harbor, WA | `pr2p_uvmXh8` |
+| `e_aransas` | Aransas Pass Harbor Park, TX | `Mn3vY8bordE` |
+| `e_sheboygan` | Sheboygan marina, WI | `lu-YXDumeps` |
+| `e_colchester` | Champlain Marina, Colchester, VT | `WYgjhPHIw1k` |
+| `e_porthenry` | Bridgeview Harbour Marina, Port Henry, NY | `Bf7ewHyVP5I` |
+| `e_bayfield` | Pikes Bay Marina, Bayfield, WI | `O8kPCPZEFE4` |
+
+**Capture.** Two hours of each stream's DVR audio from 2026-10-31T17:00Z, with its true clock from the fragment
+timestamps. If a stream's DVR does not reach back that far, 2026-11-03T17:00Z instead, and the case says so. A stream
+that cannot be captured at either time is listed as not captured. Set E runs on R2, R3 and R1, with R2 scored as
+above.
+
+**Set D truth.** The Livermore recorder position is not published. It is recomputed here from the dataset's tracks and
+offsets, not taken from `dopplerprint`'s fit. The dataset does not publish each audio file's start time, so time of
+closest approach is scored only if it can be recovered from the dataset's own timestamps. Otherwise that column is
+dropped and this file says so.
