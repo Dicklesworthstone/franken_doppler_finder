@@ -902,13 +902,13 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     let found = !res.candidates.is_empty();
     if found {
         let top = &res.candidates[0];
-        let (lat, lon, radius, basis, radius_lower_bound) = match &res.refine {
+        let (lat, lon, radius, basis, radius_unresolved) = match &res.refine {
             Some(r) => (
                 r.lat,
                 r.lon,
                 r.radius_m,
                 r.radius_basis.clone(),
-                r.radius_lower_bound,
+                r.radius_lower_bound || r.region_cells == 0,
             ),
             None => (
                 top.lat,
@@ -1018,11 +1018,9 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             ),
             (
                 "radius".to_string(),
-                radius <= 1000.0 && !radius_lower_bound,
-                if radius_lower_bound {
-                    format!(
-                        "{radius:.0} m is a lower bound: the 95% region reached the edge of the widest refinement window"
-                    )
+                radius <= 1000.0 && !radius_unresolved,
+                if radius_unresolved {
+                    format!("{radius:.0} m radius is unresolved: {basis}")
                 } else {
                     format!("{radius:.0} m")
                 },

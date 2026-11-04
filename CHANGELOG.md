@@ -19,6 +19,38 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Continuous spatial refinement with coherent reported evidence
+
+- The observer is now polished below the contour grid spacing with bounded physical-model evaluations.
+  The same step improves the pilot before estimating excess-noise scales. Every accepted move reprofiles
+  the shared clock under the fixed calibrated objective; interpolated contour values never replace
+  trace fits. The search remains local to the selected assignment and refinement window.
+- Four continuously profiled edge minima detect thin rotated contours crossing between grid nodes.
+  Edge minima can replace the position minimum before deltas are formed, preventing negative deltas.
+  An open contour widens the window. A contour with zero accepted nodes instead recenters and halves
+  the grid spacing; if still unsampled, it fails the radius gate. `radius_lower_bound` keeps its existing
+  window-clipping meaning, while `region_cells == 0` identifies unresolved sampling. Padding is now
+  half a cell diagonal rather than half a cell side. The 75 m systematic floor and 5.99 cutoff stay.
+- `search::RefineResult` adds the fitted `t_start_utc`. The winning candidate's position, elevation,
+  clock, event fits, free-clock checks, evidence, core status and unheard-close-pass veto are rebuilt at
+  the refined solution. The CLI reports and plots consume this coherent candidate. Every locating
+  assignment must survive; failed reevaluation retains the coarse candidate with a warning and no
+  refined radius. Newly promoted candidates are checked and refined before the final margin is built,
+  with each candidate attempted at most once. Refined clocks obey the existing search interval slack.
+- All 37 search tests pass. `subgrid_polish_recovers_analytic_observers_across_grid_phases` uses an
+  independent closed-form Doppler generator across 25/50/100 m grids and three phase offsets: worst
+  grid-only error is 68.809 m, versus 0.265 m after polishing. The noisy-third-pass regression now
+  improves from a 52.0 m raw-grid pilot to 6.0 m. The still-air and wind two-flyover searches each
+  recover the observer to about 0.2 m while retaining a 75 m reported radius.
+- Further regressions cover parallel equal-velocity tracks rotated by 0/7/17 degrees, including an
+  open contour missed by all boundary nodes; a narrow contour requiring resampling; bounded search
+  around unscorable points; and direct-emission verification of regenerated trace fits, terrain
+  elevation and a close-pass veto that changes at the refined point. Candidate promotion tests
+  prevent an unchecked single-event survivor or a stale radius from becoming the reported winner.
+- These results calibrate numerical behavior under the synthetic model. Reference/field recordings
+  have not been replayed; empirical spatial coverage, propagation/track error and search-wide
+  confidence calibration remain unvalidated by these tests.
+
 ### Consistent spatial calibration and shared-clock refinement
 
 - Fit diagnostics count the observed union of six-second correlation supports, capped by the samples
@@ -43,7 +75,7 @@ at that commit, not per-change commits.
 - Reference and field replays are not available in this environment: there is no recording/archive cache
   or `yt-dlp`. No new real-recording accuracy or confidence-coverage claim is made. The 75 m radius floor,
   5.99 contour threshold, detection caps and confidence-grade thresholds are unchanged.
-- Validation: both `search::tests::calibrated_` regressions, all five `fit::tests`, and all 13
+- Validation at `e13c7fc`: both `search::tests::calibrated_` regressions, all five `fit::tests`, and all 13
   `fdop-types` tests pass. In `calibrated_refinement_recovers_clean_pair_and_has_nonnegative_deltas`,
   the noisy third pass has an 80 m transverse bias: pilot position error is 52.0 m and calibrated
   grid position error is 17.5 m. The previous mixed objective gives a minimum delta of -27.80 in

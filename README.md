@@ -222,7 +222,7 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
           4. confirmers (other events at the locked clock) and the unheard-pass veto (a tonal aircraft that
              passed much closer than anything heard costs evidence)
           5. evidence in nats against a calibrated chance-match null; margin over the best distinct rival
-          6. refine on a 25 m grid; the 95 % Δχ² region gives the radius (75 m floor)
+          6. refine below grid spacing; sample the 95 % Δχ² region on a 25 m grid (75 m floor)
       │
       ▼
  gates ─► confidence ─► reverse geocode ─► map.png / report.html / report.md / result.json ─► run ledger
@@ -236,17 +236,32 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
 | clock lock | every match's own best clock is within its timing tolerance (clamped to 4–6 s) of the shared clock |
 | margin | no pair, fine or confirmation comparison cut was recorded, and the answer beats the best *different* explanation by ≥ 6 nats or no rival survived. A rival is different if it matches a shared event to another flight, shares no match, or lies more than 5 km away |
 | no unheard close pass | no tonal aircraft passed much closer than the heard ones without leaving a detection |
-| radius | the 95 % radius is ≤ 1,000 m and is not merely a lower bound (the region did not reach the edge of the refinement window) |
+| radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
 
-Refinement widens and recenters its grid when any accepted confidence-contour cell touches a grid edge,
-including when the best point lies off center. If the contour still reaches an edge after the available
-expansions, the radius remains a lower bound.
+Refinement uses the grid to find a basin, then improves the observer position with a bounded continuous
+search that evaluates the same physical trace model at every proposed point. The grid spacing controls
+contour sampling, not the number of decimal places permitted in the location. The pilot used to estimate
+event noise is also polished, so grid quantization is not mistaken for excess measurement noise.
+
+The contour is checked both at grid nodes and at continuously profiled minima on all four window edges.
+This catches thin, rotated uncertainty regions crossing between edge nodes. Refinement widens and recenters
+the window when the contour reaches a boundary; if it still reaches an edge after the available expansions,
+the radius remains a lower bound. If no grid node samples the contour, refinement recenters and halves the
+grid spacing instead. A still-unsampled contour fails the radius gate. Radius padding uses half a cell's
+diagonal, and the systematic floor remains 75 m. Sub-metre numerical convergence in synthetic cases is not
+a claim of sub-metre accuracy for recordings.
 
 Refinement estimates each event's excess noise once from a pilot fit and holds those scales fixed, including
 when the window expands. The shared recording clock, best location and confidence contour all minimize the
 same weighted trace objective. This prevents a noisy pass from pulling the reported position under one
 weighting while the radius describes another. The radius remains conditional on the flight assignments and
 propagation model; this numerical consistency does not calibrate the search-wide confidence grade.
+
+The reported candidate is regenerated at the refined position and its fitted recording clock: terrain
+elevation, trace fits, independent clock checks, core matches, unheard close passes, evidence and the final
+margin all refer to that same solution. If a locating match fails reevaluation, the coherent coarse candidate
+is retained with a warning and no refined radius. A changed ranking causes the newly promoted leader to be
+checked and refined before reporting it.
 
 Effective trace counts use the observed union of six-second correlation supports, rather than counting the
 elapsed time across silent gaps. Duplicate samples and denser resampling do not add independent information,
@@ -845,6 +860,11 @@ The unit tests check:
   rejects unqualified noise, non-peak shoulders and ripple on a stronger ridge;
 - deferred fit diagnostics match eager refinement, and failed refinement keeps its trace and fit consistent;
 - fit recovery and range coverage;
+- gap-aware effective information, including duplicate/density invariance and unchanged support across
+  longer silent gaps; a weighted shared-clock oracle and a noisy third-pass regression with nonnegative
+  confidence deltas;
+- independent analytic observers at nine grid-spacing/phase combinations, narrow contours requiring
+  resampling, rotated parallel-flight ambiguity, and fixed-clock regeneration of reported fits and vetoes;
 - Hermite track models against closed forms;
 - sparse turning tracks, including unequal sample spacing and heading wraparound, against an analytic circle;
 - a turn cannot excuse a wrong reported heading, speed or vertical rate, and a turn starting or ending between

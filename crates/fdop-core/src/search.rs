@@ -957,6 +957,8 @@ pub struct Funnel {
 pub struct RefineResult {
     pub lat: f64,
     pub lon: f64,
+    /// Recording start at the refined position, profiled with the fixed event weights.
+    pub t_start_utc: f64,
     pub radius_m: f64,
     pub radius_basis: String,
     pub step_m: f64,
@@ -966,6 +968,7 @@ pub struct RefineResult {
     pub dchi2: Vec<Vec<f64>>,
     /// The 95 % region reached the edge of the widest window tried.
     pub radius_lower_bound: bool,
+    /// Grid nodes inside the 95 % contour; zero means its width is unresolved.
     pub region_cells: usize,
 }
 
@@ -2025,13 +2028,27 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     });
     // A coincidence can lose a match at the clock check. Remove candidates that no longer
     // explain two distinct events and check every newly promoted leader before choosing it.
-    cands = finalize_candidates(cands, &|cand| {
+    let check_candidate = |cand: &mut Candidate| {
         lock_prune(cand, &evs, tracks, p, atmo, inp.fine_dem);
         let o = observer(cand.lat, cand.lon, inp.fine_dem);
         cand.fit_score = fit_score(&cand.events, &evs, p.kappa);
         cand.unheard_close_passes = unheard_passes(cand, &o, tracks, &tix, heard, p);
         let nu = cand.unheard_close_passes.len();
         cand.score = evidence(&mut cand.events, &nulls, nu);
+    };
+    cands = finalize_candidates(cands, &check_candidate);
+    let (cands, refine) = refine_candidates(cands, &check_candidate, |cand| {
+        let r = refine_winner(cand, &evs, tracks, p, inp.fine_dem, atmo)?;
+        match refresh_refined_candidate(cand, &r, inp, &evs, p, &nulls, &tix) {
+            Some(updated) => Some((updated, r)),
+            None => {
+                warnings.push(format!(
+                    "refinement at {:.6},{:.6} did not preserve the locating matches at its fitted clock; retaining the fine-grid candidate without a refined radius",
+                    r.lat, r.lon
+                ));
+                None
+            }
+        }
     });
     // margin against the best *different explanation*: a place more than 5 km away, or one
     // that explains the events differently (no shared event-flight match, or a shared event
@@ -2058,9 +2075,6 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     } else {
         serde_json::json!({})
     };
-    let refine = cands
-        .first()
-        .and_then(|top| refine_winner(top, &evs, tracks, p, inp.fine_dem, atmo));
     if let Some(r) = &refine {
         progress(&format!(
             "refined: {:.6},{:.6} r={:.0} m",
@@ -2077,6 +2091,56 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     }
 }
 
+/// Refinement can reduce a winner's evidence (for example by exposing an unheard close
+/// pass). Recheck newly promoted leaders, keeping each candidate and its radius together.
+/// Every supplied candidate is attempted at most once; a failed update retains the entire
+/// coherent fine-grid candidate, never a mixture of old evidence and refined coordinates.
+fn refine_candidates(
+    cands: Vec<Candidate>,
+    check: &(dyn Fn(&mut Candidate) + Sync),
+    mut update: impl FnMut(&Candidate) -> Option<(Candidate, RefineResult)>,
+) -> (Vec<Candidate>, Option<RefineResult>) {
+    let mut states: Vec<(Candidate, Option<RefineResult>, bool)> =
+        cands.into_iter().map(|c| (c, None, false)).collect();
+    states.retain(|s| has_distinct_events(&s.0));
+    while let Some((top, radius, attempted)) = states.first_mut() {
+        // Refinement can promote a candidate below the original leading 20. Its coarse
+        // fallback must pass the same lock/pruning policy before it can become the answer.
+        if !top.lock_checked {
+            check(top);
+            top.lock_checked = true;
+            states.retain(|s| has_distinct_events(&s.0));
+            states.sort_by(|a, b| {
+                b.0.score
+                    .total_cmp(&a.0.score)
+                    .then(a.0.pair_chi.total_cmp(&b.0.pair_chi))
+            });
+            continue;
+        }
+        if *attempted {
+            break;
+        }
+        *attempted = true;
+        if let Some((updated, refined)) = update(top) {
+            *top = updated;
+            *radius = Some(refined);
+        }
+        states.sort_by(|a, b| {
+            b.0.score
+                .total_cmp(&a.0.score)
+                .then(a.0.pair_chi.total_cmp(&b.0.pair_chi))
+        });
+    }
+    let refined = states.first_mut().and_then(|s| s.1.take());
+    (states.into_iter().map(|s| s.0).collect(), refined)
+}
+
+fn has_distinct_events(c: &Candidate) -> bool {
+    c.events
+        .first()
+        .is_some_and(|first| c.events.iter().any(|m| m.event != first.event))
+}
+
 /// Finalize the leaders until pruning and reranking promote no unchecked candidate into
 /// the leading 20. Every pass checks at least one previously unchecked candidate, so work
 /// is bounded by the supplied candidate count rather than an arbitrary number of rounds.
@@ -2085,12 +2149,7 @@ fn finalize_candidates(
     mut cands: Vec<Candidate>,
     check: &(dyn Fn(&mut Candidate) + Sync),
 ) -> Vec<Candidate> {
-    let locates = |c: &Candidate| {
-        c.events
-            .first()
-            .is_some_and(|first| c.events.iter().any(|m| m.event != first.event))
-    };
-    cands.retain(locates);
+    cands.retain(has_distinct_events);
     loop {
         let n_lock = cands.len().min(20);
         if cands[..n_lock].iter().all(|c| c.lock_checked) {
@@ -2103,7 +2162,7 @@ fn finalize_candidates(
                 check(cand);
                 cand.lock_checked = true;
             });
-        cands.retain(locates);
+        cands.retain(has_distinct_events);
         cands.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
@@ -2251,6 +2310,119 @@ fn free_clocks(
             Some(bt - cand.t_start_utc)
         })
         .collect()
+}
+
+/// Rebuild the reported evidence at the refined position and its already-profiled clock.
+/// Weak confirmers may fall away, but every assignment that defined the confidence contour
+/// must survive. Refitting the clock on all matches here would undo the calibrated core fit.
+fn refresh_refined_candidate(
+    top: &Candidate,
+    refined: &RefineResult,
+    inp: &SearchInputs,
+    evs: &[SearchEvent],
+    p: &SearchParams,
+    nulls: &[EventNull],
+    tix: &TimeIndex,
+) -> Option<Candidate> {
+    if top.trk.len() != top.events.len()
+        || !p.region.contains(refined.lat, refined.lon)
+        || !refined.t_start_utc.is_finite()
+        || refined.t_start_utc < p.start_lo - 1.0
+        || refined.t_start_utc > p.start_hi + 1.0
+    {
+        return None;
+    }
+    let o = observer(refined.lat, refined.lon, inp.fine_dem);
+    let core_only = top.events.iter().filter(|m| m.core).count() >= 2;
+    let required = |k: usize| !core_only || top.events[k].core;
+    // Keep the locating passes if a moved observer makes an optional match collapse onto
+    // the same physical pass. The original order is preserved within each group.
+    let mut order: Vec<usize> = (0..top.events.len()).collect();
+    order.sort_by_key(|&k| !required(k));
+    let mut used_cpas: Vec<(u32, f64)> = Vec::new();
+    let mut must_keep = Vec::new();
+    let mut fresh = Candidate {
+        lat: refined.lat,
+        lon: refined.lon,
+        elev_m: o.z,
+        t_start_utc: refined.t_start_utc,
+        lock_checked: true,
+        ..Candidate::default()
+    };
+    let mut scratch = TraceScratch::default();
+    for k in order {
+        let (ei, ti) = top.trk[k];
+        let old = &top.events[k];
+        let fitted = (|| {
+            let ev = evs.get(ei)?;
+            let tr = inp.tracks.get(ti as usize)?;
+            let cpa = tr.cpa_near(o.x, old.t_cpa_heard_utc - old.d / old.c_path, 150.0)?;
+            let prop = prop_for(inp.atmo, &o, tr, cpa.t_e);
+            if !gates_ok(ev, &cpa, &prop, 0.0)
+                || tr.gap_at(cpa.t_e) > p.max_gap_s
+                || (cpa.t_r_p(&prop) - fresh.t_start_utc - ev.t_rec).abs() > ev.t_tol + 3.0
+                || used_cpas
+                    .iter()
+                    .any(|&(used, te)| used == ti && (cpa.t_e - te).abs() < SAME_FLIGHT_MIN_DT_S)
+            {
+                return None;
+            }
+            let lo = fresh.t_start_utc + *ev.tr_t.first()? - 1.0;
+            let hi = fresh.t_start_utc + *ev.tr_t.last()? + 1.0;
+            let grid = RatioGrid::build(tr, o.x, &prop, lo, hi, 0.2, p.max_gap_s);
+            let fit = trace_chi(
+                &ev.tr_t,
+                &ev.tr_f,
+                &|tu| grid.at(tu),
+                fresh.t_start_utc,
+                ev,
+                ev.sigma_hz,
+                p.cap_sigma,
+                true,
+                &mut scratch,
+            );
+            (fit.chi <= p.kappa && fit.cov >= 0.6)
+                .then(|| (cpa.t_e, make_match(ev, tr, &cpa, fit, &prop, &old.role)))
+        })();
+        let Some((te, matched)) = fitted else {
+            if required(k) {
+                return None;
+            }
+            continue;
+        };
+        fresh.events.push(matched);
+        fresh.trk.push((ei, ti));
+        used_cpas.push((ti, te));
+        must_keep.push(required(k));
+    }
+    let clocks = free_clocks(&fresh, &o, evs, inp.tracks, p, inp.atmo);
+    for k in (0..fresh.events.len()).rev() {
+        fresh.events[k].dt_free = clocks[k];
+        if !clocks[k].is_some_and(|dt| dt.is_finite() && dt.abs() <= lock_tol(&evs[fresh.trk[k].0]))
+        {
+            if must_keep[k] {
+                return None;
+            }
+            fresh.events.remove(k);
+            fresh.trk.remove(k);
+        }
+    }
+    let first = fresh.events.first()?;
+    if !fresh.events.iter().any(|m| m.event != first.event) {
+        return None;
+    }
+    fresh.n_explained = fresh.events.len();
+    fresh.fit_score = fit_score(&fresh.events, evs, p.kappa);
+    fresh.pair_chi = fresh
+        .events
+        .iter()
+        .zip(&fresh.trk)
+        .map(|(m, &(ei, _))| evs[ei].n_eff * m.chi)
+        .sum::<f64>()
+        / fresh.trk.iter().map(|&(ei, _)| evs[ei].n_eff).sum::<f64>();
+    fresh.unheard_close_passes = unheard_passes(&fresh, &o, inp.tracks, tix, &inp.heard_times, p);
+    fresh.score = evidence(&mut fresh.events, nulls, fresh.unheard_close_passes.len());
+    Some(fresh)
 }
 
 /// Lock check with pruning: while some event's own clock is further than max(t_tol, 4 s) from
@@ -2425,7 +2597,7 @@ fn refine_winner(
             .map(|(&(ei, ti), m)| (ei, ti, m.t_cpa_heard_utc - m.d / m.c_path))
             .collect();
     }
-    // widen (and coarsen) the window until the 95 % region fits inside it
+    // Expand clipped contours; resample contours too narrow for the current grid.
     let mut q = p.clone();
     let (mut lat0, mut lon0) = (top.lat, top.lon);
     let mut out = None;
@@ -2442,16 +2614,96 @@ fn refine_winner(
             atmo,
             &mut weights,
         )?;
-        let done = !r.radius_lower_bound;
+        let done = !r.radius_lower_bound && r.region_cells > 0;
+        let resample = r.region_cells == 0;
         (lat0, lon0) = (r.lat, r.lon);
         out = Some(r);
         if done {
             break;
         }
-        q.refine_half_m *= 2.0;
-        q.refine_step_m *= 2.0;
+        if resample {
+            q.refine_step_m *= 0.5;
+        } else {
+            q.refine_half_m *= 2.0;
+            q.refine_step_m *= 2.0;
+        }
     }
     out
+}
+
+/// Bounded pattern search in the original grid's ENU frame. Every accepted move is
+/// evaluated with the physical model; interpolation never substitutes for a trace fit.
+fn polish_grid_minimum(
+    mut best: (f64, f64, f64),
+    half_m: f64,
+    grid_step_m: f64,
+    score: impl Fn(f64, f64) -> Option<f64>,
+) -> (f64, f64, f64) {
+    let mut step = grid_step_m * 0.5;
+    for _ in 0..64 {
+        if step < 0.25 {
+            break;
+        }
+        let mut next = best;
+        for (de, dn) in [
+            (-1.0, -1.0),
+            (0.0, -1.0),
+            (1.0, -1.0),
+            (-1.0, 0.0),
+            (1.0, 0.0),
+            (-1.0, 1.0),
+            (0.0, 1.0),
+            (1.0, 1.0),
+        ] {
+            let e = (best.0 + de * step).clamp(-half_m, half_m);
+            let n = (best.1 + dn * step).clamp(-half_m, half_m);
+            if let Some(cost) = score(e, n)
+                && cost.is_finite()
+                && cost < next.2
+            {
+                next = (e, n, cost);
+            }
+        }
+        if next.2 < best.2 {
+            best = next;
+        } else {
+            step *= 0.5;
+        }
+    }
+    best
+}
+
+/// Profile an edge between the neighbors of its best sampled node. This finds narrow,
+/// rotated contours that cross a boundary between grid nodes, using actual trace fits.
+fn polish_edge_minimum(
+    mut best: (f64, f64),
+    lo: f64,
+    hi: f64,
+    grid_step_m: f64,
+    score: impl Fn(f64) -> Option<f64>,
+) -> (f64, f64) {
+    let mut step = grid_step_m * 0.5;
+    for _ in 0..64 {
+        if step < 0.25 {
+            break;
+        }
+        let mut next = best;
+        for sign in [-1.0, 1.0] {
+            let t = (best.0 + sign * step).clamp(lo, hi);
+            if let Some(cost) = score(t)
+                && cost.is_finite()
+                && cost < next.1
+            {
+                next = (t, cost);
+            }
+        }
+        if next.1 < best.1 {
+            best = next;
+        } else {
+            step *= 0.5;
+        }
+    }
+    best
 }
 
 /// One refinement grid of `p.refine_half_m` / `p.refine_step_m` around (lat0, lon0).
@@ -2469,6 +2721,23 @@ fn refine_on(
     weights: &mut Option<Vec<f64>>,
 ) -> Option<RefineResult> {
     let grid = local_grid(lat0, lon0, p.refine_half_m, p.refine_step_m);
+    let frame = Enu::new(lat0, lon0, 0.0);
+    let half = grid.last()?.2;
+    let evaluate_at = |east: f64, north: f64, w: Option<&[f64]>| {
+        let (la, lo, _) = frame.to_geodetic([east, north, 0.0]);
+        eval_point_weighted(
+            &observer(la, lo, dem),
+            assign,
+            evs,
+            tracks,
+            p,
+            atmo,
+            p.region.contains(la, lo),
+            false,
+            false,
+            w,
+        )
+    };
     let evaluate = |w: Option<&[f64]>| -> Vec<Option<PointEval>> {
         grid.par_iter()
             .map(|&(la, lo, _, _)| {
@@ -2498,8 +2767,19 @@ fn refine_on(
     };
     let mut evals = evaluate(weights.as_deref());
     let mut k_best = best_index(&evals)?;
+    let polish = |k: usize, evals: &[Option<PointEval>], w: Option<&[f64]>| {
+        let (_, _, east, north) = grid[k];
+        let seed = (east, north, evals[k].as_ref()?.total);
+        let best = polish_grid_minimum(seed, half, p.refine_step_m, |e, n| {
+            evaluate_at(e, n, w).map(|pe| pe.total)
+        });
+        Some((best, evaluate_at(best.0, best.1, w)?))
+    };
+    let mut best = polish(k_best, &evals, weights.as_deref())?;
     if weights.is_none() {
-        let pilot = evals[k_best].as_ref()?;
+        // Grid quantization is not measurement noise. Estimate scales at the polished
+        // pilot, then freeze them for every subsequent point, clock and window.
+        let pilot = &best.1;
         let calibrated: Vec<f64> = pilot
             .chis
             .iter()
@@ -2513,15 +2793,60 @@ fn refine_on(
             // to the wrong objective and can put the reported center off its own minimum.
             evals = evaluate(weights.as_deref());
             k_best = best_index(&evals)?;
+            best = polish(k_best, &evals, weights.as_deref())?;
         }
     }
-    let t_best = evals[k_best].as_ref()?.total;
     let n = (p.refine_half_m / p.refine_step_m).round() as usize * 2 + 1;
+    let mut boundary = Vec::with_capacity(4);
+    for side in 0..4 {
+        let index = |i| match side {
+            0 => i,
+            1 => (n - 1) * n + i,
+            2 => i * n,
+            _ => i * n + n - 1,
+        };
+        let Some((i, cost)) = (0..n)
+            .filter_map(|i| evals[index(i)].as_ref().map(|pe| (i, pe.total)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+        else {
+            continue;
+        };
+        let coordinates = |t| match side {
+            0 => (t, -half),
+            1 => (t, half),
+            2 => (-half, t),
+            _ => (half, t),
+        };
+        let t0 = -half + i as f64 * p.refine_step_m;
+        let edge = polish_edge_minimum(
+            (t0, cost),
+            (t0 - p.refine_step_m).max(-half),
+            (t0 + p.refine_step_m).min(half),
+            p.refine_step_m,
+            |t| {
+                let (e, n) = coordinates(t);
+                evaluate_at(e, n, weights.as_deref()).map(|pe| pe.total)
+            },
+        );
+        let (e, n) = coordinates(edge.0);
+        boundary.push((e, n, edge.1));
+        if edge.1 < best.0.2 {
+            best = ((e, n, edge.1), evaluate_at(e, n, weights.as_deref())?);
+        }
+    }
+    let ((best_e, best_n, t_best), best_eval) = best;
     let mut dchi = vec![vec![f64::NAN; n]; n];
-    let (bla, blo, _, _) = grid[k_best];
+    let (bla, blo, _) = frame.to_geodetic([best_e, best_n, 0.0]);
     let mut rmax: f64 = 0.0;
     let mut cells = 0usize;
-    let mut edge = false;
+    let mut edge = best_e.abs() >= half || best_n.abs() >= half;
+    for (e, n, cost) in boundary {
+        if cost - t_best <= 5.99 {
+            edge = true;
+            let (la, lo, _) = frame.to_geodetic([e, n, 0.0]);
+            rmax = rmax.max(haversine_m(bla, blo, la, lo));
+        }
+    }
     for (k, e) in evals.iter().enumerate() {
         let (iy, ix) = (k / n, k % n);
         if let Some(pe) = e {
@@ -2541,13 +2866,15 @@ fn refine_on(
     let lons: Vec<f64> = (0..n).map(|ix| grid[ix].1).collect();
     let area_r = (cells as f64 * p.refine_step_m * p.refine_step_m / std::f64::consts::PI).sqrt();
     let floor = 75.0;
-    let radius = (rmax + 0.5 * p.refine_step_m).max(floor);
+    // Half a cell diagonal covers an unsampled corner in two dimensions.
+    let radius = (rmax + p.refine_step_m / std::f64::consts::SQRT_2).max(floor);
     Some(RefineResult {
         lat: bla,
         lon: blo,
+        t_start_utc: best_eval.t_s,
         radius_m: radius,
         radius_basis: format!(
-            "95% chi-square region (2 dof) of the joint trace fit over {} events ({}) on a {:.0} m grid, with shared clock profiled using fixed pilot-fit event noise scales; max extent {:.0} m, equal-area radius {:.0} m, floor {:.0} m{}",
+            "95% chi-square region (2 dof) of the joint trace fit over {} events ({}) on a {:.0} m contour grid, with position polished below grid spacing and shared clock profiled using fixed pilot-fit event noise scales; boundary minima checked between nodes; max extent {:.0} m, equal-area radius {:.0} m, floor {:.0} m{}",
             assign.len(),
             assign
                 .iter()
@@ -2558,7 +2885,9 @@ fn refine_on(
             rmax,
             area_r,
             floor,
-            if edge {
+            if cells == 0 {
+                "; contour unresolved between grid nodes (radius uses the grid padding and floor only)"
+            } else if edge {
                 "; region touches the refine window edge (radius is a lower bound)"
             } else {
                 ""
@@ -3024,6 +3353,315 @@ mod tests {
         assert!(out[0].lock_checked);
         assert_eq!(out[0].events[0].event, "e3");
         assert_eq!(out[0].n_explained, 2);
+    }
+
+    fn refinement_at(lat: f64, lon: f64, t_start_utc: f64) -> RefineResult {
+        RefineResult {
+            lat,
+            lon,
+            t_start_utc,
+            radius_m: 75.0,
+            radius_basis: "synthetic test point".into(),
+            step_m: 25.0,
+            lats: vec![lat],
+            lons: vec![lon],
+            dchi2: vec![vec![0.0]],
+            radius_lower_bound: false,
+            region_cells: 1,
+        }
+    }
+
+    #[test]
+    fn refinement_reranks_promoted_leaders_without_mixing_candidate_state() {
+        let candidates: Vec<Candidate> = [("A", 10.0), ("B", 9.0), ("C", 6.0)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (flight, score))| Candidate {
+                lat: 40.0 + i as f64 * 0.1,
+                lon: -73.0,
+                t_start_utc: 1000.0,
+                score,
+                lock_checked: true,
+                n_explained: 2,
+                events: ["e1", "e2"]
+                    .into_iter()
+                    .map(|event| EventMatch {
+                        event: event.into(),
+                        flight: flight.into(),
+                        ..EventMatch::default()
+                    })
+                    .collect(),
+                ..Candidate::default()
+            })
+            .collect();
+        // B wins after rescoring; B's refinement fails; or rescoring B promotes the
+        // already-refined A again. A cached radius must always travel with its candidate.
+        for (a_score, b_score, winner, has_radius) in [
+            (5.0, Some(8.0), "B", true),
+            (5.0, None, "B", false),
+            (8.0, Some(7.0), "A", true),
+        ] {
+            let mut checked = Vec::new();
+            let (out, refined) = refine_candidates(candidates.clone(), &|_| {}, |c| {
+                let flight = c.events[0].flight.as_str();
+                checked.push(flight.to_string());
+                let score = match flight {
+                    "A" => a_score,
+                    "B" => b_score?,
+                    _ => panic!("a lower-ranked unpromoted candidate need not be refined"),
+                };
+                let updated = Candidate {
+                    lat: c.lat + 0.001,
+                    t_start_utc: c.t_start_utc + 0.375,
+                    score,
+                    ..c.clone()
+                };
+                let r = refinement_at(updated.lat, updated.lon, updated.t_start_utc);
+                Some((updated, r))
+            });
+            assert_eq!(checked, ["A", "B"]);
+            assert_eq!(out[0].events[0].flight, winner);
+            assert!(out.windows(2).all(|w| w[0].score >= w[1].score));
+            assert_eq!(refined.is_some(), has_radius);
+            if let Some(r) = refined {
+                assert_eq!((out[0].lat, out[0].lon), (r.lat, r.lon));
+                assert_eq!(out[0].t_start_utc, r.t_start_utc);
+            } else {
+                assert_eq!(out[0].lat, candidates[1].lat);
+                assert_eq!(out[0].t_start_utc, candidates[1].t_start_utc);
+                assert_eq!(out[0].score, candidates[1].score);
+            }
+        }
+    }
+
+    #[test]
+    fn refinement_checks_newly_promoted_coarse_candidates_before_fallback() {
+        let candidates = ["A", "B", "C", "D"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, flight)| Candidate {
+                score: 10.0 - i as f64,
+                t_start_utc: 1000.0,
+                lock_checked: i < 2,
+                n_explained: 2,
+                events: ["e1", "e2"]
+                    .into_iter()
+                    .map(|event| EventMatch {
+                        event: event.into(),
+                        flight: flight.into(),
+                        ..EventMatch::default()
+                    })
+                    .collect(),
+                ..Candidate::default()
+            })
+            .collect();
+        let checked = AtomicUsize::new(0);
+        let mut attempted = Vec::new();
+        let (out, refined) = refine_candidates(
+            candidates,
+            &|c| {
+                checked.fetch_add(1, Ordering::Relaxed);
+                match c.events[0].flight.as_str() {
+                    "C" => {
+                        c.events.pop();
+                        c.n_explained = 1;
+                    }
+                    "D" => {}
+                    _ => panic!("previously checked candidates must not be rechecked"),
+                }
+            },
+            |c| {
+                let flight = c.events[0].flight.as_str();
+                attempted.push(flight.to_string());
+                let score = match flight {
+                    "A" => 2.0,
+                    "B" => 3.0,
+                    "D" => return None,
+                    _ => panic!("a rejected one-event candidate cannot be refined"),
+                };
+                Some((
+                    Candidate { score, ..c.clone() },
+                    refinement_at(c.lat, c.lon, c.t_start_utc),
+                ))
+            },
+        );
+        assert_eq!(checked.load(Ordering::Relaxed), 2);
+        assert_eq!(attempted, ["A", "B", "D"]);
+        assert_eq!(out[0].events[0].flight, "D");
+        assert!(out[0].lock_checked);
+        assert_eq!(out[0].n_explained, 2);
+        assert_eq!(out[0].score, 7.0);
+        assert!(refined.is_none());
+        assert!(out.iter().all(|c| c.events[0].flight != "C"));
+    }
+
+    #[test]
+    fn refined_reporting_recomputes_physics_evidence_and_veto_at_one_fixed_clock() {
+        struct Slope(f64, f64);
+        impl Elevation for Slope {
+            fn elev_m(&self, lat: f64, lon: f64) -> f64 {
+                let (mlat, mlon) = fdop_types::geo::m_per_deg(self.0);
+                137.0 + 0.03 * (lon - self.1) * mlon + 0.02 * (lat - self.0) * mlat
+            }
+            fn describe(&self) -> String {
+                "synthetic slope".into()
+            }
+        }
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        let t_origin = case.t_s;
+        case.t_s += 0.137;
+        let dem = Slope(case.obs.0, case.obs.1);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let frame = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let truth = observer(case.obs.0, case.obs.1, &dem);
+        for (k, (f0, offset)) in [(112.7, 1000.0), (129.5, 1900.0)].into_iter().enumerate() {
+            case.events[k] = synth_event(
+                &format!("e{}", k + 1),
+                &case.tracks[k],
+                truth.x,
+                case.t_s,
+                f0,
+                343.0,
+                t_origin + offset,
+                &Prop::still(343.0),
+            );
+        }
+        // This pass is just outside the unheard-pass threshold at the old point, but
+        // inside it at the refined point. A stale veto would incorrectly remain clear.
+        let mut close = straight_track(
+            &frame,
+            [0.0, 1200.0, 600.0],
+            [90.0, 0.0, 0.0],
+            t_origin + 2400.0,
+            t_origin + 2000.0,
+            t_origin + 2800.0,
+            5.0,
+        );
+        close.key = "C".into();
+        case.tracks.push(close);
+        let tix = TimeIndex::new(&case.tracks);
+        let inputs = SearchInputs {
+            events: case.events.clone(),
+            tracks: &case.tracks,
+            heard_times: vec![],
+            coarse_dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let (lat, lon, _) = frame.to_geodetic([70.0, -100.0, 0.0]);
+        let mut top = explain_at(
+            &inputs,
+            &case.p,
+            lat,
+            lon,
+            case.t_s,
+            10.0,
+            &[("e1".into(), "A".into()), ("e2".into(), "B".into())],
+        )
+        .unwrap();
+        let nulls: Vec<EventNull> = case
+            .events
+            .iter()
+            .map(|e| EventNull {
+                event: e.id.clone(),
+                gate_nats: 6.0,
+                ..EventNull::default()
+            })
+            .collect();
+        top.unheard_close_passes = unheard_passes(
+            &top,
+            &observer(lat, lon, &dem),
+            &case.tracks,
+            &tix,
+            &[],
+            &case.p,
+        );
+        top.score = evidence(&mut top.events, &nulls, top.unheard_close_passes.len());
+        assert!(top.unheard_close_passes.is_empty());
+        assert!((top.t_start_utc - case.t_s).abs() > 0.2);
+        assert!((top.elev_m - truth.z).abs() > 0.05);
+        let refined = refinement_at(case.obs.0, case.obs.1, case.t_s);
+        let fresh =
+            refresh_refined_candidate(&top, &refined, &inputs, &case.events, &case.p, &nulls, &tix)
+                .unwrap();
+        assert_eq!((fresh.lat, fresh.lon), case.obs);
+        assert_eq!(fresh.t_start_utc, case.t_s);
+        assert_eq!(fresh.elev_m, truth.z);
+        assert_eq!(fresh.n_explained, 2);
+        assert!(
+            fresh
+                .events
+                .iter()
+                .all(|m| m.core && m.dt_free.unwrap().abs() < 0.25)
+        );
+        assert_eq!(fresh.unheard_close_passes.len(), 1);
+        assert!(fresh.unheard_close_passes[0].starts_with("C "));
+        assert_eq!(fresh.score, 12.0 - UNHEARD_NATS);
+        assert!(
+            fresh.score < top.score,
+            "the refreshed veto must change evidence"
+        );
+
+        // Evaluate the regenerated matches using direct emission-time solves, independent
+        // of the refresh path's RatioGrid interpolation and the old point's fitted clock.
+        let mut scratch = TraceScratch::default();
+        for (&(ei, ti), matched) in fresh.trk.iter().zip(&fresh.events) {
+            let ev = &case.events[ei];
+            let tr = &case.tracks[ti as usize];
+            let te = t_origin + if ei == 0 { 1000.0 } else { 1900.0 };
+            let cpa = tr.cpa_near(truth.x, te, 150.0).unwrap();
+            let prop = prop_for(&atmo, &truth, tr, cpa.t_e);
+            let expected = trace_chi(
+                &ev.tr_t,
+                &ev.tr_f,
+                &|tu| tr.solve_emission_p(tu, truth.x, &prop, None).unwrap().2,
+                case.t_s,
+                ev,
+                ev.sigma_hz,
+                case.p.cap_sigma,
+                true,
+                &mut scratch,
+            );
+            assert!((matched.chi - expected.chi).abs() < 0.002);
+            assert!((matched.rms_hz - expected.rms).abs() < 0.0001);
+            assert!((matched.f0 - expected.f0).abs() < 0.001);
+            assert!((matched.d - cpa.d).abs() < 0.01);
+            assert!((matched.t_cpa_heard_utc - cpa.t_r_p(&prop)).abs() < 0.002);
+        }
+        // The same physically supported clock must be refused if it lies outside the
+        // requested interval, while retaining the evaluator's existing one-second slack.
+        for (lo, hi, allowed) in [
+            (case.t_s + 1.25, case.t_s + 10.0, false),
+            (case.t_s - 10.0, case.t_s - 1.25, false),
+            (case.t_s + 1.0, case.t_s + 10.0, true),
+            (case.t_s - 10.0, case.t_s - 1.0, true),
+        ] {
+            let mut bounded = case.p.clone();
+            bounded.start_lo = lo;
+            bounded.start_hi = hi;
+            assert_eq!(
+                refresh_refined_candidate(
+                    &top,
+                    &refined,
+                    &inputs,
+                    &case.events,
+                    &bounded,
+                    &nulls,
+                    &tix,
+                )
+                .is_some(),
+                allowed,
+                "permitted clock interval {lo}..{hi}"
+            );
+        }
+        let mut unsupported = case.events.clone();
+        for f in &mut unsupported[1].tr_f {
+            *f += 30.0;
+        }
+        assert!(refresh_refined_candidate(
+            &top, &refined, &inputs, &unsupported, &case.p, &nulls, &tix,
+        ).is_none(), "losing a locating trace must discard the refined report");
     }
 
     #[test]
@@ -4030,6 +4668,9 @@ mod tests {
         let top = &res.candidates[0];
         let r = res.refine.as_ref().unwrap();
         let err = haversine_m(r.lat, r.lon, lat0, lon0);
+        assert_eq!((top.lat, top.lon), (r.lat, r.lon));
+        assert_eq!(top.t_start_utc, r.t_start_utc);
+        assert_eq!(res.margin["top_score"].as_f64(), Some(top.score));
         assert!(err < 60.0, "observer error {err:.1} m");
         assert!((top.t_start_utc - t_s).abs() < 1.0);
         for (event, flight) in [("e1", "A"), ("e2", "B")] {
@@ -4177,6 +4818,273 @@ mod tests {
                 assert!(res.candidates.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn subgrid_polish_respects_the_window_and_unscorable_points() {
+        let loss = |e: f64, n: f64| (e - 80.0).powi(2) + (n + 3.0).powi(2);
+        for limit in [10.0, 20.0] {
+            let polished = polish_grid_minimum((0.0, 0.0, loss(0.0, 0.0)), 20.0, 10.0, |e, n| {
+                (e <= limit).then(|| loss(e, n))
+            });
+            assert_eq!(polished.0, limit);
+            assert!((polished.1 + 3.0).abs() < 0.25);
+            assert_eq!(polished.2, loss(polished.0, polished.1));
+        }
+    }
+
+    #[test]
+    fn parallel_flights_keep_the_position_clock_ambiguity_visible() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let mut missed_boundary_on_grid = false;
+        // Along-track position can trade exactly against a shared recording clock when
+        // the two aircraft have the same velocity. Finer numerical optimization must not
+        // turn this unidentifiable geometry into a closed spatial confidence contour.
+        for angle in [0.0_f64, 7.0, 17.0] {
+            let mut case = two_flyover_case(med);
+            let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let rotate = |[e, n, z]: V3| [e * cos - n * sin, e * sin + n * cos, z];
+            for (i, (p0, dt, f0)) in [
+                ([0.0, 5000.0, 1500.0], 1000.0, 112.7),
+                ([0.0, -3500.0, 1200.0], 1900.0, 129.5),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let tr = straight_track(
+                    &enu,
+                    rotate(p0),
+                    rotate([137.0, 0.0, 0.0]),
+                    case.t_s + dt,
+                    case.t_s + dt - 600.0,
+                    case.t_s + dt + 600.0,
+                    5.0,
+                );
+                let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+                let mut ev = synth_event(
+                    &format!("parallel_{i}"),
+                    &tr,
+                    x,
+                    case.t_s,
+                    f0,
+                    343.0,
+                    case.t_s + dt,
+                    &Prop::still(343.0),
+                );
+                // Deliberately thin, high-information contours stress grid aliasing;
+                // these noiseless traces do not assert a realistic measurement floor.
+                ev.sigma_hz = 0.03;
+                ev.n_eff = ev.tr_t.len() as f64;
+                for (&t, f) in ev.tr_t.iter().zip(&mut ev.tr_f) {
+                    *f = f0
+                        * tr.solve_emission_p(t + case.t_s, x, &Prop::still(343.0), None)
+                            .unwrap()
+                            .2;
+                }
+                (ev.q_t, ev.q_f) = subsample(&ev.tr_t, &ev.tr_f, 40);
+                case.events[i] = ev;
+                case.tracks[i] = tr;
+            }
+            let assign = [(0, 0, case.t_s + 1000.0), (1, 1, case.t_s + 1900.0)];
+            // Shift along the unresolved direction: an interior node lies in the thin
+            // contour, while its rotated boundary intersections fall between nodes.
+            let (lat, lon, _) = enu.to_geodetic([13.0 * cos, 13.0 * sin, 0.0]);
+            let mut weights = None;
+            for half in [200.0, 400.0] {
+                case.p.refine_half_m = half;
+                case.p.refine_step_m = half / 4.0;
+                let r = refine_on(
+                    lat,
+                    lon,
+                    &assign,
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &dem,
+                    &atmo,
+                    &mut weights,
+                )
+                .unwrap();
+                let last = r.dchi2.len() - 1;
+                let sampled_edge = r.dchi2.iter().enumerate().any(|(iy, row)| {
+                    row.iter().enumerate().any(|(ix, &dc)| {
+                        (iy == 0 || ix == 0 || iy == last || ix == last) && dc <= 5.99
+                    })
+                });
+                missed_boundary_on_grid |= !sampled_edge && r.region_cells > 0;
+                assert!(
+                    r.radius_lower_bound,
+                    "{angle} degree parallel tracks falsely bounded: {r:?}"
+                );
+                assert!(
+                    r.radius_m >= half,
+                    "extent must include the unresolved direction"
+                );
+            }
+        }
+        assert!(
+            missed_boundary_on_grid,
+            "fixture must expose a thin contour crossing between edge nodes"
+        );
+    }
+
+    fn analytic_two_flyover_case() -> (TwoCase, [(usize, u32, f64); 2]) {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        case.t_s += 0.137;
+        let assign = [
+            (0, 0, case.t_s - 0.137 + 1000.0),
+            (1, 1, case.t_s - 0.137 + 1900.0),
+        ];
+        // Independent forward model: analytic constant-velocity CPA and closed-form
+        // retarded Doppler, not the interpolated track/Newton solver being calibrated.
+        for (k, (p0, velocity, f0)) in [
+            ([0.0, 5000.0, 1500.0], [137.0, 0.0, 0.0], 112.7),
+            ([2500.0, 0.0, 900.0], [0.0, 104.0, 0.0], 129.5),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let relative = sub(p0, [0.0, 0.0, MIC_HEIGHT_M]);
+            let dt = -dot(relative, velocity) / dot(velocity, velocity);
+            let at_cpa = fdop_types::geo::add(relative, fdop_types::geo::scale(velocity, dt));
+            let (d, v, te) = (norm(at_cpa), norm(velocity), assign[k].2 + dt);
+            let ev = &mut case.events[k];
+            ev.t_rec = te + d / 343.0 - case.t_s;
+            ev.tr_t = (0..=120).map(|i| ev.t_rec - 60.0 + i as f64).collect();
+            ev.tr_f = ev
+                .tr_t
+                .iter()
+                .map(|&t| cv_curve(t, f0, v, d, te - case.t_s, 343.0))
+                .collect();
+            (ev.q_t, ev.q_f) = subsample(&ev.tr_t, &ev.tr_f, 40);
+        }
+        (case, assign)
+    }
+
+    #[test]
+    fn subgrid_contour_aliasing_stays_unresolved_until_resampled() {
+        let (mut case, assign) = analytic_two_flyover_case();
+        for event in &mut case.events {
+            event.n_eff = 120.0;
+        }
+        case.p.refine_half_m = 200.0;
+        case.p.refine_step_m = 100.0;
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let frame = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let (lat, lon, _) = frame.to_geodetic([37.0, -42.0, 0.0]);
+        let coarse = refine_on(
+            lat,
+            lon,
+            &assign,
+            &case.events,
+            &case.tracks,
+            &case.p,
+            &dem,
+            &atmo,
+            &mut Some(vec![1.0, 1.0]),
+        )
+        .unwrap();
+        assert_eq!(
+            coarse.region_cells, 0,
+            "fixture must leave the contour between grid nodes"
+        );
+        assert!(
+            !coarse.radius_lower_bound,
+            "fixture isolates undersampling from a clipped boundary"
+        );
+        assert!(haversine_m(coarse.lat, coarse.lon, case.obs.0, case.obs.1) < 3.0);
+
+        let inputs = SearchInputs {
+            events: case.events.clone(),
+            tracks: &case.tracks,
+            heard_times: vec![],
+            coarse_dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let top = explain_at(
+            &inputs,
+            &case.p,
+            lat,
+            lon,
+            case.t_s,
+            10.0,
+            &[("e1".into(), "A".into()), ("e2".into(), "B".into())],
+        )
+        .unwrap();
+        let resolved =
+            refine_winner(&top, &case.events, &case.tracks, &case.p, &dem, &atmo).unwrap();
+        assert!(resolved.region_cells > 0);
+        assert!(!resolved.radius_lower_bound, "{resolved:?}");
+        assert!(
+            resolved.step_m < coarse.step_m,
+            "an unresolved contour needs finer sampling"
+        );
+        assert!(resolved.radius_m >= 75.0);
+        assert!(haversine_m(resolved.lat, resolved.lon, case.obs.0, case.obs.1) < 3.0);
+    }
+
+    #[test]
+    fn subgrid_polish_recovers_analytic_observers_across_grid_phases() {
+        let (case, assign) = analytic_two_flyover_case();
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let mut max_polished_error = 0.0f64;
+        let mut max_grid_error = 0.0f64;
+        for grid_step in [25.0, 50.0, 100.0] {
+            for (phase_e, phase_n) in [(0.37, -0.42), (-0.43, 0.28), (0.20, 0.44)] {
+                let (lat, lon, _) =
+                    enu.to_geodetic([phase_e * grid_step, phase_n * grid_step, 0.0]);
+                let frame = Enu::new(lat, lon, 0.0);
+                let half = 2.0 * grid_step;
+                let score = |e, n| {
+                    let (la, lo, _) = frame.to_geodetic([e, n, 0.0]);
+                    eval_point_weighted(
+                        &observer(la, lo, &dem),
+                        &assign,
+                        &case.events,
+                        &case.tracks,
+                        &case.p,
+                        &atmo,
+                        true,
+                        false,
+                        false,
+                        Some(&[1.0, 1.0]),
+                    )
+                    .map(|pe| pe.total)
+                };
+                let seed = local_grid(lat, lon, half, grid_step)
+                    .iter()
+                    .map(|&(_, _, e, n)| (e, n, score(e, n).unwrap()))
+                    .min_by(|a, b| a.2.total_cmp(&b.2))
+                    .unwrap();
+                let polished = polish_grid_minimum(seed, half, grid_step, score);
+                let (gla, glo, _) = frame.to_geodetic([seed.0, seed.1, 0.0]);
+                let (pla, plo, _) = frame.to_geodetic([polished.0, polished.1, 0.0]);
+                let grid_error = haversine_m(gla, glo, case.obs.0, case.obs.1);
+                let polished_error = haversine_m(pla, plo, case.obs.0, case.obs.1);
+                assert!(polished.2 <= seed.2);
+                assert!(
+                    polished_error < 3.0,
+                    "{grid_step} m grid, phase {phase_e}/{phase_n}: {polished_error} m"
+                );
+                assert!(polished_error < 0.2 * grid_error);
+                max_polished_error = max_polished_error.max(polished_error);
+                max_grid_error = max_grid_error.max(grid_error);
+                eprintln!(
+                    "grid {grid_step} m phase {phase_e}/{phase_n}: cell error {grid_error:.3} m, polished {polished_error:.3} m"
+                );
+            }
+        }
+        eprintln!(
+            "analytic grid calibration: max cell error {max_grid_error:.3} m, max polished error {max_polished_error:.3} m"
+        );
     }
 
     #[test]
@@ -4388,11 +5296,29 @@ mod tests {
         .unwrap();
         let delta: Vec<f64> = refined.dchi2.iter().flatten().copied().collect();
         assert!(delta.iter().all(|&dc| dc.is_finite() && dc >= 0.0));
-        let minimum = delta.iter().position(|&dc| dc == 0.0).unwrap();
-        assert_eq!(
-            (refined.lat, refined.lon),
-            (grid[minimum].0, grid[minimum].1)
-        );
+        let minimum = (0..delta.len())
+            .min_by(|&a, &b| delta[a].total_cmp(&delta[b]))
+            .unwrap();
+        let evaluate = |la, lo| {
+            eval_point_weighted(
+                &observer(la, lo, &dem),
+                &assign,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                true,
+                false,
+                false,
+                weights.as_deref(),
+            )
+            .unwrap()
+            .total
+        };
+        let center_cost = evaluate(refined.lat, refined.lon);
+        let cell_cost = evaluate(grid[minimum].0, grid[minimum].1);
+        assert!(center_cost <= cell_cost);
+        assert!((cell_cost - center_cost - delta[minimum]).abs() < 1e-8);
         assert!(weights.as_ref().unwrap()[2] < 0.25);
         let pilot_error = haversine_m(grid[k_pilot].0, grid[k_pilot].1, case.obs.0, case.obs.1);
         let refined_error = haversine_m(refined.lat, refined.lon, case.obs.0, case.obs.1);
@@ -4490,6 +5416,9 @@ mod tests {
         let top = &res.candidates[0];
         let r = res.refine.as_ref().unwrap();
         let err = haversine_m(r.lat, r.lon, lat0, lon0);
+        assert_eq!((top.lat, top.lon), (r.lat, r.lon));
+        assert_eq!(top.t_start_utc, r.t_start_utc);
+        assert_eq!(res.margin["top_score"].as_f64(), Some(top.score));
         assert!(
             err < 60.0,
             "refined {:.6},{:.6} err {err:.0} m; top {:?}",
