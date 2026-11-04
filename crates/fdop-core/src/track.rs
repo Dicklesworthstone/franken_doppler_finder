@@ -97,7 +97,7 @@ fn consistent_chain(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) -> 
         // bound on every remaining chain; it makes clean tracks stop after their immediate
         // predecessor without sacrificing a longer chain across arbitrarily dense junk.
         for i in (0..j).rev() {
-            if pts[j].t - pts[i].t > bp.max_gap_s || prefix_best[i] + 1 <= best[j] {
+            if pts[j].t - pts[i].t > bp.max_gap_s || prefix_best[i] < best[j] {
                 break;
             }
             if best[i] + 1 > best[j] && ok(i, j) {

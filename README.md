@@ -45,7 +45,7 @@ finding the faint curves in a spectrogram to naming the town.
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
 | Has it located a real recording? | **One recording, three ways, one answer.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three pass every gate at **high** confidence and give the same spot: a 292 m radius about **224 m** from the location published in the video (221 m for the county search). Each matched the same three flyovers: a Pilatus PC-12, a Cessna 208 and a King Air 350 |
 | Has it been wrong? | **Yes, and so far every committed build has graded its wrong answers low.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off). In the field tests below, five answers were wrong. A low grade does not mean wrong, though: one build put the state-wide answer 129 m off at high confidence but graded the county search low. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points. A working-tree experiment that measured more of a 3 h recording's flyovers graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer either |
-| Is it tested? | **120 offline unit tests,** plus two opt-in FFmpeg/FFprobe integration tests: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. See [Testing](#testing) for the checks completed on the current code. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording |
+| Is it tested? | **123 offline unit tests,** plus two opt-in FFmpeg/FFprobe integration tests: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. See [Testing](#testing) for the checks completed on the current code. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording |
 | Has it located a recording it was not developed on? | **Once, at the same site.** Nine recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: about 150 m from the cam's geocoded street address, just outside its 147 m radius (an address geocode only approximates where a camera is), with the recording start off by only 0.33 s. The same cam on two other days gave wrong answers graded **low**. An eagle cam at Duke Farms (Hillsborough, NJ) came out in the right township, about 2.2 km from the property's entrance address, graded **low** (the nest position is not published, so a smaller error cannot be scored). At five other sites (railcams in Rochelle, IL, Tucson, AZ, Plant City, FL and Fullerton, CA, and a bird-feeder cam in Ithaca, NY), three answers were wrong and graded **low**, and Plant City and Fullerton gave no location. All but Fullerton held only 0–3 non-jet passes within reach. Fullerton (13 within 3 km) and Duke Farms (16) had more traffic but poor audio. Fullerton's is high-pass filtered at about 125 Hz, which removes or weakens the propeller fundamentals, under broadband wind and road noise; Duke Farms has a wind-saturated microphone. No wrong answer from a committed build was graded above low |
 | What is not validated? | Any site other than the reference one; low-traffic or rural sites (all four tried failed); CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
 | Which code produced these results? | The reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
@@ -566,6 +566,15 @@ Design notes:
   the same recording times after fitting their frequency ratio. Distinct shapes can seed separate flight
   matches. Compatible harmonics remain one event whichever is strongest, and insufficient overlapping
   trace support keeps them grouped.
+- **Hidden curves get a residual scan before weak detections can mask them.** The first template-bank
+  pass accepts strong events. One additional pass searches their remaining evidence, retaining the
+  original coverage counts and score normalization. Weak-only recordings keep their ordinary scan.
+  Both passes share the existing candidate allowance and detection cap. This lets different curves
+  with the same tone and CPA reach measurement; their initial cell winner no longer has the only chance.
+- **Guided measurement follows the predicted ridge.** It selects the nearest qualified local spectral
+  peak within the existing model band, using the existing SNR and robust-z requirements. A brighter
+  neighbouring aircraft no longer automatically takes over the trace when both tones enter that band.
+  Standalone unguided ridge tracing retains its strongest-peak rule.
 - **Hypotheses are compact.** Each is 20 bytes (a `u32` track index and four `f32`). The budgets are sized from
   physical memory: a tenth of RAM, capped at 2 G hypotheses (40 GB). Smaller machines no longer receive a
   mandatory 4 GB allowance; an 8 GiB machine budgets about 819 MiB. If memory cannot be detected, the fallback
@@ -629,6 +638,14 @@ the configured fallback allowance after the preferred request has been tried.
 
 ## Testing
 
+The actual-audio overlap regressions recover two same-tone, simultaneous passes at 1 km and 7 km,
+including when the nearer aircraft is louder. Both measured curves satisfy the existing known-answer
+tolerances: CPA within 0.3 s, tone within 0.3 Hz, speed within 4 m/s and distance within 8%. Each aircraft
+alone still counts as one independent event after measured-curve filtering. The guided-peak test checks
+qualified local maxima, below-threshold neighbouring noise and a strong shoulder outside the model band;
+the detection-cap test also verifies weak-only recordings retain their detections. These are synthetic
+fixtures, not evidence of reference-recording accuracy.
+
 The dense-burst track regression failed on the previous cleaner: 49 corrupt reports removed half of a
 160-sample genuine flight despite a permitted 21 s coverage gap. The corrected cleaner passes all five
 track tests, retaining the entire genuine trajectory with 2, 49 or 97 corrupt reports and interpolating
@@ -651,19 +668,18 @@ confirmer; the synthetic observer is recovered within 60 m and the clock within 
 from one pass remain excluded in still air and wind. A closer return with no detection counts against
 the candidate, while the original explained passes and a detected return do not.
 
-The integrated search and detection snapshot
-([`d55ef79`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/d55ef7948b887090d7bbb6e41ed9c347743235c6))
-passed all 39 default `fdop-core` tests and all 13 `fdop-types` tests. After integrating the final
-region-boundary and confidence-margin corrections, all 21 search tests were rerun and passed.
-The opt-in multi-track audio integration test also passed with FFmpeg and FFprobe installed. This
-includes close-pass coverage, overlapping independent flyovers, symmetric higher-harmonic grouping,
-confidence-grid expansion, hillside coverage, bounded hypothesis accumulation and clock-pruning recovery.
-Core and shared-type Clippy passed for all targets with warnings denied, and workspace formatting passed.
-The checks use the pinned nightly, one build job, two Rayon workers and unoptimised dependencies with debug
+Together, the targeted and integrated runs pass all **49 default `fdop-core` tests**, all **13
+`fdop-types` tests** and **both opt-in media integration tests**: 64 test cases, with no failures.
+The long same-tone audio and detection-cap regressions ran separately; the remaining tests then ran
+together, including the actual FFmpeg/FFprobe checks. Coverage includes close-pass geometry, independent
+overlapping flyovers, harmonic grouping, returning aircraft, incomplete numerical margins, confidence-grid
+expansion, hillside coverage, bounded hypothesis accumulation and clock-pruning recovery. Core and
+shared-type Clippy passed for all targets with warnings denied, and workspace formatting passed. These
+checks use the pinned nightly, one build job, two Rayon workers and unoptimised dependencies with debug
 information disabled to fit the shared host's memory limit.
 
-The unchanged `src/selftest.rs` also passed against the final core libraries: **0.4 m** synthetic position
-error, **75 m** radius, **+0.20 s** clock error and both intended aircraft matched. A small external entry
+The unchanged `src/selftest.rs` was rebuilt and rerun against these final core libraries: **0.4 m**
+synthetic position error, **75 m** radius, **+0.20 s** clock error and both intended aircraft matched. A small external entry
 point invoked `selftest::run` directly, exercising the real FFmpeg decode, detection, measurement, search
 and refinement on the full 1,300 s generated recording. This run covers the core path. Full CLI validation
 remains blocked by dependency compilation, and a default release-profile run was not attempted.
@@ -675,7 +691,7 @@ ignored-Range recovery and range overruns remain unrun in the current workspace.
 matches its pre-disconnection Git blob byte-for-byte.
 The margin-policy regression also passed earlier in an isolated Rust build of the production helper and
 data fields using the pinned `serde_json` dependency. Formatting of both newly changed Rust files passed,
-and targeted UBS found no critical issues; the combined core integration is covered by the 21 search tests above.
+and targeted UBS found no critical issues; the combined core integration is covered by the current core tests above.
 The weather-deadline scheduling regression passed in an isolated Rust build of the exact test and constants;
 it fails with the former 150 s wait. The full workspace test build was attempted with the same memory
 settings, but rustc received SIGKILL while compiling `asupersync 0.6.2`, before the tests ran. A subsequent
@@ -685,7 +701,7 @@ selftest therefore remain unverified. The historical real-recording results abov
 on these changes.
 
 ```bash
-cargo test --workspace --locked                               # 120 unit tests, no network
+cargo test --workspace --locked                               # 123 unit tests, no network
 cargo test -p fdop-core audio::tests -- --ignored              # media integration, needs ffmpeg/ffprobe
 cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
@@ -700,6 +716,9 @@ The unit tests check:
 - emission-time physics against the light-time equation;
 - detection: it finds a pass and ignores a flat tone, and noise stays below threshold;
 - detect → measure recovery of `f0`, `v`, `d` and `t0r`;
+- same-tone overlapping aircraft survive actual detection, refinement and measurement in both tested
+  strength cases; one-aircraft controls still supply one independent event, and guided peak selection
+  rejects unqualified noise and non-peak shoulders;
 - deferred fit diagnostics match eager refinement, and failed refinement keeps its trace and fit consistent;
 - fit recovery and range coverage;
 - Hermite track models against closed forms;
@@ -825,6 +844,9 @@ audio or video recorded somewhere sensitive:
   comparisons now fail the margin gate whether a rival was found or not; that correction does not calibrate
   the larger event search. Events omitted from pair seeding by driver or hypothesis limits can still leave
   unexplored explanations, even when no pair/fine/confirmation cut was recorded.
+  Multiple seeds of one physical pass can also consume measurement slots before measured-curve filtering
+  groups them. The residual detector's distant-only synthetic control uses two slots while correctly
+  contributing one independent event; its preceding single-bank baseline used one slot.
 - Measurement took 205 s of a 509 s run on a 3 h recording. Full uncertainty profiles and manoeuvre
   diagnostics now run once for the final accepted trace, instead of in every ridge-refinement round. The
   point fits and final diagnostics are retained; the wall-clock improvement has not yet been measured.

@@ -77,6 +77,60 @@ pub(crate) fn ridge_peak(
     noise_band: f64,
     half: usize,
 ) -> Option<(f64, f64, f64)> {
+    profile_peak(
+        spec,
+        j,
+        f_pred,
+        slope,
+        band,
+        noise_band,
+        half,
+        PeakChoice::Strongest,
+    )
+}
+
+/// A model-guided trace follows the nearest qualifying local peak, so a louder nearby
+/// aircraft does not take over the trace merely by entering the same search band.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn guided_ridge_peak(
+    spec: &Spec,
+    j: usize,
+    f_pred: f64,
+    slope: f64,
+    band: f64,
+    noise_band: f64,
+    half: usize,
+    min_snr: f64,
+    min_z: f64,
+) -> Option<(f64, f64, f64)> {
+    profile_peak(
+        spec,
+        j,
+        f_pred,
+        slope,
+        band,
+        noise_band,
+        half,
+        PeakChoice::NearestQualified { min_snr, min_z },
+    )
+}
+
+enum PeakChoice {
+    Strongest,
+    NearestQualified { min_snr: f64, min_z: f64 },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn profile_peak(
+    spec: &Spec,
+    j: usize,
+    f_pred: f64,
+    slope: f64,
+    band: f64,
+    noise_band: f64,
+    half: usize,
+    choice: PeakChoice,
+) -> Option<(f64, f64, f64)> {
     let df = spec.df();
     let n_off = ((2.0 * noise_band + 0.5 * df) / df).floor() as usize + 1;
     let nt = spec.nt();
@@ -123,20 +177,47 @@ pub(crate) fn ridge_peak(
     if n_in < 3 || noise.len() < 6 {
         return None;
     }
-    let k = kin?;
-    let peak = prof[k];
-    let mut fhat = f_pred + offs[k];
-    if k > 0 && k + 1 < n_off && prof[k - 1].is_finite() && prof[k + 1].is_finite() {
-        let (a, b, cc) = (prof[k - 1], prof[k], prof[k + 1]);
-        let den = a - 2.0 * b + cc;
-        if den < 0.0 {
-            fhat += 0.5 * (a - cc) / den * df;
-        }
-    }
     let med = median_f64(&mut noise.clone());
     let mut dev: Vec<f64> = noise.iter().map(|x| (x - med).abs()).collect();
     let mad = 1.4826 * median_f64(&mut dev) + 1e-6;
-    Some((fhat, peak - med, (peak - med) / mad))
+    let peak_frequency = |k: usize| {
+        let mut fhat = f_pred + offs[k];
+        if k > 0 && k + 1 < n_off && prof[k - 1].is_finite() && prof[k + 1].is_finite() {
+            let (a, b, cc) = (prof[k - 1], prof[k], prof[k + 1]);
+            let den = a - 2.0 * b + cc;
+            if den < 0.0 {
+                fhat += 0.5 * (a - cc) / den * df;
+            }
+        }
+        fhat
+    };
+    let k = match choice {
+        PeakChoice::Strongest => kin?,
+        PeakChoice::NearestQualified { min_snr, min_z } => (1..n_off - 1)
+            .filter(|&k| {
+                // Check the full profile, including the bins just outside the search band:
+                // an increasing shoulder at the band edge is not an observed ridge peak.
+                prof[k].is_finite()
+                    && prof[k - 1].is_finite()
+                    && prof[k + 1].is_finite()
+                    && prof[k] >= prof[k - 1]
+                    && prof[k] >= prof[k + 1]
+                    && (prof[k] > prof[k - 1] || prof[k] > prof[k + 1])
+                    && offs[k].abs() <= band
+                    && prof[k] - med >= min_snr
+                    && (prof[k] - med) / mad >= min_z
+                    && (peak_frequency(k) - f_pred).abs() <= band
+            })
+            .min_by(|&a, &b| {
+                (peak_frequency(a) - f_pred)
+                    .abs()
+                    .total_cmp(&(peak_frequency(b) - f_pred).abs())
+                    .then_with(|| prof[b].total_cmp(&prof[a]))
+                    .then(a.cmp(&b))
+            })?,
+    };
+    let snr = prof[k] - med;
+    Some((peak_frequency(k), snr, snr / mad))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -261,4 +342,63 @@ pub fn polyline_trace(spec: &Spec, pts: &[(f64, f64)]) -> Trace {
             .push(spec.bilinear(tt, ff).map_or(f64::NAN, |v| v as f64));
     }
     tr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spectro::SpecMeta;
+
+    fn profile_spec(peaks: &[(f64, f64)]) -> Spec {
+        let f: Vec<f64> = (0..=160).map(|i| 80.0 + 0.25 * i as f64).collect();
+        let db = f
+            .iter()
+            .flat_map(|&f| {
+                let profile = 0.2 * (1.7 * f).sin()
+                    + peaks
+                        .iter()
+                        .map(|&(center, height)| {
+                            height * (-0.5 * ((f - center) / 0.5).powi(2)).exp()
+                        })
+                        .sum::<f64>();
+                [profile as f32; 3]
+            })
+            .collect();
+        Spec {
+            t: vec![0.0, 1.0, 2.0],
+            f,
+            db,
+            meta: SpecMeta {
+                sr: 1000,
+                win_s: 2.0,
+                hop_s: 1.0,
+                nfft: 4000,
+                df: 0.25,
+                fmin: 80.0,
+                fmax: 120.0,
+                norm: "analytic profile".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn guided_peak_requires_a_qualified_local_maximum() {
+        let p = TraceParams::default();
+        for (near_height, expected) in [(6.0, 100.0), (2.0, 104.0)] {
+            let spec = profile_spec(&[(100.0, near_height), (104.0, 12.0)]);
+            let strongest = ridge_peak(&spec, 1, 100.1, 0.0, 5.0, 12.0, 1).unwrap();
+            assert!((strongest.0 - 104.0).abs() < 0.1, "{strongest:?}");
+            let guided =
+                guided_ridge_peak(&spec, 1, 100.1, 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).unwrap();
+            // A qualified nearer ridge wins despite being weaker. A nearer noise bump
+            // below the unchanged SNR gate must not hide a valid, more distant ridge.
+            assert!((guided.0 - expected).abs() < 0.1, "{guided:?}");
+        }
+        let edge = profile_spec(&[(105.5, 16.0)]);
+        assert!(edge.bilinear(1.0, 105.0).unwrap() as f64 > p.min_snr);
+        assert!(
+            guided_ridge_peak(&edge, 1, 100.0, 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).is_none(),
+            "a strong band-edge shoulder is not a local maximum"
+        );
+    }
 }

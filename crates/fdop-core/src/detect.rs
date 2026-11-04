@@ -287,148 +287,168 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
             *v = 1.0;
         }
     }
-    // Per template: min-halves score map; keep the best template per (row, frame).
-    let best = tmpls
-        .par_iter()
-        .enumerate()
-        .fold(
-            || {
-                (
-                    vec![f32::NEG_INFINITY; nr * nt],
-                    vec![0u16; nr * nt],
-                    vec![0f32; nr * nt],
-                    vec![0f32; nr * nt],
-                )
-            },
-            |(mut bs, mut bi, mut ba, mut bb), (ti, tm)| {
-                let mut sa = vec![0f32; nr * nt];
-                let mut sr = vec![0f32; nr * nt];
-                let mut ca = vec![0f32; nr * nt];
-                let mut cr = vec![0f32; nr * nt];
-                for &(dt, dr, app) in &tm.path {
-                    let (s, c) = if app {
-                        (&mut sa, &mut ca)
-                    } else {
-                        (&mut sr, &mut cr)
-                    };
-                    for r in 0..nr {
-                        let src = (r as i64 + pad_r0 as i64 + dr as i64) as usize * pt
-                            + (pad_t as i64 + dt as i64) as usize;
-                        let srow = &lp[src..src + nt];
-                        let mrow = &mp[src..src + nt];
-                        let drow = &mut s[r * nt..(r + 1) * nt];
-                        let crow = &mut c[r * nt..(r + 1) * nt];
-                        for i in 0..nt {
-                            drow[i] += srow[i];
-                            crow[i] += mrow[i];
+    // Only score + template index are retained; half scores are recomputed for accepted
+    // seeds below. One map uses 6 bytes/cell, versus 14 with stored half scores.
+    let score_bank = |evidence: &[f32]| {
+        tmpls
+            .par_iter()
+            .enumerate()
+            .fold(
+                || (vec![f32::NEG_INFINITY; nr * nt], vec![0u16; nr * nt]),
+                |(mut bs, mut bi), (ti, tm)| {
+                    let mut sa = vec![0f32; nr * nt];
+                    let mut sr = vec![0f32; nr * nt];
+                    let mut ca = vec![0f32; nr * nt];
+                    let mut cr = vec![0f32; nr * nt];
+                    for &(dt, dr, app) in &tm.path {
+                        let (s, c) = if app {
+                            (&mut sa, &mut ca)
+                        } else {
+                            (&mut sr, &mut cr)
+                        };
+                        for r in 0..nr {
+                            let src = (r as i64 + pad_r0 as i64 + dr as i64) as usize * pt
+                                + (pad_t as i64 + dt as i64) as usize;
+                            let srow = &evidence[src..src + nt];
+                            let mrow = &mp[src..src + nt];
+                            let drow = &mut s[r * nt..(r + 1) * nt];
+                            let crow = &mut c[r * nt..(r + 1) * nt];
+                            for i in 0..nt {
+                                drow[i] += srow[i];
+                                crow[i] += mrow[i];
+                            }
                         }
                     }
-                }
-                let (na, nrr) = (tm.n_a as f32, tm.n_r as f32);
-                for k in 0..nr * nt {
-                    if ca[k] < 0.6 * na || cr[k] < 0.6 * nrr {
-                        continue;
+                    let (na, nrr) = (tm.n_a as f32, tm.n_r as f32);
+                    for k in 0..nr * nt {
+                        if ca[k] < 0.6 * na || cr[k] < 0.6 * nrr {
+                            continue;
+                        }
+                        // Matched-filter sum/sqrt(n) is ~N(0,1) per half under noise and
+                        // grows as mean_z * sqrt(n) along a real ridge.
+                        let s = (sa[k] / ca[k].sqrt()).min(sr[k] / cr[k].sqrt());
+                        if s > bs[k] || (s == bs[k] && ti < bi[k] as usize) {
+                            bs[k] = s;
+                            bi[k] = ti as u16;
+                        }
                     }
-                    // matched-filter statistic: sum / sqrt(n) is ~N(0,1) per half under noise
-                    // and grows as mean_z * sqrt(n) along a real ridge
-                    let a = sa[k] / ca[k].sqrt();
-                    let b = sr[k] / cr[k].sqrt();
-                    let s = a.min(b);
-                    if s > bs[k] {
-                        bs[k] = s;
-                        bi[k] = ti as u16;
-                        ba[k] = a;
-                        bb[k] = b;
+                    (bs, bi)
+                },
+            )
+            .reduce(
+                || (vec![f32::NEG_INFINITY; nr * nt], vec![0u16; nr * nt]),
+                |mut x, y| {
+                    for k in 0..nr * nt {
+                        if y.0[k] > x.0[k] || (y.0[k] == x.0[k] && y.1[k] < x.1[k]) {
+                            x.0[k] = y.0[k];
+                            x.1[k] = y.1[k];
+                        }
                     }
-                }
-                (bs, bi, ba, bb)
-            },
-        )
-        .reduce(
-            || {
-                (
-                    vec![f32::NEG_INFINITY; nr * nt],
-                    vec![0u16; nr * nt],
-                    vec![0f32; nr * nt],
-                    vec![0f32; nr * nt],
-                )
-            },
-            |mut x, y| {
-                for k in 0..nr * nt {
-                    if y.0[k] > x.0[k] {
-                        x.0[k] = y.0[k];
-                        x.1[k] = y.1[k];
-                        x.2[k] = y.2[k];
-                        x.3[k] = y.3[k];
-                    }
-                }
-                x
-            },
-        );
-    let (bs, bi, ba, bb) = best;
+                    x
+                },
+            )
+    };
     // Greedy non-maximum suppression in (t0r, log f0) plus residual evidence: `known` marks
     // the cells (+-3 log-rows) along every accepted curve; a later candidate is re-scored with
     // those cells counted as zero, so a template that merely rides an already detected ridge
     // with a different (v, d) cannot become a second event.
-    let mut cand: Vec<usize> = (0..nr * nt)
-        .filter(|&k| bs[k] as f64 >= p.thr_silence_db)
-        .collect();
-    cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
-    cand.truncate(400_000);
     let mut known = vec![false; nr * nt];
     let bpo = p.bins_per_octave as f64;
     let mut out: Vec<Detection> = Vec::new();
-    for k in cand {
-        if out.len() >= p.max_detections * 3 {
+    let mut remaining_candidates = 400_000usize;
+    for pass in 0..2 {
+        let (bs, bi) = score_bank(&lp);
+        // Weak detections excuse unheard passes; they must not erase a measurable curve
+        // before its template gets a chance to win. Accept strong curves first, then search
+        // their residual for both strong and weak curves. A weak-only recording keeps the
+        // ordinary single scan at the silence threshold.
+        let strong_pass = pass == 0 && bs.iter().any(|&s| s as f64 >= p.thr_db);
+        let threshold = if strong_pass {
+            p.thr_db.max(p.thr_silence_db)
+        } else {
+            p.thr_silence_db
+        };
+        let mut cand: Vec<usize> = (0..nr * nt)
+            .filter(|&k| bs[k] as f64 >= threshold)
+            .collect();
+        cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
+        cand.truncate(remaining_candidates);
+        remaining_candidates -= cand.len();
+        for k in cand {
+            if out.len() >= p.max_detections * 3 {
+                break;
+            }
+            let (r, i) = (k / nt, k % nt);
+            let tm = &tmpls[bi[k] as usize];
+            let t0r = ls.t[i];
+            let f0 = ls.freqs[r];
+            let tau = tm.d / tm.v;
+            let half = tm.half;
+            let mut candidate = Detection {
+                id: out.len(),
+                t0r,
+                f0,
+                v: tm.v,
+                d: tm.d,
+                score: bs[k] as f64,
+                score_approach: 0.0,
+                score_recede: 0.0,
+                half_s: half,
+                harmonic_of: None,
+                harmonics: Vec::new(),
+            };
+            let suppressed = out.iter().any(|o| {
+                let dt_lim = (0.5 * tau.min(o.d / o.v)).max(10.0);
+                let same_line = ((f0 / o.f0).log2() * bpo).abs() < 4.0;
+                // Separate aircraft can share a tone and CPA. Suppress a neighbouring seed only
+                // when its transition also agrees at the accepted-curve mask resolution.
+                (t0r - o.t0r).abs() < dt_lim && same_line && harmonic_shapes(&candidate, o, p)
+            });
+            if suppressed {
+                continue;
+            }
+            let (ra, rr) = residual_halves(ls, r, i, tm, &known);
+            if (ra.min(rr) as f64) < threshold {
+                continue;
+            }
+            // mark this curve
+            let (j0, j1) = (
+                ls.t.partition_point(|&x| x < t0r - half),
+                ls.t.partition_point(|&x| x <= t0r + half),
+            );
+            for j in j0..j1 {
+                let fr = f0 * cv_ratio_rel_t0r(ls.t[j] - t0r, tm.v, tm.d, p.c);
+                let row = ((fr / ls.freqs[0]).log2() * bpo).round() as i64;
+                for rr2 in
+                    (row - RIDGE_HALF_ROWS).max(0)..=(row + RIDGE_HALF_ROWS).min(nr as i64 - 1)
+                {
+                    known[rr2 as usize * nt + j] = true;
+                }
+            }
+            candidate.score = ra.min(rr) as f64;
+            candidate.score_approach = ra as f64;
+            candidate.score_recede = rr as f64;
+            out.push(candidate);
+        }
+        if !strong_pass
+            || out.is_empty()
+            || out.len() >= p.max_detections * 3
+            || remaining_candidates == 0
+        {
             break;
         }
-        let (r, i) = (k / nt, k % nt);
-        let tm = &tmpls[bi[k] as usize];
-        let t0r = ls.t[i];
-        let f0 = ls.freqs[r];
-        let tau = tm.d / tm.v;
-        let half = tm.half;
-        let suppressed = out.iter().any(|o| {
-            let dt_lim = (0.5 * tau.min(o.d / o.v)).max(10.0);
-            let same_line = ((f0 / o.f0).log2() * bpo).abs() < 4.0;
-            (t0r - o.t0r).abs() < dt_lim && same_line
-        });
-        if suppressed {
-            continue;
-        }
-        let (ra, rr) = if out.is_empty() {
-            (ba[k], bb[k])
-        } else {
-            residual_halves(ls, r, i, tm, &known)
-        };
-        if (ra.min(rr) as f64) < p.thr_silence_db {
-            continue;
-        }
-        // mark this curve
-        let (j0, j1) = (
-            ls.t.partition_point(|&x| x < t0r - half),
-            ls.t.partition_point(|&x| x <= t0r + half),
-        );
-        for j in j0..j1 {
-            let fr = f0 * cv_ratio_rel_t0r(ls.t[j] - t0r, tm.v, tm.d, p.c);
-            let row = ((fr / ls.freqs[0]).log2() * bpo).round() as i64;
-            for rr2 in (row - RIDGE_HALF_ROWS).max(0)..=(row + RIDGE_HALF_ROWS).min(nr as i64 - 1) {
-                known[rr2 as usize * nt + j] = true;
+        // A weaker, different curve can lose every (time, tone) cell to the stronger pass.
+        // Search the residual evidence once so its template can become a cell winner.
+        // Keep the original coverage mask and denominator: known samples contribute zero,
+        // exactly as in residual_halves, rather than making short fragments look stronger.
+        for r in 0..nr {
+            let dst = (r + pad_r0) * pt + pad_t;
+            for i in 0..nt {
+                if known[r * nt + i] {
+                    lp[dst + i] = 0.0;
+                }
             }
         }
-        out.push(Detection {
-            id: out.len(),
-            t0r,
-            f0,
-            v: tm.v,
-            d: tm.d,
-            score: ra.min(rr) as f64,
-            score_approach: ra as f64,
-            score_recede: rr as f64,
-            half_s: half,
-            harmonic_of: None,
-            harmonics: Vec::new(),
-        });
     }
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     let cut = out.len().saturating_sub(p.max_detections);
@@ -767,5 +787,14 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert!(cut >= 1, "cut {cut}");
         assert_eq!(one[0].score, all[0].score, "the cap keeps the strongest");
+
+        // Classify every curve as weak without changing the silence floor. Such recordings
+        // still need their ordinary detections, so audible passes do not count as unheard.
+        p.thr_db = f64::INFINITY;
+        let (weak, weak_cut) = detect_counted(&ls, &p);
+        assert_eq!(weak.len(), 1);
+        assert_eq!(weak[0].score, one[0].score);
+        assert!(weak[0].score >= p.thr_silence_db && weak[0].score < p.thr_db);
+        assert!(weak_cut >= 1, "weak-only cap cut {weak_cut}");
     }
 }

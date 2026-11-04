@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover overlapping tones through detection and measurement
+
+- Detection no longer suppresses a nearby same-tone seed unless its Doppler shape also agrees. Strong
+  curves are accepted before weak fallback detections; one residual template-bank scan can recover a
+  hidden curve that lost every initial time/pitch cell to another aircraft. The residual scan keeps
+  masked samples in the original coverage counts and denominators. Both scans share the existing
+  400,000-candidate allowance, detection cap and measurement cap. Weak-only recordings retain their
+  ordinary scan at the unchanged silence threshold.
+- Guided measurement associates each frame with the nearest local spectral peak meeting the existing
+  SNR and robust-z gates inside its model band. This addresses a separate failure where the brighter
+  aircraft took over the distant aircraft's trace, even from an exact initial model. Generic unguided
+  ridge tracing keeps its strongest-peak behavior; fitting thresholds and physical models are unchanged.
+- `simultaneous_same_tone_passes_survive_detection_and_measurement` first reproduced a 1 km pass being
+  lost behind a simultaneous 7 km pass with the same 118 Hz tone. Both original and stronger-near-aircraft
+  cases now retain two independent measured events and pass the unchanged 0.3 s CPA, 0.3 Hz tone, 4 m/s
+  speed and 8% distance tolerances. The single-aircraft controls each contribute one independent event.
+  The guided-selector regression and weak-only/cap control also pass. Reference and field recordings
+  have not been rerun.
+- The extra bank scan has bounded storage: each retained score/index map uses 6 bytes per cell instead
+  of the previous 14; temporary scoring arrays still require additional memory. Raw aliases remain a
+  measurement-budget cost: the distant-only control now measures two seeds instead of one, although
+  measured-curve filtering correctly counts one physical pass. No detection or measurement cap was raised.
+- Final targeted and integrated verification passes all 49 default core tests, all 13 shared-type tests
+  and both opt-in media integration tests. Core/shared-type all-target Clippy passes with warnings denied,
+  and workspace formatting passes. A fresh run of the unchanged `selftest::run` against the final libraries
+  exercises the real decode, detect, measure, search and refinement path on 1,300 s of generated audio:
+  0.4 m synthetic position error, 75 m radius, +0.20 s clock error and both intended aircraft matched.
+  This uses a small external entry point; full workspace checks and the release CLI remain unverified
+  after the earlier dependency-compilation SIGKILLs documented in the README.
+
 ### Match individual passes by returning aircraft
 
 - An aircraft already assigned to one event can now explain a later confirming event. Confirmation

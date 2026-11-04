@@ -4,9 +4,9 @@
 //!    (win ~ 1/sqrt(RoC)), hop 0.1 s, bins <= 0.25 Hz, band from the detection's asymptotes;
 //!    rows median-normalised over a wide context (+-`context_s`) so the pass itself does not
 //!    raise its own noise floor.
-//! 2. Model-guided ridge trace: at every frame, the ridge is searched only within `band` Hz of
-//!    the current model curve (integrating along the model's local slope), so the trace cannot
-//!    wander onto a crossing engine tone or a neighbouring flyover.
+//! 2. Model-guided ridge trace: at every frame, choose the nearest qualifying local peak within
+//!    `band` Hz of the current model curve (integrating along the model's local slope), so a
+//!    louder neighbouring ridge does not win solely on strength.
 //! 3. Retarded-time constant-velocity fit of the trace; the fitted curve becomes the next model
 //!    and the band shrinks to a few fit-RMS. Three rounds.
 //! 4. Quality gates: points, coverage of both sides of the CPA, fit RMS, plausible v and d.
@@ -15,7 +15,7 @@ use crate::detect::Detection;
 use crate::fit::{FitResult, PreparedFit, Side, prepare_constant_velocity};
 use crate::physics::{cv_curve, window_for_roc};
 use crate::spectro::{Spec, stft_band_db};
-use crate::trace::{Trace, ridge_peak};
+use crate::trace::{Trace, guided_ridge_peak};
 use serde::Serialize;
 
 /// At most this many events are measured, strongest primary detections first. Measuring more
@@ -118,10 +118,11 @@ pub fn guided_trace(
                 }
                 let fp = model(t);
                 let slope = (model(t + 0.5) - model(t - 0.5)) / 1.0;
-                ridge_peak(spec, j, fp, slope, band, noise_band, half).and_then(|(fh, snr, z)| {
-                    (snr >= min_snr && z >= min_z && (fh - fp).abs() <= band)
-                        .then_some((t, fh, snr))
-                })
+                guided_ridge_peak(spec, j, fp, slope, band, noise_band, half, min_snr, min_z)
+                    .and_then(|(fh, snr, z)| {
+                        (snr >= min_snr && z >= min_z && (fh - fp).abs() <= band)
+                            .then_some((t, fh, snr))
+                    })
             })
             .collect()
     };
@@ -389,6 +390,143 @@ mod tests {
         assert!((fr.best.f0 - f0).abs() < 0.3, "f0 {}", fr.best.f0);
         assert!((fr.best.v - v).abs() < 4.0, "v {}", fr.best.v);
         assert!((fr.best.d / d - 1.0).abs() < 0.08, "d {}", fr.best.d);
+    }
+
+    fn measure_simultaneous_same_tone_passes(amplitudes: [f64; 2]) -> Vec<MeasuredEvent> {
+        let sr = 4000u32;
+        let (f0, v, t0r, c) = (118.0, 120.0, 180.0, 343.0);
+        let distances = [1000.0, 7000.0];
+        let mut phases = [0.0f64; 2];
+        let mut seed = 99u64;
+        let x: Vec<f32> = (0..sr as usize * 360)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr as f64;
+                let mut sample = 0.5 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+                for k in 0..2 {
+                    phases[k] += std::f64::consts::TAU
+                        * cv_curve(t, f0, v, distances[k], t0r - distances[k] / c, c)
+                        / sr as f64;
+                    sample += amplitudes[k] * phases[k].sin();
+                }
+                sample as f32
+            })
+            .collect();
+        let dp = DetectParams::default();
+        let (ls, lin) = survey(&x, sr, &dp).unwrap();
+        let started = std::time::Instant::now();
+        let detections = detect(&ls, &dp);
+        let strong = detections
+            .iter()
+            .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
+            .count();
+        eprintln!(
+            "same-tone {amplitudes:?}: {} detections, {strong} strong primaries, detection {:.2}s",
+            detections.len(),
+            started.elapsed().as_secs_f64()
+        );
+        let events: Vec<_> = detections
+            .into_iter()
+            .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
+            .take(MAX_MEASURED)
+            .enumerate()
+            .map(|(k, d)| {
+                let refined = refine(&lin, &d, c);
+                measure(
+                    &x,
+                    sr,
+                    &refined,
+                    &format!("e{k}"),
+                    &MeasureParams::default(),
+                )
+            })
+            .collect();
+        eprintln!(
+            "same-tone {amplitudes:?}: {} measured seeds, {} quality-passing fits",
+            events.len(),
+            events.iter().filter(|e| e.quality.ok).count()
+        );
+        events
+    }
+
+    fn independent_measured_passes(events: &[MeasuredEvent]) -> usize {
+        use crate::search::{SearchEvent, SearchInputs, SearchParams};
+        use fdop_types::atmo::{Medium, UniformAtmosphere};
+        use fdop_types::{BBox, FlatElevation};
+
+        let ground = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(343.0));
+        let input = SearchInputs {
+            events: events
+                .iter()
+                .filter_map(|e| SearchEvent::from_measured(e, 0.0))
+                .collect(),
+            tracks: &[],
+            heard_times: Vec::new(),
+            coarse_dem: &ground,
+            fine_dem: &ground,
+            atmo: &atmo,
+        };
+        let (lat, lon) = (40.876466, -73.524951);
+        let region = BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01);
+        let params = SearchParams::new(0.0, 0.0, 360.0, region);
+        crate::search::run(&input, &params, &|_| {})
+            .funnel
+            .events_used
+    }
+
+    #[test]
+    fn simultaneous_same_tone_passes_survive_detection_and_measurement() {
+        // Similar engines can have the same emitted tone and received CPA while tracing
+        // different Doppler transitions. The long, distant pass must not hide the close one.
+        for near_amplitude in [0.10, 0.20] {
+            let events = measure_simultaneous_same_tone_passes([near_amplitude, 0.08]);
+            let fits: Vec<_> = events
+                .iter()
+                .filter(|e| e.quality.ok)
+                .map(|e| e.fit.as_ref().unwrap().best)
+                .collect();
+            assert_eq!(
+                independent_measured_passes(&events),
+                2,
+                "near amplitude {near_amplitude}: {fits:?}"
+            );
+            for distance in [1000.0, 7000.0] {
+                let fit = fits
+                    .iter()
+                    .find(|b| (b.d / distance - 1.0).abs() < 0.08)
+                    .unwrap_or_else(|| panic!("distance {distance} missing from {fits:?}"));
+                assert!((fit.t0r - 180.0).abs() < 0.3, "{fit:?}");
+                assert!((fit.f0 - 118.0).abs() < 0.3, "{fit:?}");
+                assert!((fit.v - 120.0).abs() < 4.0, "{fit:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn simultaneous_same_tone_single_pass_counts_once() {
+        for (amplitudes, distance) in [([0.10, 0.0], 1000.0), ([0.0, 0.08], 7000.0)] {
+            let events = measure_simultaneous_same_tone_passes(amplitudes);
+            let fits: Vec<_> = events
+                .iter()
+                .filter(|e| e.quality.ok)
+                .map(|e| e.fit.as_ref().unwrap().best)
+                .collect();
+            // The detector can produce several seeds for one pass; its measured curves
+            // must still supply only one independent constraint to the aircraft search.
+            assert_eq!(
+                independent_measured_passes(&events),
+                1,
+                "distance {distance}: {fits:?}"
+            );
+            assert!(
+                fits.iter().all(|b| (b.d / distance - 1.0).abs() < 0.08),
+                "{fits:?}"
+            );
+            assert!(fits.iter().all(|b| (b.t0r - 180.0).abs() < 0.3), "{fits:?}");
+        }
     }
 
     #[test]
