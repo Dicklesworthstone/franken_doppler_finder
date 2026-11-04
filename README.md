@@ -895,7 +895,10 @@ audio or video recorded somewhere sensitive:
   not yet allow for how many events were searched, so the caps stay until it does. On one recording, measuring all
   detections instead of the strongest 24 moved a wrong low answer (365 km) to the right place (0.61 km, still low):
   `f_osprey_1102b_s7b` against a throwaway build, `f_osprey_1102b_cap60`. Its missing event was a 568 m pass at
-  detection rank 45. Wrong-date and reference effects are not yet measured. Explicitly truncated
+  detection rank 45. On the reference recording the same build keeps the county and state-wide answers and grades
+  (margins 12.77 to 11.06 and 5.01 to 4.72), and both wrong dates stay low (2.37 to 0.25 and 5.49 to 1.89), for 43–69 %
+  more time. Its one new usable event there joins the best rival on all four runs, with no archived pass near it. The
+  three-day run and the other three wrong-date runs have not been run on it. Explicitly truncated
   comparisons now fail the margin gate whether a rival was found or not; that correction does not calibrate
   the larger event search. Events omitted from pair seeding by driver or hypothesis limits can still leave
   unexplored explanations, even when no pair/fine/confirmation cut was recorded.

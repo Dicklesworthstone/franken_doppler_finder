@@ -127,10 +127,21 @@ at that commit, not per-change commits.
   none on 20 fine cells, and is low on its other gates. These gates do not scale with the size of the search (README
   "Known issues").
 - **A lead, not landed.** On one recording, measuring all detections instead of the strongest 24 moved a wrong low
-  answer (365 km) to the right place (0.61 km, still low, radius 338 m): `f_osprey_1102b_s7b` against a throwaway
-  build with `MAX_MEASURED` at 60, `f_osprey_1102b_cap60`. Its new event is a 568 m pass at detection rank 45, 99 %
-  traversed. Wrong-date and reference effects are not yet measured, and AGENTS wants the medium grade's scaling
-  fixed first.
+  answer (365 km) to the right place (0.61 km, still low, radius 338 m): `f_osprey_1102b_s7b` against a throwaway build
+  with `MAX_MEASURED` at 60, `f_osprey_1102b_cap60`. Its new event is a 568 m pass at detection rank 45, 99 % traversed.
+  On the reference recording that build gave, with times overlapped:
+
+| Run | At 24 | At 60 | Time |
+|---|---|---|---:|
+| `r_nassau_cap60` | high, 306 m, margin 12.77 | high, 306 m, margin 11.06 | 58 → 92 s |
+| `r_ny_cap60` | medium, 271 m, margin 5.01 | medium, 271 m, margin 4.72 | 226 → 340 s |
+| `n_ref_on_0907_cap60` | low, 138 km, core 2 of 2, margin 2.37 | low, 138 km, core 2 of 2, margin 0.25 | 359 → 513 s |
+| `n_ref_on_0909_cap60` | low, 73 km, core 1 of 2, margin 5.49 | low, 73 km, core 1 of 2, margin 1.89 | 124 → 210 s |
+
+  Only one new event passes quality on this recording (at 958 s, 534.5 Hz). It joins the best rival on all four runs
+  and has no archived pass near it, so the larger cap adds nothing real here and lowers margins on right and wrong dates
+  alike. The three-day run and the other three wrong-date runs have not been run on it, so the effect on false grades
+  is only partly measured, and AGENTS wants the medium grade's scaling fixed first.
 - **Checks.** On `7e5cf3e`, whose code is that of `4b88d7c`: `cargo test --workspace --locked -j 2` passed 139 with
   0 failed and 2 ignored, and clippy with warnings denied passed. A release build passed `fdop selftest`: 0.4 m
   error, 75 m radius, +0.20 s clock error, 4 events (known answer, not evidence about real recordings).
