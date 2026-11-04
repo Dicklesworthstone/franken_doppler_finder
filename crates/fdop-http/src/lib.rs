@@ -87,6 +87,23 @@ fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str>
         .map(|(_, v)| v.as_str())
 }
 
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    if end < start {
+        return None;
+    }
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse().ok()?)
+    };
+    Some((start, end, total))
+}
+
 /// One asupersync runtime + one pooled HTTP client.
 pub struct Net {
     rt: Runtime,
@@ -264,11 +281,54 @@ impl Net {
                 } else if !(200..300).contains(&status) {
                     return Err(HttpError::new(&u, Some(status), "unexpected status"));
                 }
-                if expected_total.is_none()
-                    && let Some(cl) = header_of(&resp.head.headers, "content-length")
-                        .and_then(|v| v.trim().parse::<u64>().ok())
-                {
-                    expected_total = Some(if status == 206 { cl + start_at } else { cl });
+                let content_length = header_of(&resp.head.headers, "content-length")
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                if status == 206 {
+                    let raw = header_of(&resp.head.headers, "content-range").ok_or_else(|| {
+                        HttpError::new(&u, Some(status), "partial response missing Content-Range")
+                    })?;
+                    let (range_start, range_end, range_total) =
+                        parse_content_range(raw).ok_or_else(|| {
+                            HttpError::new(
+                                &u,
+                                Some(status),
+                                format!("invalid Content-Range: {raw}"),
+                            )
+                        })?;
+                    if range_start != start_at {
+                        return Err(HttpError::new(
+                            &u,
+                            Some(status),
+                            format!("resume started at byte {range_start}, expected {start_at}"),
+                        ));
+                    }
+                    let range_len = range_end - range_start + 1;
+                    if let Some(cl) = content_length
+                        && cl != range_len
+                    {
+                        return Err(HttpError::new(
+                            &u,
+                            Some(status),
+                            format!(
+                                "partial Content-Length {cl} disagrees with Content-Range length {range_len}"
+                            ),
+                        ));
+                    }
+                    let total = range_total.or_else(|| content_length.map(|cl| start_at + cl));
+                    if let (Some(old), Some(new)) = (expected_total, total)
+                        && old != new
+                    {
+                        return Err(HttpError::new(
+                            &u,
+                            Some(status),
+                            format!("partial response total changed from {old} to {new} bytes"),
+                        ));
+                    }
+                    if expected_total.is_none() {
+                        expected_total = total;
+                    }
+                } else if expected_total.is_none() {
+                    expected_total = content_length;
                 }
                 loop {
                     if cancel.load(Ordering::Relaxed) {
@@ -291,6 +351,15 @@ impl Net {
                                     skip -= k as u64;
                                 }
                                 if !piece.is_empty() {
+                                    if let Some(total) = expected_total
+                                        && start_at + got_this_attempt + piece.len() as u64 > total
+                                    {
+                                        return Err(HttpError::new(
+                                            &u,
+                                            Some(status),
+                                            format!("response body exceeds declared total of {total} bytes"),
+                                        ));
+                                    }
                                     sink(piece).map_err(|m| {
                                         HttpError::new(&u, Some(499), format!("sink: {m}"))
                                     })?;
@@ -502,6 +571,54 @@ mod tests {
     /// A server that sends 10 of 100 bytes and then goes silent with the socket open
     /// (the hang seen on a GitHub release download) must not hang `stream`: the idle
     /// timeout fires and the download resumes with `Range`.
+    fn serve_truncated_then_partial(second_head: &'static [u8], second_body: Vec<u8>) -> (String, Vec<u8>) {
+        let body: Vec<u8> = (0..100u8).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let served = body.clone();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().expect("accept 1");
+            let _ = read_head(&mut first);
+            first.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n").expect("head 1");
+            first.write_all(&served[..10]).expect("part 1");
+            first.flush().expect("flush 1");
+            drop(first);
+            let (mut second, _) = listener.accept().expect("accept 2");
+            let h2 = read_head(&mut second);
+            second.write_all(second_head).expect("head 2");
+            second.write_all(&second_body).expect("part 2");
+            second.flush().expect("flush 2");
+            h2
+        });
+        let net = Net::new().expect("net").with_retries(0).with_body_idle(Duration::from_millis(300));
+        let mut got = Vec::new();
+        let err = net.stream(&format!("http://{addr}/blob"), &[], &AtomicBool::new(false), &mut |c| { got.extend_from_slice(c); Ok(()) }).expect_err("invalid resume must fail");
+        let h2 = server.join().expect("server");
+        assert!(h2.contains("range: bytes=10-"), "resume request: {h2}");
+        (err.to_string(), got)
+    }
+
+    #[test]
+    fn resume_rejects_wrong_content_range_start() {
+        let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 91\r\nContent-Range: bytes 9-99/100\r\nConnection: close\r\n\r\n", (9u8..100).collect());
+        assert!(err.contains("started at byte 9, expected 10"), "{err}");
+        assert_eq!(got, (0u8..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resume_rejects_changed_total_length() {
+        let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 90\r\nContent-Range: bytes 10-99/101\r\nConnection: close\r\n\r\n", (10u8..100).collect());
+        assert!(err.contains("total changed from 100 to 101 bytes"), "{err}");
+        assert_eq!(got, (0u8..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resume_rejects_partial_length_mismatch() {
+        let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 89\r\nContent-Range: bytes 10-99/100\r\nConnection: close\r\n\r\n", (10u8..99).collect());
+        assert!(err.contains("disagrees with Content-Range length 90"), "{err}");
+        assert_eq!(got, (0u8..10).collect::<Vec<_>>());
+    }
+
     #[test]
     fn stalled_body_resumes_after_idle_timeout() {
         let body: Vec<u8> = (0..100u8).collect();

@@ -44,6 +44,7 @@ at that commit, not per-change commits.
 
 ### Changes
 
+- Streamed download resumption now validates every `206 Partial Content` response before accepting bytes: `Content-Range` must start at the requested offset, its span must agree with `Content-Length`, and the total object length must stay constant across reconnects. A contradictory partial response fails instead of silently splicing the wrong bytes into an ADS-B archive. Servers that ignore `Range` with `200 OK` still use the existing safe skip fallback. Three loopback regressions cover wrong offsets, changed totals and mismatched partial lengths.
 - The deferred-measurement regression now also exercises first-round and later-round fitting failures on
   synthetic audio. It checks that a failed later round retains the last successful trace and its own complete
   fit, reports the failure, and rejects the event. A failed first round retains its trace for inspection and
