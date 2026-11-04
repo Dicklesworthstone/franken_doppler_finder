@@ -813,7 +813,8 @@ audio or video recorded somewhere sensitive:
    more, with the time between them intact, is high risk. One, plus a known recording time, is also high
    risk.
 2. **What the source video found does not work:**
-   - high-pass filtering (the 80–500 Hz band overlaps speech, and the curve came back after a boost);
+   - high-pass filtering (the 80–500 Hz band overlaps speech, and the curve came back after a boost). `fdop detect`
+     warns on such audio and may list fewer flyovers, but a lower count there does not make the file safe;
    - talking over it;
    - phone-call compression and noise suppression;
    - uniformly pitch-shifting or time-stretching the whole file. This last one is derived, not tested:
