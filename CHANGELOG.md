@@ -165,8 +165,11 @@ mostly trains, idling locomotives, wind and traffic.
 
 The last three:
 - **Fullerton** had 13 non-jet passes within 3 km in its 3 h window, training traffic from an airport about 5 km
-  away, but none was audible. Wind and road noise fill 50–300 Hz, and its 4 detections were trains and vehicles
-  (one with a 42 m closest approach).
+  away, but none was audible. The audio is high-pass filtered: −3 dB at about 125 Hz, falling 24 dB per octave,
+  so the propeller fundamentals at 45–95 Hz are 20–40 dB down. Broadband wind and road noise fills 120–300 Hz,
+  where the harmonics sit. Either could have hidden the passes; the audio cannot say which. Its 4 detections
+  were trains and vehicles (one with a 42 m closest approach). An earlier version of this entry blamed wind and
+  road noise across 50–300 Hz alone, but such noise raises the low band, and here it is 26 dB down.
 - **Duke Farms** had 16 passes within 3 km, but a wind-saturated microphone. All four matched aircraft (two core,
   two confirming) were real passes over the property, so the search found the right flights and clock and
   placed them loosely. Only 1 of 4 traces fit cleanly (chi 1.2; the others 10–12), and a C172 passed 604 m from
@@ -174,8 +177,9 @@ The last three:
 - **The osprey cam on 2026-11-02** (15:45–18:30Z) had only 4 passes within 3 km, one of them close: margin
   4.8 nats, 1 of 2 core.
 
-Two dense-traffic sites had noisy microphones, and neither reached high. Every wrong answer from a committed build
-is still low: nine across the field tests and builds.
+Neither dense-traffic site reached high: one was high-pass filtered under road noise, the other had a
+wind-saturated microphone. Every wrong answer from a committed build is still low: nine across the field tests
+and builds.
 
 ---
 
