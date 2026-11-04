@@ -280,3 +280,12 @@ as exactly that. Addendum 2 asked only for a difference between `dp` and `dp48` 
 - `dopplertrack`, R2: our script overwrote its own variable and passed a run name as the box's north bound, so `fetch-day`
   exited 2 and no `search` ran. No answer existed. The chain was stopped, its directory kept as `r2_dt_fault_n_clobbered`,
   and it restarts from the first case.
+
+## Addendum 4, 2026-11-04, before any ground-model run
+
+Addendum 3 says every ground model comes from Terrarium tiles. For the 30 m models that would have handicapped
+`dopplerprint`: `prep.dem` reads Terrarium at zoom 7, about 0.9 km per pixel, and its docs use that only for the national
+file. So `r2_dpdem` and `sd_dpdem` use the tool's default sources, as its docs do for a region: USGS 3DEP 1″ bare earth,
+then Copernicus GLO-30. `conus_1000m` stays on Terrarium, as its docs say. The tools therefore read different elevation
+data: `fdop` Terrarium at zooms 10 and 13, `dopplertrack` Terrarium at zoom 12, `dopplerprint` the sources above. Each uses
+its own.
