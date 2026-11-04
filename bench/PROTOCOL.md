@@ -328,3 +328,61 @@ Three recordings say little about "set E alone", so five more are added.
   `fdop` stays pinned at `7e66501`.
 
 "Set E alone" in the claim now means the three recordings with sound and these replacements.
+
+## Addendum 6, 2026-11-04, the five replacements, before their capture
+
+Listed before capture, as Addendum 5 requires. No tool has run on these streams, nobody has listened to them, and no
+spectrogram, ADS-B or aircraft data was consulted.
+
+| Case | Site | Video | Mean level | Limit |
+|---|---|---|---|---|
+| `e_tehachapi` | West Cable, Tehachapi, CA (a milepost on the Mojave Subdivision) | `8GmYBH2jH5w` | -30.7 dB | 5 km |
+| `e_kelso` | City of Kelso railcam, Kelso, WA (a milepost in town) | `TLi5ZJgXOYI` | -45.3 dB | 5 km |
+| `e_sagharbor` | Foster Memorial Beach, Sag Harbor, NY (a beach, no building) | `p1IbYzNwWDQ` | -58.8 dB | 5 km |
+| `e_harbourgate` | Harbourgate Marina, North Myrtle Beach, SC | `SmCHAs7oQYM` | -28.8 dB | 1 km |
+| `e_lakeshore` | Lake Shore Railway Museum, North East, PA | `DFOARJuSfwQ` | -41.8 dB | 1 km |
+
+**How the rule was applied, including where this goes beyond Addendum 5's wording:**
+
+- **Depth.** The rule set no depth. Positions 1-40 of each query were read in query order and gave four. Positions 41-120 were
+  then read in the same order, and the first stream to qualify there is `e_lakeshore`. A strict reading, finishing each query
+  before the next, could have picked differently.
+- **Terms.** Each stream's own YouTube description was read. Wider site terms were not, with one exception: EarthCam's terms page
+  could not be retrieved, so its cams are left out rather than assumed to allow recording. A bare copyright notice is not
+  counted as a ban, so `e_sagharbor`, which carries one, stays in. "Use by permission only", "strictly prohibited" and the like
+  are counted, and they apply to that operator's other cams in the lists. Reno's permission to reproduce only with a prominent
+  attribution is counted as a ban too.
+- **Radio.** Added here: a stream whose operator says its sound is a radio or scanner feed is out, because it carries no sound
+  of the place, which is why the silent files were voided. This was not in Addendum 5. The five above do not say what their
+  sound is, and that is not checked further: the level says only that something is there.
+- **Level.** The 60 s were taken by the capture tool from 2026-11-04T17:00:00Z, so the same step tests whether the DVR reaches
+  that time. Those files stay on the bench disk, unread apart from the level.
+
+**Screened in order and not taken:**
+
+| Stream | Why not |
+|---|---|
+| Greenville Jct, ME, and Boston and Maine Live's other cams | use by permission only |
+| Golden Spike Tower, North Platte, NE | -77.3 dB |
+| Truckee Railroad Museum, CA | duplication strictly prohibited |
+| Lehigh Gorge Scenic Railway, PA | names a railway, not where the camera is |
+| Miami rail cam, FL | names no particular station |
+| Caveman Aviation, Anchorage, AK | a hosted show, no fixed site named |
+| Grand Sierra Resort, Reno, NV | reproduction prohibited without a prominent attribution |
+| Mitchell Airport, Milwaukee, WI | reproduction strictly prohibited |
+| DFW Airport, TX, third-party feed | video and radio from third parties, not on site |
+| Lake Hood, Anchorage, AK, and StreamTime Live's other cams | duplication strictly prohibited |
+| Auburn Airport, CA | operator says the sound is CTAF radio |
+| EarthCam: Midway, Chicago, IL; Lincoln Harbor, NJ | terms not retrievable |
+| Harbor Island (S), San Diego, CA | tower radio; rebroadcast needs a paid license |
+| Edgartown Harbor, MA | use needs a written request |
+| Channel Islands Harbor, Oxnard, CA | private property, and not live sound |
+| Sag Harbor Bay, NY | -66.4 dB |
+| Long Wharf, Sag Harbor, NY | -68.4 dB |
+| Bay Street, Sag Harbor, NY | -72.7 dB |
+| Holy Childhood steeple, Harbor Springs, MI; Oceanside Harbor, CA; Waukegan Harbor, IL; Redondo Beach Harbor, CA; Grand Marais Harbor, MN; Neenah Harbor, WI; Harbour Town Clubhouse, SC; Blue Harbor Resort, Sheboygan, WI; HarborWalk, Destin, FL; Friday Harbor Airport, WA; Tahoe Donner Marina, CA; Choptank Marina, MD; Dagmar's Marina, WA; Hubbard's Marina, FL; Lake Carroll West Marina, IL; Sutter's Marina, NY; Shipyard Cove Marina, WA; Brown's Wharf, ME | -91.0 dB, digital silence |
+| Manitowoc Marina, WI; Norris Lake, TN | no fragments at that time |
+| Barefoot Marina | stream not readable |
+
+Set E's streams are mostly silent: of the 27 levels taken here, 18 were digital silence. So were 5 of the first 8 captures.
+That is a fact about these cams, and it is why the search ran as deep as it did.
