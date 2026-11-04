@@ -3336,6 +3336,43 @@ mod tests {
         }
     }
 
+    /// The confirmer cap is a cut like the pair and fine budgets: `run` must record it in the
+    /// funnel and warn, because `margin_passes` lets a missing rival pass only when no cut was
+    /// recorded.
+    #[test]
+    fn confirmer_cap_is_reported() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        case.p.max_confirm = usize::MAX;
+        let res = run_case(&case, med);
+        assert!(!res.candidates.is_empty(), "{:?}", res.funnel);
+        assert!(
+            !res.funnel
+                .truncated
+                .iter()
+                .any(|s| s.starts_with("confirmers")),
+            "{:?}",
+            res.funnel
+        );
+        case.p.max_confirm = 0;
+        let res = run_case(&case, med);
+        assert!(
+            res.funnel
+                .truncated
+                .iter()
+                .any(|s| s.starts_with("confirmers: ") && s.ends_with(" -> 0")),
+            "{:?}",
+            res.funnel
+        );
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("rival comparison is incomplete")),
+            "{:?}",
+            res.warnings
+        );
+    }
+
     #[test]
     fn rising_terrain_can_reenter_the_distance_gate() {
         struct Hillside {
