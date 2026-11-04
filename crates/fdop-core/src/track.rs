@@ -136,10 +136,18 @@ fn fd_velocity(t: &[f64], p: &[V3]) -> Vec<V3> {
     v
 }
 
-/// A secant measures the average velocity along an arc, not its endpoint tangent. For a
-/// constant-speed turn through angle `a`, that average has the middle heading and speed
-/// `gs * sin(a/2)/(a/2)`. Compare this prediction with each nearby position chord separately:
-/// a bogus report must not gain an unbounded tolerance just by implying a rapid turn.
+/// A secant measures the average velocity along an arc, not its endpoint tangent. On a
+/// constant-speed, constant-rate turn, the chord from knot `k` to a neighbour runs along the
+/// middle heading, at `gs * sin(a/2)/(a/2)` for a turn through angle `a`. So the chord and the
+/// neighbour's reported heading alone predict the tangent at `k`: half the turn lies between the
+/// chord and the neighbour, and the other half on the far side of the chord. Nothing in the
+/// prediction comes from the report under test. Bending it toward `k`'s own heading would excuse
+/// half of a wrong heading, and a bogus report must not gain tolerance by implying a turn.
+///
+/// One chord that agrees is enough. A turn that starts or ends between two knots breaks the
+/// constant-rate assumption on that side only, so requiring both would discard correct reports
+/// wherever an aircraft rolls in or out. In steady flight and steady turns both chords predict
+/// the same tangent, so a wrong report fails either way.
 fn turn_consistent(
     pts: &[fdop_types::store::TrackPoint],
     pos: &[V3],
@@ -152,42 +160,42 @@ fn turn_consistent(
     if p.gs_mps <= 0.0 {
         return false;
     }
-    let heading = (p.track_deg as f64).to_radians();
-    let mut checked = false;
-    for j in [k.checked_sub(1), (k + 1 < pts.len()).then_some(k + 1)]
+    let (gs, heading) = (p.gs_mps as f64, (p.track_deg as f64).to_radians());
+    let reported = [gs * heading.sin(), gs * heading.cos(), vu];
+    [k.checked_sub(1), (k + 1 < pts.len()).then_some(k + 1)]
         .into_iter()
         .flatten()
-    {
-        let dt = pts[j].t - p.t;
-        if dt.abs() >= 30.0 {
-            continue;
-        }
-        if !pts[j].track_deg.is_finite() {
-            return false;
-        }
-        let half_turn = (((pts[j].track_deg as f64).to_radians() - heading + std::f64::consts::PI)
-            .rem_euclid(std::f64::consts::TAU)
-            - std::f64::consts::PI)
-            * 0.5;
-        let chord_speed = p.gs_mps as f64
-            * if half_turn.abs() < 1e-8 {
-                1.0
-            } else {
-                half_turn.sin() / half_turn
-            };
-        let middle_heading = heading + half_turn;
-        let expected = [
-            chord_speed * middle_heading.sin(),
-            chord_speed * middle_heading.cos(),
-            vu,
-        ];
-        let chord = enu.vec_from_ecef(scale(sub(pos[j], pos[k]), 1.0 / dt));
-        if norm(sub(expected, chord)) > tolerance {
-            return false;
-        }
-        checked = true;
-    }
-    checked
+        .any(|j| {
+            let dt = pts[j].t - p.t;
+            if dt.abs() >= 30.0 || !pts[j].track_deg.is_finite() {
+                return false;
+            }
+            // average velocity between the two knots, in flight direction for either neighbour
+            let chord = enu.vec_from_ecef(scale(sub(pos[j], pos[k]), 1.0 / dt));
+            let chord_heading = chord[0].atan2(chord[1]);
+            // the part of the turn between the chord and the neighbour
+            let half_turn = ((pts[j].track_deg as f64).to_radians() - chord_heading
+                + std::f64::consts::PI)
+                .rem_euclid(std::f64::consts::TAU)
+                - std::f64::consts::PI;
+            // more than a half circle within 30 s is not a turn this model can vouch for
+            if half_turn.abs() >= std::f64::consts::FRAC_PI_2 {
+                return false;
+            }
+            let speed = chord[0].hypot(chord[1])
+                * if half_turn.abs() < 1e-8 {
+                    1.0
+                } else {
+                    half_turn / half_turn.sin()
+                };
+            let tangent_heading = chord_heading - half_turn;
+            let expected = [
+                speed * tangent_heading.sin(),
+                speed * tangent_heading.cos(),
+                chord[2],
+            ];
+            norm(sub(reported, expected)) <= tolerance
+        })
 }
 
 /// Build track models from one stored leg (possibly several, split at gaps).
@@ -586,10 +594,24 @@ mod tests {
     }
 
     fn turning_leg(enu: &Enu, times: &[f64], omega: f64) -> FlightLeg {
+        leg_from_states(times, |t| turn_state(enu, t, omega))
+    }
+
+    // Straight, level flight due east at 100 m/s.
+    fn straight_leg(enu: &Enu, times: &[f64]) -> FlightLeg {
+        leg_from_states(times, |t| {
+            (
+                enu.to_ecef([100.0 * t, 0.0, 1200.0]),
+                enu.vec_to_ecef([100.0, 0.0, 0.0]),
+            )
+        })
+    }
+
+    fn leg_from_states(times: &[f64], state: impl Fn(f64) -> (V3, V3)) -> FlightLeg {
         let points = times
             .iter()
             .map(|&t| {
-                let (p, v) = turn_state(enu, t, omega);
+                let (p, v) = state(t);
                 let (lat, lon, alt) = ecef_to_geodetic(p);
                 let [ve, vn, vu] = Enu::new(lat, lon, 0.0).vec_from_ecef(v);
                 fdop_types::store::TrackPoint {
@@ -678,6 +700,58 @@ mod tests {
         let model = &models[0];
         let fd = fd_velocity(&model.t, &model.pos);
         assert_eq!(model.vel[2], fd[2], "an unobserved turn was assumed");
+    }
+
+    #[test]
+    fn a_wrong_heading_is_not_half_excused_by_the_turn_check() {
+        // 20 degrees at 100 m/s is a 35 m/s tangent error, over the 25 m/s tolerance. A turn
+        // check that bends its prediction toward the heading under test sees only half of it.
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let times = [0.0, 25.0, 50.0, 75.0, 100.0];
+        let straight = straight_leg(&enu, &times);
+        let models = build(&straight, &BuildParams::default());
+        assert_eq!(models[0].reported_vel_frac, 1.0);
+        for leg in [straight, turning_leg(&enu, &times, 3.0_f64.to_radians())] {
+            for error in [-20.0, 20.0] {
+                let mut corrupt = leg.clone();
+                corrupt.points[2].track_deg += error;
+                let models = build(&corrupt, &BuildParams::default());
+                assert_eq!(models.len(), 1);
+                let model = &models[0];
+                let fd = fd_velocity(&model.t, &model.pos);
+                assert_eq!(
+                    model.vel[2], fd[2],
+                    "{error} degree heading error was accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_turn_starting_or_ending_between_knots_keeps_correct_reports() {
+        // At 130 m/s with 29 s between knots, the knots either side of the partial arcs fail the
+        // finite difference (about 35 m/s) and the chord over the partial arc (about 49 m/s).
+        // Only the chord over the whole arc can vouch for them.
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let (gs, omega, start, stop) = (130.0_f64, 3.0_f64.to_radians(), 43.5_f64, 130.5_f64);
+        let radius = gs / omega;
+        let times = [0.0, 29.0, 58.0, 87.0, 116.0, 145.0, 174.0, 203.0];
+        let leg = leg_from_states(&times, |t| {
+            let a = omega * (t.clamp(start, stop) - start);
+            let after = (t - stop).max(0.0);
+            (
+                enu.to_ecef([
+                    radius * (1.0 - a.cos()) + gs * after * a.sin(),
+                    gs * t.min(start) + radius * a.sin() + gs * after * a.cos(),
+                    1200.0,
+                ]),
+                enu.vec_to_ecef([gs * a.sin(), gs * a.cos(), 0.0]),
+            )
+        });
+        let models = build(&leg, &BuildParams::default());
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].t.len(), times.len());
+        assert_eq!(models[0].reported_vel_frac, 1.0);
     }
 
     #[test]
