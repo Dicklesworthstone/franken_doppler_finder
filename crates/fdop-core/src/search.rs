@@ -149,6 +149,11 @@ pub struct SearchParams {
     pub kappa: f64,
     /// Residual cap in units of sigma (bounded influence of stray trace points).
     pub cap_sigma: f64,
+    /// Joined points that may reach the quick check, and cells the fine grid may score. A cut
+    /// leaves rivals unchecked and fails the margin gate (`SearchResult::margin_passes`), and it
+    /// can hide the best place: a flight pair's first cell can lie beyond where its third flight
+    /// confirms. So these sit above the largest searches estimated from real runs, about 11 M
+    /// points and 1 M cells.
     pub max_quick: usize,
     pub max_fine: usize,
     pub refine_step_m: f64,
@@ -183,15 +188,15 @@ impl SearchParams {
             quick_chi: 60.0,
             kappa: 12.0,
             cap_sigma: 5.0,
-            max_quick: 3_000_000,
-            max_fine: 4000,
+            max_quick: 20_000_000,
+            max_fine: 2_000_000,
             refine_step_m: 25.0,
             refine_half_m: 700.0,
             tonal_only: true,
             max_events: 12,
             max_hyp_per_event: 30_000_000,
             max_hyp_total: 200_000_000,
-            max_confirm: 2000,
+            max_confirm: 2_000_000,
         }
     }
 }
@@ -1826,7 +1831,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             .truncated
             .push(format!("fine: {} -> {}", fine_in.len(), p.max_fine));
         warnings.push(format!(
-            "{} quick-check survivors > {}; scoring the best {}",
+            "{} quick-check survivors > {}; scoring the best {}; narrow the region or dates",
             fine_in.len(),
             p.max_fine,
             p.max_fine
@@ -1835,9 +1840,14 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     }
     funnel.fine_scored = fine_in.len();
     // fine grid + full scoring
+    let done = AtomicUsize::new(0);
     let fine: Vec<Candidate> = fine_in
         .par_iter()
         .filter_map(|(j, _)| {
+            let k = done.fetch_add(1, Ordering::Relaxed);
+            if k.is_multiple_of(20_000) && k > 0 {
+                progress(&format!("fine grid {k}/{}", fine_in.len()));
+            }
             let (la, lo) = frame.latlon(j.e, j.n);
             let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
             let mut best: Option<(Obs, PointEval)> = None;
@@ -2048,24 +2058,25 @@ fn finalize_candidates(
 
 /// Same place (300 m), clock (5 s) and set of event-flight matches.
 fn dedupe(sorted: Vec<Candidate>) -> Vec<Candidate> {
-    let key = |c: &Candidate| {
-        let mut v: Vec<(String, String)> = c
+    // only candidates with the same matches can be duplicates, so compare with those alone: a
+    // complete search keeps hundreds of thousands of candidates
+    let mut kept_with: HashMap<Vec<(String, String)>, Vec<usize>> = HashMap::new();
+    let mut out: Vec<Candidate> = Vec::new();
+    for f in sorted {
+        let mut matches: Vec<(String, String)> = f
             .events
             .iter()
             .map(|m| (m.event.clone(), m.flight.clone()))
             .collect();
-        v.sort();
-        v
-    };
-    let mut out: Vec<Candidate> = Vec::new();
-    for f in sorted {
-        let kf = key(&f);
-        let dup = out.iter().any(|o| {
+        matches.sort();
+        let kept = kept_with.entry(matches).or_default();
+        let dup = kept.iter().any(|&i| {
+            let o: &Candidate = &out[i];
             haversine_m(o.lat, o.lon, f.lat, f.lon) < 300.0
                 && (o.t_start_utc - f.t_start_utc).abs() < 5.0
-                && key(o) == kf
         });
         if !dup {
+            kept.push(out.len());
             out.push(f);
         }
     }
@@ -2913,6 +2924,32 @@ mod tests {
             d.len(),
             2,
             "same place, clock and match set collapse regardless of order"
+        );
+        let far = cand(40.1, vec![m("e15", "A")]);
+        let mut later = cand(40.0001, vec![m("e15", "A")]);
+        later.t_start_utc += 6.0;
+        let other = cand(40.0001, vec![m("e15", "Z")]);
+        let first = cand(40.0, vec![m("e15", "A")]);
+        let d = dedupe(vec![
+            first.clone(),
+            far.clone(),
+            later.clone(),
+            other.clone(),
+            first,
+        ]);
+        let kept: Vec<(f64, f64, &str)> = d
+            .iter()
+            .map(|c| (c.lat, c.t_start_utc, c.events[0].flight.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (40.0, later.t_start_utc - 6.0, "A"),
+                (40.1, far.t_start_utc, "A"),
+                (40.0001, later.t_start_utc, "A"),
+                (40.0001, other.t_start_utc, "Z"),
+            ],
+            "another place, clock or flight is not a duplicate, and the order holds"
         );
     }
 
