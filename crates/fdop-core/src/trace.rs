@@ -77,11 +77,12 @@ pub(crate) fn ridge_peak(
     noise_band: f64,
     half: usize,
 ) -> Option<(f64, f64, f64)> {
+    let tj = spec.t[j];
     profile_peak(
         spec,
         j,
         f_pred,
-        slope,
+        |t| slope * (t - tj),
         band,
         noise_band,
         half,
@@ -92,13 +93,15 @@ pub(crate) fn ridge_peak(
 /// A model-guided trace follows the nearest qualifying local peak, so a louder nearby
 /// aircraft does not take over the trace merely by entering the same search band. A peak
 /// qualifies only if it also stands `min_snr` clear of any stronger bin, so ripple on a smeared
-/// ridge is not taken for a ridge of its own.
+/// ridge is not taken for a ridge of its own. `along(t)` is the curve's frequency at time `t`
+/// relative to `f_pred`: near the CPA of a close pass the ridge leaves any straight line within
+/// the integration length, and a tangent would smear it away where it is steepest.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn guided_ridge_peak(
     spec: &Spec,
     j: usize,
     f_pred: f64,
-    slope: f64,
+    along: impl Fn(f64) -> f64,
     band: f64,
     noise_band: f64,
     half: usize,
@@ -109,7 +112,7 @@ pub(crate) fn guided_ridge_peak(
         spec,
         j,
         f_pred,
-        slope,
+        along,
         band,
         noise_band,
         half,
@@ -145,7 +148,7 @@ fn profile_peak(
     spec: &Spec,
     j: usize,
     f_pred: f64,
-    slope: f64,
+    along: impl Fn(f64) -> f64,
     band: f64,
     noise_band: f64,
     half: usize,
@@ -154,19 +157,21 @@ fn profile_peak(
     let df = spec.df();
     let n_off = ((2.0 * noise_band + 0.5 * df) / df).floor() as usize + 1;
     let nt = spec.nt();
-    let jj: Vec<usize> = (0..=2 * half)
-        .map(|k| (j as i64 + k as i64 - half as i64).clamp(0, nt as i64 - 1) as usize)
+    let path: Vec<(f64, f64)> = (0..=2 * half)
+        .map(|k| {
+            let k = (j as i64 + k as i64 - half as i64).clamp(0, nt as i64 - 1) as usize;
+            (spec.t[k], along(spec.t[k]))
+        })
         .collect();
-    let need = 3usize.max(jj.len() / 3);
+    let need = 3usize.max(path.len() / 3);
     let mut prof = vec![f64::NAN; n_off];
     let mut offs = vec![0.0; n_off];
     for (o, (pv, ov)) in prof.iter_mut().zip(offs.iter_mut()).enumerate() {
         let off = -noise_band + o as f64 * df;
         *ov = off;
         let (mut sum, mut cnt) = (0.0f64, 0usize);
-        for &k in &jj {
-            let tk = spec.t[k];
-            if let Some(v) = spec.bilinear(tk, f_pred + off + slope * (tk - spec.t[j])) {
+        for &(tk, shift) in &path {
+            if let Some(v) = spec.bilinear(tk, f_pred + off + shift) {
                 sum += v as f64;
                 cnt += 1;
             }
@@ -408,7 +413,8 @@ mod tests {
             let strongest = ridge_peak(&spec, 1, 100.1, 0.0, 5.0, 12.0, 1).unwrap();
             assert!((strongest.0 - 104.0).abs() < 0.1, "{strongest:?}");
             let guided =
-                guided_ridge_peak(&spec, 1, 100.1, 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).unwrap();
+                guided_ridge_peak(&spec, 1, 100.1, |_| 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z)
+                    .unwrap();
             // A qualified nearer ridge wins despite being weaker. A nearer noise bump
             // below the unchanged SNR gate must not hide a valid, more distant ridge.
             assert!((guided.0 - expected).abs() < 0.1, "{guided:?}");
@@ -416,7 +422,7 @@ mod tests {
         let edge = profile_spec(&[(105.5, 16.0)]);
         assert!(edge.bilinear(1.0, 105.0).unwrap() as f64 > p.min_snr);
         assert!(
-            guided_ridge_peak(&edge, 1, 100.0, 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).is_none(),
+            guided_ridge_peak(&edge, 1, 100.0, |_| 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).is_none(),
             "a strong band-edge shoulder is not a local maximum"
         );
     }
@@ -432,7 +438,7 @@ mod tests {
                 + 0.5 * (std::f64::consts::TAU * f).sin()
         });
         let guided =
-            guided_ridge_peak(&spec, 1, 100.0, 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).unwrap();
+            guided_ridge_peak(&spec, 1, 100.0, |_| 0.0, 5.0, 12.0, 1, p.min_snr, p.min_z).unwrap();
         assert!((guided.0 - 102.25).abs() < 0.15, "{guided:?}");
     }
 }
