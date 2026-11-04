@@ -267,18 +267,23 @@ results in the commit message.
   The upload is the recorder's 1:00:00–2:00:00 window. The published answer is 40.876466, −73.524951. Report the
   distance, the radius, the confidence, the gates and the funnel for each configuration:
 
-  | Configuration | Last recorded result (2026-11-03) |
+  | Configuration | Last recorded result (2026-11-04, `18d8476`: the production code of `8b4bea3`) |
   |---|---|
-  | `--dates 2026-09-08 --near NY` (`ny9`) | 224 m off, radius 292 m, **high**, margin 8.5 nats, 295 s |
-  | `--dates 2026-09-08 --near "Nassau County, NY"` (`nassau3`) | 221 m off, radius 292 m, **high**, margin 6.8 nats, 101 s |
-  | `--dates 2026-09-07..2026-09-09 --near NY` (`md2`) | 224 m off, radius 292 m, **high**, margin 7.9 nats, 440 s |
+  | `--dates 2026-09-08 --near NY` (`r_ny_18d8476`) | 267 m off, radius 316 m, **low**, margin gate failed on its recorded cuts (7.7 nats, provisional) |
+  | `--dates 2026-09-08 --near "Nassau County, NY"` (`r_nassau_18d8476`) | 306 m off, radius 316 m, **low**, margin gate failed on its recorded cut (11.5 nats, provisional) |
+  | `--dates 2026-09-07..2026-09-09 --near NY` (`r_md_18d8476`) | 267 m off, radius 316 m, **low**, margin gate failed on its recorded cut (6.6 nats, provisional) |
 
-  All three matched N22NY (PC-12) and N501EX (C208) as the core pair, with N93CQ (B350) as a confirmer. They
-  ran on the import commit plus the 5-line evidence-calibration change described in CHANGELOG section 11.
-  `ny10` repeated the first row on `1f321cb`: high, 224 m off, radius 292 m, margin 7.7 nats, the same flights.
-  Earlier builds got the second and third rows wrong or low (CHANGELOG reference-case table), so re-run all
-  three after any change to detection, measurement, search or grading, and update this table and README
-  "Honest status" with the result. The county margin (6.8 nats) sits closest to its gate (6 nats).
+  All three matched N22NY (PC-12) and N501EX (C208) as the core pair and passed the other four gates. An R44
+  confirmed where N93CQ (B350) used to; the county search also matched N93CQ, at chi 8.79. The grade comes from
+  `9620d2e`: any recorded pair, fine or confirmation cut fails the margin gate, and the fine stage cut on all
+  three at its default 4,000 cells. So low here does not mean the point is wrong. No flag raises that budget.
+
+  The first high results were `ny9` (224 m off, margin 8.5 nats), `nassau3` (221 m, 6.8 nats) and `md2` (224 m,
+  7.9 nats), all radius 292 m with N93CQ as the confirmer, on the import commit plus the 5-line
+  evidence-calibration change described in CHANGELOG section 11. `ny10` repeated the first on `1f321cb`: high,
+  224 m off, radius 292 m, margin 7.7 nats, the same flights. Other builds got these configurations wrong or low
+  (CHANGELOG reference-case table and Unreleased), so re-run all three after any change to detection,
+  measurement, search or grading, and update this table and README "Honest status" with the result.
 
 ---
 
@@ -391,14 +396,15 @@ fdop runs --json                                         # the run ledger
 The pipeline runs end to end. It has offline unit tests, a selftest and one validated reference case (above).
 Field tests on public live-cam recordings are summarised in README "Honest status": the reference site was
 located again from a recording on another day, and four sparse-traffic sites failed, graded low or with no
-location. The open issues are listed in README "Known issues".
+location. On the current code every real recording replayed so far grades low, because each records a fine
+cut (the reference table above). The open issues are listed in README "Known issues".
 
 Known fixes not landed. Each one changes answers, so it waits until the reference configurations and the
 quoted field tests can be re-run, which needs a Mac build:
 - The medium grade does not allow for how many events were searched (README "Known issues"). Fix it before
   raising the detection or measurement caps.
 
-Landed without that re-run: `f717f6f` keeps reported ADS-B velocities on sparsely sampled turns, by checking
+Landed before any re-run: `f717f6f` keeps reported ADS-B velocities on sparsely sampled turns, by checking
 the position chords against the arc implied by neighbouring headings at the same 25 m/s limit. Synthetic
-turning-track tests cover it; the reference configurations and field recordings still need to be rerun on it
-(README "Honest status").
+turning-track tests cover it. The reference configurations and two field recordings have since been replayed
+on a build containing it; the other seven field recordings have not (README "Honest status").

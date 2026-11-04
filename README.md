@@ -43,24 +43,22 @@ finding the faint curves in a spectrogram to naming the town.
 | Question | Answer |
 |---|---|
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
-| Has it located a real recording? | **One recording, three ways, one answer.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three pass every gate at **high** confidence and give the same spot: a 292 m radius about **224 m** from the location published in the video (221 m for the county search). Each matched the same three flyovers: a Pilatus PC-12, a Cessna 208 and a King Air 350 |
-| Has it been wrong? | **Yes, and so far every committed build has graded its wrong answers low.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off). In the field tests below, five answers were wrong. A low grade does not mean wrong, though: one build put the state-wide answer 129 m off at high confidence but graded the county search low. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points. A working-tree experiment that measured more of a 3 h recording's flyovers graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer either |
-| Is it tested? | **123 offline unit tests,** plus two opt-in FFmpeg/FFprobe integration tests: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. See [Testing](#testing) for the checks completed on the current code. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording |
-| Has it located a recording it was not developed on? | **Once, at the same site.** Nine recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: about 150 m from the cam's geocoded street address, just outside its 147 m radius (an address geocode only approximates where a camera is), with the recording start off by only 0.33 s. The same cam on two other days gave wrong answers graded **low**. An eagle cam at Duke Farms (Hillsborough, NJ) came out in the right township, about 2.2 km from the property's entrance address, graded **low** (the nest position is not published, so a smaller error cannot be scored). At five other sites (railcams in Rochelle, IL, Tucson, AZ, Plant City, FL and Fullerton, CA, and a bird-feeder cam in Ithaca, NY), three answers were wrong and graded **low**, and Plant City and Fullerton gave no location. All but Fullerton held only 0–3 non-jet passes within reach. Fullerton (13 within 3 km) and Duke Farms (16) had more traffic but poor audio. Fullerton's is high-pass filtered at about 125 Hz, which removes or weakens the propeller fundamentals, under broadband wind and road noise; Duke Farms has a wind-saturated microphone. No wrong answer from a committed build was graded above low |
+| Has it located a real recording? | **One recording, three ways, one area, all graded low on the current code.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). On the current code the first two land **267 m** from the location published in the video and the county search **306 m**, with a 316 m radius. All three grade **low**, which here does not mean the point is wrong: only the margin gate fails, because each run records a cut at the fine stage and any recorded cut fails that gate. Each matched a Pilatus PC-12 and a Cessna 208 as the core pair, with a Robinson R44 as confirmer (the county search also matched a King Air 350, at chi 8.79). Earlier builds graded the same recording higher: `d79d90d` gave **high** on all three at 221–224 m with a 292 m radius, the results shown in [See it work](#see-it-work) |
+| Has it been wrong? | **Yes, at low and at medium.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off); `9aeeb9a` put the county search 14.4 km off and the state-wide search 87 km off, both low, until the guided-peak fix. In the field tests below, five answers were wrong. On `d55ef79` four of them were low and one was **medium**: a bird-feeder cam in Ithaca, NY placed on Long Island. The current code names the same wrong town, at low. A working-tree experiment that measured more of a 3 h recording's flyovers also graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer. A low grade does not mean wrong either: one build put the state-wide answer 129 m off at high confidence but graded the county search low, and all three reference searches on the current code land within about 300 m at low. All five wrong-date runs on `d55ef79` were low too, failing the core and margin gates on their own numbers, before any recorded cut failed that gate; wrong-date runs have not been repeated on the current code. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points |
+| Is it tested? | **128 offline unit tests,** plus two opt-in FFmpeg/FFprobe integration tests: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. See [Testing](#testing) for the checks completed on the current code. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording |
+| Has it located a recording it was not developed on? | **Once, at the same site.** Nine recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: about 150 m from the cam's geocoded street address, just outside its 147 m radius (an address geocode only approximates where a camera is), with the recording start off by only 0.33 s. The same cam on two other days gave wrong answers graded **low**. An eagle cam at Duke Farms (Hillsborough, NJ) came out in the right township, about 2.2 km from the property's entrance address, graded **low** (the nest position is not published, so a smaller error cannot be scored). At five other sites (railcams in Rochelle, IL, Tucson, AZ, Plant City, FL and Fullerton, CA, and a bird-feeder cam in Ithaca, NY), three answers were wrong and graded **low**, and Plant City and Fullerton gave no location. All but Fullerton held only 0–3 non-jet passes within reach. Fullerton (13 within 3 km) and Duke Farms (16) had more traffic but poor audio. Fullerton's is high-pass filtered at about 125 Hz, which removes or weakens the propeller fundamentals, under broadband wind and road noise; Duke Farms has a wind-saturated microphone. These grades come from the builds named in the next row, and `d55ef79` later graded the bird-feeder answer **medium**, still wrong. Two of these recordings were rerun on the current code. The osprey recording lands 222 m from the reference recording's published location (radius 214 m) and grades **low**, failing only the margin gate on its recorded cut. The bird-feeder answer is wrong and **low**, failing margin and radius |
 | What is not validated? | Any site other than the reference one; low-traffic or rural sites (all four tried failed); CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
-| Which code produced these results? | The reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
+| Which code produced these results? | "The current code" means replays on `18d8476`, a local build whose production code is the same as `8b4bea3` (it carried one extra test, dropped before pushing): runs `r_ny_18d8476`, `r_md_18d8476`, `r_nassau_18d8476`, `f_osprey_1101_18d8476` and `f_feederwatch_18d8476`. The other seven field recordings have not been rerun on it. The older reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
 | Is it fast? | **Three measurements on one machine.** The state-wide run took 295 s and the three-day run 440 s on an Apple M5 Ultra, with the ADS-B days already cached. See [Performance](#performance) |
 
-[`f717f6f`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/f717f6faec84803d360207884e91c8b830e3578c), which changed how ADS-B tracks are interpolated through turns,
-came after every run above. Its synthetic tests pass, but the reference and field recordings have not been rerun
-on it, so the distances and grades above do not validate it. The later correction that prevents empty hypothesis
-clouds from consuming search-driver slots, the correction to refinement-window boundary detection, and the
-recovery of close passes between cross-track grid lines also have synthetic regression coverage only.
-The later harmonic-family changes likewise have synthetic coverage, including simultaneous independent
-flyovers; the historical real-recording results do not validate those changes.
+The `18d8476` replays include [`f717f6f`](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/f717f6faec84803d360207884e91c8b830e3578c), which changed how ADS-B tracks are interpolated through turns,
+the corrections to empty hypothesis clouds and refinement-window boundary detection, the recovery of close
+passes between cross-track grid lines, and the harmonic-family changes. Those five replays are the only
+real-recording evidence for these changes; results quoted from older builds do not validate them.
 The current margin gate also requires no recorded pair, fine or confirmation comparison cut, even when
-a numerical gap is available. Historical high grades from truncated runs are not evidence of the current
-grade; those configurations still need a new run.
+a numerical gap is available. All five replays recorded a fine cut (`fine: 395037 -> 4000` on `r_ny_18d8476`)
+and no flag raises that budget, so all five grade low. Historical high grades from truncated runs are not
+evidence of the current grade.
 
 ---
 
@@ -96,6 +94,10 @@ against everything else in the recording and grades it.
 
 The reference case: colsto's raw upload of the recording ([youtu.be/4CxVxuMVkMc](https://youtu.be/4CxVxuMVkMc),
 the recorder's 1:00:00–2:00:00 window), searched across all of New York State with only the date given.
+
+This section shows run `ny9` from an early build (`d79d90d`), because it shows a full set of passing gates.
+**The current code does not reproduce it:** the same search lands 267 m off and grades low
+([Honest status](#honest-status)).
 
 ```console
 $ fdop locate ref_raw.m4a --dates 2026-09-08 --near NY -o runs/ny9
@@ -139,7 +141,7 @@ The search funnel for that run:
 - 1.1 M passed the quick check and merged into 426 k cells, of which the best 4,000 were scored exactly and 535
   passed.
 
-The same recording with a three-day window (`--dates 2026-09-07..2026-09-09`, run `md2`) gave the same point,
+On that build, the same recording with a three-day window (`--dates 2026-09-07..2026-09-09`, run `md2`) gave the same point,
 radius and flights at high confidence, with a 7.9-nat margin over a rival 130 km away. Searching only Nassau
 County (run `nassau3`) gave a point 221 m from the published one, also high, with the same 292 m radius.
 
@@ -574,6 +576,8 @@ Design notes:
 - **Guided measurement follows the predicted ridge.** It selects the nearest qualified local spectral
   peak within the existing model band, using the existing SNR and robust-z requirements. A brighter
   neighbouring aircraft no longer automatically takes over the trace when both tones enter that band.
+  The peak must also stand the SNR requirement above the valley separating it from any stronger bin, so
+  ripple on a stronger ridge's top does not qualify, while a separate aircraft's ridge still does.
   Standalone unguided ridge tracing retains its strongest-peak rule.
 - **Hypotheses are compact.** Each is 20 bytes (a `u32` track index and four `f32`). The budgets are sized from
   physical memory: a tenth of RAM, capped at 2 G hypotheses (40 GB). Smaller machines no longer receive a
@@ -641,9 +645,9 @@ the configured fallback allowance after the preferred request has been tried.
 The actual-audio overlap regressions recover two same-tone, simultaneous passes at 1 km and 7 km,
 including when the nearer aircraft is louder. Both measured curves satisfy the existing known-answer
 tolerances: CPA within 0.3 s, tone within 0.3 Hz, speed within 4 m/s and distance within 8%. Each aircraft
-alone still counts as one independent event after measured-curve filtering. The guided-peak test checks
-qualified local maxima, below-threshold neighbouring noise and a strong shoulder outside the model band;
-the detection-cap test also verifies weak-only recordings retain their detections. These are synthetic
+alone still counts as one independent event after measured-curve filtering. The guided-peak tests check
+qualified local maxima, below-threshold neighbouring noise, a strong shoulder outside the model band and
+ripple on a stronger ridge; the detection-cap test also verifies weak-only recordings retain their detections. These are synthetic
 fixtures, not evidence of reference-recording accuracy.
 
 The dense-burst track regression failed on the previous cleaner: 49 corrupt reports removed half of a
@@ -681,8 +685,7 @@ information disabled to fit the shared host's memory limit.
 The unchanged `src/selftest.rs` was rebuilt and rerun against these final core libraries: **0.4 m**
 synthetic position error, **75 m** radius, **+0.20 s** clock error and both intended aircraft matched. A small external entry
 point invoked `selftest::run` directly, exercising the real FFmpeg decode, detection, measurement, search
-and refinement on the full 1,300 s generated recording. This run covers the core path. Full CLI validation
-remains blocked by dependency compilation, and a default release-profile run was not attempted.
+and refinement on the full 1,300 s generated recording. This run covers the core path.
 
 Eight tests of the exact clock helpers and time module also passed in an earlier isolated Rust build.
 The three new HTTP byte-extent tests passed in an isolated build of the exact production helpers, and
@@ -696,12 +699,16 @@ The weather-deadline scheduling regression passed in an isolated Rust build of t
 it fails with the former 150 s wait. The full workspace test build was attempted with the same memory
 settings, but rustc received SIGKILL while compiling `asupersync 0.6.2`, before the tests ran. A subsequent
 workspace-wide all-target Clippy attempt also received SIGKILL while checking `asupersync 0.5.0` metadata,
-before reaching the project crates. Full workspace tests, workspace-wide Clippy and the release CLI
-selftest therefore remain unverified. The historical real-recording results above have not been rerun
-on these changes.
+before reaching the project crates.
+
+Those builds have since completed on remote workers. On `56cb23e`, `cargo test --workspace --locked -j 2`
+passed 128 tests with 0 failed and 2 ignored, and `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings`
+passed. A release build of `18d8476`, the same production code, passed `fdop selftest`: 0.4 m error, 75 m
+radius, +0.20 s clock error and 4 events. A selftest does not show that real recordings work; the reference
+and field reruns on that build are in [Honest status](#honest-status).
 
 ```bash
-cargo test --workspace --locked                               # 123 unit tests, no network
+cargo test --workspace --locked                               # 128 unit tests, no network
 cargo test -p fdop-core audio::tests -- --ignored              # media integration, needs ffmpeg/ffprobe
 cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
@@ -718,7 +725,7 @@ The unit tests check:
 - detect → measure recovery of `f0`, `v`, `d` and `t0r`;
 - same-tone overlapping aircraft survive actual detection, refinement and measurement in both tested
   strength cases; one-aircraft controls still supply one independent event, and guided peak selection
-  rejects unqualified noise and non-peak shoulders;
+  rejects unqualified noise, non-peak shoulders and ripple on a stronger ridge;
 - deferred fit diagnostics match eager refinement, and failed refinement keeps its trace and fit consistent;
 - fit recovery and range coverage;
 - Hermite track models against closed forms;
@@ -793,12 +800,13 @@ audio or video recorded somewhere sensitive:
 | `date range ... spans more than 15 days; narrow it` | Range too long | Split it into several runs |
 | `unrecognised date '09/08/2026': put the four-digit year first` | The year is not first. `09/08/2026` is 8 September in the US and 9 August in most other countries | Write it year first: `2026-09-08` |
 | Warning `detection kept the 60 strongest of N candidate curves` or `measured the 24 strongest of N flyover detections` | A long or busy recording hit a fixed cap (see [Known issues](#known-issues)) | Nothing to change: the weaker flyovers are not used |
+| Warning `the audio has little energy below 100 Hz (45-95 Hz is N dB below 150-600 Hz)` | A high-pass filter does this, removing the fundamentals of slower propellers and weakening those near the cut. Speech-heavy audio can also read low | Use the unfiltered recording if you have one. Otherwise expect fewer usable flyovers, and do not read a failed search as evidence about the place |
 | Warning `the answer lies in CT, outside the searched state NY` (or `appears to lie in`, when the state is a gazetteer estimate) | A state search covers the state's bounding box, which takes in parts of its neighbours | If you know the recording was made in the searched state, distrust the answer whatever its grade, unless its radius reaches back across the border. A narrower `--near`, such as a county, takes in less of the neighbours |
 | `needs network or a cached file: Census gazetteer ...` | `--offline` before the gazetteer was cached | Run once online, or use a state, point or box region |
 | `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days are cached. A day missing from adsb.lol cannot be searched |
 | A download pauses for a minute, then carries on | The server stopped sending with the connection still open. After 60 s with no data, `fdop` reconnects and resumes with an HTTP `Range` request | Nothing. Resumed `206` responses are checked for their byte offset, range boundary and total length before new bytes are accepted. Capped ranges continue until the full object is proved complete; a range's body length is never treated as the archive length. After repeated failures with no new bytes it stops |
 | Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears some hours after it ends | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |
-| Answer graded **low** | One or more gates failed | Read the gates in `report.html`. A small margin means another flight pair explains the curves almost as well |
+| Answer graded **low** | One or more gates failed | Read the gates in `report.html`. A margin marked `provisional, comparison truncated` failed because a comparison was cut: an unchecked rival could still win, so the answer is unconfirmed, not refuted. Otherwise, a small margin means another flight pair explains the curves almost as well |
 | Disk filling up | Many cached regions and days | Delete old `adsb/<date>/` folders under the cache root |
 
 ---
@@ -824,11 +832,12 @@ audio or video recorded somewhere sensitive:
   partially. adsb.lol has gaps on some days.
 - **The HTML report's map needs internet** to load Leaflet and tiles. `map.png` is self-contained.
 - **Located real recordings at one site only.** The reference recording, and a public osprey cam at the same
-  site on a different day with different flights, both came out high. Eight further field recordings were graded
-  low or gave no location: two from the same cam on other days, four from sites with sparse light-aircraft
+  site on a different day with different flights, both came out high on earlier builds; on the current code
+  both still land there, graded low. Eight further field recordings were graded low or gave no location on
+  those earlier builds: two from the same cam on other days, four from sites with sparse light-aircraft
   traffic, and two from busier sites with poor audio (a high-pass filter under road noise, and a
-  wind-saturated microphone). One of those, at Duke Farms, NJ, was low but in the right township. See
-  [Honest status](#honest-status).
+  wind-saturated microphone). One of those, at Duke Farms, NJ, was low but in the right township. One
+  later build graded the bird-feeder answer medium, and it was wrong. See [Honest status](#honest-status).
 
 ### Known issues
 
@@ -847,6 +856,10 @@ audio or video recorded somewhere sensitive:
   Multiple seeds of one physical pass can also consume measurement slots before measured-curve filtering
   groups them. The residual detector's distant-only synthetic control uses two slots while correctly
   contributing one independent event; its preceding single-bank baseline used one slot.
+- **Every real recording replayed on the current code grades low.** The fine stage scores the best 4,000 cells,
+  and all five recordings had far more (43,497 for the county reference search, 395,037 state-wide). Any
+  recorded cut fails the margin gate, and no flag raises that budget. A narrower region did not avoid it: the
+  county search cut too.
 - Measurement took 205 s of a 509 s run on a 3 h recording. Full uncertainty profiles and manoeuvre
   diagnostics now run once for the final accepted trace, instead of in every ridge-refinement round. The
   point fits and final diagnostics are retained; the wall-clock improvement has not yet been measured.
@@ -871,12 +884,13 @@ not heard counts against it.
 **Why ignore jets?** Jet noise is broadband roar without a stable tone, so there is no clean curve to fit.
 Unknown aircraft types are kept.
 
-**How precise is it?** On the reference recording, the high-confidence answers landed 221–224 m from the
-published location, inside their 292 m radius. On the osprey-cam field recording it was about 150 m from the
-cam's geocoded street address, just outside its 147 m radius; an address geocode only approximates where a
-camera is. Precision depends on how many clean passes there are, how close they were, and the ADS-B cadence. The
-radius is the run's own measure of its uncertainty, and is meaningful only for a **high** or **medium**
-answer. A **low** answer can be far off; one was 102 km off.
+**How precise is it?** On the reference recording, the current code lands 267–306 m from the published
+location with a 316 m radius, graded low because its comparison is cut. Earlier builds' high-confidence answers
+landed 221–224 m away, inside a 292 m radius. On the osprey-cam field recording an early build was about 150 m
+from the cam's geocoded street address, just outside its 147 m radius; an address geocode only approximates
+where a camera is. Precision depends on how many clean passes there are, how close they were, and the ADS-B
+cadence. The radius is the run's own measure of its uncertainty, and is meaningful only for a **high** or
+**medium** answer. A **low** answer can be close or far off; one was 102 km off.
 
 **How long does it take?** A one-day state-wide search of a 1 h recording took about 5 minutes with the data
 cached; a three-day window took about 7.5, and a 3 h recording about 8.5. The first run on new dates is

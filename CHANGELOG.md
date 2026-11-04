@@ -19,6 +19,74 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### A guided peak must clear any stronger bin; reference and field reruns
+
+- `9aeeb9a`'s nearest-peak rule (next section) also accepted ripple on a ridge's top. The nearest ripple hugs
+  the model, so a trace could confirm its own model: the fit RMS fell while speed and distance went wrong. On
+  the reference county search one matched event moved from v 76.2, d 7374, RMS 0.190 to v 60.5, d 4909,
+  RMS 0.124, against 81 m/s and 8,430 m from ADS-B, and stopped matching its flight.
+- A candidate must now stand `min_snr` above the valley separating it from any stronger bin (`clearance` in
+  `trace.rs`). No parameter was added, and a separate aircraft's ridge still qualifies because a real valley
+  divides them: the same-tone overlap tests still pass. `guided_peak_ignores_ripple_on_a_stronger_ridge` fails
+  without this. An audio-level wrong-seed test passed with and without the change, so it was not kept; the
+  replays below are the evidence that this fixes the reference recording.
+- Replays at default budgets, each read from its own `result.json` and `search.json`. `18d8476` is a local build
+  with the same production code as `8b4bea3`, which has one test fewer. "Three-day" is the New York window that
+  `md2` used; the `r_md` run names follow that name and do not mean Maryland.
+
+| Build | Configuration | Run | Off by | Radius | Grade | Margin (nats) | Recorded cuts |
+|---|---|---|---:|---:|---|---:|---|
+| `d55ef79` | state-wide | `r_ny` | 224 m | 292 m | high | 7.27 | pairs 66→64, fine 434,223→4,000 |
+| `d55ef79` | three-day | `r_md` | 224 m | 292 m | medium | 5.37 | fine 292,213→4,000 |
+| `d55ef79` | county | `r_nassau` | 221 m | 292 m | high | 8.05 | fine 48,344→4,000 |
+| `3f00c61` | county | `r_nassau_3f00c61` | 221 m | 292 m | low | 7.73 | fine 48,347→4,000 |
+| `9aeeb9a` | state-wide | `r_ny_9aeeb9a` | 86,692 m | 360 m | low | 4.51 | pairs 66→58, fine 348,439→4,000 |
+| `9aeeb9a` | county | `r_nassau_9aeeb9a` | 14,357 m | 757 m | low | 6.03 | fine 58,725→4,000 |
+| `18d8476` | state-wide | `r_ny_18d8476` | 267 m | 316 m | low | 7.72 | pairs 66→63, fine 395,037→4,000 |
+| `18d8476` | three-day | `r_md_18d8476` | 267 m | 316 m | low | 6.56 | fine 225,239→4,000 |
+| `18d8476` | county | `r_nassau_18d8476` | 306 m | 316 m | low | 11.47 | fine 43,497→4,000 |
+
+- **Why everything is low.** `9620d2e` (after `d55ef79`) fails the margin gate on any recorded pair, fine or
+  confirmation cut, and the fine stage cut on every run above. On `18d8476` the other four gates pass on all three
+  configurations. So these grades say the comparison was incomplete, not that the point is wrong. No flag raises
+  the fine budget.
+- **What got worse against `d55ef79`.** The answers are 43–85 m further from the published location. A Robinson
+  R44 is now the confirmer where the King Air 350 was; the county search also matches the King Air, at chi 8.79.
+  Against `3f00c61`, the corrected event's trace is identical on all 911 points they share but loses the first
+  14, giving v 69.6, d 6,437, RMS 0.172. That fit is weakly determined: dropping the first 14, 60 or 100 of
+  `3f00c61`'s points gives v 69.6, 73.4 or 80.4. Those 14 points were not restored, because they sit 0.58 Hz above
+  the curve with ADS-B's v and d. Other traces also differ, some for the worse: at 2560 s d goes from 526 to 978
+  and RMS from 0.368 to 0.865, and 1641 s now fails the RMS gate at 1.54.
+- **Field recordings.** Two were rerun on `18d8476`. The osprey cam lands 222 m from the reference recording's
+  published location, radius 214 m, low, failing only margin on its recorded cuts at 13.20 nats (`f_osprey_1101_18d8476`).
+  `d55ef79` had it 150 m from that point at high, 23.29 nats. The bird-feeder cam stays wrong, on the same Long
+  Island town: low, radius 1,176 m, 2.85 nats (`f_feederwatch_18d8476`). `d55ef79` graded that wrong answer
+  **medium**, radius 2,019 m, 5.06 nats, which retracts the earlier claim here and in the README that no committed
+  build graded a wrong answer above low. The other seven field recordings were not rerun.
+- **Wrong dates.** All five wrong-date runs on `d55ef79` were low, failing the core and margin gates on their
+  own numbers, one also failing the unheard-pass gate. They have not been repeated on the current code.
+- **Checks.** See README "Testing". A release build of `18d8476` passed `fdop selftest`: 0.4 m error, 75 m radius,
+  +0.20 s clock error, 4 events (known answer, not evidence about real recordings).
+
+### Warn when the audio looks high-passed
+
+- `fdop locate` adds a report warning when 45–95 Hz is more than 15 dB below 150–600 Hz, measured as mean power
+  over 1 s Hann frames. Nine outdoor recordings read +10.0 to +19.5 dB; the Fullerton, CA railcam, high-passed at
+  about 125 Hz, read −26.1 dB. Turboprops' fundamentals sit at about 95–135 Hz, so the warning says the filter
+  removes slower propellers' fundamentals and weakens those near the cut, not that most lie below 100 Hz.
+  Speech-heavy audio can also read low. The warning changes no answer or grade. Test:
+  `low_band_ratio_flags_high_passed_audio`.
+
+### Offline county estimate scales by county size
+
+- When the Census API is unavailable, the county came from the nearest county centroid in the state. Over all
+  36,291 county-subdivision internal points in the 2024 Gazetteer, that named the wrong county for 11.8%. The
+  estimate now divides distance by each county's equal-area radius and names a second county when its scaled
+  distance is within 1.5× of the best. On the same points this names two counties for 33%, and 2.7% end up
+  wrong. These percentages come from a one-off evaluation that is not in this repository. The Census API path
+  is unchanged, and the search and grades do not use the county. Test:
+  `offline_county_names_both_when_too_close_to_call`.
+
 ### Recover overlapping tones through detection and measurement
 
 - Detection no longer suppresses a nearby same-tone seed unless its Doppler shape also agrees. Strong
@@ -36,7 +104,7 @@ at that commit, not per-change commits.
   cases now retain two independent measured events and pass the unchanged 0.3 s CPA, 0.3 Hz tone, 4 m/s
   speed and 8% distance tolerances. The single-aircraft controls each contribute one independent event.
   The guided-selector regression and weak-only/cap control also pass. Reference and field recordings
-  have not been rerun.
+  had not been rerun at this commit; the section above reports the regression those reruns found.
 - The extra bank scan has bounded storage: each retained score/index map uses 6 bytes per cell instead
   of the previous 14; temporary scoring arrays still require additional memory. Raw aliases remain a
   measurement-budget cost: the distant-only control now measures two seeds instead of one, although
