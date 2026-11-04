@@ -12,7 +12,7 @@
 //! 4. Quality gates: points, coverage of both sides of the CPA, fit RMS, plausible v and d.
 
 use crate::detect::Detection;
-use crate::fit::{FitResult, Side, fit_constant_velocity};
+use crate::fit::{FitResult, PreparedFit, Side, prepare_constant_velocity};
 use crate::physics::{cv_curve, window_for_roc};
 use crate::spectro::{Spec, stft_band_db};
 use crate::trace::{Trace, ridge_peak};
@@ -178,7 +178,7 @@ pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams)
     let mut model: Box<dyn Fn(f64) -> f64 + Sync> =
         Box::new(model_fn(det.f0, det.v, det.d, det.t0r, c));
     let mut band = (0.04 * det.f0).clamp(3.0, 12.0);
-    let mut fit: Option<FitResult> = None;
+    let mut prepared: Option<PreparedFit> = None;
     let mut trace = Trace::default();
     for round in 0..p.rounds {
         let tr = guided_trace(&spec, &*model, ta, tb, band, p.min_snr, p.min_z);
@@ -190,21 +190,26 @@ pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams)
             }
             break;
         }
-        match fit_constant_velocity(&tr.t, &tr.f, c, Side::Both) {
+        match prepare_constant_velocity(&tr.t, &tr.f, c, Side::Both) {
             Ok(fr) => {
-                let b = fr.best;
+                let b = fr.best();
                 model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
                 band = (3.0 * b.rmse).clamp(1.0, band);
                 trace = tr;
-                fit = Some(fr);
+                prepared = Some(fr);
             }
             Err(e) => {
                 quality.reasons.push(format!("fit: {e}"));
-                trace = tr;
+                // Keep a successful fit paired with its own trace if a later round fails.
+                if prepared.is_none() {
+                    trace = tr;
+                }
                 break;
             }
         }
     }
+    // Only the final accepted trace needs uncertainty profiles and manoeuvre diagnostics.
+    let fit = prepared.map(PreparedFit::complete);
     // Keep only the analysis window plus a scoring margin in memory.
     let keep_a = spec.frame_index((ta - 60.0).max(spec.t[0]));
     let keep_b = (spec.frame_index((tb + 60.0).min(spec.t[spec.nt() - 1])) + 1).min(spec.nt());
@@ -276,6 +281,73 @@ pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams)
 mod tests {
     use super::*;
     use crate::detect::{DetectParams, detect, refine, survey};
+    use crate::fit::fit_constant_velocity;
+
+    #[test]
+    fn deferred_diagnostics_match_eager_refinement() {
+        let sr = 4000u32;
+        let c = 343.0;
+        let det = Detection {
+            id: 0,
+            t0r: 60.0,
+            f0: 118.0,
+            v: 120.0,
+            d: 3000.0,
+            score: 10.0,
+            score_approach: 10.0,
+            score_recede: 10.0,
+            half_s: 60.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+        };
+        let mut seed = 789u64;
+        let mut phase = 0.0;
+        let tone = model_fn(det.f0, det.v, det.d, det.t0r, c);
+        let x: Vec<f32> = (0..sr as usize * 120)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr as f64;
+                phase += 2.0 * std::f64::consts::PI * tone(t) / sr as f64;
+                (0.2 * phase.sin() + 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0)) as f32
+            })
+            .collect();
+        let p = MeasureParams {
+            hop_s: 0.25,
+            ..Default::default()
+        };
+        let event = measure(&x, sr, &det, "e1", &p);
+        assert!(event.quality.ok, "{:?}", event.quality.reasons);
+        // This short recording lies entirely inside the analysis window, so the saved
+        // spectrogram is the same one used by every refinement round, without cropping.
+        let spec = event.spec.as_ref().unwrap();
+        assert!(spec.t[0] < 1.0 && spec.t[spec.nt() - 1] > 119.0);
+        let mut model: Box<dyn Fn(f64) -> f64 + Sync> = Box::new(tone);
+        let mut band = (0.04 * det.f0).clamp(3.0, 12.0);
+        let mut eager_trace = Trace::default();
+        let mut eager_fit = None;
+        // The previous measurement path completed full uncertainty diagnostics in each
+        // round. Use that public API as the oracle for all three model/band updates.
+        for _ in 0..p.rounds {
+            let trace = guided_trace(spec, &*model, 0.0, 120.0, band, p.min_snr, p.min_z);
+            assert!(trace.len() >= 20);
+            let fit = fit_constant_velocity(&trace.t, &trace.f, c, Side::Both).unwrap();
+            let b = fit.best;
+            model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
+            band = (3.0 * b.rmse).clamp(1.0, band);
+            eager_trace = trace;
+            eager_fit = Some(fit);
+        }
+        assert_eq!(event.trace.t, eager_trace.t);
+        assert_eq!(event.trace.f, eager_trace.f);
+        assert_eq!(event.trace.snr, eager_trace.snr);
+        assert_eq!(
+            serde_json::to_value(&event.fit).unwrap(),
+            serde_json::to_value(&eager_fit).unwrap()
+        );
+        assert_eq!(event.quality.n_points, event.trace.len());
+    }
 
     #[test]
     fn detect_then_measure_recovers_parameters() {

@@ -45,7 +45,7 @@ finding the faint curves in a spectrogram to naming the town.
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
 | Has it located a real recording? | **One recording, three ways, one answer.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three pass every gate at **high** confidence and give the same spot: a 292 m radius about **224 m** from the location published in the video (221 m for the county search). Each matched the same three flyovers: a Pilatus PC-12, a Cessna 208 and a King Air 350 |
 | Has it been wrong? | **Yes, and so far every committed build has graded its wrong answers low.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off). In the field tests below, five answers were wrong. A low grade does not mean wrong, though: one build put the state-wide answer 129 m off at high confidence but graded the county search low. The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points. A working-tree experiment that measured more of a 3 h recording's flyovers graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer either |
-| Is it tested? | **81 unit tests,** all offline: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording and recovers the observer to under 1 m |
+| Is it tested? | **83 unit tests,** all offline: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording and recovers the observer to under 1 m |
 | Has it located a recording it was not developed on? | **Once, at the same site.** Nine recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: about 150 m from the cam's geocoded street address, just outside its 147 m radius (an address geocode only approximates where a camera is), with the recording start off by only 0.33 s. The same cam on two other days gave wrong answers graded **low**. An eagle cam at Duke Farms (Hillsborough, NJ) came out in the right township, about 2.2 km from the property's entrance address, graded **low** (the nest position is not published, so a smaller error cannot be scored). At five other sites (railcams in Rochelle, IL, Tucson, AZ, Plant City, FL and Fullerton, CA, and a bird-feeder cam in Ithaca, NY), three answers were wrong and graded **low**, and Plant City and Fullerton gave no location. All but Fullerton held only 0–3 non-jet passes within reach. Fullerton (13 within 3 km) and Duke Farms (16) had more traffic but poor audio. Fullerton's is high-pass filtered at about 125 Hz, which removes or weakens the propeller fundamentals, under broadband wind and road noise; Duke Farms has a wind-saturated microphone. No wrong answer from a committed build was graded above low |
 | What is not validated? | Any site other than the reference one; low-traffic or rural sites (all four tried failed); CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
 | Which code produced these results? | The reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
@@ -576,8 +576,14 @@ usually spans two UTC days. Worst-case search memory is set by the hypothesis bu
 
 ## Testing
 
+The clock-window and deferred-measurement changes add focused regressions. Eight tests of the exact clock
+helpers and time module passed in an isolated Rust build. The new fitting equivalence tests, full workspace
+checks and `fdop selftest` could not run in that session: dependency builds were killed at the shared host's
+memory limit, then the execution environment became unavailable. The historical real-recording results above
+have not been rerun on these changes.
+
 ```bash
-cargo test --workspace --locked                               # 81 unit tests, no network
+cargo test --workspace --locked                               # 83 unit tests, no network
 cargo run --release -- selftest                               # end-to-end known answer, needs ffmpeg
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings  # warnings are errors
@@ -698,7 +704,9 @@ audio or video recorded somewhere sensitive:
   measured) was tried on a 3 h osprey-cam recording. Its answer went from wrong and **low** to wrong and
   **medium**, 103 km off, and rested on two weak events that the old cap never measured. The medium grade does
   not yet allow for how many events were searched, so the caps stay until it does.
-- Measurement is slow on long traces: 205 s of a 509 s run on a 3 h recording.
+- Measurement took 205 s of a 509 s run on a 3 h recording. Full uncertainty profiles and manoeuvre
+  diagnostics now run once for the final accepted trace, instead of in every ridge-refinement round. The
+  point fits and final diagnostics are retained; the wall-clock improvement has not yet been measured.
 - `--near <state>` searches the state's bounding box, which takes in parts of neighbouring states, so a wrong
   (low) answer can land outside the state (Connecticut for a New York search). The report warns when the
   answer's reverse geocode is in another state.

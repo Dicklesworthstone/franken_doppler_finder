@@ -348,6 +348,38 @@ pub enum Side {
     Recede,
 }
 
+/// A point fit and the trace it was fitted to. Iterative ridge refinement only needs `best`;
+/// the expensive profiles and side fits are deferred until the last accepted trace is known.
+pub(crate) struct PreparedFit {
+    t: Vec<f64>,
+    f: Vec<f64>,
+    c: f64,
+    p_best: [f64; 4],
+    inl: Vec<bool>,
+    cmin: f64,
+    res_i: Vec<f64>,
+    t_i: Vec<f64>,
+    f_i: Vec<f64>,
+    side_check: bool,
+}
+
+impl PreparedFit {
+    pub(crate) fn best(&self) -> Best {
+        Best {
+            f0: self.p_best[0],
+            v: self.p_best[1],
+            d: self.p_best[2],
+            t0e: self.p_best[3],
+            t0r: self.p_best[3] + self.p_best[2] / self.c,
+            rmse: (self.cmin / self.t_i.len() as f64).sqrt(),
+        }
+    }
+
+    pub(crate) fn complete(self) -> FitResult {
+        finish_fit(self)
+    }
+}
+
 /// Fit a constant-velocity pass to trace points (t in recording seconds, f in Hz).
 pub fn fit_constant_velocity(
     t: &[f64],
@@ -355,6 +387,15 @@ pub fn fit_constant_velocity(
     c: f64,
     side: Side,
 ) -> Result<FitResult, String> {
+    prepare_constant_velocity(t, f, c, side).map(PreparedFit::complete)
+}
+
+pub(crate) fn prepare_constant_velocity(
+    t: &[f64],
+    f: &[f64],
+    c: f64,
+    side: Side,
+) -> Result<PreparedFit, String> {
     if t.len() < 12 || t.len() != f.len() {
         return Err(format!("need >= 12 trace points to fit (got {})", t.len()));
     }
@@ -386,22 +427,20 @@ pub fn fit_constant_velocity(
             (a, b, vec![pj])
         }
     };
-    fit_inner(&tt, &ff, c, &anchors, side == Side::Both)
+    prepare_fit(tt, ff, c, &anchors, side == Side::Both)
 }
 
-fn fit_inner(
-    t: &[f64],
-    f: &[f64],
+fn prepare_fit(
+    t: Vec<f64>,
+    f: Vec<f64>,
     c: f64,
     anchors: &[[f64; 4]],
     side_check: bool,
-) -> Result<FitResult, String> {
-    const CORR_S: f64 = 6.0;
-    const ASYM_FLOOR_HZ: f64 = 0.25;
-    let (p_best, inl, cmin, res_i) = robust_point_fit(t, f, c, anchors);
+) -> Result<PreparedFit, String> {
+    let (p_best, inl, cmin, res_i) = robust_point_fit(&t, &f, c, anchors);
     let (t_i, f_i): (Vec<f64>, Vec<f64>) = t
         .iter()
-        .zip(f)
+        .zip(&f)
         .zip(&inl)
         .filter(|(_, k)| **k)
         .map(|((a, b), _)| (*a, *b))
@@ -410,6 +449,36 @@ fn fit_inner(
     if n < 8 {
         return Err("too few inliers after outlier trim".into());
     }
+    Ok(PreparedFit {
+        t,
+        f,
+        c,
+        p_best,
+        inl,
+        cmin,
+        res_i,
+        t_i,
+        f_i,
+        side_check,
+    })
+}
+
+fn finish_fit(prepared: PreparedFit) -> FitResult {
+    const CORR_S: f64 = 6.0;
+    const ASYM_FLOOR_HZ: f64 = 0.25;
+    let PreparedFit {
+        t,
+        f,
+        c,
+        p_best,
+        inl,
+        cmin,
+        res_i,
+        t_i,
+        f_i,
+        side_check,
+    } = prepared;
+    let n = t_i.len();
     let (tmin, tmax) = t_i
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |a, &v| {
@@ -508,7 +577,7 @@ fn fit_inner(
     let t0r = p_best[3] + p_best[2] / c;
     let res_all: Vec<f64> = t
         .iter()
-        .zip(f)
+        .zip(&f)
         .map(|(&tt, &ff)| cv_curve(tt, p_best[0], p_best[1], p_best[2], p_best[3], c) - ff)
         .collect();
     let rms = |sel: &dyn Fn(f64) -> bool| -> f64 {
@@ -639,7 +708,7 @@ fn fit_inner(
         t0r: pad(ranges.t0r, t0r, None, 3.0),
     };
     let ro = readouts(p_best[0], p_best[1], p_best[2], c);
-    Ok(FitResult {
+    FitResult {
         best: Best {
             f0: p_best[0],
             v: p_best[1],
@@ -672,7 +741,7 @@ fn fit_inner(
             c,
         },
         warnings,
-    })
+    }
 }
 
 fn corrcoef(a: &[f64], b: &[f64]) -> f64 {
@@ -690,6 +759,37 @@ fn corrcoef(a: &[f64], b: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_fit_keeps_its_trace_and_matches_eager_diagnostics() {
+        let c = 343.0;
+        let mut t: Vec<f64> = (0..240).map(|i| 900.0 + i as f64).collect();
+        let mut f: Vec<f64> = t
+            .iter()
+            .enumerate()
+            .map(|(i, &tt)| {
+                cv_curve(tt, 112.7, 140.0, 6100.0, 1000.0, c)
+                    + 0.12 * (i as f64 * 1.731).sin()
+                    + if i % 37 == 0 { 8.0 } else { 0.0 }
+            })
+            .collect();
+        let eager = fit_constant_velocity(&t, &f, c, Side::Both).unwrap();
+        let prepared = prepare_constant_velocity(&t, &f, c, Side::Both).unwrap();
+        assert_eq!(
+            serde_json::to_value(prepared.best()).unwrap(),
+            serde_json::to_value(eager.best).unwrap()
+        );
+        // A later refinement owns a different trace. Deferred diagnostics must use the
+        // retained point fit's original samples, including its original outlier mask.
+        t.clear();
+        f.clear();
+        let deferred = prepared.complete();
+        assert!(deferred.diagnostics.n_inliers < deferred.diagnostics.n);
+        assert_eq!(
+            serde_json::to_value(deferred).unwrap(),
+            serde_json::to_value(eager).unwrap()
+        );
+    }
 
     #[test]
     fn recovers_synthetic_pass() {

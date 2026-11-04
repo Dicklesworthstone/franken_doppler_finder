@@ -44,6 +44,13 @@ at that commit, not per-change commits.
 
 ### Changes
 
+- Measurement now computes profile-likelihood ranges and manoeuvre diagnostics only once, for its final
+  accepted ridge trace. All refinement rounds keep the same robust point fits and model/band updates; the
+  public fitting API still returns complete diagnostics. A failed later round retains the last successful
+  trace with its own fit. Two synthetic regressions compare exact point estimates, trace arrays and all
+  serialized fit fields against eager refinement. The diagnostic arithmetic is unchanged. Formatting and
+  source review passed, but Cargo execution was blocked by dependency OOM failures and environment loss;
+  these new tests and real-recording timings remain unverified.
 - An explicit `locate --start` now limits archive-availability checks, weather retrieval and ADS-B downloads
   as well as the search. A broader `--dates` range no longer requires unrelated UTC-day archives, so a known
   recording clock can run with only its required days cached. Track padding and recordings crossing UTC
