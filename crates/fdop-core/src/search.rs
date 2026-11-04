@@ -654,16 +654,24 @@ struct RatioGrid {
     r: Vec<f64>,
 }
 
+/// Newton stops once a step is shorter than this (s). Wind keeps the steps from converging
+/// quadratically, but in a 20 m/s wind each still shrinks the error about 50 times, so the
+/// emission time is then good to a few microseconds. Grids take most of a search's time. Against
+/// 1e-7 s on a real recording's fine stage, chi moved by under 1e-4 in 803 of 806 cells and by at
+/// most 0.024, and no cell's best point changed.
+const RATIO_GRID_TOL_S: f64 = 1e-4;
+
 impl RatioGrid {
     #[allow(clippy::too_many_arguments)]
     fn build(tr: &TrackModel, x: V3, m: &Prop, lo: f64, hi: f64, dt: f64, max_gap: f64) -> Self {
         let n = (((hi - lo) / dt).ceil() as usize + 1).max(2);
         let mut r = Vec::with_capacity(n);
         let mut warm: Option<f64> = None;
+        let mut hint = 0;
         for k in 0..n {
             let tu = lo + k as f64 * dt;
-            match tr.solve_emission_p(tu, x, m, warm) {
-                Some((te, _, ratio)) if tr.gap_at(te) <= max_gap => {
+            match tr.solve_emission_sweep(tu, x, m, warm, &mut hint, RATIO_GRID_TOL_S) {
+                Some((te, _, ratio)) if tr.gap_of(hint) <= max_gap => {
                     warm = Some(te);
                     r.push(ratio);
                 }
@@ -2905,6 +2913,56 @@ mod tests {
             d.len(),
             2,
             "same place, clock and match set collapse regardless of order"
+        );
+    }
+
+    #[test]
+    fn a_ratio_grid_matches_independent_solves_and_skips_sample_gaps() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let mut tr = straight_track(
+            &enu,
+            [0.0, 3000.0, 1200.0],
+            [130.0, 0.0, 0.0],
+            1000.0,
+            600.0,
+            1400.0,
+            20.0,
+        );
+        // a 120 s hole in the samples, over the 60 s allowed below
+        let keep: Vec<usize> = (0..tr.t.len())
+            .filter(|&k| !(tr.t[k] > 900.0 && tr.t[k] < 1020.0))
+            .collect();
+        tr.pos = keep.iter().map(|&k| tr.pos[k]).collect();
+        tr.vel = keep.iter().map(|&k| tr.vel[k]).collect();
+        tr.t = keep.iter().map(|&k| tr.t[k]).collect();
+        let x = enu.to_ecef([0.0, 0.0, 0.0]);
+        let m = Prop {
+            c: 343.0,
+            w: enu.vec_to_ecef([20.0, -15.0, 0.0]),
+        };
+        let (lo, dt) = (500.0, 0.2);
+        let g = RatioGrid::build(&tr, x, &m, lo, 1500.0, dt, 60.0);
+        let (mut solved, mut refused) = (0, 0);
+        for (k, &ratio) in g.r.iter().enumerate() {
+            let tu = lo + k as f64 * dt;
+            let cold = tr
+                .solve_emission_p(tu, x, &m, None)
+                .filter(|c| tr.gap_at(c.0) <= 60.0);
+            match cold {
+                Some(c) => {
+                    assert!((ratio - c.2).abs() < 1e-5, "t={tu}: {ratio} vs {}", c.2);
+                    solved += 1;
+                }
+                None => {
+                    assert!(ratio.is_nan(), "t={tu}: {ratio}");
+                    refused += 1;
+                }
+            }
+        }
+        // the hole and both ends of the track
+        assert!(
+            solved > 2000 && refused > 1000,
+            "{solved} solved, {refused} refused"
         );
     }
 

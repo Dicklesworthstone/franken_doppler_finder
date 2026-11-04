@@ -293,11 +293,28 @@ impl TrackModel {
         k.clamp(1, n - 1) - 1
     }
 
+    /// `seg(t)` for a time usually in interval `hint` or the next one, as along a time sweep.
+    #[inline]
+    fn seg_near(&self, t: f64, hint: usize) -> usize {
+        let n = self.t.len();
+        for i in [hint, hint + 1] {
+            if i + 1 < n && self.t[i] <= t && (t < self.t[i + 1] || i + 2 == n) {
+                return i;
+            }
+        }
+        self.seg(t)
+    }
+
     /// Position and velocity (ECEF) at time t (clamped to the track span).
     #[inline]
     pub fn pv(&self, t: f64) -> (V3, V3) {
         let t = t.clamp(self.t0(), self.t1());
-        let i = self.seg(t);
+        self.pv_in(self.seg(t), t)
+    }
+
+    /// `pv` at a time already within the track span, in its interval `i`.
+    #[inline]
+    fn pv_in(&self, i: usize, t: f64) -> (V3, V3) {
         let (ta, tb) = (self.t[i], self.t[i + 1]);
         let h = tb - ta;
         let s = (t - ta) / h;
@@ -329,7 +346,12 @@ impl TrackModel {
         if t < self.t0() || t > self.t1() {
             return f64::INFINITY;
         }
-        let i = self.seg(t);
+        self.gap_of(self.seg(t))
+    }
+
+    /// Length (s) of sample interval `i`.
+    #[inline]
+    pub fn gap_of(&self, i: usize) -> f64 {
         self.t[i + 1] - self.t[i]
     }
 
@@ -389,28 +411,48 @@ impl TrackModel {
         m: &Prop,
         warm: Option<f64>,
     ) -> Option<(f64, f64, f64)> {
+        self.solve_emission_sweep(t_r, x, m, warm, &mut 0, 1e-7)
+    }
+
+    /// `solve_emission_p` for a sweep of reception times: `hint` carries the sample interval from
+    /// one solve to the next and ends in the interval of a returned t_e, and Newton stops once a
+    /// step is shorter than `tol` (s).
+    #[inline]
+    pub fn solve_emission_sweep(
+        &self,
+        t_r: f64,
+        x: V3,
+        m: &Prop,
+        warm: Option<f64>,
+        hint: &mut usize,
+        tol: f64,
+    ) -> Option<(f64, f64, f64)> {
         let (t0, t1) = (self.t0(), self.t1());
         let mut te = match warm {
             Some(w) => w.clamp(t0, t1),
             None => {
-                let p = self.pos_at(t_r.clamp(t0, t1));
+                let t = t_r.clamp(t0, t1);
+                *hint = self.seg_near(t, *hint);
+                let (p, _) = self.pv_in(*hint, t);
                 (t_r - norm(sub(p, x)) / m.c).clamp(t0, t1)
             }
         };
         for _ in 0..30 {
-            let (p, v) = self.pv(te);
+            *hint = self.seg_near(te, *hint);
+            let (p, v) = self.pv_in(*hint, te);
             let rv = sub(p, x);
             let r = norm(rv);
             let vr = dot(rv, v) / r;
             let g = te + m.travel(rv, r) - t_r;
             let te_new = (te - g / (1.0 + vr / m.c)).clamp(t0, t1);
-            let done = (te_new - te).abs() < 1e-7;
+            let done = (te_new - te).abs() < tol;
             te = te_new;
             if done {
                 break;
             }
         }
-        let (p, v) = self.pv(te);
+        *hint = self.seg_near(te, *hint);
+        let (p, v) = self.pv_in(*hint, te);
         let rv = sub(p, x);
         let r = norm(rv);
         let g = te + m.travel(rv, r) - t_r;
@@ -752,6 +794,89 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].t.len(), times.len());
         assert_eq!(models[0].reported_vel_frac, 1.0);
+    }
+
+    #[test]
+    fn seg_near_agrees_with_seg_from_any_hint() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let mut tr = straight_track(
+            &enu,
+            [0.0, 3000.0, 1200.0],
+            [100.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            50.0,
+            10.0,
+        );
+        tr.t = vec![0.0, 1.0, 2.5, 7.0, 7.5, 30.0];
+        let knots = tr.t.clone();
+        let mut times = vec![-1.0, f64::NAN, 31.0];
+        times.extend(&knots);
+        times.extend(knots.windows(2).map(|w| 0.5 * (w[0] + w[1])));
+        for &t in &times {
+            for hint in 0..knots.len() + 2 {
+                assert_eq!(tr.seg_near(t, hint), tr.seg(t), "t={t} hint={hint}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_emission_sweep_matches_independent_solves() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let omega = 3.0_f64.to_radians();
+        let times: Vec<f64> = (0..=40).map(|k| k as f64 * 3.0).collect();
+        let models = build(&turning_leg(&enu, &times, omega), &BuildParams::default());
+        assert_eq!(models.len(), 1);
+        let tr = &models[0];
+        // close under the turn, in a crosswind, so the Newton steps converge at their slowest
+        let x = enu.to_ecef([0.0, 0.0, 0.0]);
+        let m = Prop {
+            c: 343.0,
+            w: enu.vec_to_ecef([20.0, -15.0, 0.0]),
+        };
+        let (mut hint, mut warm) = (0, None);
+        let (mut solved, mut refused) = (0, 0);
+        for k in 0..1000 {
+            let t_r = tr.t0() - 20.0 + k as f64 * 0.2;
+            let swept = tr.solve_emission_sweep(t_r, x, &m, warm, &mut hint, 1e-4);
+            let cold = tr.solve_emission_p(t_r, x, &m, None);
+            assert_eq!(swept.is_some(), cold.is_some(), "t_r={t_r}");
+            warm = swept.map(|s| s.0);
+            if let (Some(s), Some(c)) = (swept, cold) {
+                assert!(
+                    (s.0 - c.0).abs() < 1e-5,
+                    "t_r={t_r}: t_e {} vs {}",
+                    s.0,
+                    c.0
+                );
+                assert!(
+                    (s.2 - c.2).abs() < 1e-5,
+                    "t_r={t_r}: ratio {} vs {}",
+                    s.2,
+                    c.2
+                );
+                assert_eq!(hint, tr.seg(s.0), "t_r={t_r}");
+                assert_eq!(tr.gap_of(hint), tr.gap_at(s.0), "t_r={t_r}");
+                solved += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        assert!(
+            solved > 500 && refused > 50,
+            "{solved} solved, {refused} refused"
+        );
+        // a solve that `tol` stops right after crossing a knot still ends in the new interval
+        let still = Prop::still(343.0);
+        let k = tr.t.len() / 2;
+        let rv = sub(tr.pos_at(tr.t[k] + 0.05), x);
+        let t_r = tr.t[k] + 0.05 + still.travel(rv, norm(rv));
+        let mut hint = k - 1;
+        let s = tr
+            .solve_emission_sweep(t_r, x, &still, Some(tr.t[k] - 0.05), &mut hint, 1.0)
+            .unwrap();
+        assert!(s.0 > tr.t[k], "{} vs {}", s.0, tr.t[k]);
+        assert_eq!(hint, k);
     }
 
     #[test]
