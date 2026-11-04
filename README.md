@@ -663,6 +663,9 @@ a second replay running and so not a clean timing, a 3 h osprey-cam recording se
 Detector scoring now reuses one row of scratch per worker instead of full temporary spectrograms for every
 template. Scalar-oracle and before/after synthetic comparisons preserve the scores and detections. The real
 recording timings above predate this optimization; they have not been remeasured.
+Search clock scans also reuse trace-fit and result buffers, preserving the original clock grid and all
+candidate comparisons. Before/after synthetic comparisons check complete point scores and chosen clocks
+bit-for-bit; the size of the end-to-end speedup has not yet been measured on a real recording.
 
 Weather retrieval overlaps audio analysis. After audio analysis, the pipeline waits up to 190 s for weather:
 the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. This retains

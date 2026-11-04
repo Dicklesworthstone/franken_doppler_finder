@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Reuse trace-fit buffers throughout the search
+
+- Clock scans reuse model-ratio, robust-deviation and tone-change prefix buffers instead of
+  allocating them for every trial. The per-clock match-results vector is reused too. This applies
+  to fine/quick point scoring, null calibration, confirming flights and independent clock checks.
+  The ratio callback can be inlined. Search coverage, clock/spatial grids, arithmetic order,
+  tone-change candidates, thresholds and budgets are unchanged.
+- `reused_trace_scratch_preserves_fit_results` checks all fit fields bit-for-bit against outputs
+  recorded from the allocating Rust implementation at `695f952`, repeatedly alternating long and
+  short traces, clean/outlier-contaminated tones, tone changes, missing coverage and early returns.
+  An external comparison of the actual old/new functions also passed 2,178 trace/clock cases.
+  The complete point evaluation agrees bit-for-bit at 75 synthetic observer points covering clean,
+  changing-tone and quick pairs, with the same unchanged track implementation on both sides.
+  These are synthetic equivalence checks, not real-recording performance measurements.
+
 ### Detector scoring with bounded per-worker scratch
 
 - The matched-filter bank now scores independent frequency rows with reusable row buffers. It

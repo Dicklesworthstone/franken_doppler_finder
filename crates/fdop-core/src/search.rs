@@ -659,11 +659,11 @@ struct RatioGrid {
     r: Vec<f64>,
 }
 
-/// Newton stops once a step is shorter than this (s). Wind keeps the steps from converging
-/// quadratically, but in a 20 m/s wind each still shrinks the error about 50 times, so the
-/// emission time is then good to a few microseconds. Grids take most of a search's time. Against
-/// 1e-7 s on a real recording's fine stage, chi moved by under 1e-4 in 803 of 806 cells and by at
-/// most 0.024, and no cell's best point changed.
+/// Newton stops once a step is shorter than this (s); each solve also checks its final
+/// reception-time residual. Grids take most of a search's time. In the original tolerance
+/// benchmark, before the exact wind derivative, this versus 1e-7 s on a real recording's fine
+/// stage moved chi by under 1e-4 in 803 of 806 cells and by at most 0.024, with no cell's best
+/// point changed.
 const RATIO_GRID_TOL_S: f64 = 1e-4;
 
 impl RatioGrid {
@@ -719,21 +719,38 @@ struct TraceFit {
     brk: Option<(f64, f64)>,
 }
 
+/// Reused across a clock scan (and its events), including shorter traces after longer ones.
+/// A fine cell evaluates hundreds of clocks at each observer; allocating these buffers for
+/// every trace fit otherwise dominates allocation traffic without changing the model.
+#[derive(Default)]
+struct TraceScratch {
+    ratios: Vec<f64>,
+    deviations: Vec<f64>,
+    prefix: [Vec<f64>; 3],
+}
+
 /// Fit of one event's trace against a model ratio curve at clock t_s. The tone is fitted in
 /// closed form; misfit events may also change tone once (searched over every split).
 #[allow(clippy::too_many_arguments)]
 fn trace_chi(
     tt: &[f64],
     ff: &[f64],
-    ratio: &dyn Fn(f64) -> f64,
+    ratio: &impl Fn(f64) -> f64,
     t_s: f64,
     ev: &SearchEvent,
     sigma: f64,
     cap_sigma: f64,
     robust: bool,
+    scratch: &mut TraceScratch,
 ) -> TraceFit {
     let n = tt.len();
-    let mut rr = Vec::with_capacity(n);
+    let TraceScratch {
+        ratios: rr,
+        deviations: ad,
+        prefix,
+    } = scratch;
+    rr.clear();
+    rr.reserve(n);
     let (mut sfr, mut srr) = (0.0, 0.0);
     for k in 0..n {
         let r = ratio(t_s + tt[k]);
@@ -743,6 +760,7 @@ fn trace_chi(
             srr += r * r;
         }
     }
+    let rr = rr.as_slice();
     let cov = rr.iter().filter(|r| r.is_finite()).count();
     if cov < 5 || srr <= 0.0 {
         return TraceFit {
@@ -757,11 +775,13 @@ fn trace_chi(
     let mut f0 = clamp_f0(sfr / srr);
     let mut lim = f64::INFINITY;
     if robust {
-        let mut ad: Vec<f64> = (0..n)
-            .filter(|&k| rr[k].is_finite())
-            .map(|k| (ff[k] - f0 * rr[k]).abs())
-            .collect();
-        let mad = 1.4826 * crate::spectro::median_f64(&mut ad);
+        ad.clear();
+        ad.extend(
+            (0..n)
+                .filter(|&k| rr[k].is_finite())
+                .map(|k| (ff[k] - f0 * rr[k]).abs()),
+        );
+        let mad = 1.4826 * crate::spectro::median_f64(ad);
         lim = (4.0 * mad).max(3.0 * sigma);
         let (mut a, mut b) = (0.0, 0.0);
         for k in 0..n {
@@ -805,7 +825,11 @@ fn trace_chi(
     };
     if robust && ev.misfit && n >= 40 {
         // prefix sums over inliers of the single-tone fit; split with the least squared error
-        let (mut pa, mut pb, mut pc) = (vec![0.0; n + 1], vec![0.0; n + 1], vec![0.0; n + 1]);
+        for sums in prefix.iter_mut() {
+            sums.resize(n + 1, 0.0);
+            sums[0] = 0.0;
+        }
+        let [pa, pb, pc] = prefix;
         for k in 0..n {
             let ok = rr[k].is_finite() && (ff[k] - f0 * rr[k]).abs() <= lim.max(0.15 * ev.f0);
             let (fr, r2, f2) = if ok {
@@ -1060,9 +1084,11 @@ fn eval_point(
             )
         })
         .collect();
-    let cost = |t_s: f64| -> (f64, Vec<TraceFit>) {
+    let mut scratch = TraceScratch::default();
+    let mut chis = Vec::with_capacity(assign.len());
+    let mut cost = |t_s: f64| -> f64 {
         let mut tot = 0.0;
-        let mut v = Vec::with_capacity(assign.len());
+        chis.clear();
         for (k, &(ei, _, _)) in assign.iter().enumerate() {
             let ev = &evs[ei];
             let g = &grids[k];
@@ -1076,6 +1102,7 @@ fn eval_point(
                     ev.sigma_hz.max(0.6),
                     p.cap_sigma,
                     false,
+                    &mut scratch,
                 )
             } else {
                 trace_chi(
@@ -1087,19 +1114,20 @@ fn eval_point(
                     ev.sigma_hz,
                     p.cap_sigma,
                     true,
+                    &mut scratch,
                 )
             };
             tot += ev.n_eff * r.chi;
-            v.push(r);
+            chis.push(r);
         }
-        (tot, v)
+        tot
     };
     let step = if quick { 1.0 } else { 0.25 };
     let n = (((hi - lo) / step).ceil() as usize).clamp(1, 400);
     let (mut bt, mut bc) = (lo, f64::INFINITY);
     for k in 0..=n {
         let ts = lo + (hi - lo) * k as f64 / n as f64;
-        let c0 = cost(ts).0;
+        let c0 = cost(ts);
         if c0 < bc {
             bc = c0;
             bt = ts;
@@ -1112,28 +1140,28 @@ fn eval_point(
         let (mut a, mut b) = ((bt - step).max(lo), (bt + step).min(hi));
         let gr = 0.618_033_988_749_895;
         let (mut c1, mut c2) = (b - gr * (b - a), a + gr * (b - a));
-        let (mut f1, mut f2) = (cost(c1).0, cost(c2).0);
+        let (mut f1, mut f2) = (cost(c1), cost(c2));
         while b - a > 0.01 {
             if f1 < f2 {
                 b = c2;
                 c2 = c1;
                 f2 = f1;
                 c1 = b - gr * (b - a);
-                f1 = cost(c1).0;
+                f1 = cost(c1);
             } else {
                 a = c1;
                 c1 = c2;
                 f1 = f2;
                 c2 = a + gr * (b - a);
-                f2 = cost(c2).0;
+                f2 = cost(c2);
             }
         }
         let tm = 0.5 * (a + b);
-        if cost(tm).0 < bc {
+        if cost(tm) < bc {
             bt = tm;
         }
     }
-    let (total, chis) = cost(bt);
+    let total = cost(bt);
     Some(PointEval {
         t_s: bt,
         chis,
@@ -1298,6 +1326,7 @@ fn calibrate(
             let enu = Enu::new(la0, lo0, 0.0);
             let tr = &tracks[h.trk as usize];
             let mut best = f64::INFINITY;
+            let mut scratch = TraceScratch::default();
             for (de, dn) in [
                 (0.0, 0.0),
                 (off, 0.0),
@@ -1339,6 +1368,7 @@ fn calibrate(
                         ev.sigma_hz,
                         p.cap_sigma,
                         true,
+                        &mut scratch,
                     );
                     if r.cov >= 0.6 {
                         best = best.min(r.chi);
@@ -1428,6 +1458,7 @@ fn best_confirmer(
     let c = p.c;
     let t_heard = t_start + ev.t_rec;
     let mut best: Option<(f64, EventMatch, u32)> = None;
+    let mut scratch = TraceScratch::default();
     for ti in tix.overlapping(t_heard - 1.2 * ev.d_gate[1] / c - 120.0, t_heard + 30.0) {
         let tr = &tracks[ti as usize];
         if p.tonal_only && !tr.engine.tonal() {
@@ -1476,6 +1507,7 @@ fn best_confirmer(
             ev.sigma_hz,
             p.cap_sigma,
             true,
+            &mut scratch,
         );
         if chi.chi <= p.kappa && chi.cov >= 0.6 && best.as_ref().is_none_or(|b| chi.chi < b.0) {
             best = Some((
@@ -2171,6 +2203,7 @@ fn free_clocks(
                 p.max_gap_s,
             );
             let (mut bt, mut bc) = (cand.t_start_utc, f64::INFINITY);
+            let mut scratch = TraceScratch::default();
             let mut ts = lo;
             while ts <= hi {
                 let r = trace_chi(
@@ -2182,6 +2215,7 @@ fn free_clocks(
                     ev.sigma_hz,
                     p.cap_sigma,
                     true,
+                    &mut scratch,
                 );
                 if r.chi < bc {
                     bc = r.chi;
@@ -2566,6 +2600,154 @@ mod tests {
     }
 
     #[test]
+    fn reused_trace_scratch_preserves_fit_results() {
+        // Recorded from the allocating implementation at 695f952. Binary-fraction inputs
+        // avoid platform-dependent transcendental functions in this arithmetic oracle.
+        let cases = [
+            (
+                "clean",
+                360,
+                [
+                    0.10415637981994283,
+                    128.0156251142463,
+                    0.04034158443450885,
+                    1.0,
+                ],
+                None,
+            ),
+            (
+                "short",
+                17,
+                [
+                    0.10152418931537552,
+                    131.01875324932504,
+                    0.03982857589787441,
+                    1.0,
+                ],
+                None,
+            ),
+            (
+                "step",
+                480,
+                [
+                    0.10485764832078733,
+                    120.01460581627941,
+                    0.04047716337655471,
+                    1.0,
+                ],
+                Some((0.0_f64, 136.01688873192379_f64)),
+            ),
+            (
+                "partial",
+                96,
+                [
+                    11.512689447271427,
+                    128.01776667806186,
+                    0.03959753559424399,
+                    0.5416666666666666,
+                ],
+                None,
+            ),
+            (
+                "step",
+                96,
+                [
+                    0.10508603972990578,
+                    120.01553737892266,
+                    0.040521221239984584,
+                    1.0,
+                ],
+                Some((0.0, 136.0176750511019)),
+            ),
+            (
+                "missing",
+                80,
+                [f64::INFINITY, f64::NAN, f64::NAN, 0.0],
+                None,
+            ),
+            (
+                "outliers",
+                360,
+                [
+                    1.6253969814093876,
+                    128.01609489540493,
+                    2.964880445234016,
+                    1.0,
+                ],
+                None,
+            ),
+            (
+                "quick",
+                40,
+                [25.0, 128.91811991098655, 3.1468784234305947, 1.0],
+                None,
+            ),
+            ("missing", 0, [f64::INFINITY, f64::NAN, f64::NAN, 0.0], None),
+            ("clean", 3, [f64::INFINITY, f64::NAN, f64::NAN, 1.0], None),
+        ];
+        let mut scratch = TraceScratch::default();
+        // Repeat through the same scratch to exercise growing and shrinking both traces and
+        // change-point prefixes, interspersed with early returns and non-robust quick fits.
+        for _ in 0..2 {
+            for (kind, n, expected, expected_break) in cases {
+                let tt: Vec<f64> = (0..n).map(|k| (k as f64 - n as f64 / 2.0) / 4.0).collect();
+                let ff: Vec<f64> = tt
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &t)| {
+                        let tone = match kind {
+                            "step" if t < 0.0 => 120.0,
+                            "step" => 136.0,
+                            "short" => 131.0,
+                            _ => 128.0,
+                        };
+                        let noise = ((k * 17 % 9) as f64 - 4.0) / 64.0;
+                        let outlier = if matches!(kind, "outliers" | "quick") && k % 17 == 0 {
+                            12.0
+                        } else {
+                            0.0
+                        };
+                        tone * (1.0 - t / 1024.0) + noise + outlier
+                    })
+                    .collect();
+                let ratio = |t: f64| {
+                    if kind == "missing" || (kind == "partial" && !(-5.0..=8.0).contains(&t)) {
+                        f64::NAN
+                    } else {
+                        1.0 - t / 1024.0
+                    }
+                };
+                let fit = trace_chi(
+                    &tt,
+                    &ff,
+                    &ratio,
+                    0.125,
+                    &plain_event(128.0, matches!(kind, "step" | "short")),
+                    0.125,
+                    5.0,
+                    kind != "quick",
+                    &mut scratch,
+                );
+                for (got, want) in [fit.chi, fit.f0, fit.rms, fit.cov]
+                    .into_iter()
+                    .zip(expected)
+                {
+                    if want.is_nan() {
+                        assert!(got.is_nan(), "{kind}, {n}: {fit:?}");
+                    } else {
+                        assert_eq!(got.to_bits(), want.to_bits(), "{kind}, {n}: {fit:?}");
+                    }
+                }
+                assert_eq!(
+                    fit.brk.map(|(a, b)| (a.to_bits(), b.to_bits())),
+                    expected_break.map(|(a, b)| (a.to_bits(), b.to_bits())),
+                    "{kind}, {n}: {fit:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn misfit_events_may_change_tone_once() {
         // tone 121 Hz before t = 10 s, 131 Hz after (a prop RPM change), on a Doppler-like ratio
         let ratio = |t: f64| 1.0 + 0.05 * (-t / 20.0).tanh();
@@ -2574,6 +2756,7 @@ mod tests {
             .iter()
             .map(|&t| if t < 10.0 { 121.0 } else { 131.0 } * ratio(t) + 0.03 * ((t * 7.0).sin()))
             .collect();
+        let mut scratch = TraceScratch::default();
         let single = trace_chi(
             &tt,
             &ff,
@@ -2583,6 +2766,7 @@ mod tests {
             0.12,
             5.0,
             true,
+            &mut scratch,
         );
         let split = trace_chi(
             &tt,
@@ -2593,6 +2777,7 @@ mod tests {
             0.12,
             5.0,
             true,
+            &mut scratch,
         );
         assert!(
             single.chi > 10.0 && single.brk.is_none(),
@@ -2617,6 +2802,7 @@ mod tests {
             0.12,
             5.0,
             true,
+            &mut scratch,
         );
         assert!(one.chi < 1e-6, "{one:?}");
     }
