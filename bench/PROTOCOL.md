@@ -425,3 +425,39 @@ Nothing below changes a pinned result.
 - **Later builds.** Set E's results on this build are read once its R2 runs on set E are all done. A later build is
   tested on set E only if its own addendum, naming its commit, is committed before then. Each such build runs as its
   own tool and is reported. None replaces another's row, and the claim is not moved to whichever build did best.
+
+## Addendum 8, 2026-11-05, a second later `fdop` build, before any later build's set E result is read
+
+`6914ab7` is `9087ec4` plus documents and one commit to the curve match alone: `refine_point` scans the 1 km disc each
+start stands for on a 100 m grid, then climbs at each scale until it stops improving, instead of one 5x5 move per scale.
+The decoy windows run the same code. No trace-search, grading or gate code changed. It runs as its own tool,
+`fdop-6914ab7`, beside the pinned `7e66501` and `fdop-9087ec4`, under every rule of Addendum 7: same runs, inputs,
+scoring and machine. Neither earlier build's row changes.
+
+- **When.** Committed before any set E result of `9087ec4` or of this build was read. `9087ec4`'s R2 runs on set E's
+  five replacements had finished, unread, and its R3 run on the first of them had started; its R2 runs on the three
+  original set E cases had not started.
+- **This delays Addendum 7's read.** Addendum 7 reads `9087ec4`'s set E rows once its set E R2 runs are done. They are
+  now read once both builds' set E R2 runs are done, so that neither build's addendum is written knowing the other's set
+  E result.
+- **What is a test of it.** As in Addendum 7: set E is, and sets A, B and C are development rows. Its change was made on
+  development recordings with R2 inputs.
+- **Gate before this addendum.** The 15 development rows and the 42 runs with no right answer, R2 inputs, on `069c971`
+  plus this change, on the controlling Mac. Sets A, B and C: 5 correct and 0 wrong (4 and 0 without it). The osprey
+  cam's 11-02 recording goes from low, 14.18 km off, to medium, 0.22 km off, with the curve match standing; the other
+  four right answers keep their grade and place, and Sapsucker Woods is still declined. None of the 42 changed grade,
+  and the curve match stands on none (largest margin -0.18). `cargo fmt`, `clippy`, the workspace tests and
+  `fdop selftest` pass on the committed code. That evaluation binary lacks `9087ec4`'s terrain change, so osprey 11-02 and the
+  null with the largest margin were run again on the committed code, and both matched to the hundredth.
+- **Known before it runs.** The wrong-date medium recorded in Addendum 7 (the osprey cam's 10-31 recording searched on
+  11-01) is unchanged: still medium from the trace search, and the curve match does not stand there (-5.65). Falsifier 2
+  therefore fires for this build's development claim as well, and set E is its only test.
+- **Both builds are reported.** Each build's row stands as run, and neither is chosen after the fact.
+
+### Reruns so far (continued)
+
+- `fdop-9087ec4`, R2, `c_ref_0909` (a development row): the process got SIGTERM (exit 143) at 05:17:39Z, 224 s in,
+  during the curve match, and wrote no `result.json`. Two other agents with processes on that machine checked their own
+  commands and sent none then, no Claude or Codex session log on the controlling Mac shows a kill in that window, and
+  the sender was not found. The faulted files are kept as `c_ref_0909_fault_term*`, and the case is run once more from
+  the job file's own line (`tools/match/rerun_c_ref_0909_9087ec4.sh`, logged in the run directory's `RERUNS.log`).
