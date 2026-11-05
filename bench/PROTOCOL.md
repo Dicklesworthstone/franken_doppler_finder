@@ -461,3 +461,48 @@ scoring and machine. Neither earlier build's row changes.
   commands and sent none then, no Claude or Codex session log on the controlling Mac shows a kill in that window, and
   the sender was not found. The faulted files are kept as `c_ref_0909_fault_term*`, and the case is run once more from
   the job file's own line (`tools/match/rerun_c_ref_0909_9087ec4.sh`, logged in the run directory's `RERUNS.log`).
+
+## Addendum 9, 2026-11-05, set F: a second sealed set, fixed before any search for it
+
+Set E can test only builds whose addendum came before its read (Addenda 7 and 8). Set F is for builds after that. It is
+larger, because eight cases say little. It is chosen by rule, captured and sealed before any tool runs on it.
+
+- **Search.** YouTube's live filter, in its own order, on: train camera, railroad live, train station live, airport
+  live, airport camera, harbor, marina, pier live, beach live cam, lake live cam, river live cam, bridge live cam.
+  Positions 1-40 of every query are read in query order, then positions 41-120 in the same order. YouTube's order
+  changes by the hour and by account, so each query's full result list (position, video id, channel, title) is saved to
+  a file when it is taken, and the selection follows those files.
+- **Qualifying.** As in Addenda 5 and 6: in the US, at a named public site, new to all three projects, no ban on
+  recording in the stream's own description, no private residences, and no stream whose operator says its sound is a
+  radio or scanner feed. Out, with their operators' other cams: Virtual Railfan, LIVE Trains, Duluth Harbor Cam,
+  RailStream, EarthCam (terms not retrievable), and every operator Addendum 6 screened out for its terms. Every stream
+  already considered for set B or E stays out, whatever its level was then.
+- **Sound.** 60 s of the stream's audio from 2026-11-05T17:00:00Z, fetched by the capture tool, as in Addendum 6. It
+  qualifies if its mean level, ffmpeg's `volumedetect` `mean_volume` over that file, is above -60 dBFS. That number is
+  the only thing taken from the audio: nobody listens to it, no tool runs on it, and no spectrogram, ADS-B or aircraft
+  data is consulted.
+- **Selection.** The first ten to qualify, in search order. They are listed in a later addendum before capture, with
+  their case ids and every stream screened and why it was not taken.
+- **Capture.** Two hours of DVR audio from 2026-11-05T17:00Z by the same tool. The outage rule is unchanged: the audio
+  is cut at the first outage and a case is kept if its clock holds for at least 30 min. A stream whose DVR does not
+  reach 17:00Z, or whose clock holds for less, is listed as not captured, and the next to qualify takes its place. A
+  capture whose whole-file mean and peak are digital silence is void for every tool, as in Addendum 5.
+- **Truth and limits.** As before: an OpenStreetMap feature or the operator's published address, 1 km for a single
+  building, station or marina, 5 km where the operator gives no building. Each is fixed in the listing addendum, before
+  capture.
+- **Inputs.** Made by the rule in the R2 section, so none is drawn by hand. The true clock is the capture's first
+  fragment's First-Frame stamp, as for set E. R2's start is that clock rounded down to the minute, with ±2 min. Its
+  circle has a 25 km radius, and its centre is 10 km from the truth, on the bearing given by the first four bytes of
+  `sha256(case id)` modulo 360. R3 and R1 are made as they were for set E.
+- **Runs.** R2, then R3 and R1 as time allows and in that order, for every tool and variant that ran on set E (`dp`,
+  `dp48`, `dpdem`, `dopplertrack`, pinned `fdop` `7e66501`), once 2026-11-05's ADS-B archive is out. The same goes for
+  each later `fdop` build registered below.
+- **Registration.** `fdop-9087ec4` and `fdop-6914ab7` are registered now. Any other `fdop` build is registered only by
+  an addendum naming its sha, committed before registration closes. Registration closes at 2026-11-06T03:00:00Z, or when
+  the first set F run of any tool starts, whichever is first. No build is added after that.
+- **Sealed.** No set F result of any tool is read, and no set F recording is diagnosed, until every registered build's
+  R2 runs on set F are done. Then all are read at once and reported, losses included.
+- **What it tests, and how it is reported.** The claim stated before Set D, on set F alone, holding against each of
+  `dp`, `dp48` and `dpdem` as Addendum 3 requires, and against `dopplertrack`, for each registered build separately. The
+  report gives the number of `fdop` builds registered and scores every one. The best of them is not presented as
+  `fdop`'s result: each build passes or fails the claim by its own row.
