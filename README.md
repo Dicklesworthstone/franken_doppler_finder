@@ -1175,8 +1175,18 @@ audio or video recorded somewhere sensitive:
   it can lower a right answer's margin. A small margin can also mean other flights at the same place, because a
   shared event matched to another flight counts as a different explanation at any distance: one field run has 0.11
   nats against a rival 140 m away. A wrong answer can pass the core gate, leaving margin alone to keep it low: three
-  runs here (2.89, 2.37 and 0.47 nats). And no rival passes the gate, however small the search: one county search
-  scored 20 fine cells, found no rival, and is low only on its other gates.
+  runs on `7e5cf3e` (2.89, 2.37 and 0.47 nats), and on the current code the 09-07 wrong date (2.95) and the feeder
+  (1.81, `n_ref_on_0907_r5`, `f_feederwatch_r5`). And no rival passes the gate, however small the search: one county search
+  scored 20 fine cells, found no rival, and is low only on its other gates. A large margin means nothing when the core
+  gate fails: the eagle cam's county search has 26.83 nats with 1 core match of 7, and is low (`f_duke_county_r5`).
+- **Trace evidence past what the chance null measures is extrapolated.** Below the null's 5 % quantile `trace_nats`
+  follows a log-normal tail fitted to two quantiles, capped at 25 nats, where an empirical null of n samples supports
+  at most ln(n+1), about 6. On the `*_r5` runs one reference event earns 2.3–8.3 nats past that bound on right and
+  wrong dates alike, and the feeder's rival 10.6. Capping it at ln(n+1) in the stored candidates (arithmetic on
+  `search.json`, not a rerun) keeps the right answers high, their margins 3.7, 0.2 and 0.2 nats lower, and the wrong
+  dates low at 2.0 and 0.2 with new leaders. The feeder's wrong answer rises from 1.81 to 2.2–3.2, depending on how its
+  new rival, 1.1 km away, refines, and the top of that range is medium. The tail is not what separates right from
+  wrong on these rows, and changing it needs replays.
 - **The ridge check rests on limited evidence.** The 15 % line was picked with these recordings in view; synthetic
   tests justify its two sides, and the replays can only show harm. Real ridges steeper than 4 Hz/s exist in the
   recordings, but no event follows one, so that side is synthetic only. A faint steep pass can fall under the line
@@ -1184,8 +1194,9 @@ audio or video recorded somewhere sensitive:
   gentle. At 8 times most are lost, and 3 of 108 synthetic rows with a detection 4–8 times too gentle were accepted
   with a wrong fit (a 120 m/s pass at 1,500 m read 69 m/s at 576 m). Tones spaced under 2 Hz can still pass for a
   ridge, and a tone that keeps falling and jumping back earns each fall, though no real event has read much above a
-  full drop (1.02 of 1). On the reference recording it leaves 4 usable events of 24. One it refuses, at 13 %, was a confirmer in a correct county answer; whether that event was a real pass is
-  not settled.
+  full drop (1.02 of 1). On the reference recording it left 4 usable events of 24 on `7e5cf3e`, and 3 on the current
+  code (`r_ny_r5`). One it refuses, at 13 %, was a confirmer in a correct county answer; whether that event was a real
+  pass is not settled.
 - Measurement took 205 s of a 509 s run on a 3 h recording. Full uncertainty profiles and manoeuvre
   diagnostics now run once for the final accepted trace, instead of in every ridge-refinement round. The
   point fits and final diagnostics are retained; the wall-clock improvement has not yet been measured.

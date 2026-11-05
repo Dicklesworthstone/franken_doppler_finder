@@ -43,7 +43,11 @@ at that commit, not per-change commits.
   twice. If either side cannot be refined, the margin compares both at their fine-grid cells. Refining the rival was
   not enough by itself: on the feeder its refinement was refused, and the margin stayed 3.10 until that case compared
   fine cells (`f_feederwatch_ri`, then `f_feederwatch_r3`). No threshold or constant changes.
-  `margin_compares_the_leader_and_its_rival_at_the_same_polish` is the metamorphic test. Two mutants of the search code ran against the same tests on `42677a4`: crediting the leader alone fails it and `refinement_reranks_promoted_leaders_without_mixing_candidate_state` (88 passed, 2 failed), and taking the margin from the reported scores fails it at the refined leader's refused rival, `margin_nats` 2.5 for a gain of 0.5 (89 passed, 1 failed).
+  `margin_compares_the_leader_and_its_rival_at_the_same_polish` is the metamorphic test. Two mutants of the search code
+  ran against the same tests on `42677a4`: crediting the leader alone fails it and
+  `refinement_reranks_promoted_leaders_without_mixing_candidate_state` (88 passed, 2 failed), and taking the margin from
+  the reported scores fails it at the refined leader's refused rival, `margin_nats` 2.5 for a gain of 0.5 (89 passed, 1
+  failed).
 - **`result.json`:** `margin` gains `margin_top_score`, `margin_rival_score` and `margin_basis` (`refined` or
   `fine_grid`). `margin_nats` and `ratio_distinct` follow that pair; `top_score` and `next_distinct_score` stay the
   reported scores. The margin gate's text prints the compared pair at two decimals, because 2.95 printed as "3.0 nats"
@@ -87,7 +91,12 @@ at that commit, not per-change commits.
   but its rival changed (34.6 km to 20.1 km) and that rival's refinement is refused, so that pair is not like with like.
   The feeder's fell from 2.15 to 1.81, at fine cells both times. The 09-09 answer moved from 126 km back to 73 km, with
   one core match of two instead of none. This is one recording and a few wrong answers, and a near miss is not a
-  regression, but the trend is the wrong way for a margin that has to separate them. **On `a827820` as it stood, 09-07 is a wrong-date medium:** 138.14 km off, core 2 of 2, margin 3.008 (`n_ref_on_0907_a82`), the refined leader's 32.19 against the rival's fine 29.18. The same rival refined scores 29.24, so this change grades it low at 2.95. That removes the regression by 0.05 nats and does not reopen the gap. Its three reference searches and the feeder lose refinement there, so they report a nominal 300 m; the reference margins match this change's within 0.01 nats, and the radius gate alone separates its medium from the high here.
+  regression, but the trend is the wrong way for a margin that has to separate them. **On `a827820` as it stood, 09-07
+  is a wrong-date medium:** 138.14 km off, core 2 of 2, margin 3.008 (`n_ref_on_0907_a82`), the refined leader's 32.19
+  against the rival's fine 29.18. The same rival refined scores 29.24, so this change grades it low at 2.95. That
+  removes the regression by 0.05 nats and does not reopen the gap. Its three reference searches and the feeder lose
+  refinement there, so they report a nominal 300 m; the reference margins match this change's within 0.01 nats, and
+  the radius gate alone separates its medium from the high here.
 - **`a827820`'s dedicated profile bounds barely moved these rows.** Compare `*_r4` and `*_r5`: margins moved by 0.03 nats
   or less. Hypothesis counts per event match on all six rows, compared to 0.1 M, and no new budget
   warning appears, so the wider `t_tol` it can pass to `SearchEvent` did not visibly grow the search here. One refusal went
@@ -206,7 +215,13 @@ at that commit, not per-change commits.
   4.5 Hz at a passing RMS, a steep frame allows the larger of that and 0.25 s of chirp, and a wider band can step
   further, which makes a real ridge read low. Removing the limit
   changed none of the synthetic passes, and the comment now says this.
-- **Replays on this code.** On `630bba5` with these changes, the county and state-wide reference searches match exact `630bba5` on answer, radius, margin, rival, funnel, gates, warnings and every candidate's score, and `fdop selftest` gives the same 7.1 m. The three-day run and the wrong dates were not replayed. The weather change does feed the search, and what stands in for those replays is the scan above: no cached pressure-level response is refused, so these recordings' atmosphere does not change. `b8c0819`, which this lands on, has no real-recording replay of its own yet.
+- **Replays on this code.** On `630bba5` with these changes, the county and state-wide reference searches match exact
+  `630bba5` on answer, radius, margin, rival, funnel, gates, warnings and every candidate's score, and `fdop selftest`
+  gives the same 7.1 m. The three-day run and the wrong dates were not replayed. The weather change does feed the
+  search, and what stands in for those replays is the scan above: no cached pressure-level response is refused, so
+  these recordings' forecast winds do not change. At most 1 of 106 cached soundings is skipped, which matters only
+  on a radiosonde fallback.
+  `b8c0819`, which this lands on, has no real-recording replay of its own yet.
 
 - **Corrections to `42677a4`, all in text or comments except the radiosonde source above.**
   - `max_roc` is the rate at the CPA as heard, `t0r`. Its comment said the steepest fall comes just after that, and the
