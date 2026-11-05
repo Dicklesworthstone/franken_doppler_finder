@@ -400,7 +400,7 @@ fdop runs --json                                         # the run ledger
 ```
 
 - **Cache:** `--cache`, then `$FDOP_CACHE`, `$FDOP_CACHE_DIR`, `$XDG_CACHE_HOME/fdop`, then `~/.cache/fdop`. It
-  holds ADS-B day stores, terrain, map tiles, gazetteer, weather and `runs.sqlite`.
+  holds ADS-B day stores, terrain, map tiles, gazetteer, weather, geoid heights and `runs.sqlite`.
 - **Runs:** written to `./fdop_runs/<name>_<unix time>/` unless `-o` is given.
 - **Data cost:** about 4 GB per uncached UTC day; one local date usually spans two UTC days.
 - **`GITHUB_TOKEN`:** optional; raises the GitHub API limit used to list adsb.lol releases.

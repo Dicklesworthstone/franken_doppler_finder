@@ -34,7 +34,7 @@ fn main() {
     let bbox = BBox::new(40.5024, -79.7621, 45.0147, -71.8562).padded_km(30.0);
     let (lat_c, lon_c) = bbox.center();
     // the oracle used N at the recording site
-    let (n, src) = geoid_height_or_default(40.876466, -73.524951);
+    let (n, src) = geoid_height_or_default(&cache, 40.876466, -73.524951);
     println!("geoid N (site) = {n:.3} m ({src}); bbox centre {lat_c:.3},{lon_c:.3}");
     let spec = IngestSpec {
         bbox,

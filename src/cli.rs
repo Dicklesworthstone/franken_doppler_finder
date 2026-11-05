@@ -370,7 +370,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             let n = if f.common.offline {
                 -30.0
             } else {
-                fdop_data::geoid_height_or_default(region.center.0, region.center.1).0
+                fdop_data::geoid_height_or_default(&cache, region.center.0, region.center.1).0
             };
             let mut spec = fdop_data::IngestSpec {
                 bbox: region.bbox.padded_km(f.pad_km),

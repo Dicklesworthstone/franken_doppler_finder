@@ -13,7 +13,7 @@ fn main() {
     let bbox = BBox::new(40.5024, -79.7621, 45.0147, -71.8562).padded_km(30.0);
     println!("bbox (NY padded 30 km): {:?}", bbox);
     let (lat_c, lon_c) = bbox.center();
-    let (n, src) = geoid_height_or_default(lat_c, lon_c);
+    let (n, src) = geoid_height_or_default(&cache, lat_c, lon_c);
     println!("geoid N at centre ({lat_c:.4},{lon_c:.4}) = {n:.3} m ({src})");
     let spec = IngestSpec {
         bbox,

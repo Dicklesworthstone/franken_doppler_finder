@@ -930,7 +930,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     let (geoid_n, geoid_src) = if a.offline {
         (-30.0, "offline-default")
     } else {
-        fdop_data::geoid_height_or_default(region.center.0, region.center.1)
+        fdop_data::geoid_height_or_default(&a.cache, region.center.0, region.center.1)
     };
     if geoid_src != "ngs" {
         warnings.push(format!(

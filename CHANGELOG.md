@@ -19,6 +19,33 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### The geoid height comes from two reads that agree, and it is kept
+
+- **The fault.** The NGS geoid API can answer a request with the height and error of another made at the same
+  moment, while echoing the coordinates it was asked for, so one reply cannot show it. In a check of four simultaneous
+  requests on 2026-11-05, a point in Georgia came back with a Pennsylvania point's values. `fdop` asked once per run
+  and kept nothing, against this project's rule to cache every response. Local runs in parallel lanes crossed:
+  `np_o02_p1` got −24.07 m where it had −31.36 m (`nh`, `nm`), which moved its curve-match margin from −1.35 to −1.287
+  nats, and `np_o02_p3` got −33.48 m for −33.66 m, which moved its place 5 cm. No cited row shows one, and none of the
+  benchmark's 125 `fdop` rows, on 60 pairs of case and region, differs from another of its pair. A lookup that
+  hangs costs a run up to 240 s and then the −30 m default for that run. Two local rows did that around 21:10Z on
+  2026-11-05 (`x_32d4e1a`, beside `fh`, `nh`): 0.58 m of height kept `b1_osprey_1031` high but moved it 29 m and took
+  its radius from 349 m to 575 m.
+- **The change** (`crates/fdop-data/src/geoid.rs`). A height is taken once two reads agree to 1.5 mm, in at most three
+  reads, with a pause of 300 ms to 1 s between them that depends on the point. Only different points can cross, and
+  a kept height outlives the run, so runs started together must not read in step. It is kept at
+  `<cache>/geoid/<lat>_<lon>.txt`, written by rename, and later runs read the file and not the service. Reads that
+  fail or never agree fall back to the −30 m default and its warning, as a failed lookup did. An unreadable or
+  implausible file counts as nothing kept. `geoid_height_or_default` now takes the cache directory.
+- **Tests.** `a_height_needs_two_reads_to_agree`: a crossed read on the first or second read is never taken, and
+  three different heights give no height. `a_failed_read_stops_the_reads`. `the_read_gap_depends_on_the_point`.
+  `a_kept_height_is_used_and_a_bad_file_is_not`, which reads the kept height back through the lookup without the
+  network.
+- **Effect.** One real row, `b1_osprey_1031` (`g1`): two reads gave −30.58 m, the height `fh` used, and its
+  `result.json` equals `fh`'s in every field but run time and paths. A height that was right before gives the same
+  answer. Set F's registered builds ask once, as before, and each run's log keeps the value it used (bench/PROTOCOL.md
+  Addendum 14).
+
 ### The curve match needs two heard passes
 
 - **The fault.** On the benchmark's sealed set E, `6914ab7` graded the marina `e_harbourgate` **medium, 7.97 km

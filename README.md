@@ -501,7 +501,7 @@ or change their Doppler frequencies.
 
 | Shared option | Meaning |
 |---|---|
-| `--cache <PATH>` | Cache root for ADS-B day stores, terrain, gazetteer and map tiles. Default: see [Configuration](#configuration) |
+| `--cache <PATH>` | Cache root for ADS-B day stores, terrain, gazetteer, map tiles and geoid heights. Default: see [Configuration](#configuration) |
 | `--offline` | Never use the network; cached data only |
 | `-q, --quiet` | Less progress output on stderr |
 
@@ -669,6 +669,7 @@ Cache layout:
 ├── adsb/<YYYY-MM-DD>/<feeds>_<S>_<W>_<N>_<E>.fdtrk   regional track store per UTC day (gzip, magic FDOPTRK1)
 ├── adsb/<YYYY-MM-DD>/releases.json                   archive release metadata
 ├── weather/                                          Open-Meteo and radiosonde responses
+├── geoid/<lat>_<lon>.txt                             NGS geoid height at a region's centre
 ├── terrarium/<z>/<x>/<y>.png                         elevation tiles
 ├── usgs_topo/<z>/<y>/<x>.jpg                         basemap tiles for map.png
 ├── gazetteer/                                        Census 2024 gazetteer zips
@@ -689,7 +690,7 @@ region on the same day downloads that day again if no usable cache covers it.
 | Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Jets are dropped; unknown types are kept |
 | Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. Falls back to a 15 °C standard atmosphere with a warning |
 | Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search; a tile that cannot be fetched counts as 0 m, with a warning giving the number of such tiles. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
-| Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL; −30 m, with a warning, if unreachable or `--offline` |
+| Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL. Taken once two reads agree, then kept in the cache; −30 m, with a warning, if the reads fail or never agree, or under `--offline` |
 | Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Offline fallback uses the gazetteer's internal points |
 | Basemap | [USGS The National Map](https://www.usgs.gov/programs/national-geospatial-program/national-map) Topo tiles; OSM in the HTML report | |
 
@@ -1280,11 +1281,6 @@ audio or video recorded somewhere sensitive:
   flying the same way at one speed leave the same trade: two arrivals on one approach, or one aircraft flying the
   same lap twice, since it counts passes, not aircraft. The rule does not catch that case. The tied-place radius
   catches it only where the other places along the track fall inside the clock window and among the kept modes.
-- The geoid height comes from the NGS API on every run and is not cached. That API can answer a request with the
-  value of another made at the same moment, while echoing the coordinates it was asked for: in a check of four
-  simultaneous requests on 2026-11-05, a point in Georgia came back with a Pennsylvania point's height. So a run
-  can use a height metres off, and two runs of one input can differ: `np_o02_p1` got −24.07 m where it had
-  −31.36 m (`nh`, `nm`), which moved its curve-match margin 0.06 nats. Each run prints the value it used.
 - Detection and measurement are capped: at most 60 candidate curves; flyovers measured strongest first, from the
   silence line (detection score 3.5) up, until 24 pass the quality gates; and 12 of those driving the pair join
   (`--max-events`). Before this change only primaries scoring 4.5 or more were measured, and only the strongest 24
