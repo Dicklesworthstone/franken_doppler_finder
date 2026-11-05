@@ -243,6 +243,13 @@ const CURVE_MAX_CLOCK_S: f64 = 1800.0;
 const CURVE_MAX_CELLS: f64 = 200_000.0;
 /// A trace answer asserted this far from a curve-match answer that stands names another place.
 const CURVE_CONFLICT_M: f64 = 3000.0;
+/// Heard passes the curve match needs before it raises a low or missing answer to medium. They are
+/// passes, not aircraft: `n_heard` counts one aircraft heard twice as two. One pass's Doppler curve
+/// fixes when and how close it passed. The curve match searches a window of clocks, so that leaves
+/// place and clock free to trade along the pass's track at its speed; the trace search asks two
+/// core events of a medium for the same reason. The decoy test does not cover this: it asks
+/// whether the recording's clock beats the decoy clocks, not whether one curve fixes a place.
+const CURVE_RAISE_HEARD: usize = 2;
 
 /// What the curve match does to the trace search's answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,10 +261,15 @@ enum CurveCall {
     Agrees,
     /// Trace answer asserted, curve match stands somewhere else: nobody gets to assert.
     Conflicts,
-    /// Trace answer low, curve match stands at the same place: asserted at medium, trace position.
+    /// Trace answer low, curve match stands at the same place on `CURVE_RAISE_HEARD` heard passes or
+    /// more: asserted at medium, trace position.
     Confirms,
-    /// Trace answer low or absent, curve match stands elsewhere: asserted at medium, its position.
+    /// Trace answer low or absent, curve match stands elsewhere on `CURVE_RAISE_HEARD` heard passes
+    /// or more: asserted at medium, its position.
     Adopts,
+    /// Trace answer low or absent, curve match stands on fewer than `CURVE_RAISE_HEARD` heard
+    /// passes: nothing is raised, the trace answer (or no answer) stays as it was.
+    HeardTooFew,
     /// Trace answer medium, and the curve match ran with enough decoy clocks to judge but stands
     /// nowhere: lowered to low. The medium grade's margin has no calibrated false-alarm rate, and
     /// it has named wrong-date places (`nd_o31_1101` under 069c971, 9087ec4 and 6914ab7). The curve
@@ -288,10 +300,47 @@ fn curve_call(
         } else {
             CurveCall::Conflicts
         }
+    } else if v.n_heard < CURVE_RAISE_HEARD {
+        CurveCall::HeardTooFew
     } else if apart.is_some_and(|d| d <= v.radius_m) {
         CurveCall::Confirms
     } else {
         CurveCall::Adopts
+    }
+}
+
+/// Gate text for a curve match that stands on fewer heard passes than it takes to raise an answer.
+fn heard_too_few(v: &curvematch::CurveVerdict) -> String {
+    format!(
+        "it stands on {} heard pass(es), and one pass's Doppler curve lets place and clock trade along its track, so it raises an answer only on {CURVE_RAISE_HEARD}: {}",
+        v.n_heard, v.why
+    )
+}
+
+/// The answer when neither search found a place. A curve match standing on too few heard passes
+/// adds a failed gate and a clause to the verdict, so the report says why nothing was raised.
+fn no_location_answer(n_events: usize, too_few: Option<&curvematch::CurveVerdict>) -> Answer {
+    Answer {
+        lat: f64::NAN,
+        lon: f64::NAN,
+        radius_m: f64::NAN,
+        radius_basis: "no candidate".into(),
+        confidence: "none".into(),
+        verdict: format!(
+            "no location found: {n_events} usable flyover events; {}{}",
+            if n_events < 2 {
+                "need at least two clear propeller flyovers"
+            } else {
+                "no ADS-B flight pair explains two events at one place and clock (check dates/region, or the aircraft lacked ADS-B)"
+            },
+            too_few.map_or_else(String::new, |v| format!(
+                "; the curve match stands on {} heard pass(es), fewer than the {CURVE_RAISE_HEARD} it takes to raise an answer",
+                v.n_heard
+            ))
+        ),
+        gates: too_few.map_or_else(Vec::new, |v| {
+            vec![("curve match".to_string(), false, heard_too_few(v))]
+        }),
     }
 }
 
@@ -1359,15 +1408,15 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             let apart = fdop_types::geo::haversine_m(lat, lon, v.lat, v.lon);
             gates.push((
                 "curve match".to_string(),
-                call != CurveCall::Conflicts,
-                if call == CurveCall::Conflicts {
-                    format!(
+                !matches!(call, CurveCall::Conflicts | CurveCall::HeardTooFew),
+                match call {
+                    CurveCall::Conflicts => format!(
                         "another place stands {:.1} km away: {}",
                         apart / 1000.0,
                         v.why
-                    )
-                } else {
-                    v.why.clone()
+                    ),
+                    CurveCall::HeardTooFew => heard_too_few(v),
+                    _ => v.why.clone(),
                 },
             ));
         }
@@ -1660,23 +1709,14 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             vec![],
         );
     } else {
-        report.answer = Answer {
-            lat: f64::NAN,
-            lon: f64::NAN,
-            radius_m: f64::NAN,
-            radius_basis: "no candidate".into(),
-            confidence: "none".into(),
-            verdict: format!(
-                "no location found: {} usable flyover events; {}",
-                sevs.len(),
-                if sevs.len() < 2 {
-                    "need at least two clear propeller flyovers"
-                } else {
-                    "no ADS-B flight pair explains two events at one place and clock (check dates/region, or the aircraft lacked ADS-B)"
-                }
-            ),
-            gates: vec![],
-        };
+        // a curve match that stands on too few heard passes is reported, not used
+        let too_few = curve_verdict.as_ref().filter(|_| {
+            curve_call("none", None, curve_verdict.as_ref(), curve_judged) == CurveCall::HeardTooFew
+        });
+        if too_few.is_some() {
+            curve_used = CurveCall::HeardTooFew;
+        }
+        report.answer = no_location_answer(sevs.len(), too_few);
         log.say(&report.answer.verdict);
     }
     report.figures.insert(
@@ -1994,6 +2034,101 @@ mod tests {
                 CurveCall::Adopts
             );
         }
+    }
+
+    /// A curve match that stands on fewer than two heard passes raises nothing: a low answer stays
+    /// low wherever the curve match stands, a missing one stays missing. Asserted answers are settled
+    /// as before, since only raising needs a place fixed by the curve match itself.
+    #[test]
+    fn one_heard_pass_raises_nothing() {
+        let east = |km: f64| -73.5 + km / (111.2 * 40f64.to_radians().cos());
+        let at = |km: f64| Some((40.0, east(km)));
+        for n in [0, 1] {
+            let v = curvematch::CurveVerdict {
+                n_heard: n,
+                ..stands_at(40.0, east(0.0), true)
+            };
+            for judged in [false, true] {
+                for km in [0.5, 1.1, 100.0] {
+                    assert_eq!(
+                        curve_call("low", at(km), Some(&v), judged),
+                        CurveCall::HeardTooFew,
+                        "{n} heard, {km} km"
+                    );
+                }
+                assert_eq!(
+                    curve_call("none", None, Some(&v), judged),
+                    CurveCall::HeardTooFew
+                );
+                for conf in ["high", "medium"] {
+                    assert_eq!(
+                        curve_call(conf, at(0.5), Some(&v), judged),
+                        CurveCall::Agrees
+                    );
+                    assert_eq!(
+                        curve_call(conf, at(3.1), Some(&v), judged),
+                        CurveCall::Conflicts
+                    );
+                }
+            }
+            assert!(heard_too_few(&v).contains("trade along its track"));
+        }
+        // two heard passes raise as before
+        let v = curvematch::CurveVerdict {
+            n_heard: CURVE_RAISE_HEARD,
+            ..stands_at(40.0, east(0.0), true)
+        };
+        assert_eq!(
+            curve_call("low", at(0.5), Some(&v), true),
+            CurveCall::Confirms
+        );
+        assert_eq!(curve_call("none", None, Some(&v), true), CurveCall::Adopts);
+    }
+
+    /// With no place from either search, a curve match on too few heard passes shows in the report as
+    /// a failed gate and in the verdict. Without one, the answer is what it always was.
+    #[test]
+    fn no_location_reports_a_curve_match_on_too_few_heard_passes() {
+        let plain = no_location_answer(0, None);
+        assert_eq!(plain.confidence, "none");
+        assert!(plain.lat.is_nan() && plain.lon.is_nan() && plain.radius_m.is_nan());
+        assert!(plain.gates.is_empty());
+        assert_eq!(
+            plain.verdict,
+            "no location found: 0 usable flyover events; need at least two clear propeller flyovers"
+        );
+        let v = curvematch::CurveVerdict {
+            n_heard: 1,
+            ..stands_at(40.0, -73.5, true)
+        };
+        let a = no_location_answer(3, Some(&v));
+        assert_eq!(a.confidence, "none");
+        assert!(a.lat.is_nan() && a.lon.is_nan() && a.radius_m.is_nan());
+        assert!(
+            a.verdict
+                .contains("no ADS-B flight pair explains two events"),
+            "{}",
+            a.verdict
+        );
+        assert!(
+            a.verdict.ends_with(
+                "stands on 1 heard pass(es), fewer than the 2 it takes to raise an answer"
+            ),
+            "{}",
+            a.verdict
+        );
+        assert_eq!(a.gates.len(), 1);
+        assert_eq!(a.gates[0].0, "curve match");
+        assert!(!a.gates[0].1);
+        let md = fdop_geo::report::render_markdown(&ReportInput {
+            answer: a,
+            ..Default::default()
+        });
+        assert!(md.contains("**Confidence:** none"), "{md}");
+        assert!(
+            md.contains("| curve match | FAIL | it stands on 1 heard pass(es)"),
+            "{md}"
+        );
     }
 
     /// Events measured past the old line hold up a medium answer only where the curve match judged it.

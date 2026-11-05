@@ -19,7 +19,62 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
-### Measurement goes down the list until 24 events pass, from the silence line up
+### The curve match raises an answer to medium only on two heard passes
+
+- **The fault.** On the benchmark's sealed set E, `6914ab7` graded the marina `e_harbourgate` **medium, 7.97 km
+  off** (limit 1 km; bench/PROTOCOL.md Addendum 14). The trace search detected nothing in its two hours. The curve
+  match stood +1.86 nats over the best of 48 decoy clocks on one heard pass, at a clock 110 s from the true one, and
+  adopted its own place. That pass was a chance fit. At the true clock the aircraft was 9.76 km from the site, so
+  the site did not hear it. Nor is the place a slide along its track: a clock 110 s early needs a place behind the
+  truth along the heading, by the 3.2 km the aircraft flew in that time, and this one is 7.9 km ahead of it.
+- **Why one pass does not fix a place.** One pass's Doppler curve fixes when and how close it passed. The curve
+  match searches a window of clocks, so place and clock trade along the track at the flight's speed: moving the
+  observer `v·dt` along it and the clock by `dt` leaves the curve where it was. Set E's Olympia shows this on a real
+  recording (`r2_fdop_9087ec4`). Six of its eight best places hear only its first flight, each where that flight
+  was at that place's own clock: 147 s early and 10.8 km off, back along the track, or 55 s late and 6.1 km off,
+  ahead along it. The best of them scores 13.81 nats against the true place's 17.23, and the second flight adds
+  3.97 nats at the true place. The trace search asks for two core events before it grades medium, for the same
+  reason. The decoy test does not cover this: it asks whether the recording's clock beats the decoy clocks, not
+  whether one curve fixes a place. The tied-place radius can see the slide only where the other places along the
+  track fall inside the clock window and among the kept modes.
+- **The change** (`src/pipeline.rs`, `CURVE_RAISE_HEARD` = 2, `CurveCall::HeardTooFew`). A curve match that
+  stands on fewer than two heard passes (passes at 6.9 nats or more, not shared) no longer adopts its place or
+  confirms a low trace answer. The answer stays low, or there is none, and a failed `curve match` gate says why.
+  These are passes, not aircraft: one aircraft heard twice counts as two. An asserted trace answer is settled as
+  before: the curve match still agrees with it or conflicts with it, and the medium rule below still applies.
+  `extra.curve_match.call` in `result.json` gains the value `HeardTooFew`.
+- **Where it was chosen.** This is the one wrong medium in the record that rests on the curve match alone, and it
+  is on set E, so set E is not a test of this change; set F is (Addendum 14). In the runs read for this (the
+  development, no-answer and benchmark `fdop` runs), the curve match stood on fewer than two heard passes exactly
+  once, at `e_harbourgate`. It stood on two at set E's Olympia (two aircraft; right, 66 m, under both registered
+  builds) and on 4 to 14 in every development row where it stood (all right). It stood on none of the 42 runs with
+  no right answer. On this change's own code the curve match does not stand at harbourgate at all (−0.17 nats, no
+  pass heard; a local diagnostic, in-sample, run `eh`). That curve match is `3164272`'s, and its heard-range
+  profile already removed the stand. So on the current code this rule changes no recorded row. It closes the path,
+  which `ce02222` keeps with `6914ab7`'s curve match.
+- **Needed, not sufficient.** Two heard passes flying the same way at one speed leave the same trade, and this
+  rule does not catch them: two flights on one approach, or one aircraft flying the same lap twice. See README
+  "Known issues". Flights going opposite ways do not leave it, since a later clock moves one's place forward and
+  the other's back. Olympia's two flew 158° apart.
+- **Tests.** `one_heard_pass_raises_nothing`: with 0 or 1 heard passes, a low answer stays low wherever the curve
+  match stands, a missing one stays missing, and asserted answers agree or conflict as before; with 2, it confirms
+  and adopts as before. `no_location_reports_a_curve_match_on_too_few_heard_passes`: a missing answer shows it as a
+  failed gate and in the verdict, through to the Markdown report.
+  `one_flight_trades_place_and_clock_along_its_track_and_a_crossing_flight_fixes_them` (metamorphic, exact curve
+  scores on a synthetic recording): one flight north at 70 m/s scores within 1 nat at the observer and 2.8 km along
+  its track with the clock 40 s later. A second heard flight crossing at 90° puts that moved place more than 3 nats
+  (the tied line) behind. A second flight on a parallel track, the same way at the same speed, leaves it tied.
+- **Effect.** No grade changes on any run read, on binary `bb8bdce`, this rule before its docs and wording. On the 33
+  no-answer runs outside the development rows (`nh`), 26 are low and 7 give no location, every grade equals
+  `edf1a09`'s (`nm`), and no curve match stands. The 15 development rows (`fh`), which hold the other 9 of the 42, are
+  identical to `edf1a09`'s (`fm`): 5 right, all high, none wrong. `e_harbourgate` gives no location (`eh`).
+  `r_nassau_gh` is identical to `r_nassau_gc`: 270 m off, radius 406 m, high, 14.78 nats. Two `nh` rows differ in
+  numbers and not in grade: `np_o02_p3` by 5 cm and `np_o02_p1`'s curve margin from −1.35 to −1.287. Both are the NGS
+  geoid race (README "Known issues"), not this change. The other four reference and wrong-date configurations and
+  the two feeder runs give no start, so the curve match is skipped and this rule cannot reach them; their `gc` rows
+  carry over. Replays of those six on a 256 GiB machine were running or queued when this landed. They do not repeat
+  `gc`, which ran on 32 GiB, because the hypothesis budget scales with RAM (AGENTS, reference case).
+
 
 - **The fault.** Only primary detections scoring 4.5 or more were measured, and only the strongest 24 of them,
   passing or not. On the osprey cam's 11-02 recording, 19 of the 24 measured places failed the quality gates while

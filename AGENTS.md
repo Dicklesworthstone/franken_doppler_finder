@@ -289,7 +289,10 @@ results in the commit message.
   None of these runs gives a start, so the curve match is skipped in all five. After a change to refinement, the margin
   or trace scoring, also replay the Ithaca feeder (CHANGELOG): a margin that credited only the leader with refinement's
   gain graded its wrong answer medium. On the measurement change both feeder runs are low, 0.19 and 0.99 nats
-  (`f_feederwatch_gc`, `n_feeder_on_1101_gc`).
+  (`f_feederwatch_gc`, `n_feeder_on_1101_gc`). These `gc` rows ran on the 32 GiB benchmark machine. The hypothesis
+  budget scales with RAM and the comparison budgets do not, so a larger machine has a different funnel and does not
+  repeat them: on 256 GiB the three-day run joins 21.1 M points and fills the fine stage's 2 M (`r_md_gh`, still
+  running when this was written), against 102,247 fine cells in `r_md_gc`. Replay on the machine that gave the row.
 
   The first high results were `ny9` (224 m off, margin 8.5 nats), `nassau3` (221 m, 6.8 nats) and `md2` (224 m,
   7.9 nats), all radius 292 m with N93CQ as the confirmer, on the import commit plus the 5-line
@@ -411,6 +414,9 @@ Field tests on public live-cam recordings are summarised in README "Honest statu
 located again from a recording on another day, and four sparse-traffic sites failed, graded low or with no
 location. On the current code the reference recording grades high in all three configurations above, and margin
 does not separate right from wrong (README "Known issues"), so read any grade with the wrong-date runs beside it.
+The benchmark's sealed set E has been read: no build beat `dopplerprint`, and `6914ab7` was wrong at medium, from the
+curve match alone on one heard pass ([bench/PROTOCOL.md](bench/PROTOCOL.md) Addendum 14). The curve match now raises
+an answer only on two heard passes, which is needed, not sufficient (README "Known issues").
 
 Known fixes not landed. Each one changes answers, so it waits until the reference configurations and the
 quoted field tests can be re-run, which needs a Mac build:

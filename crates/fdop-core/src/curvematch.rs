@@ -2344,6 +2344,85 @@ mod tests {
         assert!((ta.evidence - tb.evidence).abs() < 1e-6);
     }
 
+    /// Metamorphic: one heard flight cannot fix a place along its track. Moving the observer `v * dt`
+    /// along a straight flight's track and the clock by `dt` leaves its curve where it was, so its
+    /// evidence is unchanged. A second heard flight crossing it breaks the trade, and the moved place
+    /// falls more than `TIED_NATS` behind. A second flight on a parallel track, flying the same way
+    /// at the same speed, does not, so the pipeline's two-pass rule is needed, not sufficient.
+    #[test]
+    fn one_flight_trades_place_and_clock_along_its_track_and_a_crossing_flight_fixes_them() {
+        let (lat, lon) = (40.8765, -73.525);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let clock = 1_788_895_000.0;
+        let (sr, dur) = (2800.0, 900.0);
+        let m = Prop::still(BASE_C);
+        let mk = |p0: V3, v: V3, t0: f64, name: &str| {
+            let mut t =
+                straight_track(&enu, p0, v, clock + t0, clock - 1500.0, clock + 3000.0, 4.0);
+            t.key = name.into();
+            t.icao = name.into();
+            t
+        };
+        // north at 70 m/s, closest 900 m east of the observer, 200 s in
+        let along = mk([900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 200.0, "AAA");
+        // east at 65 m/s, closest 1500 m south, 450 s in: crosses the first at 90 degrees
+        let crossing = mk([0.0, -1500.0, 900.0], [65.0, 0.0, 0.0], 450.0, "BBB");
+        // north at 70 m/s too, closest 1100 m west, 500 s in: parallel to the first, same speed
+        let parallel = mk([-1100.0, 0.0, 800.0], [0.0, 70.0, 0.0], 500.0, "PPP");
+        let p = params();
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let (mlat, _) = m_per_deg(lat);
+        // 80 frames, far outside the clock sweep; the place moves 2.8 km north along the track
+        let dt = 40.0;
+        let moved_lat = lat + 70.0 * dt / mlat;
+        let score = |tracks: &[TrackModel]| {
+            let mut buf = noise((sr * dur) as usize, 42, 0.05);
+            for (i, tr) in tracks.iter().enumerate() {
+                add_flight(&mut buf, sr, clock, tr, x, &m, 90.0 + 25.0 * i as f64, 0.5);
+            }
+            let xs: Vec<f32> = buf.iter().map(|&v| v as f32).collect();
+            let im = build_image(&xs, 2800, &p).unwrap();
+            let inp = MatchInputs {
+                image: &im,
+                tracks,
+                region: BBox::new(lat - 0.05, lon - 0.07, lat + 0.05, lon + 0.07),
+                start_lo: clock - 60.0,
+                start_hi: clock + 60.0,
+                duration_s: dur,
+                catalog: (f64::NEG_INFINITY, f64::INFINITY),
+                dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            let bank = build_bank(&im, &p);
+            let idx: Vec<usize> = (0..tracks.len()).collect();
+            let at = score_exact(&inp, &p, &bank, &idx, lat, lon, clock).expect("observer scores");
+            let moved = score_exact(&inp, &p, &bank, &idx, moved_lat, lon, clock + dt)
+                .expect("moved place scores");
+            (at.evidence, at.n_heard, moved.evidence, moved.n_heard)
+        };
+        let (a, ha, b, hb) = score(std::slice::from_ref(&along));
+        assert!(ha == 1 && hb == 1, "heard {ha} and {hb}");
+        assert!(
+            (a - b).abs() < 1.0,
+            "one flight: {a} at the observer, {b} moved"
+        );
+        let (a, ha, b, hb) = score(&[along.clone(), crossing]);
+        assert!(ha == 2 && hb <= 1, "heard {ha} and {hb}");
+        assert!(
+            a - b > TIED_NATS,
+            "crossing: {a} at the observer, {b} moved"
+        );
+        let (a, ha, b, hb) = score(&[along, parallel]);
+        assert!(ha == 2 && hb == 2, "heard {ha} and {hb}");
+        assert!(
+            (a - b).abs() < 1.0,
+            "parallel: {a} at the observer, {b} moved"
+        );
+    }
+
     /// One search for every window: slide the flights by whole windows and the answer lands in a
     /// decoy, which must score what the real window scored. A decoy searched less hard would fail
     /// here, and the margin over it would flatter every recording.
