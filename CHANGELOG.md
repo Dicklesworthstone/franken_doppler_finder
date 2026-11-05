@@ -19,6 +19,39 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### A medium answer needs the curve match to stand wherever it ran
+
+- **The fault.** With the knot rule (`069c971`, `9087ec4`, `6914ab7`), the osprey cam's 10-31 recording searched
+  on 11-01 with the benchmark's R2 inputs (`nd_o31_1101`, a wrong date) graded **medium** at a wrong place: two
+  core matches and a 4.98-nat margin. The curve match ran on the same audio and clock with 48 decoy clocks and did
+  not stand (margin −5.65). That medium fired the benchmark's falsifier 2 for those builds (bench/PROTOCOL.md,
+  Addendum 8). Earlier recall changes failed the same way: build C (measure primaries from the silence line
+  until 24 pass) and a flat-tone guard with a harmonic-line fallback each graded `nd_o31_1102` medium, 35 km off,
+  where the curve match does not stand either (−5.17 on `6914ab7`).
+- **The change** (`src/pipeline.rs`, `curve_call`). A trace answer graded medium becomes low, with a failed
+  `curve match` gate giving the reason, when the curve match ran with at least `MIN_DECOYS` (40) decoy windows
+  and stands nowhere, including when it found no place at all (`CurveCall::Unsupported`). High answers, the
+  calls where the curve match stands (agrees, conflicts, confirms, adopts) and runs where it did not run or had
+  fewer decoys are unchanged.
+- **Why, on its own terms.** The medium grade's margin is an evidence-score gap with no calibrated false-alarm
+  rate, and a wider or more thorough trace search finds more chance alignments. The curve match's verdict has
+  one. With a wrong date or place, the real window is one more clock among at least 41 that the same search
+  scores, so it beats every decoy, which it must do to stand, about once in 41 at most, whatever the trace
+  search's margin did. The bound assumes the windows are interchangeable, which traffic that changes with the
+  hour weakens.
+- **Effect.** The rule reads only `result.json`, so applying it to logged runs is exact. On `6914ab7`'s R2 runs
+  of the 15 development rows (`disc_dev`) and 33 more no-right-answer rows (`disc_nulls`), it lowers one run,
+  `nd_o31_1101`, from medium to low. It keeps all five right asserted answers: the reference recording, the osprey
+  cam on 10-31 and 11-01 and Duke Farms (high), and the osprey cam on 11-02 (medium, the curve match's own answer).
+  The reference replays have no start, so the curve match does not run there and they keep their grades
+  (`r_ny_b1`, `r_md_b1`, `r_nassau_b1`, all high). All of this is in-sample: the rule was written after seeing
+  `nd_o31_1101`.
+- **Cost.** A right answer that only the trace search grades medium becomes low wherever the curve match runs
+  and does not stand. No development row has one, but the reference recording is right and high with a curve
+  match that does not stand (−3.95), so such answers exist. On inputs with the right date, which is all the
+  benchmark's R2 has, this is the rule's main effect.
+- **Tests.** `curve_call_table` covers every grade with the curve match judging or not, standing or not.
+
 ### The curve match searches the whole kilometre each of its starts stands for
 
 - **The fault.** The coarse vote keeps one start per kilometre (`nms_m`, 1,000 m: no other start is kept within

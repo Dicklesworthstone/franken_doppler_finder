@@ -247,7 +247,8 @@ const CURVE_CONFLICT_M: f64 = 3000.0;
 /// What the curve match does to the trace search's answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CurveCall {
-    /// No verdict, or one that does not stand: the trace search's answer is untouched.
+    /// No verdict, or one that does not stand, on an answer `Unsupported` does not cover: the trace
+    /// search's answer is untouched.
     Silent,
     /// Trace answer asserted, curve match stands at the same place.
     Agrees,
@@ -257,15 +258,28 @@ enum CurveCall {
     Confirms,
     /// Trace answer low or absent, curve match stands elsewhere: asserted at medium, its position.
     Adopts,
+    /// Trace answer medium, and the curve match ran with enough decoy clocks to judge but stands
+    /// nowhere: lowered to low. The medium grade's margin has no calibrated false-alarm rate, and
+    /// it has named wrong-date places (`nd_o31_1101` under 069c971, 9087ec4 and 6914ab7). The curve
+    /// match's decoy test has one: with a wrong date or place the real window is one of at least
+    /// `MIN_DECOYS` + 1 interchangeable clocks, so it stands by chance at most about once in 41,
+    /// whatever the trace margin did. A high answer passed every gate and keeps its grade; where
+    /// the curve match did not run or had too few decoys, nothing changes.
+    Unsupported,
 }
 
 fn curve_call(
     trace_confidence: &str,
     trace_at: Option<(f64, f64)>,
     verdict: Option<&curvematch::CurveVerdict>,
+    judged: bool,
 ) -> CurveCall {
     let Some(v) = verdict.filter(|v| v.stands) else {
-        return CurveCall::Silent;
+        return if judged && trace_confidence == "medium" {
+            CurveCall::Unsupported
+        } else {
+            CurveCall::Silent
+        };
     };
     let apart = trace_at.map(|(la, lo)| fdop_types::geo::haversine_m(la, lo, v.lat, v.lon));
     if matches!(trace_confidence, "high" | "medium") {
@@ -1018,6 +1032,10 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     });
     drop(curve_image);
     let curve_verdict = curve.as_ref().and_then(curvematch::verdict);
+    // the curve match ran and had decoy clocks enough to judge, whether or not it found a place
+    let curve_judged = curve
+        .as_ref()
+        .is_some_and(|r| r.decoys.len() >= curvematch::MIN_DECOYS);
     if let Some(r) = &curve
         && let Err(e) = write_json(&run_dir.join("curvematch.json"), r)
     {
@@ -1283,7 +1301,12 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         // The curve match is a second, independent reading of the recording: it can confirm a
         // low trace answer, replace it, or stop an asserted one that names another place.
         let trace_confidence = confidence;
-        let call = curve_call(confidence, Some((lat, lon)), curve_verdict.as_ref());
+        let call = curve_call(
+            confidence,
+            Some((lat, lon)),
+            curve_verdict.as_ref(),
+            curve_judged,
+        );
         curve_used = call;
         let on_trace = call != CurveCall::Adopts;
         let standing = curve_verdict.as_ref().filter(|v| v.stands);
@@ -1302,6 +1325,18 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                 } else {
                     v.why.clone()
                 },
+            ));
+        }
+        if call == CurveCall::Unsupported {
+            gates.push((
+                "curve match".to_string(),
+                false,
+                format!(
+                    "a medium answer needs the curve match to stand where it ran, and it does not: {}",
+                    curve_verdict
+                        .as_ref()
+                        .map_or_else(|| "it found no place".to_string(), |v| v.why.clone())
+                ),
             ));
         }
         let (lat, lon, radius, basis, confidence) = match (call, standing) {
@@ -1333,7 +1368,9 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                     "medium",
                 )
             }
-            (CurveCall::Conflicts, Some(_)) => (lat, lon, radius, basis, "low"),
+            (CurveCall::Conflicts, Some(_)) | (CurveCall::Unsupported, _) => {
+                (lat, lon, radius, basis, "low")
+            }
             _ => (lat, lon, radius, basis, confidence),
         };
         log.say(&format!(
@@ -1511,7 +1548,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             }
         }
     } else if let (CurveCall::Adopts, Some(v), Some(r)) = (
-        curve_call("none", None, curve_verdict.as_ref()),
+        curve_call("none", None, curve_verdict.as_ref(), curve_judged),
         curve_verdict.as_ref(),
         curve.as_ref(),
     ) {
@@ -1841,24 +1878,55 @@ mod tests {
         let east = |km: f64| -73.5 + km / (111.2 * 40f64.to_radians().cos());
         let v = stands_at(40.0, east(0.0), true);
         let at = |km: f64| Some((40.0, east(km)));
-        // does not stand, or no verdict: whatever the trace search said holds
+        // does not stand, or no verdict: where the curve match could not judge, whatever the trace
+        // search said holds; where it could, only a medium answer is lowered
         let weak = stands_at(40.0, east(50.0), false);
         for conf in ["high", "medium", "low", "none"] {
-            assert_eq!(curve_call(conf, at(0.0), Some(&weak)), CurveCall::Silent);
-            assert_eq!(curve_call(conf, at(0.0), None), CurveCall::Silent);
+            for verdict in [Some(&weak), None] {
+                assert_eq!(curve_call(conf, at(0.0), verdict, false), CurveCall::Silent);
+                let judged = if conf == "medium" {
+                    CurveCall::Unsupported
+                } else {
+                    CurveCall::Silent
+                };
+                assert_eq!(curve_call(conf, at(0.0), verdict, true), judged, "{conf}");
+            }
         }
-        // asserted answers
-        for conf in ["high", "medium"] {
-            assert_eq!(curve_call(conf, at(0.5), Some(&v)), CurveCall::Agrees);
-            assert_eq!(curve_call(conf, at(2.9), Some(&v)), CurveCall::Agrees);
-            assert_eq!(curve_call(conf, at(3.1), Some(&v)), CurveCall::Conflicts);
+        // asserted answers, judged or not: standing settles them
+        for judged in [false, true] {
+            for conf in ["high", "medium"] {
+                assert_eq!(
+                    curve_call(conf, at(0.5), Some(&v), judged),
+                    CurveCall::Agrees
+                );
+                assert_eq!(
+                    curve_call(conf, at(2.9), Some(&v), judged),
+                    CurveCall::Agrees
+                );
+                assert_eq!(
+                    curve_call(conf, at(3.1), Some(&v), judged),
+                    CurveCall::Conflicts
+                );
+            }
+            // a low answer inside the curve match's radius is confirmed, outside it is replaced
+            assert_eq!(
+                curve_call("low", at(0.9), Some(&v), judged),
+                CurveCall::Confirms
+            );
+            assert_eq!(
+                curve_call("low", at(1.1), Some(&v), judged),
+                CurveCall::Adopts
+            );
+            assert_eq!(
+                curve_call("low", at(100.0), Some(&v), judged),
+                CurveCall::Adopts
+            );
+            // the trace search found nothing
+            assert_eq!(
+                curve_call("none", None, Some(&v), judged),
+                CurveCall::Adopts
+            );
         }
-        // a low answer inside the curve match's radius is confirmed, outside it is replaced
-        assert_eq!(curve_call("low", at(0.9), Some(&v)), CurveCall::Confirms);
-        assert_eq!(curve_call("low", at(1.1), Some(&v)), CurveCall::Adopts);
-        assert_eq!(curve_call("low", at(100.0), Some(&v)), CurveCall::Adopts);
-        // the trace search found nothing
-        assert_eq!(curve_call("none", None, Some(&v)), CurveCall::Adopts);
     }
 
     /// A confirmed trace answer 0.9 km west of the curve match's best place, with a place 4 km east
@@ -1870,7 +1938,7 @@ mod tests {
         v.radius_m = 4000.0;
         let trace = (40.0, east(-0.9));
         assert_eq!(
-            curve_call("low", Some(trace), Some(&v)),
+            curve_call("low", Some(trace), Some(&v), true),
             CurveCall::Confirms
         );
         let r = confirmed_radius(250.0, trace, &v);
