@@ -40,8 +40,11 @@ finding the faint curves in a spectrogram to naming the town.
 
 ## Honest status
 
-**Real-recording validation baseline:** the reference searches, the reference recording's two wrong dates and
-the Ithaca feeder below were replayed on this code, `9087ec4` (runs named `*_b1`), on the commit before it that added the knot rule and the curve match (`*_c1`), and on the build before the knot rule (`*_r5`). Between `*_c1` and `*_b1` no grade changed and no margin moved by more than 0.02 nats. Field rows replayed on that build so far are in the [CHANGELOG](CHANGELOG.md), and the rest are still running. The row on the knot rule and the curve match names its own runs. Every other number in this
+**Real-recording validation baseline:** the numbers below belong to the archived builds and runs named with
+them. The comparable-rival correction has not been replayed on the reference or field recordings. The reference
+audio download was attempted, but its host returned "Site Unavailable"; no accuracy or grade change is claimed.
+The reference searches, the reference recording's two wrong dates and the Ithaca feeder were replayed on the
+measurement build (`*_gc`), `9087ec4` (runs named `*_b1`), on the commit before it that added the knot rule and the curve match (`*_c1`), and on the build before the knot rule (`*_r5`). Between `*_c1` and `*_b1` no grade changed and no margin moved by more than 0.02 nats. Field rows replayed on those builds are in the [CHANGELOG](CHANGELOG.md). The row on the knot rule and the curve match names its own runs. Every other number in this
 section comes from the archived `7e5cf3e` replays, which predate the moving-medium propagation correction, spatial
 refinement, frequency calibration and robust tone fit. Those are not measured results for this code.
 
@@ -285,11 +288,12 @@ slack hypotheses get: those bounds limit the search, and the trace fit is what s
 still fails reevaluation, the coherent coarse candidate is retained with a warning and no refined radius. A changed
 ranking causes the newly promoted leader to be checked and refined before reporting it.
 
-The best different explanation is refined the same way, because refinement usually raises a score (0.15–1.21 nats for
-the leader on the real runs in the CHANGELOG) and a margin must not credit one side alone. A rival that overtakes
-becomes the answer, with its own radius; one that falls yields to the next rival, which is refined in turn. If either
-side cannot be refined, the margin compares both at their fine-grid cells, the gate's text says so, and `margin_basis`
-in `result.json` reads `fine_grid`. The answer still reports its refined position and evidence.
+The rival is the different explanation with the smallest comparable score gap: refined scores when both
+refinements succeeded, or both fine-grid scores otherwise. The search attempts refinement for that rival too,
+then checks whether another explanation now gives a smaller comparable gap. Each candidate is attempted at
+most once. A rival that overtakes becomes the answer with its own radius. When either side cannot be refined,
+`margin_basis` in `result.json` reads `fine_grid`; the answer still reports its coherent position and evidence.
+The reported rival can therefore differ from the runner-up in current-score order.
 
 Effective trace counts use the observed union of six-second correlation supports, rather than counting the
 elapsed time across silent gaps. Duplicate samples and denser resampling do not add independent information,
@@ -854,10 +858,11 @@ the configured fallback allowance after the preferred request has been tried.
 
 ## Testing
 
-### Current checks
+### Earlier recorded checks
 
-These ran on a probe commit holding this commit's code and `a827820`'s docs, each from a clean snapshot of it
-(`rch exec --base <sha> --clean-overlay --no-overlay`) on a remote worker.
+These checks predate the comparable-rival and cache-recovery corrections. They ran on the earlier probe
+commit with `a827820`'s docs, each from a clean snapshot (`rch exec --base <sha> --clean-overlay --no-overlay`)
+on a remote worker; they are historical evidence, not test results for the current tree.
 
 | Command | Result |
 |---|---|
@@ -866,10 +871,15 @@ These ran on a probe commit holding this commit's code and `a827820`'s docs, eac
 | `cargo test --workspace --locked -j 2` | 179 passed, 0 failed, 2 ignored (the opt-in FFmpeg tests); the tree holds 181 `#[test]` items |
 | `cargo run --release --locked -j 2 -- selftest` | PASS: 2.4 m error, 75 m radius, +0.02 s clock error, 4 events, both intended aircraft |
 
-A selftest does not show that real recordings work: the replays are in [Honest status](#honest-status). They ran on a build
-that differs from this code only in the margin gate's printed decimals.
+A selftest does not show that real recordings work: the archived replays are in [Honest status](#honest-status).
 
 ### Refinement and the margin
+
+`refinement_reaches_rivals_hidden_by_earlier_gains` covers a third explanation hidden by the first two
+candidates' refinement gains. Fine-grid scores of 30, 29.8 and 29.7 become 35, 30 and an unrefined 29.7.
+The third candidate must receive an attempt: if it cannot be refined, the reported margin is 0.3 rather than
+5 nats; if it rises to 36, it becomes the winner with its own position, clock and radius. This is a synthetic
+comparison regression; it does not establish real-recording accuracy.
 
 `margin_compares_the_leader_and_its_rival_at_the_same_polish` is metamorphic: a gain only one side could have cannot
 move the margin, whatever the gain is. It also covers a refused rival, a refused leader, a rival that overtakes, a leader

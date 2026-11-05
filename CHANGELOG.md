@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Compare every rival at the same stage after refinement
+
+- **The fault.** The margin compared its chosen rival at the same stage as the leader, but chose that rival
+  from a list mixing refined and unrefined scores. A refinement gain could hide a stronger comparable rival.
+  In the synthetic regression, fine scores 30, 29.8 and 29.7 become 35, 30 and an unrefined 29.7: the old
+  selection stopped with a 5-nat gap while the third candidate still gave a 0.3-nat fine-grid gap.
+- **The change** (`crates/fdop-core/src/search.rs`). Both rival refinement and the reported margin select
+  the smallest comparable gap across different explanations. Another threatening rival gets an attempt
+  when earlier gains change that ordering. Each candidate is still attempted at most once; a failed
+  refinement keeps its intact fallback, and a promoted winner keeps its own coordinates, clock and radius.
+  This may refine additional rivals. The margin remains uncalibrated to the size of the search.
+- **Tests.** `refinement_reaches_rivals_hidden_by_earlier_gains` covers a third rival whose refinement fails,
+  remains below the second candidate, or overtakes the leader. It checks the margin, comparison basis,
+  attempt count, fallback state and winner/radius consistency. Existing equal-stage and promoted-candidate
+  regressions retain their numerical and coherence assertions.
+- **Real-recording evidence.** The reference and field recordings have not been replayed for this change;
+  the reference audio host returned "Site Unavailable". Their existing logged results remain evidence for
+  the builds named with those runs.
+
 ### Recover from an unreadable or incomplete covering ADS-B cache
 
 - **The fault.** Cache lookup chose only the smallest covering filename. If that file could not be read,

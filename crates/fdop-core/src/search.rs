@@ -2188,12 +2188,22 @@ fn compared_scores(top: &Candidate, rival: &Candidate) -> (f64, f64, &'static st
     }
 }
 
-/// The margin against the best different explanation. Sorted candidates, leader first.
+/// A rival challenges the leader at their shared level of polish. Current scores alone mix
+/// refined and fine-grid candidates and can hide a closer comparable rival.
+fn compared_margin(top: &Candidate, rival: &Candidate) -> f64 {
+    let (t, r, _) = compared_scores(top, rival);
+    t - r
+}
+
+/// The smallest comparable margin against a different explanation. Sorted candidates, leader first.
 fn margin_report(cands: &[Candidate]) -> serde_json::Value {
     let Some(top) = cands.first() else {
         return serde_json::json!({});
     };
-    let alt = cands[1..].iter().find(|o| is_different_explanation(top, o));
+    let alt = cands[1..]
+        .iter()
+        .filter(|o| is_different_explanation(top, o))
+        .min_by(|a, b| compared_margin(top, a).total_cmp(&compared_margin(top, b)));
     let local = cands[1..]
         .iter()
         .find(|o| same_explanation(top, o) && haversine_m(o.lat, o.lon, top.lat, top.lon) > 1000.0);
@@ -2216,8 +2226,9 @@ fn margin_report(cands: &[Candidate]) -> serde_json::Value {
 
 /// Refinement can reduce a winner's evidence (for example by exposing an unheard close
 /// pass). Recheck newly promoted leaders, keeping each candidate and its radius together.
-/// Refinement usually raises evidence too, so the best different explanation is refined as well:
-/// the margin must not credit the leader alone with a gain every candidate could have had.
+/// Refine whichever different explanation has the smallest comparable gap. A newly refined rival
+/// can move above an unrefined one by current score while challenging the leader less at equal
+/// polish; stopping there would credit the leader with a gain that further rival never had.
 /// Every supplied candidate is attempted at most once; a failed update retains the entire
 /// coherent fine-grid candidate, never a mixture of old evidence and refined coordinates.
 fn refine_candidates(
@@ -2232,7 +2243,14 @@ fn refine_candidates(
         let k = if leader.2 {
             let rival = states
                 .iter()
-                .position(|s| is_different_explanation(&leader.0, &s.0));
+                .enumerate()
+                .filter(|(_, s)| is_different_explanation(&leader.0, &s.0))
+                .min_by(|(_, a), (_, b)| {
+                    let a_margin = compared_margin(&leader.0, &a.0);
+                    let b_margin = compared_margin(&leader.0, &b.0);
+                    a_margin.total_cmp(&b_margin)
+                })
+                .map(|(i, _)| i);
             let Some(rival) = rival else { break };
             rival
         } else {
@@ -3663,9 +3681,11 @@ mod tests {
             .collect();
         // B wins after rescoring; B's refinement fails; or rescoring B promotes the
         // already-refined A again. A cached radius must always travel with its candidate.
+        // If B cannot refine, A's better fine-grid score already defeats its margin; C need
+        // not be refined before that comparison can stop.
         for (a_score, b_score, winner, has_radius, tried) in [
             (5.0, Some(8.0), "B", true, &["A", "B", "C"][..]),
-            (5.0, None, "B", false, &["A", "B", "C"][..]),
+            (5.0, None, "B", false, &["A", "B"][..]),
             (8.0, Some(7.0), "A", true, &["A", "B"][..]),
         ] {
             let mut checked = Vec::new();
@@ -3798,6 +3818,88 @@ mod tests {
         assert_eq!(leader, "A");
         assert!((nats(&report) - 3.0).abs() < 1e-12, "{report}");
         assert_eq!(report["margin_basis"], "refined");
+    }
+
+    #[test]
+    fn refinement_reaches_rivals_hidden_by_earlier_gains() {
+        let candidates: Vec<Candidate> = [("A", 30.0), ("B", 29.8), ("C", 29.7), ("D", 20.0)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (flight, score))| Candidate {
+                lat: 40.0 + i as f64 * 0.1,
+                lon: -73.0,
+                t_start_utc: 1000.0,
+                score,
+                lock_checked: true,
+                n_explained: 2,
+                events: ["e1", "e2"]
+                    .into_iter()
+                    .map(|event| EventMatch {
+                        event: event.into(),
+                        flight: flight.into(),
+                        ..EventMatch::default()
+                    })
+                    .collect(),
+                ..Candidate::default()
+            })
+            .collect();
+        // A rises to 35 and B to 30. Comparing their refined scores gives 5 nats, but C
+        // still trails A by only 0.3 at their fine cells. It must get a refinement attempt:
+        // it may fail, remain behind B, or become the winner with its own place and radius.
+        for (c_score, winner, margin, basis) in [
+            (None, "A", 0.3, "fine_grid"),
+            (Some(29.9), "A", 5.0, "refined"),
+            (Some(36.0), "C", 1.0, "refined"),
+        ] {
+            let mut attempted = Vec::new();
+            let (out, refined) = refine_candidates(
+                candidates.clone(),
+                &|_| panic!("these candidates already passed the clock check"),
+                |c| {
+                    let flight = c.events[0].flight.as_str();
+                    attempted.push(flight.to_string());
+                    let score = match flight {
+                        "A" => 35.0,
+                        "B" => 30.0,
+                        "C" => c_score?,
+                        _ => panic!("D cannot limit the margin"),
+                    };
+                    let updated = Candidate {
+                        lat: c.lat + 0.001,
+                        t_start_utc: c.t_start_utc + 0.375,
+                        score,
+                        ..c.clone()
+                    };
+                    let r = refinement_at(updated.lat, updated.lon, updated.t_start_utc);
+                    Some((updated, r))
+                },
+            );
+            assert_eq!(attempted, ["A", "B", "C"]);
+            assert_eq!(out[0].events[0].flight, winner);
+            assert!(out.windows(2).all(|w| w[0].score >= w[1].score));
+            let r = refined.expect("the reported winner was refined");
+            assert_eq!((out[0].lat, out[0].lon), (r.lat, r.lon));
+            assert_eq!(out[0].t_start_utc, r.t_start_utc);
+            let report = margin_report(&out);
+            assert!(
+                (report["margin_nats"].as_f64().unwrap() - margin).abs() < 1e-12,
+                "{report}"
+            );
+            assert_eq!(report["margin_basis"], basis);
+            if c_score.is_none() {
+                // C stays below B in current-score order, but its fine-grid comparison
+                // still controls the margin. A retains its coherent refined answer.
+                assert_eq!(out[1].events[0].flight, "B");
+                assert_eq!(out[2].events[0].flight, "C");
+                assert_eq!(report["top_score"], 35.0);
+                assert_eq!(report["margin_top_score"], 30.0);
+                assert_eq!(report["margin_rival_score"], 29.7);
+                assert_eq!(report["next_distinct_score"], 29.7);
+                assert_eq!(out[2].lat, candidates[2].lat);
+                assert_eq!(out[2].t_start_utc, candidates[2].t_start_utc);
+                assert!(out[2].fine_score.is_none());
+            }
+        }
     }
 
     #[test]
