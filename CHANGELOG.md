@@ -19,6 +19,66 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### The curve match checks its answer along each heard flight's track
+
+- **The fault.** One heard flight fixes when its closest approach was heard, not where along its track the
+  recorder stood. Move the place along the track and the clock by the distance over the flight's speed, and that
+  flight's curve stays where it was (exactly, for a straight, level, steady flight). Another heard flight with a
+  different velocity breaks that tie. One with the same velocity does not: a parallel track flown the same way
+  at the same speed, or the same leg flown again. The curve match's radius came only from its other modes, at
+  least 1 km apart and 16 at most, and a climb moves the place only a little at a time, so nothing in the search
+  had to look along that line. In set E, 1d's reading found `e_olympia`'s one-flight modes moving that way along
+  their track. Set E is used up as a test, and this change was not tuned on it.
+- **The change** (`crates/fdop-core/src/curvematch.rs`: `along_track_aliases`, `verdict`).
+  - After the real window's search, the best place is scored every 1 km out to 6 km either way along each heard
+    pass's track, with the clock moved to match. Only places inside the region and clocks inside the window count.
+  - Each twin within 3 nats of the best, or better than it, widens the radius as a mode does. Past 5 km, the
+    answer does not stand.
+  - No evidence, mode, margin or decoy changes, so the decoy calibration is unchanged. The check can only widen
+    the real window's radius. In `src/pipeline.rs` that can remove a stand (past 5 km). Where a stand survives,
+    it can turn `Adopts` into `Confirms`: a low trace answer inside the wider radius is asserted at its own place
+    instead of the curve match's, medium either way. `Agrees` and `Conflicts` use the fixed 3 km, not the radius.
+  - The new `aliases` field of `curvematch.json` lists the twins. The verdict line says how many of them tied.
+- **Tests.**
+  - One heard flight: twins tie past 5.5 km, and the answer is refused.
+  - Two flights on parallel tracks, same direction and speed: the same.
+  - The same leg flown twice by one aircraft (`a_lap_flown_twice_still_slides`): the same, each pass checked from
+    its own closest approach.
+  - The parallel pair flown opposite ways: no twin 1 km or more out ties.
+  - A twin counts toward the radius exactly as a mode does (`a_tied_alias_widens_the_radius_like_a_mode`).
+  - In the three-flight scene, with tracks crossing, nothing ties 4 km or more out. One twin 3 km along a track
+    is 2.67 nats down: there that flight's curve, and a silent flight's curve landing on another flight's sound,
+    explain the audio. So the radius reaches at least 3 km, and stays inside 5 km.
+  - A heard flight is worth only about 3 to 5 nats (11.5 nats of curve give 4.9), so this check is strict by the
+    radius rule's own 3-nat standard.
+- **The three-flight test.** `3164272` widened its clock tolerance from 2 s to 3 s, justified by a place-clock
+  trade along one track that crossing tracks do not have. It keeps the 3 s and now also requires the truth itself,
+  scored at its own place over a wide clock range, to be within 3 nats of the best at a clock within 2 s.
+- **Effect.** Full `locate` runs with the benchmark's R2 inputs (start ±2 min, 25 km region) on the development
+  machine, binary `cd639aca`, against a rule written before any of them ran. Its source differs from this commit's
+  only in the test module and one comment. The verdict without the twins is recomputed from each run's own modes,
+  so geoid-service noise between runs cannot enter the comparison.
+  - **15 development rows** (runs `alias_dev`, with `b3_sapsucker` rerun in `alias_rest/dev` after a disk guard
+    stopped it). The check changed no stand, call, grade or radius on any of them.
+    - The four right answers the curve match agrees with still stand, radius 1 km: `b1_osprey_1031` (110 twins),
+      `b1_osprey_1101` (67), `b1_osprey_1102b` (41) and `b3_duke` (147). No twin tied.
+    - `a_ref` is right and high from the traces. The curve match stands neither way there (margin −4.12).
+      `b3_sapsucker` has no answer either way (margin −5.45).
+    - On the nine rows with no right answer, the curve match stands on none, either way. Twins tied on six of
+      them (1 to 7 each, out to 6.0 km), but those radii were already wider from the modes.
+  - **33 no-right-answer runs** (`nulls42_full.sh`: wrong dates, and places 90 km or more from the truth; runs
+    `alias_nulls` and `alias_rest/nulls`). 28 had finished when this was written; the other five are in the
+    benchmark's Addendum 15. The curve match stands on none of the 28, with or without the twins, and none is
+    asserted (27 `Silent`, 1 `Unsupported`). Twins widened four radii, all on runs that do not stand:
+    `nd_o01_1102` 1000 to 1001 m, `nd_o31_1101` 1000 to 1996 m, `np_o01_p2` 1000 to 2998 m and `np_o31_p3`
+    4967 to 5997 m. The largest margin is −0.67 (`np_o31_p2`).
+  - **Cost:** 0.0 to 4.4 s per run (`b3_duke`, 147 twins), against 242 to 2202 s for the whole curve
+    match in `c_ref_0909`, `b3_duke` and `b1_osprey_1031`.
+  - So on these recordings the check changed nothing. Their four stands are all `Agrees`, and no row is
+    `Confirms` or `Adopts`. It guards against the one-flight slide, which they do not show. It can raise an
+    answer one way only: where the curve match stands more than 3 km from a high trace answer (`Conflicts`,
+    lowered to low) and the check removes that stand, the high answer stays high. No row here is `Conflicts`.
+
 ### Measurement goes down the list until 24 events pass, from the silence line up
 
 - **The fault.** Only primary detections scoring 4.5 or more were measured, and only the strongest 24 of them,
