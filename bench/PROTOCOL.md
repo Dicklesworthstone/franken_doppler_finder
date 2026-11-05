@@ -940,3 +940,90 @@ one-pass curve match can no longer veto an asserted answer or keep a medium, and
   no row had ended between 21:50Z and the drop. Set F's capture folders, clock files, jobs, `cases.json` and
   `truth_f.json` were all present, with folder sizes in line with their clock lengths. No set F audio was opened. The
   clock files hold no sizes or hashes, so that is not a byte-level check.
+
+## Addendum 15, 2026-11-05, a sixth later `fdop` build, `5f6348c`, for set F
+
+`5f6348c` is `c6e5800` plus one commit, in `crates/fdop-core/src/curvematch.rs` (`along_track_aliases`, `verdict`), with
+its README and CHANGELOG. After the real window's search, the curve match's best place is also scored every 1 km out to
+6 km either way along each heard flight's track, with the clock moved by the distance over the flight's speed. A twin
+within 3 nats of the best, or better, widens the radius as another mode does, and past 5 km the curve match does not
+stand. No evidence, margin or decoy changes, so the check can remove a stand but never add one. In `src/pipeline.rs`, a
+removed stand also removes its conflict with a high trace answer. Where a stand survives with a wider radius, a low
+trace answer inside it is confirmed at its own place instead of adopted at the curve match's, medium either way.
+
+It is registered for set F as `fdop-5f6348c`, under every rule of Addendum 9. It sits beside `fdop-9087ec4`,
+`fdop-6914ab7`, Addendum 11's `fdop-ce02222`, Addendum 12's `fdop-3164272` and Addendum 14's `fdop-32d4e1a`. It is
+built from `5f6348c` itself. `main` got it through the merge `981fad1`, onto `700853f`. Under `e13f2d2`'s clock
+bounds, that merge bounds the twins' clocks by the window's end, and both its tree and `5f6348c`'s passed the four
+checks.
+
+- **When.** Committed at 23:28Z, before any set F run of any tool. The agent that made this build read no set F
+  result. The idea came from set E: 1d's reading of `e_olympia`, whose one-flight modes slide along that flight's
+  track. So set E is not a test of this build.
+- **What is a test of it.** Set F. Every recording below is a development recording, run with R2 inputs.
+- **The rule it had to pass.** Written at 20:17Z, before the evaluation started at 20:24Z:
+  1. On the 42 runs with no right answer (33 at wrong dates or places, and the 9 development rows without one), no
+     grade reaches medium or high that `c6e5800` does not give, and the curve match stands on none.
+  2. On the 15 development rows, every right asserted answer stays asserted and right, and no wrong one is asserted.
+  3. Every row is reported, with and without the twins.
+
+  At 21:02Z, before any right row with a stand had a result, one criterion was added, because 1 and 2 can barely
+  fail. The check raises an answer only where a curve stand conflicts with a high trace answer, and no wrong or
+  no-answer row has a high trace answer. The note written then said "medium or high". One no-answer row,
+  `nd_o31_1102`, has a medium trace answer, which the check cannot raise: without a stand it stays low.
+
+  4. If the check removes the stand at 2 or more of the four right rows where the curve match stands, the build is too
+     strict for set F and is not registered. If it removes 1, it is registered with that cost stated first.
+- **Outcome.** Full `locate` runs on the controlling Mac, binary `cd639aca`, whose source differs from
+  `5f6348c`'s only in the test module and one comment. The verdict without the twins is recomputed from each
+  run's own modes, so the geoid service cannot enter the comparison.
+  - **Rule 4.** No stand removed. The four stands (osprey cam 10-31, 11-01 and 11-02, and Duke Farms) keep a 1 km
+    radius, with 41 to 147 twins each and none within 3 nats.
+  - **Development rows.** On all 15, no stand, call, grade or radius changed.
+    - Right: 5 asserted, all high. Sapsucker Woods is declined either way: the trace search found nothing, and the
+      curve match's margin is −5.45. `a_ref`'s run used the default geoid, −30.00 m, as its log shows.
+    - The nine rows with no right answer: no stand either way. Twins tied on six of them, out to 6.0 km, inside radii
+      the modes had already made wider.
+  - **No-answer runs.** All 33. The curve match stands on none, with or without the twins, and none is asserted
+    (32 `Silent`, 1 `Unsupported`). Twins tied on 22. They widened four radii, all on runs that do not stand:
+    `nd_o01_1102` from 1000 to 1001 m, `nd_o31_1101` from 1000 to 1996 m, `np_o01_p2` from 1000 to 2998 m and
+    `np_o31_p3` from 4967 to 5997 m. The largest margin is −0.67, on `np_o31_p2`.
+  - **Calls.** The four stands are all `Agrees`. No row is `Confirms`, `Adopts` or `Conflicts`, so neither the
+    move nor the raise above occurs here.
+  - **Cost.** 0.0 to 4.4 s per run, against 242 to 2202 s for the whole curve match in the three runs timed.
+  - **The interruption.** At 22:18Z the Mac's data volume fell to 1.6 GiB free because of other jobs. A guard stopped
+    this evaluation and deleted nothing. From 22:31Z, the unfinished rows (`b3_sapsucker`, `nd_duk_0908` and the 18
+    wrong-place rows) ran again, on the same binary with the same arguments, writing to network storage.
+- **The committed binary.** It was built on the benchmark machine from `git archive 5f6348c` by 1d, from 23:30:33Z to
+  23:37:20Z, with direct cargo after touching the sources. The build log shows six `Compiling` lines, and
+  `curvematch.rs`'s hash was checked. Its sha256 is `0c1b51bb01290c4363ad9bb63be2f746e70b83f1be9463324abeddde7982ca4b`,
+  and `fdop selftest` passes: error 2.4 m, radius 75 m, clock error +0.02 s, 4 events.
+  - That same binary was then run on the controlling Mac, on `w_ref` and `nd_ref_1101`, with the evaluation's
+    arguments. The two runs started 3 minutes apart, because the geoid service can cross simultaneous requests.
+  - `cmp_strict.py` against the evaluation's rows finds 0 differences on each. Both took the geoid from NGS, at
+    −30.39 m and −30.89 m, as in the evaluation.
+- **Checks on `5f6348c`'s sources.** `cargo fmt`, `clippy` and `fdop selftest` pass, and the workspace tests give 222
+  passed, 0 failed and 2 ignored.
+- **Tests changed after the evaluation started.** These add no behaviour: the lap test
+  (`a_lap_flown_twice_still_slides`), helpers for the synthetic scenes, rustfmt, and one comment in
+  `along_track_aliases`.
+  - The three-flight test keeps `3164272`'s 3 s clock tolerance. It now also requires the truth, scored at its own
+    place, to be within 3 nats of the best at a clock within 2 s.
+  - One of that scene's twins, 3 km along a track, is 2.67 nats below the best, inside the 3-nat tie. It is a real
+    near-tie, and the test documents it.
+- **A wrong lead, corrected before any use.** While planning, this agent first named `e_harbourgate` as a slide. It is
+  not (Addendum 14), and it was never used for this build.
+- **What it does not catch.**
+  - A chance fit of one pass, like `e_harbourgate`'s, is not a slide, and its twins need not tie.
+  - Only places inside the region and clocks inside the window are checked. A best place pinned at the region's edge
+    or the window's end can have none to check. `nd_fee_0908` heard 1 flight and had 0 twins: its best place sat in
+    a corner of the region and 1.5 s before the window, and each 1 km step moved its 52 m/s flight's clock 19 s.
+- **Known before it runs.** On set F this check lowers an answer only by removing a curve stand, where that stand
+  rests on one flight or on flights sharing a velocity.
+  - If the removed stand would have raised or confirmed a right answer, the check costs that answer. If it would have
+    placed a wrong one, the check saves it.
+  - Otherwise it can move a medium answer from the curve match's place to a low trace answer's place inside the wider
+    radius. It can also raise a high trace answer that a conflicting stand had lowered to low.
+  - The development rows show none of these cases, so set F is its only test.
+- **Every build is reported.** This makes six registered later `fdop` builds: `9087ec4`, `6914ab7`, `ce02222`,
+  `3164272`, `32d4e1a` and `5f6348c`. Each passes or fails the claim by its own row, and none is chosen after the fact.
