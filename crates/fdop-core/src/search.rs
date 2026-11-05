@@ -3758,7 +3758,7 @@ mod tests {
                 let (_, gain) = gains
                     .iter()
                     .find(|(f, _)| *f == flight)
-                    .expect("only the leader and the best rival are refined");
+                    .expect("only the flights a case lists are refined");
                 let score = c.score + (*gain)?;
                 Some((
                     Candidate { score, ..c.clone() },
@@ -3797,9 +3797,12 @@ mod tests {
             assert_eq!(report["margin_basis"], "fine_grid");
             assert!(!has_radius);
         }
-        // A rival that overtakes when refined takes the lead, with its own radius.
-        let (tried, leader, report, has_radius) = run(&[("A", Some(0.0)), ("B", Some(5.0))]);
-        assert_eq!(tried, ["A", "B"]);
+        // A rival that overtakes when refined takes the lead, with its own radius. At the fine
+        // cells it trails A's neighbour, a different explanation from it, and leads C by 1 nat,
+        // closer than A's 3 refined, so both get a refinement attempt before the margin is read.
+        let (tried, leader, report, has_radius) =
+            run(&[("A", Some(0.0)), ("B", Some(5.0)), ("C", Some(0.0))]);
+        assert_eq!(tried, ["A", "B", "A", "C"]);
         assert_eq!(leader, "B");
         assert!((nats(&report) - 3.0).abs() < 1e-12, "{report}");
         assert_eq!(report["margin_basis"], "refined");
