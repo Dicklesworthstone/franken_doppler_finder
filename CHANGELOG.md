@@ -117,6 +117,12 @@ at that commit, not per-change commits.
   | eagle-nest cam, Lee County, FL, state search | `s_swfl_fl_r5` | about 17 km from the county's centre | 487 m | low | 0.07 | core, margin | 135 km from the site, low, 0.20 |
   | same recording, county search | `s_swfl_lee_r5` | about 17 km from the county's centre | 467 m | low | 1.78, fine cells | core, margin | about 4 km from the site, low, no rival |
   | eagle cam, Hillsborough, NJ, county search | `f_duke_county_r5` | about 6.5 km from the township's centre | 300 m, nominal | low | 26.83, fine cells | core, unheard, radius | not replayed |
+  | wrong date, same eagle cam | `n_duke_on_1102_r5` | about 70 km from the township's centre | 158 m | low | 4.79 | core, margin | 106 km, low, 2.07 |
+  | osprey cam, Oyster Bay, NY, 11-02 | `f_osprey_1102b_r5` | 365 km | 244 m | low | 0.16 | margin | 365 km, low, 0.47 |
+
+  Only the core gate keeps `n_duke_on_1102_r5` from a wrong-date medium: its margin, 4.79 refined against refined,
+  clears 3, and 1 of its 4 matches is core. The nearest other match, e11, passes on chi (1.86) and on its own clock
+  (−4.0 s, exactly the 4 s limit) but its trace is only 0.7 nats better than chance, against 2.
 
 - **Checks.** `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings`
   exit 0; `cargo test --workspace --locked -j 2` 179 passed, 0 failed, 2 ignored; `cargo run --release --locked -j 2 -- selftest`

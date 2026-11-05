@@ -1175,18 +1175,21 @@ audio or video recorded somewhere sensitive:
   it can lower a right answer's margin. A small margin can also mean other flights at the same place, because a
   shared event matched to another flight counts as a different explanation at any distance: one field run has 0.11
   nats against a rival 140 m away. A wrong answer can pass the core gate, leaving margin alone to keep it low: three
-  runs on `7e5cf3e` (2.89, 2.37 and 0.47 nats), and on the current code the 09-07 wrong date (2.95) and the feeder
-  (1.81, `n_ref_on_0907_r5`, `f_feederwatch_r5`). And no rival passes the gate, however small the search: one county search
-  scored 20 fine cells, found no rival, and is low only on its other gates. A large margin means nothing when the core
-  gate fails: the eagle cam's county search has 26.83 nats with 1 core match of 7, and is low (`f_duke_county_r5`).
+  runs on `7e5cf3e` (2.89, 2.37 and 0.47 nats), and on the current code three: the 09-07 wrong date (2.95), the feeder
+  (1.81) and the osprey cam on 11-02 (0.16; `n_ref_on_0907_r5`, `f_feederwatch_r5`, `f_osprey_1102b_r5`). The other
+  way round, a wrong date on the eagle cam clears the medium line at 4.79 nats and is low only on its 1 core match of
+  4 (`n_duke_on_1102_r5`). And no rival passes the gate, however small the search: one county search scored 20 fine
+  cells, found no rival, and is low only on its other gates. A large margin means nothing when the core gate fails:
+  the eagle cam's county search has 26.83 nats with 1 core match of 7, and is low (`f_duke_county_r5`).
 - **Trace evidence past what the chance null measures is extrapolated.** Below the null's 5 % quantile `trace_nats`
   follows a log-normal tail fitted to two quantiles, capped at 25 nats, where an empirical null of n samples supports
   at most ln(n+1), about 6. On the `*_r5` runs one reference event earns 2.3–8.3 nats past that bound on right and
-  wrong dates alike, and the feeder's rival 10.6. Capping it at ln(n+1) in the stored candidates (arithmetic on
-  `search.json`, not a rerun) keeps the right answers high, their margins 3.7, 0.2 and 0.2 nats lower, and the wrong
-  dates low at 2.0 and 0.2 with new leaders. The feeder's wrong answer rises from 1.81 to 2.2–3.2, depending on how its
-  new rival, 1.1 km away, refines, and the top of that range is medium. The tail is not what separates right from
-  wrong on these rows, and changing it needs replays.
+  wrong dates alike, and rivals carry it too: 10.6 for the feeder's. Capping it at ln(n+1) in the stored candidates
+  (arithmetic on `search.json`, not a rerun) moves margins both ways, by up to 3.7 nats. The stored scores mix refined
+  points and fine cells, and refinement moved scores by 0.15–1.21 nats on these runs, so each capped margin is
+  uncertain by about that much: county about 14 and state-wide 7.2–8.4, both high; three-day 5.8–7.0, either side of
+  the high line; 09-07 0.8–3.2 and 09-09 at most 0.2, both with new leaders; the feeder's wrong answer 2.0–3.2, either
+  side of the medium line. So the arithmetic cannot say what a cap does to grades; that needs replays.
 - **The ridge check rests on limited evidence.** The 15 % line was picked with these recordings in view; synthetic
   tests justify its two sides, and the replays can only show harm. Real ridges steeper than 4 Hz/s exist in the
   recordings, but no event follows one, so that side is synthetic only. A faint steep pass can fall under the line
