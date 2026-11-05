@@ -1069,6 +1069,12 @@ fn pass_value(p: &MatchParams, r50: f64, nats: f64, d: f64) -> f64 {
     ln_add((1.0 - pd).ln(), pd.ln() + ln_e)
 }
 
+/// Timing penalties can make even a strong lookup contribute no evidence. Only positive-valued
+/// passes participate in pixel ownership, so only they can count as independent heard flyovers.
+fn counts_as_heard(value: f64, nats: f64, shared: bool) -> bool {
+    value > 0.0 && nats >= 6.9 && !shared
+}
+
 struct Exact {
     evidence: f64,
     r50_m: f64,
@@ -1079,7 +1085,8 @@ struct Exact {
 }
 
 /// Evidence at a point with exact curves (real trajectory, emission-time solve, modelled wind and
-/// sound speed), over a small clock sweep shared by all passes. `None` if no pass is in reach.
+/// sound speed), over a small clock sweep shared by all passes, inside this window's start bounds.
+/// `None` if no pass is in reach.
 fn score_exact(
     inp: &MatchInputs<'_>,
     p: &MatchParams,
@@ -1090,6 +1097,10 @@ fn score_exact(
     clock0: f64,
 ) -> Option<Exact> {
     let im = inp.image;
+    // Coarse votes are quantized to image frames, even for an exact fractional-second start.
+    // Clamp the seed before predicting curves, then constrain the sweep too: repeated spatial
+    // moves must not walk the clock out of this prior or decoy window.
+    let clock0 = clock0.clamp(inp.start_lo, inp.start_hi);
     let z = inp.fine_dem.elev_m(lat, lon);
     let x = geodetic_to_ecef(lat, lon, z + MIC_HEIGHT_M);
     let enu = Enu::new(lat, lon, z + MIC_HEIGHT_M);
@@ -1323,6 +1334,10 @@ fn score_exact(
     let mut best = (f64::NEG_INFINITY, 0i64, p.r50_m[0]);
     for &r50 in &p.r50_m {
         for k in -kmax..=kmax {
+            let clock = clock0 - k as f64 * im.dt;
+            if clock < inp.start_lo || clock > inp.start_hi {
+                continue;
+            }
             let (sum, _) = assign(k, r50);
             if sum > best.0 {
                 best = (sum, k, r50);
@@ -1338,7 +1353,7 @@ fn score_exact(
         let (s, r) = o.table[(at + span) as usize];
         let usable = s.is_finite();
         let nats = if usable { o.null.nats(s) as f64 } else { 0.0 };
-        if nats >= 6.9 && !shared {
+        if counts_as_heard(value, nats, shared) {
             n_heard += 1;
         } else if usable && !o.at_end && o.d <= 2000.0 && nats < 1.0 {
             n_close += 1;
@@ -1543,7 +1558,8 @@ pub struct CurveVerdict {
 
 /// Grade one result. The margin line comes from recordings with no right answer: see
 /// `ASSERT_MARGIN_NATS`. Places the evidence cannot rule out widen the radius, and an answer whose
-/// radius would be wider than `MAX_ASSERT_RADIUS_M` does not stand.
+/// radius would be wider than `MAX_ASSERT_RADIUS_M` does not stand. At least two independently
+/// credited flyovers are required, as in the trace search.
 pub fn verdict(r: &MatchResult) -> Option<CurveVerdict> {
     let top = r.modes.first()?;
     let (margin, p) = (r.decoy_margin?, r.decoy_p?);
@@ -1559,13 +1575,14 @@ pub fn verdict(r: &MatchResult) -> Option<CurveVerdict> {
         .map(|m| haversine_m(top.lat, top.lon, m.lat, m.lon))
         .fold(RADIUS_FLOOR_M, f64::max);
     let enough = r.decoys.len() >= MIN_DECOYS;
+    let enough_passes = top.n_heard >= 2;
     let finite = top.evidence.is_finite()
         && margin.is_finite()
         && r.decoys.iter().all(|w| w.best_evidence.is_finite());
     let clears = finite && margin > ASSERT_MARGIN_NATS;
     let tight = radius_m <= MAX_ASSERT_RADIUS_M;
     let why = format!(
-        "{:.1} nats at this place and clock, {margin:+.1} over the best of {} decoy clocks (line {ASSERT_MARGIN_NATS:+.1}), {} flights heard, places within {TIED_NATS:.0} nats span {radius_m:.0} m{}",
+        "{:.1} nats at this place and clock, {margin:+.1} over the best of {} decoy clocks (line {ASSERT_MARGIN_NATS:+.1}), {} flights heard, places within {TIED_NATS:.0} nats span {radius_m:.0} m{}{}",
         top.evidence,
         r.decoys.len(),
         top.n_heard,
@@ -1574,9 +1591,14 @@ pub fn verdict(r: &MatchResult) -> Option<CurveVerdict> {
         } else {
             "; too few decoy clocks to judge"
         },
+        if enough_passes {
+            ""
+        } else {
+            "; at least two independent flyovers are required"
+        },
     );
     Some(CurveVerdict {
-        stands: enough && clears && tight,
+        stands: enough && enough_passes && clears && tight,
         lat: top.lat,
         lon: top.lon,
         clock_unix: top.clock_unix,
@@ -1587,6 +1609,22 @@ pub fn verdict(r: &MatchResult) -> Option<CurveVerdict> {
         p,
         n_heard: top.n_heard,
         why,
+    })
+}
+
+/// Test the interpolated path within the catalogue span, at the same time resolution used for
+/// closest-approach searches. A stride through original ADS-B knots can skip an entire sparse pass.
+/// The caller pads the region by the acoustic reach plus 2 km for the spatial refinement.
+fn track_near_region(tr: &TrackModel, pad: &BBox, span: (f64, f64), sample_s: f64) -> bool {
+    let (ta, tb) = (tr.t0().max(span.0), tr.t1().min(span.1));
+    if tb < ta {
+        return false;
+    }
+    let n = (((tb - ta) / sample_s).ceil() as usize).max(1);
+    (0..=n).any(|i| {
+        let t = ta + (tb - ta) * i as f64 / n as f64;
+        let (lat, lon, _) = ecef_to_geodetic(tr.pos_at(t));
+        pad.contains(lat, lon)
     })
 }
 
@@ -1775,22 +1813,15 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
     let pad = inp.region.padded_km(p.reach_m / 1000.0 + 2.0);
     let keep: Vec<usize> = (0..inp.tracks.len())
         .into_par_iter()
-        .filter(|&i| {
-            let tr = &inp.tracks[i];
-            tr.t.iter()
-                .step_by(4)
-                .zip(tr.pos.iter().step_by(4))
-                .any(|(&tt, &q)| {
-                    if tt < span.0 || tt > span.1 {
-                        return false;
-                    }
-                    let (la, lo, _) = ecef_to_geodetic(q);
-                    pad.contains(la, lo)
-                })
-        })
+        .filter(|&i| track_near_region(&inp.tracks[i], &pad, span, p.sample_s))
         .collect();
     // The whole search inside one clock window. Run once for the real window and once per decoy.
-    let search_window = |list: &[Top]| -> Vec<MatchMode> {
+    let search_window = |list: &[Top], shift_s: f64| -> Vec<MatchMode> {
+        let window = MatchInputs {
+            start_lo: inp.start_lo + shift_s,
+            start_hi: inp.start_hi + shift_s,
+            ..*inp
+        };
         let mut list = list.to_vec();
         list.sort_unstable_by(|a, b| b.coarse.total_cmp(&a.coarse).then(a.cell.cmp(&b.cell)));
         let mut chosen: Vec<(Top, f64, f64)> = Vec::new();
@@ -1810,8 +1841,16 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
             .par_iter()
             .enumerate()
             .filter_map(|(i, m)| {
-                score_exact(inp, p, &bank, &keep, m.1, m.2, bin_clock(m.0.bin as usize))
-                    .map(|e| (i, e))
+                score_exact(
+                    &window,
+                    p,
+                    &bank,
+                    &keep,
+                    m.1,
+                    m.2,
+                    bin_clock(m.0.bin as usize),
+                )
+                .map(|e| (i, e))
             })
             .collect();
         scored.sort_by(|a, b| b.1.evidence.total_cmp(&a.1.evidence).then(a.0.cmp(&b.0)));
@@ -1821,7 +1860,15 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
             .filter_map(|(rank, (i, e))| {
                 let m = &chosen[i];
                 let (la, lo, e) = if rank < p.refine_modes {
-                    refine_point(inp, p, &bank, &keep, m.1, m.2, bin_clock(m.0.bin as usize))?
+                    refine_point(
+                        &window,
+                        p,
+                        &bank,
+                        &keep,
+                        m.1,
+                        m.2,
+                        bin_clock(m.0.bin as usize),
+                    )?
                 } else {
                     (m.1, m.2, e)
                 };
@@ -1851,11 +1898,16 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         }
         distinct
     };
-    let modes = search_window(&per_window[n_lo as usize]);
+    let modes = search_window(&per_window[n_lo as usize], 0.0);
     timings.push(("exact".to_string(), t.elapsed().as_secs_f64()));
     // Diagnostic only, on recordings whose place is known: evidence at a given place, best over a
     // wide range of clocks, then after refining from it (`refine_point`: the `nms_m` disc around
     // it, then the climb). Never used to choose anything.
+    let probe_inputs = MatchInputs {
+        start_lo: f64::NEG_INFINITY,
+        start_hi: f64::INFINITY,
+        ..*inp
+    };
     let probe: Vec<MatchMode> = p
         .probe
         .iter()
@@ -1863,12 +1915,14 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
             let step = (2 * p.clock_sweep_frames + 1) as f64 * im.dt;
             let best = (-15i32..=15)
                 .into_par_iter()
-                .filter_map(|i| score_exact(inp, p, &bank, &keep, la, lo, ck + i as f64 * step))
+                .filter_map(|i| {
+                    score_exact(&probe_inputs, p, &bank, &keep, la, lo, ck + i as f64 * step)
+                })
                 .max_by(|a, b| a.evidence.total_cmp(&b.evidence));
             let mut out = Vec::new();
             if let Some(e) = best {
                 let clock = e.clock;
-                let up = refine_point(inp, p, &bank, &keep, la, lo, clock);
+                let up = refine_point(&probe_inputs, p, &bank, &keep, la, lo, clock);
                 out.push(MatchMode {
                     lat: la,
                     lon: lo,
@@ -1904,7 +1958,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         .filter(|&wi| wi as i64 != n_lo)
         .map(|wi| {
             let shift_s = (wi as i64 - n_lo) as f64 * stride;
-            match search_window(&per_window[wi]).first() {
+            match search_window(&per_window[wi], shift_s).first() {
                 Some(m) => DecoyWindow {
                     shift_s,
                     best_coarse: m.coarse,
@@ -2163,6 +2217,114 @@ mod tests {
             atmo: &atmo,
         };
         run(&inp, p, &|_| {})
+    }
+
+    /// Both knots are outside the spatial and time filters, but their interpolated pass produces
+    /// coarse votes inside them. Exact scoring must retain that same flight.
+    #[test]
+    fn sparse_interpolated_passes_survive_the_exact_track_filter() {
+        let (lat, lon) = (40.8765, -73.525);
+        let enu = Enu::new(lat, lon, 0.0);
+        let p = MatchParams::default();
+        let region = BBox::new(lat - 0.002, lon - 0.002, lat + 0.002, lon + 0.002);
+        let pad = region.padded_km(p.reach_m / 1000.0 + 2.0);
+        let tr = straight_track(
+            &enu,
+            [0.0, 0.0, 500.0],
+            [160.0, 0.0, 0.0],
+            100.0,
+            10.0,
+            190.0,
+            180.0,
+        );
+        assert_eq!(tr.t.len(), 2);
+        for &q in &tr.pos {
+            let (la, lo, _) = ecef_to_geodetic(q);
+            assert!(!pad.contains(la, lo));
+        }
+        let span = (30.0, 170.0);
+        assert!(tr.t.iter().all(|&t| t < span.0 || t > span.1));
+        let grid = make_grid(&p, &region, &FlatElevation(0.0));
+        let mut stamps = Vec::new();
+        stamp_track(&tr, &grid, &p, &|_| BASE_C, 0.0, span, &mut stamps);
+        assert!(
+            !stamps.is_empty(),
+            "the coarse search sees the crossing pass"
+        );
+        assert!(track_near_region(&tr, &pad, span, p.sample_s));
+        assert!(!track_near_region(&tr, &pad, (200.0, 300.0), p.sample_s));
+        assert!(!track_near_region(&tr, &pad, (10.0, 20.0), p.sample_s));
+
+        let far = straight_track(
+            &enu,
+            [0.0, 30_000.0, 500.0],
+            [160.0, 0.0, 0.0],
+            100.0,
+            10.0,
+            190.0,
+            180.0,
+        );
+        assert!(!track_near_region(&far, &pad, span, p.sample_s));
+    }
+
+    /// Frame-quantized seeds may lie outside a sub-frame prior, but the physical prediction and
+    /// every shared-clock trial must obey the supplied interval. The quarter-second boundaries
+    /// make an unconstrained half-second sweep unable to pass by coincidence.
+    #[test]
+    fn exact_curve_scores_respect_fractional_start_bounds() {
+        let c = case(0.5, false);
+        let p = params();
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let bank = build_bank(&im, &p);
+        let idx: Vec<usize> = (0..c.tracks.len()).collect();
+        for (a, b) in [(1.25, 1.25), (-1.25, -1.25), (0.25, 0.4), (-0.4, -0.25)] {
+            let inp = MatchInputs {
+                image: &im,
+                tracks: &c.tracks,
+                region: c.region,
+                start_lo: c.clock + a,
+                start_hi: c.clock + b,
+                duration_s: c.x.len() as f64 / 2800.0,
+                catalog: (f64::NEG_INFINITY, f64::INFINITY),
+                dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            for seed in [c.clock - 2.0, c.clock, c.clock + 2.0] {
+                let e = score_exact(&inp, &p, &bank, &idx, c.lat, c.lon, seed)
+                    .expect("the audible passes score inside the requested interval");
+                assert!(
+                    (inp.start_lo..=inp.start_hi).contains(&e.clock),
+                    "{} outside [{}, {}]",
+                    e.clock,
+                    inp.start_lo,
+                    inp.start_hi
+                );
+                assert!(
+                    e.n_heard >= 2,
+                    "the constrained score still hears the flights"
+                );
+            }
+        }
+    }
+
+    /// Fixing the clock must still permit a spatial search, including every refinement move.
+    #[test]
+    fn a_fixed_fractional_clock_still_locates_the_observer() {
+        let c = case(0.5, false);
+        let p = MatchParams {
+            decoy_span_s: 180.0,
+            ..params()
+        };
+        let clock = c.clock + 0.25;
+        let r = run_case(&c, &p, clock, clock);
+        let top = r.modes.first().expect("a mode at the fixed clock");
+        assert!(r.modes.iter().all(|m| m.clock_unix == clock));
+        let err = haversine_m(top.lat, top.lon, c.lat, c.lon);
+        assert!(err < 200.0, "error {err} m: {top:?}");
+        assert!(top.n_heard >= 3, "{top:?}");
     }
 
     #[test]
@@ -2466,7 +2628,7 @@ mod tests {
         }
     }
 
-    /// Each of the three conditions can refuse on its own, and a place the evidence cannot rule
+    /// Each condition can refuse on its own, and a place the evidence cannot rule
     /// out widens the radius even when it does not refuse.
     #[test]
     fn a_verdict_needs_margin_decoys_and_one_place() {
@@ -2474,6 +2636,18 @@ mod tests {
         let v = verdict(&fake_result(m + 1.0, 48, None)).unwrap();
         assert!(v.stands, "{v:?}");
         assert_eq!(v.radius_m, RADIUS_FLOOR_M);
+        // Beating the decoys with a tight radius cannot turn one flyover into a location.
+        for n_heard in 0..=2 {
+            let mut r = fake_result(m + 1.0, 48, None);
+            r.modes[0].n_heard = n_heard;
+            let v = verdict(&r).unwrap();
+            assert_eq!(v.stands, n_heard == 2, "{v:?}");
+            assert_eq!(
+                v.why
+                    .contains("at least two independent flyovers are required"),
+                n_heard < 2
+            );
+        }
         assert!(!verdict(&fake_result(m - 0.1, 48, None)).unwrap().stands);
         // a decoy that ties is a decoy that was not beaten
         assert!(!verdict(&fake_result(m, 48, None)).unwrap().stands);
@@ -2507,6 +2681,30 @@ mod tests {
         let mut r = fake_result(m + 1.0, 48, Some((20.0, 1.0)));
         r.modes[1].evidence = f64::NAN;
         assert!(!verdict(&r).unwrap().stands);
+    }
+
+    #[test]
+    fn timing_penalties_do_not_count_uncredited_passes_as_heard() {
+        let p = MatchParams::default();
+        let nats = 7.0;
+        let raw = pass_value(&p, 2000.0, nats, 3100.0);
+        let z = p.pass_slack_frames as f64 * p.hop_s / p.pass_clock_sigma_s;
+        let value = raw - 1.5 * (1.0 + 0.5 * z * z).ln();
+        // This shifted lookup beats silence and can win value_at, despite earning no credit.
+        assert!(raw > 0.0 && value < 0.0);
+        assert!(value > pass_value(&p, 2000.0, 0.0, 3100.0));
+        assert!(!counts_as_heard(value, nats, false));
+        assert!(!counts_as_heard(0.0, nats, false));
+        assert!(counts_as_heard(raw, nats, false));
+        assert!(!counts_as_heard(raw, nats, true));
+        let passes = [(raw, nats, false), (value, nats, false), (0.0, nats, false)];
+        assert_eq!(
+            passes
+                .into_iter()
+                .filter(|&(v, n, shared)| counts_as_heard(v, n, shared))
+                .count(),
+            1
+        );
     }
 
     /// A bright curve on quiet audio can score thousands of nats; its value must stay finite and
@@ -2725,6 +2923,7 @@ mod tests {
         let b = run_case(&c1, &p, c1.clock - 60.0, c1.clock + 60.0);
         let shared = b.modes[0].passes.iter().filter(|q| q.shared).count();
         assert!(shared >= 1, "{:?}", b.modes[0]);
+        assert_eq!(b.modes[0].n_heard, a.modes[0].n_heard);
         assert!(
             b.modes[0].evidence < a.modes[0].evidence + 1.0,
             "{} vs {}",

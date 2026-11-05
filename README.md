@@ -41,7 +41,7 @@ finding the faint curves in a spectrogram to naming the town.
 ## Honest status
 
 **Real-recording validation baseline:** the numbers below belong to the archived builds and runs named with
-them. The comparable-rival correction has not been replayed on the reference or field recordings. The reference
+them. The comparable-rival and curve-match corrections have not been replayed on the reference or field recordings. The reference
 audio download was attempted, but its host returned "Site Unavailable"; no accuracy or grade change is claimed.
 The reference searches, the reference recording's two wrong dates and the Ithaca feeder were replayed on the
 measurement build (`*_gc`), `9087ec4` (runs named `*_b1`), on the commit before it that added the knot rule and the curve match (`*_c1`), and on the build before the knot rule (`*_r5`). Between `*_c1` and `*_b1` no grade changed and no margin moved by more than 0.02 nats. Field rows replayed on those builds are in the [CHANGELOG](CHANGELOG.md). The row on the knot rule and the curve match names its own runs. Every other number in this
@@ -351,6 +351,9 @@ in `crates/fdop-core/src/curvematch.rs`:
   every place within 1 km of it, so every point of that disc is scored on a 100 m grid before it is climbed to
   25 m. A close pass with no energy costs evidence, as in the trace search, and one audio event can credit only
   one flight.
+  Flights are screened for exact scoring using their interpolated paths over the catalogue span, at the
+  closest-approach sampling interval. This retains sparse passes that enter the search area between logged
+  ADS-B positions.
 - **How far it hears.** A pass is credited by how likely it was to be heard at its slant range: a logistic in dB
   around the range heard half the time. That range depends on the microphone, wind and noise, and is not known
   before the match: the osprey cam's 10-31 recording has 9- to 12-nat curves from passes 4 to 6 km out. So every
@@ -363,11 +366,16 @@ in `crates/fdop-core/src/curvematch.rs`:
 - **Decoy clocks.** The same search, step for step, runs at 48 other clock windows, each the width of the clock
   window plus 60 s apart, out to about ±2 hours, on whichever side the fetched days cover. A clock that far off
   cannot be right, so the best decoy is what this recording and this sky give by chance.
-- **When it stands.** The answer must beat every decoy (margin over the best of them above 0), with at least 40
-  decoys, and every place within 3 nats of it must lie within 5 km. Its radius is that spread, and at least
+  Exact scoring and every spatial refinement keep the recording start inside the supplied interval,
+  including fixed and fractional-second starts. Each decoy enforces the same interval shifted to its own
+  clock window.
+- **When it stands.** At least two independently credited passes must be heard: each reaches the 6.9-nat
+  heard line and retains positive value after the timing penalty and the shared-pixel check. The answer
+  must also beat every decoy (margin over the best of them above 0), with at least 40 decoys, and every
+  place within 3 nats of it must lie within 5 km. Its radius is that spread, and at least
   1 km, because its places are 1 km apart. Under exchangeable windows a place beats all 48 decoys by chance
   about 1 time in 49. On 42 runs with no right answer (six recordings at wrong dates and at places 90 km or more
-  from the truth) none beat every decoy. The largest margin on this code is −0.47, the Ithaca feeder's
+  from the truth) none beat every decoy. The largest margin in those logged runs was −0.47, the Ithaca feeder's
   11-02 recording searched on 11-01 (full `locate` runs `r50_dev` and `r50_nulls`, and the same with measurement past
   the old line, `fm` and `nm`). It was −0.18 before the
   heard range was profiled, −0.6 before each start's whole disc was searched, and −0.8 on the version the line
@@ -378,7 +386,9 @@ in `crates/fdop-core/src/curvematch.rs`:
   therefore uses the trace search alone. It fetches its own wider ADS-B span, and the trace search's tracks are
   unchanged. `--no-curve-match` turns it off.
 
-What it did on the development recordings is in the [CHANGELOG](CHANGELOG.md).
+What it did on the development recordings is in the [CHANGELOG](CHANGELOG.md). The sparse-track,
+clock-bound and counted-pass changes have synthetic regressions; the reference and field recordings have
+not been replayed for these changes. The logged outcomes describe the builds named with those runs.
 
 ---
 
@@ -858,9 +868,27 @@ the configured fallback allowance after the preferred request has been tried.
 
 ## Testing
 
+### Current correction checks (2026-11-05)
+
+These results cover the cache-recovery, comparable-rival and curve-match corrections, using the pinned
+`nightly-2026-08-31` toolchain. Source review and formatting passed; runtime verification remains incomplete.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | Passed on the final Rust source |
+| `git diff --check` | Passed before the final validation notes were added |
+| `cargo test -p fdop-core -p fdop-data --locked --no-run -j1` | Build exited 101: the compiler for `asupersync 0.6.2` received SIGKILL during shared-host memory exhaustion; no runtime result was obtained |
+| `cargo test -p fdop-core --locked --no-run -j1` | The smaller retry last reported compiling `fsci-stats`; the host then ran out of disk and its process handles became unavailable. No runtime result was recovered |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Not run on this host |
+| `cargo test --workspace --locked` | No completed workspace test result |
+| `cargo run --release --locked -- selftest` | Not run on this host |
+
+The reference audio host also returned "Site Unavailable", so the reference and field recordings were
+not replayed. The historical results below do not validate these corrections.
+
 ### Earlier recorded checks
 
-These checks predate the comparable-rival and cache-recovery corrections. They ran on the earlier probe
+These checks predate the comparable-rival, cache-recovery and curve-match corrections. They ran on the earlier probe
 commit with `a827820`'s docs, each from a clean snapshot (`rch exec --base <sha> --clean-overlay --no-overlay`)
 on a remote worker; they are historical evidence, not test results for the current tree.
 

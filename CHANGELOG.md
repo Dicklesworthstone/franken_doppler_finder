@@ -19,6 +19,41 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve sparse passes and bounded clocks in the curve match
+
+- **Sparse tracks** (`crates/fdop-core/src/curvematch.rs`). The exact-stage track filter now samples the
+  interpolated trajectory over the catalogue span, at the closest-approach sampling interval. Checking
+  only every fourth original ADS-B position could discard a sparse crossing pass that had already voted
+  in the coarse search.
+- **Recording clocks.** Exact scoring clamps its frame-quantized seed to the supplied start interval and
+  keeps every shared-clock trial inside it. Spatial refinement retains those bounds through each move.
+  The real window and every shifted decoy use their own intervals, including fixed and fractional-second
+  starts. Diagnostic probes retain their wider exploratory clock sweep and never choose the answer.
+- **Two credited flyovers.** A curve-match verdict now requires at least two independently credited
+  passes as well as its existing margin, decoy-count and radius conditions. A pass counts as heard only
+  when it reaches the existing 6.9-nat line, retains positive value after the timing penalty, and is not
+  excluded by the shared-pixel assignment. A strong lookup with no positive credited value cannot supply
+  a second flyover.
+- **Synthetic regressions.** `sparse_interpolated_passes_survive_the_exact_track_filter` checks a crossing
+  pass whose original knots lie outside both filters, plus nonoverlapping controls.
+  `exact_curve_scores_respect_fractional_start_bounds` checks exact and sub-frame intervals from seeds
+  on either side; `a_fixed_fractional_clock_still_locates_the_observer` checks spatial localization with
+  a fixed clock. `timing_penalties_do_not_count_uncredited_passes_as_heard` covers positive, zero,
+  negative and shared credit. The verdict regression checks zero, one and two heard passes, and
+  `one_audio_event_cannot_credit_two_flights` now also checks that a duplicate flight leaves the heard
+  count unchanged.
+- **Real-recording evidence.** No reference or field replay has been completed for these changes. The
+  documented reference video's metadata was reachable, but its audio host returned a 195-byte
+  "Site Unavailable" page instead of audio. Existing logged accuracy and grade results remain evidence
+  for their named builds, not a validation of this change.
+
+- **Validation of these corrections (2026-11-05).** The pinned `cargo fmt --all -- --check` and
+  `git diff --check` passed before these final notes. The combined core/data test build exited 101 when
+  `asupersync 0.6.2` compilation received SIGKILL during shared-host memory exhaustion. A smaller core-only
+  retry reached `fsci-stats`, but the host subsequently filled its disk and lost the process handles;
+  no runtime test result was recovered. Workspace Clippy, the full workspace tests and the release
+  self-test have no completed result for this change. README's current-check table records the commands.
+
 ### Compare every rival at the same stage after refinement
 
 - **The fault.** The margin compared its chosen rival at the same stage as the leader, but chose that rival
