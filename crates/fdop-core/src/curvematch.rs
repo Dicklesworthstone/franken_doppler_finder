@@ -1352,7 +1352,17 @@ fn score_exact(
     })
 }
 
-/// Climb from a coarse cell on successively finer local grids, moving the clock with the best point.
+/// Refine a coarse cell: scan the disc it stands for, then climb on successively finer local grids,
+/// moving the clock with the best point.
+///
+/// A start stands for every place within `nms_m` of it, because no other start is kept there. The
+/// coarse vote picks that start, and the vote can favour a broad bump over a sharper peak elsewhere
+/// in the disc. So every point of the disc on the first (coarsest) step is scored first
+/// (`disc_offsets`). Then, at each scale, the 5x5 grid moves to its best point until none beats
+/// the centre, for at most `refine_moves` moves. Before both, one 5x5 move per scale reached 350 m
+/// on each axis. On osprey 11-02 that left the answer on a broad bump 0.61 km from the cam, while a
+/// sharper peak in the same disc, near the cam, scored about 2 nats more. Each decoy window runs
+/// this same code (`search_window`), so a better search does not flatter the real window.
 fn refine_point(
     inp: &MatchInputs<'_>,
     p: &MatchParams,
@@ -1363,23 +1373,21 @@ fn refine_point(
     clock: f64,
 ) -> Option<(f64, f64, Exact)> {
     let mut cur = (lat, lon, score_exact(inp, p, bank, idx, lat, lon, clock)?);
-    for &step in &p.refine_steps_m {
-        let (mlat, mlon) = m_per_deg(cur.0);
+    // The whole disc the start stands for, on the first (coarsest) step, before any climbing: the
+    // coarse vote picks one cell per disc, and a sharper peak elsewhere in it can sit across a
+    // valley. As in the climb, each point sweeps the clock around the start's (`clock_sweep_frames`) and
+    // the best point brings its own clock.
+    if let Some(&step) = p.refine_steps_m.first() {
+        let (mlat, mlon) = m_per_deg(lat);
         let (dla, dlo) = (step / mlat, step / mlon);
-        let centre = (cur.0, cur.1, cur.2.clock);
-        let best = (-2i32..=2)
-            .flat_map(|i| (-2i32..=2).map(move |j| (i, j)))
-            .collect::<Vec<_>>()
+        let best = disc_offsets(p.nms_m, step)
             .into_par_iter()
             .filter_map(|(i, j)| {
-                if i == 0 && j == 0 {
-                    return None;
-                }
-                let (la, lo) = (centre.0 + i as f64 * dla, centre.1 + j as f64 * dlo);
+                let (la, lo) = (lat + i as f64 * dla, lon + j as f64 * dlo);
                 if !inp.region.contains(la, lo) {
                     return None;
                 }
-                score_exact(inp, p, bank, idx, la, lo, centre.2).map(|e| (la, lo, e))
+                score_exact(inp, p, bank, idx, la, lo, cur.2.clock).map(|e| (la, lo, e))
             })
             .max_by(|a, b| a.2.evidence.total_cmp(&b.2.evidence));
         if let Some(b) = best
@@ -1388,7 +1396,66 @@ fn refine_point(
             cur = b;
         }
     }
+    for &step in &p.refine_steps_m {
+        for _ in 0..refine_moves(p.nms_m, step) {
+            let (mlat, mlon) = m_per_deg(cur.0);
+            let (dla, dlo) = (step / mlat, step / mlon);
+            let centre = (cur.0, cur.1, cur.2.clock);
+            let best = (-2i32..=2)
+                .flat_map(|i| (-2i32..=2).map(move |j| (i, j)))
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .filter_map(|(i, j)| {
+                    if i == 0 && j == 0 {
+                        return None;
+                    }
+                    let (la, lo) = (centre.0 + i as f64 * dla, centre.1 + j as f64 * dlo);
+                    if !inp.region.contains(la, lo) {
+                        return None;
+                    }
+                    score_exact(inp, p, bank, idx, la, lo, centre.2).map(|e| (la, lo, e))
+                })
+                .max_by(|a, b| a.2.evidence.total_cmp(&b.2.evidence));
+            match best {
+                Some(b) if b.2.evidence > cur.2.evidence => cur = b,
+                _ => break,
+            }
+        }
+    }
     Some(cur)
+}
+
+/// Widest disc scanned before climbing, in steps: about 1,260 points.
+const DISC_MAX_STEPS: i32 = 20;
+
+/// Whole steps in the radius of the disc scanned before climbing: `nms_m` on `step_m`, at most
+/// `DISC_MAX_STEPS`. `None` when there is no disc to scan.
+fn disc_steps(nms_m: f64, step_m: f64) -> Option<i32> {
+    (step_m > 0.0 && nms_m.is_finite() && nms_m >= step_m)
+        .then(|| ((nms_m / step_m).floor() as i32).min(DISC_MAX_STEPS))
+}
+
+/// Grid offsets, in steps, of every point of that disc but its centre (the defaults give 316). The
+/// radius is `nms_m / step_m` itself, not its whole part, and at most `DISC_MAX_STEPS`.
+fn disc_offsets(nms_m: f64, step_m: f64) -> Vec<(i32, i32)> {
+    let Some(n) = disc_steps(nms_m, step_m) else {
+        return Vec::new();
+    };
+    let r2 = (nms_m / step_m).min(f64::from(DISC_MAX_STEPS)).powi(2);
+    (-n..=n)
+        .flat_map(|i| (-n..=n).map(move |j| (i, j)))
+        .filter(|&(i, j)| (i != 0 || j != 0) && f64::from(i * i + j * j) <= r2)
+        .collect()
+}
+
+/// Moves allowed at one refinement scale: enough for the 5x5 grid (two steps a move) to cross
+/// `nms_m`, at least one and at most 100 (the defaults give 5, 10 and 20).
+fn refine_moves(nms_m: f64, step_m: f64) -> usize {
+    if step_m > 0.0 && nms_m.is_finite() && nms_m > 0.0 {
+        ((nms_m / (2.0 * step_m)).ceil() as usize).clamp(1, 100)
+    } else {
+        1
+    }
 }
 
 /// A mode from the coarse stage, or a window's best cell.
@@ -1766,7 +1833,8 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
     let modes = search_window(&per_window[n_lo as usize]);
     timings.push(("exact".to_string(), t.elapsed().as_secs_f64()));
     // Diagnostic only, on recordings whose place is known: evidence at a given place, best over a
-    // wide range of clocks, then after climbing from it. Never used to choose anything.
+    // wide range of clocks, then after refining from it (`refine_point`: the `nms_m` disc around
+    // it, then the climb). Never used to choose anything.
     let probe: Vec<MatchMode> = p
         .probe
         .iter()
@@ -2076,6 +2144,92 @@ mod tests {
             r.decoy_margin,
             r.decoys
         );
+    }
+
+    /// A climb that starts 600 m from the observer (420 m north, 430 m west: past the 350 m on
+    /// each axis one move per scale could reach) gets at least the evidence the observer's own
+    /// point has, within the 200 m this scene locates to
+    /// (`three_flights_locate_the_observer_and_beat_every_decoy`). The old refinement, one move per
+    /// scale and no disc (both what `nms_m` 0 gives), stops short on both counts. The disc's points
+    /// are checked against Gauss's lattice counts.
+    #[test]
+    fn refinement_climbs_from_a_start_beyond_one_move_per_scale() {
+        let c = case(0.5, false);
+        let p = params();
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &c.tracks,
+            region: c.region,
+            start_lo: c.clock - 60.0,
+            start_hi: c.clock + 60.0,
+            duration_s: c.x.len() as f64 / 2800.0,
+            catalog: (f64::NEG_INFINITY, f64::INFINITY),
+            dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let bank = build_bank(&im, &p);
+        let idx: Vec<usize> = (0..c.tracks.len()).collect();
+        let (mlat, mlon) = m_per_deg(c.lat);
+        let (la0, lo0) = (c.lat + 420.0 / mlat, c.lon - 430.0 / mlon);
+        let start = haversine_m(la0, lo0, c.lat, c.lon);
+        assert!(start > 590.0 && start < 610.0, "start {start} m");
+        let e0 = score_exact(&inp, &p, &bank, &idx, la0, lo0, c.clock).expect("start scores");
+        let (la, lo, e) =
+            refine_point(&inp, &p, &bank, &idx, la0, lo0, c.clock).expect("climb scores");
+        let at_obs = score_exact(&inp, &p, &bank, &idx, c.lat, c.lon, c.clock)
+            .expect("observer scores")
+            .evidence;
+        let err = haversine_m(la, lo, c.lat, c.lon);
+        assert!(
+            err < 200.0,
+            "ended {err} m from the observer, from {start} m"
+        );
+        assert!(
+            e.evidence >= at_obs,
+            "{} -> {}, observer {at_obs}",
+            e0.evidence,
+            e.evidence
+        );
+        let one = MatchParams {
+            nms_m: 0.0,
+            ..p.clone()
+        };
+        let (lb, ob, eb) =
+            refine_point(&inp, &one, &bank, &idx, la0, lo0, c.clock).expect("climb scores");
+        let err_one = haversine_m(lb, ob, c.lat, c.lon);
+        assert!(
+            err_one > 200.0 && eb.evidence < at_obs,
+            "one move per scale reached it too: {err_one} m, {} vs {at_obs}",
+            eb.evidence
+        );
+        assert_eq!(refine_moves(1000.0, 100.0), 5);
+        assert_eq!(refine_moves(1000.0, 25.0), 20);
+        assert_eq!(refine_moves(0.0, 100.0), 1);
+        assert_eq!(refine_moves(f64::NAN, 100.0), 1);
+        assert_eq!(refine_moves(1000.0, 1e-9), 100);
+        assert_eq!(disc_steps(1000.0, 100.0), Some(10));
+        assert_eq!(disc_steps(1e6, 100.0), Some(20));
+        assert_eq!(disc_steps(50.0, 100.0), None);
+        assert_eq!(disc_steps(0.0, 100.0), None);
+        assert_eq!(disc_steps(f64::INFINITY, 100.0), None);
+        assert_eq!(disc_steps(1000.0, 0.0), None);
+        // lattice points in a circle of radius 10 and 20 (Gauss: 317 and 1,257), less the centre
+        let d = disc_offsets(1000.0, 100.0);
+        assert_eq!(d.len(), 316);
+        assert!(!d.contains(&(0, 0)) && d.contains(&(10, 0)) && !d.contains(&(10, 1)));
+        let wide = disc_offsets(1e6, 100.0);
+        assert_eq!(wide.len(), 1256);
+        assert!(wide.iter().all(|&(i, j)| i * i + j * j <= 400));
+        // a radius of 10.5 steps keeps the points past 10 steps that its whole part would drop
+        let half = disc_offsets(1050.0, 100.0);
+        assert_eq!(half.len(), 348);
+        assert!(half.contains(&(10, 3)) && !half.contains(&(10, 4)));
+        assert!(disc_offsets(50.0, 100.0).is_empty());
+        assert!(disc_offsets(1000.0, 0.0).is_empty());
     }
 
     /// Metamorphic: moving the whole catalogue in time by a whole number of frames moves the clock by

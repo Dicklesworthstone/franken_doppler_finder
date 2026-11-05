@@ -19,6 +19,56 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### The curve match searches the whole kilometre each of its starts stands for
+
+- **The fault.** The coarse vote keeps one start per kilometre (`nms_m`, 1,000 m: no other start is kept within
+  that distance of it). Refinement then made one 5 × 5 move at each of 100, 50 and 25 m, so a start could move at
+  most 350 m along each axis, although `refine_point`'s comment said it climbed. On the osprey cam's 11-02 recording with the
+  benchmark's R2 inputs (start to the minute ±2 min, a 25 km circle), the real window's best place was a broad
+  bump 0.61 km from the cam at 13.84 nats, and the best decoy clock beat it with 14.89 (margin −1.06; 1d's local
+  run `f10` on `069c971`). A diagnostic run confined to 3 km around the cam found 15.74 nats 120 m from it, in the
+  same disc, across a valley: a sharper peak from a P28A passing at 553 m slant. That run is a diagnostic only;
+  it used the cam's position and is not a result.
+- **The change** (`crates/fdop-core/src/curvematch.rs`, `refine_point`). Each refined start first scores every
+  point of its disc on the coarsest refinement step (radius `nms_m` on 100 m: 316 points besides the start;
+  `disc_offsets`, at most 20 steps). Then each scale moves the 5 × 5 grid to its best point until none beats the centre, up to enough
+  moves to cross `nms_m` (`refine_moves`: 5, 10 and 20 moves). Every decoy window runs this same code through
+  `search_window`, so a more thorough search lifts a decoy exactly as it lifts the real window.
+- **Effect, R2 inputs, local runs on an Apple M5 Ultra** (`069c971` plus this change; 15 development rows
+  `disc_dev`, 33 more no-right-answer rows `disc_nulls`; baselines `f10` and `nb1`). These are development
+  recordings, so none of this is a clean test; the benchmark's run of this commit on set E is. `069c971` lacks
+  `9087ec4`'s terrain fix, so osprey 11-02 and `np_o31_p2` were rerun on this commit's own code (`final`). Both
+  gave the same numbers to the hundredth.
+  - osprey 11-02: low, 14 km (trace search), curve match −1.06 → **medium, about 220 m from the cam**, from the
+    curve match (15.95 nats, +1.14 over the best of 48 decoys, which went from 14.89 to 14.81; radius 1,000 m).
+  - The other right answers keep their grade and place: the reference recording at 0.25 km, the osprey cam at
+    0.09 km on 10-31 and 0.11 km on 11-01, and Duke Farms at 0.96 km, all high. The curve match still stands at
+    the last three (+9.23, +13.29 and +44.81, against +9.78, +13.23 and +44.41) and still does not at the
+    reference (−3.95 both). Sapsucker Woods still gives no location. Scored with the benchmark's `score.py` on
+    R2's 12 development cases: 5 right and 0 wrong, against 4 and 0 for `f10`. The eagle cam (`b2_eagle`) was
+    run for neither.
+  - No-right-answer runs, 42 in all (the 9 wrong-date and wrong-place development rows and the 33 in
+    `disc_nulls`): no grade changed and the curve match stands on none. Their margins rose on 17 and fell on 16
+    (median change 0.00, largest rise +3.55). The largest is now −0.18, the osprey cam's 10-31 recording
+    searched around a wrong place (`np_o31_p2`; −0.62 before). The real window and every decoy run the same
+    search, so when the date is wrong the real window is one more clock and beats all 48 decoys about 1 time in
+    49 whatever the search does. The one medium among the 42, osprey 10-31 searched on 11-01 (`nd_o31_1101`), comes
+    from the trace search and was medium before; the curve match does not stand there (−5.65).
+- **Cost.** About four to five times the curve stage. On the osprey 11-02 row, with eight threads and every
+  ADS-B day cached on a shared Apple M5 Ultra, it took 217 s against 47 s for `f10`, both at load about 50 to
+  70 (the 1- and 5-minute averages each run logged at its start); in the batch, at load about 190 to 210, it
+  took 659 s. The disc adds 316 exact scores for each of the 4 refined starts in each of the 49 windows, against
+  73 for the old climb. Runs without a start are not affected.
+- **Not affected.** A run with no `--start` (or a clock known only to worse than 1800 s) skips the curve match,
+  so the reference replays in AGENTS.md and README (`*_c1`, `*_b1`) cannot change and were not rerun; each logs
+  "curve match skipped".
+- **Test.** `refinement_climbs_from_a_start_beyond_one_move_per_scale`: on the synthetic three-flight scene, a
+  start 600 m from the observer (420 m north and 430 m west, past 350 m on each axis) ends within 200 m of it with
+  at least the observer's own evidence. The old refinement, one move per scale and no disc (what `nms_m` 0
+  gives), is checked in the same test to stop more than 200 m away with less. The disc's points are checked
+  against Gauss's lattice counts (316 for 10 steps, 1,256 for the 20-step cap, 348 for 10.5 steps, besides the
+  centre).
+
 ### Spike pixels in the terrain tiles no longer put an observer under the sea; the air column extends past its grid
 
 - **The fault.** The terrain elevation is only ever the observer's ground. The cached z13 Terrarium tiles near the
@@ -229,7 +279,7 @@ at that commit, not per-change commits.
   three-day search the C208's hypotheses now overflow what the budget has left (64,412,380 against 57,266,230,
   `r_md_r5`), so that event only confirms, with a warning.
 - **Reference case and wrong dates.** Every row is a replay, on one recording, and the runs ran with other jobs on the
-  machine. Each cell is grade, distance from the published point (the feeder's from its own site), radius and margin.
+  machine. Each cell is grade, distance from the published point (the feeder's from its town's centre), radius and margin.
 
   | Build (runs) | County | State-wide | Three-day | 09-07, wrong | 09-09, wrong | Feeder, wrong |
   |---|---|---|---|---|---|---|
