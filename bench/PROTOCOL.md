@@ -782,3 +782,161 @@ user on this site holds its downloads from 19:00Z until the capture is done.
 - The registered binaries were built from `git archive` of their commits on the bench machine, and both pass `fdop
   selftest` (2.4 m): - `fdop-ce02222`: sha256 `d93bfb38cbda4703d9154c93279b3dd3854a24795016e1bb00d975f01ca969f2` -
   `fdop-3164272`: sha256 `c21322b8045751d89491bbde653c81ceacaf75ed039342536dd4c55b410a7cb9`
+
+## Addendum 14, 2026-11-05, set E's R2 read; a fifth later `fdop` build, `32d4e1a`, for set F
+
+### Set E, R2
+
+The seal condition of Addenda 7 and 8 was met at about 18:40Z: every set E R2 run of every tool and registered build
+had finished (`fdop-9087ec4` and `fdop-6914ab7` 8 of 8, `dopplertrack` 8 of 8). All were then read at once with
+`score.py jobs/cases.json runs r2`; the output is kept on the benchmark machine as `runs/SCORE_r2_setE_20261105T1842Z.txt`.
+Eight cases count; the five void ones (Addendum 5) are out for every tool.
+
+| Tool | Correct asserted | Wrong asserted | Rows |
+|---|---|---|---|
+| `dopplerprint` (`dp`) | 1 | 0 | Olympia, 63 m, high |
+| `dp48` | 1 | 0 | Olympia, 63 m, high |
+| `dpdem` | 1 | **1** | Olympia, 82 m, high; Tehachapi, **14 km, medium** (5 km limit) |
+| `dopplertrack` | 0 | 0 | an error on all eight (below) |
+| `fdop` `7e66501` (pinned) | 0 | 0 | |
+| `fdop-9087ec4` | 1 | 0 | Olympia, 66 m, medium |
+| `fdop-6914ab7` | 1 | **1** | Olympia, 66 m, medium; Harbourgate, **7.97 km, medium** (1 km limit) |
+
+- **The claim.** No `fdop` build meets it on set E. `fdop-9087ec4` ties `dp` and `dp48`, one correct and no wrong
+  each, where the claim needs it strictly better on one count. It beats `dpdem`, which has a wrong medium, and
+  `dopplertrack`, which asserted nothing.
+- **The falsifiers** (WS question of record). Falsifier 3, a sealed set with fewer correct asserted answers than a
+  rival or any wrong one, fires on set E for pinned `fdop` (0 correct, against 1) and for `fdop-6914ab7` (a wrong
+  medium). It does not fire on set E for `fdop-9087ec4`. That does not clear `fdop-9087ec4`: falsifier 2 already fired
+  for its development claim and for `fdop-6914ab7`'s, on the wrong-date `nd_o31_1101` (Addenda 8 and 11). Falsifier 1
+  fires for pinned `fdop`, which has 1 correct answer on A+B+C.
+- **`fdop-6914ab7`'s wrong medium.** At `e_harbourgate` the trace search detected nothing in two hours. The curve
+  match stood +1.86 nats over the best of 48 decoy clocks, on one heard pass of one aircraft, at a clock 110 s from the
+  true one, and the answer took its place. That pass was a chance fit, read from the ADS-B track: the aircraft was
+  287 m from the place at the fitted clock and 9.76 km from the truth at the true clock, so the site did not hear it.
+  It is not a slide along the track either: a clock 110 s early needs a place behind the truth along the heading, by
+  the 3.2 km flown in that time, and this one is 7.9 km ahead of it. `fdop-9087ec4` gave no location there (its curve
+  match did not stand, −0.58). `ce02222` has `6914ab7`'s curve match, and so this stand. `3164272`'s heard-range
+  profile changes the curve match: on `32d4e1a`, which has it, the curve match does not stand there (−0.17, no pass
+  heard; a local diagnostic, in-sample). `ce02222` and `3164272` both keep the path that produced the wrong medium.
+  On set F's R2 either can assert a curve-match place on one heard pass.
+- **`dopplertrack`'s errors.** All eight are its own refine step failing (`IndexError`) on a candidate table that its
+  search wrote with a header and no rows: it found no candidate. Its inputs were the same R2 traces as before, 1.3 to
+  5.2 MB each, fetched after 04:19Z on 11-05. It is a failure in its own code, not in the harness, and it is scored as
+  the error it is.
+- **What set E tests.** Little, for `fdop`. Its detector found nothing at all on four of the eight cases
+  (`e_harbourgate`, `e_lakeshore`, `e_sagharbor`, `e_porthenry`) and 9 candidates each on two (`e_kelso`,
+  `e_fortmadison`), none usable. Only `e_olympia` (4 events used) and `e_tehachapi` (10) gave the search anything to
+  work with (`fdop-9087ec4`'s R2 runs). `dopplerprint` asserted only `e_olympia` as well. It declined five of the others
+  and gave `e_kelso` and `e_harbourgate` low. One right answer each is a count on about two cases, not a measure of
+  accuracy.
+- **Development rows on the benchmark machine** (A+B+C, 12 cases, in-sample): `fdop-9087ec4` 4 correct and 0 wrong,
+  meeting the rule against all four rivals there. Pinned `fdop` gives 1 and 0. `fdop-6914ab7`'s A+B+C runs are still
+  running.
+
+R3 and R1 of set E are still running and are read as they finish.
+
+### The build
+
+`32d4e1a` is `c6e5800`'s code, which is `3164272` plus the measurement change (`b0a9424`), with one more change in
+`src/pipeline.rs`: a curve match that stands on fewer than two heard passes no longer raises an answer. It does not
+adopt its own place, and it does not confirm a low trace answer. The answer stays low, or there is none. Asserted trace
+answers are settled as before. Heard passes are counted, not aircraft, so one aircraft heard twice counts as two.
+One pass's Doppler curve fixes when and how close the aircraft passed. The curve match searches a window of clocks, so
+place and clock trade along the track at the flight's speed. The trace search asks two core events of a medium for the
+same reason. `e_olympia` shows the trade on a real recording: six of its eight best places hear only its first flight,
+each where that flight was at that place's clock, up to 147 s and 10.8 km off, and its second flight separates them. A
+metamorphic test on exact curve scores shows the trade, shows a crossing flight breaking it, and shows a flight on a
+parallel track, the same way at the same speed, leaving it, so the rule is needed, not sufficient. `projects-bf` found
+the mechanism and proposed the test. `e_harbourgate` motivated the rule by its grade, not by this mechanism: its pass
+was a chance fit (above). One pass is too little for either reason.
+
+It is registered for set F as `fdop-32d4e1a`, under every rule of Addendum 9, beside `fdop-9087ec4`, `fdop-6914ab7`,
+`fdop-ce02222` and `fdop-3164272`. Its binary is built on the benchmark machine from `32d4e1a`'s tree, sha256
+`a31d1a57e2335f0e0abc3f7fdb509dd3f0015c802fa6e610f96ef4c99b7200fa`. The evaluation below used binary `bb8bdce` (sha256
+`cf86b51a`), an unpushed commit object. Its source differs from `32d4e1a` in the Markdown files, in tests, in comments,
+in the wording of this rule's gate and verdict text, and in moving the no-location answer into a function. `32d4e1a`'s
+own binary gives the same rows: `b1_osprey_1031`, `np_o31_p2` and `e_harbourgate` equal `bb8bdce`'s in every
+`result.json` field but run time and paths. The first run of the first two took the -30 m geoid default in an NGS
+outage (below) and differed for that reason; they were run again for this comparison, and both runs are kept
+(`x_32d4e1a`, `x2_32d4e1a`). This is a software comparison on in-sample rows, not a graded result.
+
+`b3828e6`, `5ab7f48` and `e13f2d2` reached `main` while `32d4e1a` was being checked. The first changes the ADS-B cache
+lookup, the second the margin and the third the curve match: exact scoring stays inside each clock window, a sparse
+crossing pass survives the track filter, and `verdict` needs two heard passes that keep positive value, so on `main` a
+curve match does not stand on one pass at all. Neither of the last two messages claims a test pass or a replay.
+`32d4e1a` contains none of the three, and none is registered for set F. It is merged into `main`, not rebased, so its
+sha is public and its tree is the one the evaluation below read. The merge keeps `e13f2d2`'s form of the rule and drops
+the one in `src/pipeline.rs`, which could no longer be reached, so `main`'s code is not `fdop-32d4e1a`'s. On `main` a
+one-pass curve match can no longer veto an asserted answer or keep a medium, and `fdop-32d4e1a`'s still can (CHANGELOG).
+
+- **When.** Written after set E's R2 was read, and because of it: `e_harbourgate` is the case. Set E is therefore not a
+  test of this build. Set F is. Committed before registration closes (2026-11-06T03:00:00Z) and before any set F run
+  of any tool. No set F result exists, and no set F audio has been listened to or run through any tool.
+- **The rule it had to pass**, logged at 18:54Z, before its binary existed. It said "heard flights"; the code counts heard
+  passes, as it did then, and the words here follow the code:
+  - on the 42 runs with no right answer (R2 inputs, local), no grade is medium or high, and every grade equals
+    `edf1a09`'s (runs `nm`);
+  - on the 15 development rows, no right answer is lost and no wrong one is asserted, and every grade equals
+    `edf1a09`'s (runs `fm`);
+  - its effect on every recorded `result.json` is read exactly. The rule reads only the trace grade, the curve
+    verdict and its heard count;
+  - `cargo fmt`, `clippy`, the workspace tests and `fdop selftest` pass.
+- **Outcome.** All four held, on `bb8bdce`. Of the 42 runs with no right answer, none is medium or high and every grade
+  equals `nm`'s: 33 in `nh` (26 low, 7 no location, no curve match standing) and 9 among the development rows. The 15
+  development rows are identical to `fm`'s in grade, place, margin and curve call: 5 right, all high, none wrong. The
+  census finds one stand on fewer than two heard passes in the whole record, `e_harbourgate` under `6914ab7`, and none
+  on this build, where that row gives no location (`eh`). Two `nh` rows differ in numbers and not in grade, and both
+  are the geoid (below): `np_o02_p3` by 5 cm and `np_o02_p1`'s curve margin from -1.35 to -1.287. On the final source,
+  `fmt` and `clippy -D warnings` pass and the workspace tests give 220 passed, 0 failed, 2 ignored. `selftest` passes
+  on `bb8bdce` (2.4 m) and on `32d4e1a` (2.4 m). `r_nassau` repeats `r_nassau_gc` exactly. The rule carried the other
+  six reference, wrong-date and feeder runs over, since they give no start and the curve match cannot run; replays of
+  them on 256 GiB had not finished at this commit and are not read here.
+- **Known before it runs.** On set F's R2 this rule can only lower answers. It costs a right answer where the curve
+  match alone, on one heard pass, would have placed a recording within its limit. No development row has one. It
+  helps only where such a place is wrong, as at `e_harbourgate`, and on this build's own curve match it does not
+  stand there, so no recorded row changes. The curve match does not run on R3, where CONUS needs about 360 million
+  cells against a limit of 200,000, or on R1, which gives no start. There this build answers as `c6e5800`'s code does.
+  Set F's R2 is also the first sealed test of the measurement change (`b0a9424`), which no other registered build has.
+- **Every build is reported.** This makes five registered `fdop` builds: `9087ec4`, `6914ab7`, `ce02222`, `3164272`
+  and `32d4e1a`. Each passes or fails the claim by its own row, and none is chosen after the fact.
+
+### Bench notes since Addendum 13
+
+- `score.py` has a set F group (Addendum 9's claim on set F alone, void cases out), added before any set F result
+  existed; a dry run on empty run dirs showed every row pending.
+- Set F's capture started at 19:01:23Z, after the 17:00-19:00Z window closed. Four streams had an outage. Addendum 9's
+  outage rule cuts each at the first one and keeps it if its clock holds for 30 min: `f_kingman` holds 75.9 min,
+  `f_brooksfalls` 92.1 and `f_bergenfield` 87.1, and all three are kept.
+- **`f_sunnyisles` is out.** Its clock holds 7.2 min, so it counts as not captured. By Addendum 13, `f_porthuron` takes
+  its place, captured from the same DVR window at 20:21:47Z to 20:24:40Z, before any set F run. It had an outage too and
+  its clock holds 74.5 min. Its whole-file mean is -49.6 dB and its peak -13.4 dB, so it is not digital silence. Set F
+  stays at ten cases.
+- **The geoid.** The NGS geoid API can answer a request with the value of another made at the same moment, and it echoes
+  the coordinates it was asked for, so a response cannot show it. In a check of four simultaneous requests on 11-05, a
+  point in Georgia came back with a Pennsylvania point's height and error. `fdop` asks NGS once per run and does not
+  cache the answer. Among the benchmark's 125 `fdop` rows, on 60 pairs of case and region, no two rows of a pair
+  differ, so no crossing shows there, though a pair with one row cannot show one. The local evaluation below ran
+  several lanes at once and has two: see the outcome. A lookup can also hang: around 21:10Z on 11-05 two local rows
+  waited out their timeouts and took the -30 m default, with its warning. On `b1_osprey_1031` that 0.58 m kept the
+  grade and took the radius from 349 m to 575 m. Set F runs as registered, and each run's log keeps the value it used.
+- The builds and the workspace tests of `bb8bdce` and `32d4e1a` ran on the benchmark machine with direct cargo, beside the
+  chains. Each cargo step waited for free space on the boot disk, 9 GB at first and 5.7 GB by the end as swap took the
+  difference, and each stopped itself above the chains' guards, under 8 GB at first and 5.3 GB by the end, or over
+  13,500 MB of swap. Two runs of the checks stopped themselves, and what was left of them was run again on the same
+  tree. The chains' guards stop at 5 GB and at 6,000 MB of swap over their baseline, and neither fired on these.
+- The hypothesis budget scales with the machine's RAM and the comparison budgets do not, so a run on a larger machine
+  is not a repeat of a run here. Every set F run is on this 32 GiB machine. `AGENTS.md` now says so beside the reference
+  table. Of the local replays on 256 GiB, only `r_nassau` was read against this machine's row: it fits the budget on both
+  machines and came out identical.
+- The bench's USB volume dropped off this machine at 22:10:27Z on 11-05 and came back about 22:24Z, which revoked every
+  file open on it. The job shells were held for about 4 minutes. Five rows were in flight, and none had written a
+  result. `r2_fdop_6914ab7/c_osprey_1031` panicked with rc 101 at its next log line. `e2_r3_fdop_6914ab7/e_tehachapi`,
+  `r1_fdop/b1_osprey_1031`, `r3_fdop_9087ec4/b1_osprey_1101` and `r3_fdop_6914ab7/b1_osprey_1101` were certain to do the
+  same, and were stopped at 22:28:54Z. All five are kept as `*_fault_usb` and run again under the same commands, as an
+  infrastructure fault, in the chains of regime `fix4`, whose guards keep the 9,618 MB swap baseline of 16:17Z through
+  a new optional argument to `watchdog`. The chains went on to their next scripts early, so R1 of `9087ec4` and `6914ab7`
+  started before their R3 finished, and no row reads another. Afterwards every `result.json` on the volume parsed, and
+  no row had ended between 21:50Z and the drop. Set F's capture folders, clock files, jobs, `cases.json` and
+  `truth_f.json` were all present, with folder sizes in line with their clock lengths. No set F audio was opened. The
+  clock files hold no sizes or hashes, so that is not a byte-level check.
