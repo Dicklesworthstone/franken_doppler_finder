@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover from an unreadable or incomplete covering ADS-B cache
+
+- **The fault.** Cache lookup chose only the smallest covering filename. If that file could not be read,
+  a larger valid cache was ignored: offline runs failed despite having the data, and online runs could
+  download the day's archive again.
+- **The change** (`crates/fdop-data/src/fetch.rs`). Try covering stores in area order, with path as a stable
+  tie-breaker, until one can be loaded. Verify its actual spatial and temporal metadata against the request's
+  slice of that UTC day. The same recovery applies to eligible partial feeds, with their priority and
+  missing-feed warnings preserved. A damaged or inadequate candidate is named in progress output.
+- **Tests.** `offline_cache_recovers_after_unreadable_candidates` covers complete prod, partial prod and
+  staging fallback, using real synthetic stores and an unreadable smaller file. It checks the recovered
+  flight, cache-hit count and diagnostics. `offline_cache_requires_readable_covering_metadata` refuses
+  unreadable stores and filenames whose actual box or either time bound does not cover the request. The
+  existing offline roundtrip still checks geoid adjustment and missing-day behavior; its stored fixture now
+  truthfully covers the full day that the later request needs.
+
 ### Measurement goes down the list until 24 events pass, from the silence line up
 
 - **The fault.** Only primary detections scoring 4.5 or more were measured, and only the strongest 24 of them,

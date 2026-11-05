@@ -99,23 +99,46 @@ fn day_dir(cache: &Path, (y, m, d): (i64, u32, u32)) -> PathBuf {
     cache.join("adsb").join(format!("{y:04}-{m:02}-{d:02}"))
 }
 
-/// Smallest cached day store for `feedset` whose bbox covers `want`.
-fn find_cached(dir: &Path, feedset: &str, want: &BBox) -> Option<PathBuf> {
+/// Smallest readable cached day store for `feedset` covering the requested day slice.
+fn find_cached(
+    dir: &Path,
+    feedset: &str,
+    want: &IngestSpec,
+    label: &str,
+    opts: &FetchOptions,
+) -> Option<(PathBuf, TrackStore)> {
     let rd = std::fs::read_dir(dir).ok()?;
-    let mut best: Option<(f64, PathBuf)> = None;
+    let mut candidates = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if let Some((fs, bb)) = parse_cache_name(&name)
             && fs == feedset
-            && covers(&bb, want)
+            && covers(&bb, &want.bbox)
         {
-            let a = bb.area_km2();
-            if best.as_ref().is_none_or(|(ba, _)| a < *ba) {
-                best = Some((a, e.path()));
-            }
+            candidates.push((bb.area_km2(), e.path()));
         }
     }
-    best.map(|(_, p)| p)
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, p) in candidates {
+        match TrackStore::load(&p) {
+            Ok(s)
+                if covers(&s.meta.bbox, &want.bbox)
+                    && s.meta.t_start <= want.t_start
+                    && s.meta.t_end >= want.t_end =>
+            {
+                return Some((p, s));
+            }
+            Ok(_) => opts.say(&format!(
+                "[adsb] {label}: cache {} does not cover the requested region and time window; checking other cached stores",
+                p.display()
+            )),
+            Err(e) => opts.say(&format!(
+                "[adsb] {label}: unreadable cache {} ({e}); checking other cached stores",
+                p.display()
+            )),
+        }
+    }
+    None
 }
 
 /// Cache feedset name of a day store built from `main` (prod or staging) plus optional mlatonly.
@@ -288,54 +311,46 @@ pub fn fetch_window(
     for (i, &day) in days.iter().enumerate() {
         let dir = day_dir(cache_dir, day);
         let label = format!("{:04}-{:02}-{:02}", day.0, day.1, day.2);
-        if let Some(p) = find_cached(&dir, feedset, &spec.bbox) {
-            match TrackStore::load(&p) {
-                Ok(s) => {
-                    opts.say(&format!(
-                        "[adsb] {label}: cached {} ({} legs)",
-                        p.display(),
-                        s.legs.len()
-                    ));
-                    day_stores[i] = Some(s);
-                    cache_hits += 1;
-                    continue;
-                }
-                Err(e) => opts.say(&format!(
-                    "[adsb] {label}: unreadable cache {} ({e}); refetching",
-                    p.display()
-                )),
-            }
+        let day_start = days_from_civil(day.0, day.1, day.2) as f64 * 86_400.0;
+        let want = IngestSpec {
+            t_start: spec.t_start.max(day_start),
+            t_end: spec.t_end.min(day_start + 86_400.0),
+            ..*spec
+        };
+        if let Some((p, s)) = find_cached(&dir, feedset, &want, &label, opts) {
+            opts.say(&format!(
+                "[adsb] {label}: cached {} ({} legs)",
+                p.display(),
+                s.legs.len()
+            ));
+            day_stores[i] = Some(s);
+            cache_hits += 1;
+            continue;
         }
         // a store built while a release was missing: use it when nothing better exists
-        let partial = partial_feedsets(feedset)
-            .iter()
-            .find_map(|fs| find_cached(&dir, fs, &spec.bbox).map(|p| (p, *fs)));
         let rels = if opts.offline {
             Vec::new()
         } else {
             find_day_releases_cached(net.as_ref(), day.0, day.1, day.2, &dir, false)?
         };
-        if let Some((p, fs)) = &partial
-            && (opts.offline
-                || feedset_available(&rels, opts.include_mlat).is_none_or(|a| a.as_str() == *fs))
-        {
-            match TrackStore::load(p) {
-                Ok(s) => {
-                    opts.say(&format!(
-                        "[adsb] {label}: cached {} ({} legs; {fs} only, nothing better is published)",
-                        p.display(),
-                        s.legs.len()
-                    ));
-                    notes.extend(feedset_gaps(&label, fs, opts.include_mlat));
-                    day_stores[i] = Some(s);
-                    cache_hits += 1;
-                    continue;
-                }
-                Err(e) => opts.say(&format!(
-                    "[adsb] {label}: unreadable cache {} ({e}); refetching",
-                    p.display()
-                )),
+        let available = feedset_available(&rels, opts.include_mlat);
+        for fs in partial_feedsets(feedset) {
+            if (opts.offline || available.as_ref().is_none_or(|a| a.as_str() == *fs))
+                && let Some((p, s)) = find_cached(&dir, fs, &want, &label, opts)
+            {
+                opts.say(&format!(
+                    "[adsb] {label}: cached {} ({} legs; {fs} only, nothing better is published)",
+                    p.display(),
+                    s.legs.len()
+                ));
+                notes.extend(feedset_gaps(&label, fs, opts.include_mlat));
+                day_stores[i] = Some(s);
+                cache_hits += 1;
+                break;
             }
+        }
+        if day_stores[i].is_some() {
+            continue;
         }
         if opts.offline {
             missing.push(format!("{label} (offline, not cached)"));
@@ -566,15 +581,26 @@ mod tests {
         );
     }
 
+    fn synthetic_store(sp: &IngestSpec) -> TrackStore {
+        use crate::ingest::tests::{gz, pc12_json, tar_of};
+        let tarb = tar_of(&[("./traces/c3/trace_full_a1b2c3.json", gz(&pc12_json()))]);
+        let part = ingest_reader(std::io::Cursor::new(tarb), "prod", sp, &|_| {}).unwrap();
+        build_store(vec![part], sp, vec!["synthetic".into()])
+    }
+
     #[test]
     fn offline_cache_roundtrip_and_geoid_adjust() {
-        use crate::ingest::tests::{gz, pc12_json, spec, tar_of};
+        use crate::ingest::tests::{T0, spec};
         let sp = spec();
-        let tarb = tar_of(&[("./traces/c3/trace_full_a1b2c3.json", gz(&pc12_json()))]);
-        let part = ingest_reader(std::io::Cursor::new(tarb), "prod", &sp, &|_| {}).unwrap();
+        // Production day caches ingest the whole day, including the later request below.
+        let cache_spec = IngestSpec {
+            t_start: T0,
+            t_end: T0 + 86_400.0,
+            ..sp
+        };
         let (_, key) = bbox_key(&sp.bbox);
         let dir = std::env::temp_dir().join(format!("fdop-data-fetch-test-{}", std::process::id()));
-        let store = build_store(vec![part], &sp, vec!["synthetic".into()]);
+        let store = synthetic_store(&cache_spec);
         let geom_alt = store.legs[0].points[2].alt_m;
         store
             .save(
@@ -609,6 +635,99 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.legs.len(), 1);
+    }
+
+    #[test]
+    fn offline_cache_recovers_after_unreadable_candidates() {
+        use crate::ingest::tests::spec;
+        let sp = spec();
+        for (include_mlat, good_feed) in
+            [(false, "prod"), (true, "prod"), (true, "staging+mlatonly")]
+        {
+            let dir = std::env::temp_dir().join(format!(
+                "fdop-data-cache-recovery-{}-{include_mlat}-{good_feed}",
+                std::process::id()
+            ));
+            let day = day_dir(&dir, (2026, 9, 8));
+            std::fs::create_dir_all(&day).unwrap();
+            let (_, small_key) = bbox_key(&sp.bbox);
+            let bad_path = day.join(format!("prod_{small_key}.fdtrk"));
+            std::fs::write(&bad_path, b"not a gzip track store").unwrap();
+            let larger = IngestSpec {
+                bbox: BBox::new(39.0, -75.0, 42.0, -72.0),
+                ..sp
+            };
+            let (_, large_key) = bbox_key(&larger.bbox);
+            let good_path = day.join(format!("{good_feed}_{large_key}.fdtrk"));
+            synthetic_store(&larger).save(&good_path).unwrap();
+            let messages = Arc::new(Mutex::new(Vec::<String>::new()));
+            let captured = messages.clone();
+            let opts = FetchOptions {
+                include_mlat,
+                offline: true,
+                progress: Some(Arc::new(move |s| {
+                    captured.lock().unwrap().push(s.to_string());
+                })),
+                ..Default::default()
+            };
+            let got = fetch_window(&sp, &dir, &opts).unwrap();
+            assert_eq!(got.legs.len(), 1);
+            assert_eq!(got.legs[0].icao, "a1b2c3");
+            assert_eq!(got.meta.stats["cache_hits"], 1);
+            let notes = got.meta.stats["notes"].as_array().unwrap();
+            assert_eq!(notes.is_empty(), !include_mlat);
+            if include_mlat {
+                let expected = if good_feed == "prod" {
+                    NO_MLATONLY
+                } else {
+                    "prod release missing, using staging"
+                };
+                assert!(notes.iter().any(|n| n.as_str().unwrap().contains(expected)));
+            }
+            let log = messages.lock().unwrap().join("\n");
+            assert!(log.contains(&format!("unreadable cache {}", bad_path.display())));
+            assert!(log.contains(&format!("cached {}", good_path.display())));
+            assert!(!log.contains("refetching"));
+        }
+    }
+
+    #[test]
+    fn offline_cache_requires_readable_covering_metadata() {
+        use crate::ingest::tests::spec;
+        let sp = spec();
+        for failure in ["unreadable", "bbox", "time_start", "time_end"] {
+            let dir = std::env::temp_dir().join(format!(
+                "fdop-data-cache-coverage-{}-{failure}",
+                std::process::id()
+            ));
+            let day = day_dir(&dir, (2026, 9, 8));
+            std::fs::create_dir_all(&day).unwrap();
+            let (_, key) = bbox_key(&sp.bbox);
+            let path = day.join(format!("prod_{key}.fdtrk"));
+            if failure == "unreadable" {
+                std::fs::write(&path, b"not a gzip track store").unwrap();
+            } else {
+                let mut incomplete = sp;
+                match failure {
+                    "bbox" => incomplete.bbox.west += 0.1,
+                    "time_start" => incomplete.t_start += 1.0,
+                    "time_end" => incomplete.t_end -= 1.0,
+                    _ => unreachable!(),
+                }
+                // Its filename claims full coverage; the actual ingest metadata disagrees.
+                synthetic_store(&incomplete).save(&path).unwrap();
+            }
+            let opts = FetchOptions {
+                include_mlat: false,
+                offline: true,
+                ..Default::default()
+            };
+            let error = fetch_window(&sp, &dir, &opts).unwrap_err().to_string();
+            assert!(
+                error.contains("2026-09-08 (offline, not cached)"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

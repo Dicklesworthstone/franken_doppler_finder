@@ -657,8 +657,11 @@ Cache layout:
 └── runs.sqlite                                       the run ledger (FrankenSQLite)
 ```
 
-A cached day store is reused whenever its box covers the request. A larger region on the same day downloads
-that day again.
+Cached day stores are tried from the smallest covering box to the largest. A store is reused only when it
+can be read and its stored box and time interval cover the requested slice of that UTC day. An unreadable
+or incomplete cache is identified in the progress output, and other eligible caches are tried before
+downloading again or failing in `--offline` mode. Partial feeds retain their missing-feed warnings. A larger
+region on the same day downloads that day again if no usable cache covers it.
 
 ### Data sources
 
