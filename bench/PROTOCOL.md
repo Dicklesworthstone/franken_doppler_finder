@@ -632,3 +632,55 @@ Regime `fix3` started at 16:06:58Z, with three chains at once instead of four:
 - The set E R3 of both builds, then the pinned `fdop` R3 and `dopplerprint` R1.
 
 Each step runs on its own, so order changes no result. A second watchdog follows chain 3 to its last script.
+
+## Addendum 12, 2026-11-05, a fourth later `fdop` build, `3164272`, for set F
+
+`3164272` is `6914ab7` plus two commits that change behaviour, and documents:
+
+- `ce02222`, in `src/pipeline.rs`: a medium answer becomes low when the curve match ran with at least 40 decoy windows
+  and stands nowhere, including when it found no place. High answers, the calls where the curve match stands, and runs
+  where it did not run are unchanged.
+- `3164272`, in `crates/fdop-core/src/curvematch.rs`: the curve match scores every place with the range heard half
+  the time at 1, 2 and 4 km and keeps the best, in the real window and in every decoy window alike. Before, it was
+  fixed at 2 km.
+
+It is registered for set F as `fdop-3164272`, under every rule of Addendum 9, beside `fdop-9087ec4`,
+`fdop-6914ab7` and Addendum 11's `fdop-ce02222`. Set E's read is not delayed: set E tests only the builds of
+Addenda 7 and 8.
+
+- **When.** Committed at 16:08Z, before set F's levels are taken (17:02Z) and before any set F run of any tool.
+  No set E or set F result was read by the agent that made this build.
+- **What is a test of it.** Set F. Every recording below is a development recording, run with R2 inputs.
+- **The rule it had to pass.** It was written at about 06:30Z, before the evaluation started (06:41Z):
+  - on the 42 runs with no right answer, no grade reaches medium or high that was not medium or high before, and the
+    curve match stands on none;
+  - on the 15 development rows, no right answer is lost and no wrong one is asserted;
+  - and the curve-match margin rises on at least 3 of the 5 right development rows, or the curve match stands at the
+    reference site.
+- **Outcome**, full `locate` runs on the controlling Mac with the profile on `50708aa`'s code.
+  - **Right rows.** 5 correct and 0 wrong. High: the reference recording at 250 m, the osprey cam at 90 m and 110 m,
+    and Duke Farms. Medium: the osprey cam's 11-02 at 240 m. Sapsucker Woods is still declined. Every grade is
+    unchanged, and so is every distance except the osprey cam's 11-02 (220 m before).
+  - **Margins.** The margin over the best decoy rose on the osprey cam's three days, from +9.23, +13.29 and +1.14 to
+    +22.24, +21.36 and +5.29. It is unchanged at Duke Farms. On the reference recording it went from -3.95 to -4.32.
+  - **No-answer runs.** None of the 42 stands: the largest margin is -0.47 (-0.18 on `6914ab7`), with 20 rising and 18
+    falling. The only medium among them is the wrong-date `nd_o31_1101`, which was already medium on `6914ab7`.
+  - **The gate.** Its effect is read exactly from each run's `result.json`. It lowers `nd_o31_1101` to low and keeps
+    all five right answers.
+  - **The committed binary.** Rerun on `nd_o31_1101` (low, curve -5.46) and on the osprey cam's 11-02 (medium, curve
+    +5.29); both matched the evaluation.
+  - **Gates.** `cargo fmt`, `clippy` and `fdop selftest` (2.4 m) pass on the committed tree; the workspace tests give
+    214 passed, 0 failed and 2 ignored.
+- **A set the rule first named and then dropped.** The rule as first written also required no wrong answer on four
+  railcam recordings: three Virtual Railfan streams and one RailStream stream. Their operators' terms prohibit
+  recording, which is why the first addendum and Addendum 2 dropped them from set B3. `6914ab7` was run on them once,
+  at 06:26Z, before this was pointed out; all four declined. At 06:50Z, before any result of this build existed, they
+  were removed from the rule and from all use. This build never ran on them, and nothing else stands in for them, so
+  no development data looks like set F's cams.
+- **Known before it runs.** Set F's R2 inputs have the right date, so the gate's benefit on wrong dates cannot show
+  there. Set F shows mostly its cost: a right medium from the trace search, lowered where the curve match does not
+  stand. No development row has one. Its benefit could show on set F only as a medium at a wrong place, and none of
+  the 22 development runs at wrong places had one. The profile was suggested by an offline rescoring of stored
+  places and chosen on development data, so set F is its only test.
+- **Every build is reported.** This makes four registered `fdop` builds: `9087ec4`, `6914ab7`, `ce02222` and
+  `3164272`. Each passes or fails the claim by its own row, and none is chosen after the fact.
