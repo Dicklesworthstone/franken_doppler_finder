@@ -386,3 +386,42 @@ spectrogram, ADS-B or aircraft data was consulted.
 
 Set E's streams are mostly silent: of the 27 levels taken here, 18 were digital silence. So were 5 of the first 8 captures.
 That is a fact about these cams, and it is why the search ran as deep as it did.
+
+## Addendum 7, 2026-11-05, a later `fdop` build, before it runs on any case here
+
+`9087ec4` is `7e66501` plus 13 commits that change the code, each with its CHANGELOG entry. Most are search, fit,
+measurement, calibration and physics fixes. The last two add:
+- a curve match, and dropping ADS-B points without GNSS height between GNSS points (`069c971`);
+- leaving terrain spike pixels out of the observer's ground height (`9087ec4`).
+
+It is run as a separate tool, `fdop-9087ec4`, beside the pinned `7e66501`, as "Rules for running" requires.
+Nothing below changes a pinned result.
+
+- **Runs.** R2, all of sets A, B, C and E as listed for R2 (including `a_ref_opus`, `b2_eagle` and the replacements),
+  with the same commands, inputs and `--clock-tol` as the pinned `fdop` jobs, once each. R3 and R1 follow if time
+  allows, in that order, and are reported however they come out. A harness fault or a machine failure is the only
+  reason to rerun, as before.
+- **Scoring.** Unchanged: asserted means high or medium, the same limits, the same claim against each competitor.
+  The new build's asserted answers include those raised to medium by the curve match.
+- **What is a test of it.** Sets A, B and C are not. The changes were developed on those recordings with R2 inputs, and
+  their results on this build were read before this addendum. Set E is, with one disclosure:
+  - no development run used set E audio;
+  - the pinned build's and the competitors' R2 results on set E's three original cases were read on 2026-11-04: the
+    pinned `fdop` declined all three, and `dopplerprint` located one. Why was not examined, and nothing in this build
+    was chosen from them;
+  - the replacements' runs for the pinned build and the competitors had started, and none of their results was read
+    before this addendum was committed;
+  - the terrain change came from spike pixels found in development runs. Set E's site list was known by then, and
+    nothing about those sites was used.
+
+  The new build's claim is made on set E alone, with the five replacements reported apart from the three original
+  cases as well as with them. The A+B+C rows are reported as development rows.
+- **Machine.** The bench machine, as for the pinned runs, one run at a time in its own chain. Its results depend on the
+  machine's memory, so runs on other machines are not scored.
+- **Known before it runs.** The development recordings were also run 42 times with no right answer: 20 at wrong
+  dates and 22 at places 90 km or more off. One of them graded **medium**: the osprey cam's 10-31 recording searched on
+  11-01. Dropping ADS-B points without GNSS height caused it (README Known issues). This build can therefore assert a
+  wrong answer, which is stated here so that no set E result is read without it.
+- **Later builds.** Set E's results on this build are read once its R2 runs on set E are all done. A later build is
+  tested on set E only if its own addendum, naming its commit, is committed before then. Each such build runs as its
+  own tool and is reported. None replaces another's row, and the claim is not moved to whichever build did best.
