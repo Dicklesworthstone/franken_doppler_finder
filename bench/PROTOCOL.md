@@ -684,3 +684,101 @@ Addenda 7 and 8.
   places and chosen on development data, so set F is its only test.
 - **Every build is reported.** This makes four registered `fdop` builds: `9087ec4`, `6914ab7`, `ce02222` and
   `3164272`. Each passes or fails the claim by its own row, and none is chosen after the fact.
+## Addendum 13, 2026-11-05, set F's ten cases, before their capture
+
+Listed before capture, as Addendum 9 requires. No tool has run on these streams, nobody has listened to them, and no
+spectrogram, ADS-B or aircraft data was consulted. The only thing taken from their audio is each 60 s level.
+
+| Case | Site | Video | Mean level | Limit |
+|---|---|---|---|---|
+| `f_kingman` | Kingman Railroad Museum, Kingman, AZ (the host of a BNSF Seligman Subdivision railcam) | `h8-J3JGU7g4` | -20.8 dB | 1 km |
+| `f_chehalis` | Lewis County Historical Museum, Chehalis, WA | `YV8hzUJCp88` | -34.1 dB | 1 km |
+| `f_santamonica` | Santa Monica Beach and Pier, Santa Monica, CA (no camera building given) | `v97JpT3ZA0w` | -56.3 dB | 5 km |
+| `f_easthampton` | Main Beach, East Hampton, NY | `C92aPUuBWA4` | -48.3 dB | 5 km |
+| `f_ftlauderdale` | Elbo Room, Fort Lauderdale, FL | `bM0GplM_vPY` | -21.0 dB | 1 km |
+| `f_sunnyisles` | Sunny Isles Beach, FL (the city; no building given) | `bi7B4EmyHHs` | -41.9 dB | 5 km |
+| `f_brooksfalls` | Brooks Falls, Katmai National Park, AK | `J7ZrIDvqlic` | -31.9 dB | 5 km |
+| `f_charlevoix` | the Bridge Street drawbridge, Charlevoix, MI | `yWIHgMW2yVQ` | -14.2 dB | 5 km |
+| `f_dossin` | Dossin Great Lakes Museum, Belle Isle, Detroit, MI | `L73DrCZHJ8A` | -31.0 dB | 1 km |
+| `f_bergenfield` | CP10 on the CSX River Line, Bergenfield, NJ (a control point in town) | `yDSZcjG4x0Y` | -16.9 dB | 5 km |
+
+If a capture fails the outage rule, the first replacement is `f_porthuron`: the St. Clair River waterfront camera in
+Port Huron, MI (`SrL74LPoXF8`, -58.8 dB, 5 km). Any further replacement is found by taking levels further down the same
+order.
+
+**Truth.** Each truth is an OpenStreetMap feature:
+
+- the museum buildings, the pier, the bar, the waterfall and the movable bridge;
+- for East Hampton, the building at the operator's published address;
+- for Sunny Isles Beach, Bergenfield and Port Huron, the town.
+
+The coordinates are kept on the bench disk and are not committed.
+
+**How the rule was applied, including where this goes beyond Addendum 9's wording:**
+
+- **Depth.** The first description screen covered search-order rows 1-272 and passed 40 streams. A second reading left
+  36, and 7 of those qualified at the level step. After those levels were read, the screen went on down the same saved
+  order, rows 273-362, under the same rules, and their passes were leveled in order.
+- **A qualifier taken out for its truth.** Gasparilla Marina, Placida, FL (`h3T6vjwktHg`, -35.8 dB) qualified but is
+  out. OpenStreetMap has no feature for it. Its published address, on a road through two communities, geocodes to points
+  about 5 km apart (OpenStreetMap's road segments and the Census 2020 address ranges), so its truth cannot be fixed
+  within its 1 km limit. This was decided after its level and before any capture.
+- **The same-site rule.** The first screen left out a second stream at a site it had already passed (12 streams). It was
+  applied to rows 273-362 only after their levels had been taken. It puts out the riffles camera 100 yards below Brooks
+  Falls (`z7_GhJeFxQI`), which had qualified at -32.1 dB, and the Riviera Motel's second stream, never leveled. It also
+  puts out Ponquogue Beach Pavilion, which had failed its level.
+- **Sound.** As with the radio feeds, a stream is out when its operator says the sound is a pre-recorded loop, or that
+  there is none. Its sound is not of the place.
+- **Site.** A camera that names only what it looks at is out when that is a lake, river or bridge several kilometres
+  long. That does not say where the camera is. A small feature it looks at, a town drawbridge or a waterfall, is kept
+  with the 5 km limit.
+- **Private.** A camera run by an individual, looking out over a park or a river with no public site hosting it, is
+  taken as a likely private home.
+
+**Screened and not taken.** 63 of the 362 rows read passed the description screen. The other 299:
+
+- 91 are outside the US.
+- 90 are from excluded operators.
+- 40 were considered for set B or E.
+- 19 are not one fixed live camera.
+- 17 name a site that does not fix where the camera is, or no particular place.
+- 14 are a second stream at a site already passed.
+- 12 carry radio or no sound of the place.
+- 11 have a ban or use restriction.
+- 4 are likely private homes.
+- 1 does not say which side of the border it is on.
+
+A second reading of the first 40 passes put out four more: a gated community's marina, a likely private home, and two
+streams under use restrictions. Every row's decision and reason is saved with the search files. The streams that reached
+the level step and were not taken:
+
+| Stream | Why not |
+|---|---|
+| Tyrone History Museum, PA | the capture tool cannot time it: its fragments carry no wall clock |
+| Sunset Beach Pier, NC | the fetch failed (HTTP 404) |
+| Napili Kai Beach Resort, HI | an outage inside the 60 s; -73.1 dB |
+| Ponquogue Bridge, Hampton Bays, NY | -69.5 dB |
+| Ponquogue Beach Pavilion, Hampton Bays, NY | -64.0 dB, and the same site as Ponquogue Bridge |
+| Tiana Beach, Hampton Bays, NY | -61.0 dB |
+| Antelope Point, Lake Powell, AZ | -87.3 dB |
+| Embassy Suites, Miami International Airport, FL; Fort Myers Beach, FL; Wailea Beach Resort, HI | -85.5 dB |
+| Mendenhall Glacier, Juneau, AK | -90.3 dB |
+| Hobby Airport, Houston, TX; Rockport Harbor, ME; Boot Key Harbor, FL; Robbie's Marina, FL; Galveston Yacht Basin, TX; Key West Bight, FL; Alton Marina, IL; Surfside Beach Pier, SC; Jacksonville Beach Pier, FL; Navarre Beach Pier, FL; Dania Beach Pier, FL; Flagler Beach Pier, FL; Fairhope Pier, AL; Huntington Beach Pier, CA; Redondo Beach Pier, CA; Pavilion Park, Myrtle Beach, SC; Chatham Fish Pier, MA; Murdoch's Bathhouse, Galveston, TX; El Porto, Manhattan Beach, CA; Southernmost Beach Resort, Key West, FL; Mirror Lake, Lake Placid, NY; Round Lake, Charlevoix, MI; Hart Hall, SUNY Oswego, NY; South Beach, South Haven, MI; Lake Nighthorse, Durango, CO; Coldwater Science and Learning Center, Mount St. Helens, WA; Back Door Saloon, Houghton Lake, MI; The Cove, Leland, MI; The Edge Hotel, Clearwater Beach, FL; Alexandria Bay, NY | -91.0 dB, digital silence |
+| Gasparilla Marina, Placida, FL | truth not fixable within its limit (above) |
+| Brooks River riffles, Katmai National Park, AK | the same site as Brooks Falls (above) |
+
+As in set E, most of these cams are silent: of the 52 levels read, 39 were below -60 dB, 30 of them digital silence.
+
+**Inputs and capture.** Inputs are made by Addendum 9's rule once the clocks are known. The capture of the ten listed
+takes two hours of DVR audio from 2026-11-05T17:00:00Z and starts at 19:01Z, after that window ends. The second network
+user on this site holds its downloads from 19:00Z until the capture is done.
+
+### Bench notes since Addendum 11
+
+- At 16:14Z a build of `fdop-ce02222` on the bench machine took the swap to 9.7 GB. Memory was 45% free, so most of that
+  swap was idle pages. The watchdogs of regime `fix3`, with a 3.7 GB baseline, were within 0.1 GB of stopping all three
+  of its chains. The build was stopped. At 16:17Z the same three watchdogs were restarted with a fresh baseline; their
+  disk floor is unchanged. No chain stopped, and the restart is in `RERUNS_guard.log`.
+- The registered binaries were built from `git archive` of their commits on the bench machine, and both pass `fdop
+  selftest` (2.4 m): - `fdop-ce02222`: sha256 `d93bfb38cbda4703d9154c93279b3dd3854a24795016e1bb00d975f01ca969f2` -
+  `fdop-3164272`: sha256 `c21322b8045751d89491bbde653c81ceacaf75ed039342536dd4c55b410a7cb9`
