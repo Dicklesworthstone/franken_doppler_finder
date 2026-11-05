@@ -99,8 +99,15 @@ pub struct MatchParams {
     pub pi_heard: f64,
     /// Likelihood ratio of "heard" for a lookup at chance (the cost of an unheard close pass).
     pub e_floor: f64,
-    /// Slant range heard with half the capped probability; spread of source and path in dB; cap.
-    pub r50_m: f64,
+    /// Slant ranges heard with half the capped probability. How far a recording hears depends on its
+    /// microphone, wind and noise, and is not known before it is matched (the osprey cam's 10-31
+    /// recording has 9- to 12-nat curves from passes 4 to 6 km out). So every place is scored at each
+    /// range and keeps its best, in steps of 6 dB (the spread
+    /// `sigma_db`); each decoy window profiles the same way. The longest is half of `reach_m`, so a
+    /// pass the reach leaves out would be heard at most about one time in eight; a longer range
+    /// would expect to hear passes it never looks at. Then the spread of source and path in dB,
+    /// and the cap.
+    pub r50_m: Vec<f64>,
     pub sigma_db: f64,
     pub p_cap: f64,
     /// Decoy clocks reach this far from the prior, in windows of the prior's width plus a guard.
@@ -161,7 +168,7 @@ impl Default for MatchParams {
             kappa: 0.5,
             pi_heard: 0.5,
             e_floor: 0.1,
-            r50_m: 2000.0,
+            r50_m: vec![1000.0, 2000.0, 4000.0],
             sigma_db: 6.0,
             p_cap: 0.9,
             decoy_span_s: 7200.0,
@@ -779,6 +786,8 @@ pub struct MatchMode {
     pub coarse: f64,
     /// Exact-curve log evidence, including unheard close passes.
     pub evidence: f64,
+    /// The heard range (`MatchParams::r50_m`) that evidence was best at.
+    pub r50_m: f64,
     pub n_heard: usize,
     pub n_unheard_close: usize,
     pub passes: Vec<MatchedPass>,
@@ -789,6 +798,8 @@ pub struct DecoyWindow {
     pub shift_s: f64,
     pub best_coarse: f64,
     pub best_evidence: f64,
+    /// The heard range its best place took; 0 where the window found no place.
+    pub r50_m: f64,
     pub lat: f64,
     pub lon: f64,
     pub n_heard: usize,
@@ -1040,16 +1051,16 @@ fn stamp_track(
 }
 
 /// Probability of hearing a pass at slant `d` (logistic in dB around `r50`).
-fn p_heard(p: &MatchParams, d: f64) -> f64 {
-    let margin = -20.0 * (d.max(1.0) / p.r50_m).log10();
+fn p_heard(p: &MatchParams, r50: f64, d: f64) -> f64 {
+    let margin = -20.0 * (d.max(1.0) / r50).log10();
     let k = std::f64::consts::PI / (3f64.sqrt() * p.sigma_db);
     p.p_cap / (1.0 + (-margin * k).exp())
 }
 
 /// Log evidence of one pass: ln(1 - P + P e), with e at least `e_floor`. A close pass at chance costs
 /// about ln(1 - P (1 - e_floor)); a far one costs nothing either way.
-fn pass_value(p: &MatchParams, nats: f64, d: f64) -> f64 {
-    let pd = p_heard(p, d);
+fn pass_value(p: &MatchParams, r50: f64, nats: f64, d: f64) -> f64 {
+    let pd = p_heard(p, r50, d);
     let ln_e = if nats < 1.0 {
         p.e_floor.ln()
     } else {
@@ -1060,6 +1071,7 @@ fn pass_value(p: &MatchParams, nats: f64, d: f64) -> f64 {
 
 struct Exact {
     evidence: f64,
+    r50_m: f64,
     clock: f64,
     passes: Vec<MatchedPass>,
     n_heard: usize,
@@ -1096,6 +1108,9 @@ fn score_exact(
         f_arr: i64,
         /// Row offset at each frame of the middle half of the path; `i32::MIN` where unsolved.
         core: Vec<i32>,
+    }
+    if p.r50_m.is_empty() {
+        return None;
     }
     let v_cap = p.v_grid.last().copied().unwrap_or(200.0) * 1.15;
     let mut ones: Vec<One> = Vec::new();
@@ -1233,7 +1248,7 @@ fn score_exact(
         .collect();
     // one pass's value at shared clock step k, and the step it used. A pass with no usable frames,
     // or at a track end, says nothing when it is silent.
-    let value_at = |o: &One, k: i64| -> (f64, i64) {
+    let value_at = |o: &One, k: i64, r50: f64| -> (f64, i64) {
         let mut best = (f64::NEG_INFINITY, k);
         for (jj, j) in (-slack..=slack).enumerate() {
             let (s, _) = o.table[(k + j + span) as usize];
@@ -1245,7 +1260,7 @@ fn score_exact(
             let v = if !s.is_finite() || (o.at_end && nats < 1.0) {
                 0.0
             } else {
-                pass_value(p, nats, o.d) - pens[jj]
+                pass_value(p, r50, nats, o.d) - pens[jj]
             };
             if v > best.0 {
                 best = (v, k + j);
@@ -1257,11 +1272,11 @@ fn score_exact(
     // its pixels, and a later pass whose curve lies mostly on claimed pixels earns nothing for them.
     // Weak passes claim too, or ten faint copies of one sound would each be credited. An unheard close
     // pass keeps its cost, because it was not heard whoever else is claiming the audio.
-    let assign = |k: i64| -> (f64, Vec<(f64, i64, bool)>) {
+    let assign = |k: i64, r50: f64| -> (f64, Vec<(f64, i64, bool)>) {
         let mut vals: Vec<(f64, i64, bool)> = ones
             .iter()
             .map(|o| {
-                let (v, at) = value_at(o, k);
+                let (v, at) = value_at(o, k, r50);
                 (v, at, false)
             })
             .collect();
@@ -1303,18 +1318,22 @@ fn score_exact(
         }
         (vals.iter().map(|v| v.0).sum(), vals)
     };
-    let mut best = (f64::NEG_INFINITY, 0i64);
-    for k in -kmax..=kmax {
-        let (sum, _) = assign(k);
-        if sum > best.0 {
-            best = (sum, k);
+    // best over the clock and the heard range together; a tie keeps the range listed first (the
+    // shorter, in the default order)
+    let mut best = (f64::NEG_INFINITY, 0i64, p.r50_m[0]);
+    for &r50 in &p.r50_m {
+        for k in -kmax..=kmax {
+            let (sum, _) = assign(k, r50);
+            if sum > best.0 {
+                best = (sum, k, r50);
+            }
         }
     }
-    let k = best.1;
+    let (k, r50) = (best.1, best.2);
     let clock = clock0 - k as f64 * im.dt;
     let mut passes = Vec::with_capacity(ones.len());
     let (mut n_heard, mut n_close) = (0, 0);
-    let (_, assigned) = assign(k);
+    let (_, assigned) = assign(k, r50);
     for (o, &(value, at, shared)) in ones.iter().zip(&assigned) {
         let (s, r) = o.table[(at + span) as usize];
         let usable = s.is_finite();
@@ -1345,6 +1364,7 @@ fn score_exact(
     passes.sort_by(|x, y| y.value.total_cmp(&x.value));
     Some(Exact {
         evidence: best.0,
+        r50_m: r50,
         clock,
         passes,
         n_heard,
@@ -1811,6 +1831,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                     clock_unix: e.clock,
                     coarse: m.0.coarse as f64,
                     evidence: e.evidence,
+                    r50_m: e.r50_m,
                     n_heard: e.n_heard,
                     n_unheard_close: e.n_close,
                     passes: e.passes,
@@ -1854,6 +1875,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                     clock_unix: e.clock,
                     coarse: 0.0,
                     evidence: e.evidence,
+                    r50_m: e.r50_m,
                     n_heard: e.n_heard,
                     n_unheard_close: e.n_close,
                     passes: e.passes,
@@ -1865,6 +1887,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                         clock_unix: e.clock,
                         coarse: 0.0,
                         evidence: e.evidence,
+                        r50_m: e.r50_m,
                         n_heard: e.n_heard,
                         n_unheard_close: e.n_close,
                         passes: e.passes,
@@ -1886,6 +1909,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                     shift_s,
                     best_coarse: m.coarse,
                     best_evidence: m.evidence,
+                    r50_m: m.r50_m,
                     lat: m.lat,
                     lon: m.lon,
                     n_heard: m.n_heard,
@@ -1894,6 +1918,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                     shift_s,
                     best_coarse: 0.0,
                     best_evidence: 0.0,
+                    r50_m: 0.0,
                     lat: 0.0,
                     lon: 0.0,
                     n_heard: 0,
@@ -1999,6 +2024,11 @@ mod tests {
 
     /// Three flights heard from one point, plus flights that are not heard at all, in noise.
     fn case(amp: f64, tone: bool) -> Case {
+        case_scaled(amp, tone, 1.0)
+    }
+
+    /// `case` with the heard flights' horizontal offsets times `scale` (the silent ones stay put).
+    fn case_scaled(amp: f64, tone: bool, scale: f64) -> Case {
         let (lat, lon) = (40.8765, -73.525);
         let enu = Enu::new(lat, lon, 0.0);
         let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
@@ -2013,9 +2043,19 @@ mod tests {
             t
         };
         let heard = vec![
-            mk([900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 200.0, "AAA"),
-            mk([0.0, -1500.0, 900.0], [65.0, 0.0, 0.0], 450.0, "BBB"),
-            mk([-1200.0, 900.0, 600.0], [55.0, 55.0, 0.0], 700.0, "CCC"),
+            mk([900.0 * scale, 0.0, 700.0], [0.0, 70.0, 0.0], 200.0, "AAA"),
+            mk(
+                [0.0, -1500.0 * scale, 900.0],
+                [65.0, 0.0, 0.0],
+                450.0,
+                "BBB",
+            ),
+            mk(
+                [-1200.0 * scale, 900.0 * scale, 600.0],
+                [55.0, 55.0, 0.0],
+                700.0,
+                "CCC",
+            ),
         ];
         let silent = vec![
             mk([6000.0, 2000.0, 1000.0], [0.0, 80.0, 0.0], 300.0, "DDD"),
@@ -2132,9 +2172,13 @@ mod tests {
         let top = r.modes.first().expect("a mode");
         let err = haversine_m(top.lat, top.lon, c.lat, c.lon);
         assert!(err < 200.0, "error {err} m: {top:?}");
+        // Place and clock trade along AAA's track at 70 m/s, so the 200 m above allows about 2.9 s.
+        // This scene has two near-tied fits, 79 m at +0.5 s and 150 m at +2.5 s: a fixed heard range
+        // of 2 km lands on the first, 1 km or 4 km on the second, and so does the profile (best at
+        // 4 km), with the decoy margin unchanged (6.03 against 6.10).
         assert!(
-            (top.clock_unix - c.clock).abs() < 2.0,
-            "clock off by {}",
+            (top.clock_unix - c.clock).abs() < 3.0,
+            "clock off by {}: {top:?}",
             top.clock_unix - c.clock
         );
         assert!(top.n_heard >= 3, "{top:?}");
@@ -2143,6 +2187,53 @@ mod tests {
             "{:?} {:?}",
             r.decoy_margin,
             r.decoys
+        );
+    }
+
+    /// The same three flights heard 2.8 to 4.6 km out, with the two silent ones still 3.2 and 6.1 km
+    /// out. One fixed heard range of 2 km gives the far curves a prior of 0.1 to 0.26 to be heard;
+    /// profiling the range lets the place take a longer one, paying for the silent passes it then
+    /// expects to hear. It must choose the longer range at the observer, still find the observer, and
+    /// beat the decoys (which profile too) by more than the fixed range does.
+    #[test]
+    fn a_recording_that_hears_far_takes_a_long_heard_range() {
+        let c = case_scaled(0.5, false, 3.0);
+        let fixed = MatchParams {
+            r50_m: vec![2000.0],
+            ..params()
+        };
+        let (r, r0) = (
+            run_case(&c, &params(), c.clock - 60.0, c.clock + 60.0),
+            run_case(&c, &fixed, c.clock - 60.0, c.clock + 60.0),
+        );
+        let (top, top0) = (
+            r.modes.first().expect("a mode"),
+            r0.modes.first().expect("a mode"),
+        );
+        let err = haversine_m(top.lat, top.lon, c.lat, c.lon);
+        eprintln!(
+            "profiled: err {err:.0} m, r50 {} m, evidence {:.2}, margin {:?}; fixed 2 km: err {:.0} m, evidence {:.2}, margin {:?}; decoy r50s {:?}",
+            top.r50_m,
+            top.evidence,
+            r.decoy_margin,
+            haversine_m(top0.lat, top0.lon, c.lat, c.lon),
+            top0.evidence,
+            r0.decoy_margin,
+            r.decoys.iter().map(|d| d.r50_m).collect::<Vec<_>>()
+        );
+        // far curves are broad, so this scene trades place against clock along the first flight's
+        // track; the profile must not make that worse
+        let err0 = haversine_m(top0.lat, top0.lon, c.lat, c.lon);
+        assert!(
+            err <= err0 + 50.0,
+            "error {err} m against {err0} m: {top:?}"
+        );
+        assert!(top.r50_m >= 4000.0, "{top:?}");
+        assert!(
+            r.decoy_margin.unwrap() > r0.decoy_margin.unwrap() + 1.0,
+            "{:?} vs {:?}",
+            r.decoy_margin,
+            r0.decoy_margin
         );
     }
 
@@ -2341,6 +2432,7 @@ mod tests {
             clock_unix: 0.0,
             coarse: 0.0,
             evidence,
+            r50_m: 2000.0,
             n_heard: 3,
             n_unheard_close: 0,
             passes: vec![],
@@ -2356,6 +2448,7 @@ mod tests {
                     shift_s: 300.0,
                     best_coarse: 0.0,
                     best_evidence: 30.0 - margin,
+                    r50_m: 2000.0,
                     lat: 0.0,
                     lon: 0.0,
                     n_heard: 0
@@ -2422,16 +2515,21 @@ mod tests {
     fn huge_lookups_stay_finite() {
         let p = MatchParams::default();
         for nats in [710.0, 1500.0, 3000.0, 1e6] {
-            let (v, pv) = (vote_value(&p, nats), pass_value(&p, nats, 700.0));
+            let (v, pv) = (vote_value(&p, nats), pass_value(&p, 2000.0, nats, 700.0));
             assert!(v.is_finite() && pv.is_finite(), "{nats}: {v} {pv}");
         }
-        assert!(pass_value(&p, 3000.0, 700.0) > pass_value(&p, 1500.0, 700.0) + 500.0);
+        assert!(
+            pass_value(&p, 2000.0, 3000.0, 700.0) > pass_value(&p, 2000.0, 1500.0, 700.0) + 500.0
+        );
         // and the small ones are what they were: ln(1 - P + P e)
         for nats in [1.0, 4.0, 30.0] {
-            let pd = p_heard(&p, 700.0);
+            let pd = p_heard(&p, 2000.0, 700.0);
             let e = (p.kappa * ((1.0 - p.kappa) * nats).exp()).max(p.e_floor);
             let old = (1.0 - pd + pd * e).ln();
-            assert!((pass_value(&p, nats, 700.0) - old).abs() < 1e-9, "{nats}");
+            assert!(
+                (pass_value(&p, 2000.0, nats, 700.0) - old).abs() < 1e-9,
+                "{nats}"
+            );
         }
     }
 
@@ -2739,11 +2837,42 @@ mod tests {
         assert!((n.nats(2.0 + 0.5 * 5f32.ln()) - 10f32.ln()).abs() < 1e-5);
     }
 
+    /// At each heard range: silence close in costs, silence far out costs nothing. A range only
+    /// scales distance: the longest default range charges a silent pass twice as far out what 2 km
+    /// charges, so a place cannot take it to credit far curves without paying for far silences.
     #[test]
     fn close_silence_costs_and_far_silence_does_not() {
         let p = MatchParams::default();
-        assert!(pass_value(&p, 0.0, 400.0) < -1.0);
-        assert!(pass_value(&p, 0.0, 7000.0).abs() < 0.1);
-        assert!(pass_value(&p, 30.0, 700.0) > 10.0);
+        assert!(pass_value(&p, 2000.0, 0.0, 400.0) < -1.0);
+        assert!(pass_value(&p, 2000.0, 0.0, 7000.0).abs() < 0.1);
+        assert!(pass_value(&p, 2000.0, 30.0, 700.0) > 10.0);
+        let longest = p.r50_m.iter().copied().fold(0.0, f64::max);
+        let k = longest / 2000.0;
+        for d in [400.0, 1500.0, 3000.0] {
+            let (a, b) = (
+                pass_value(&p, longest, 0.0, k * d),
+                pass_value(&p, 2000.0, 0.0, d),
+            );
+            assert!((a - b).abs() < 1e-9, "{d}: {a} {b}");
+        }
+        let far = pass_value(&p, longest, 0.0, 3000.0);
+        assert!(far < -0.5, "{far}");
+        // a 10-nat curve 4 km out is worth more at the longest range than at 2 km
+        let (long, short) = (
+            pass_value(&p, longest, 10.0, 4000.0),
+            pass_value(&p, 2000.0, 10.0, 4000.0),
+        );
+        assert!(long > short + 1.0, "{long} {short}");
+    }
+
+    /// No default heard range expects to hear much beyond the reach: at the reach, the longest
+    /// range's chance of hearing is at most one in eight.
+    #[test]
+    fn the_heard_ranges_stay_inside_the_reach() {
+        let p = MatchParams::default();
+        let longest = p.r50_m.iter().copied().fold(0.0, f64::max);
+        let at_reach = p_heard(&p, longest, p.reach_m);
+        assert!(at_reach <= 0.13, "{at_reach}");
+        assert!(p.r50_m.windows(2).all(|w| (w[1] / w[0] - 2.0).abs() < 1e-9));
     }
 }

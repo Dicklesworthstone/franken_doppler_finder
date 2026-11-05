@@ -19,6 +19,57 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### The curve match profiles how far each recording hears
+
+- **The fault.** The curve match credits each pass by its chance of being heard at its slant range. The range
+  heard half the time (`r50_m`) was fixed at 2 km for every recording and every type. On the reference recording, a
+  diagnostic run confined to 3 km around the published site (it used the truth) found its best place 612 m from
+  the site. There, three turboprops 3 to 8 km out carry 8.2, 5.5 and 4.9 nats and were credited 0.8, 0.2 and 0.7. At the osprey cam's
+  winning places, passes 4 to 6 km out with 8 to 12 nats were credited the same way.
+- **The change** (`crates/fdop-core/src/curvematch.rs`). `r50_m` is a list: 1, 2 and 4 km. Exact scoring takes
+  the best total over the clock and the range together, at every place it scores and in every decoy window
+  (`search_window` is shared). It reports the range it took as `r50_m` on each mode and decoy in
+  `curvematch.json`. The longest is half of `reach_m` (8 km), so a pass the reach leaves out would be heard at
+  most about one time in eight. A first version also tried 8 km. With an 8 km reach that range expects to hear
+  passes the search never looks at, and in the synthetic three-flight scene it took 8 km on chance lookups at
+  the two silent flights.
+- **Effect** (full `locate`, the benchmark's R2 inputs, on the development machine). The runs are `r50_dev` and
+  `r50_nulls`, compared with `disc_dev` and `disc_nulls` on `6914ab7`.
+  - The margin over the best decoy at the osprey cam rose on all three days: 10-31 from +9.23 to +22.24, 11-01
+    from +13.29 to +21.36, 11-02 from +1.14 to +5.29.
+  - It is unchanged at Duke Farms, +44.81 (it keeps 2 km). It fell on the reference recording, from −3.95 to
+    −4.32.
+  - Every grade is unchanged. Every distance is unchanged except the osprey cam's 11-02, from 220 m to 240 m.
+  - On the 42 runs with no right answer, none stands. The largest margin is −0.47 (it was −0.18): 20 rose, 18
+    fell and 4 are unchanged, median change 0.00.
+  - The one medium among the 42, `nd_o31_1101`, was medium before and is low under the gate below.
+  - The real windows at the osprey cam took 4 km on all three days. Most of their decoy windows took 1 km (31,
+    39 and 36 of 48), because at a wrong clock nothing far lines up.
+- **How it was chosen.** An offline rescoring of the stored best places suggested it. That rescoring matched the
+  stored evidence exactly at 2 km, and in it the osprey cam's wins rose with the range while most null winners
+  fell. Those places had been picked under 2 km, so the rescoring was a screen, not the test. The test was the
+  full runs above, judged by a rule written before they started:
+  - on the 42, no new medium or high and no stand;
+  - on the 15, no right answer lost and no wrong one asserted;
+  - the margin up on at least 3 of the 5 right rows.
+
+  A four-recording railcam battery was dropped from that rule before any of its results on this build, because
+  its operators' terms prohibit recording. All of these recordings are development data; set F is the test.
+- **Cost.** A full `locate` takes a median 1.06 times the CPU time it took before (quartiles 1.02 to 1.10, 48
+  runs).
+- **Tests.**
+  - `a_recording_that_hears_far_takes_a_long_heard_range` moves the three synthetic flights 2.8 to 4.6 km out.
+    The profile takes 4 km, and its margin over the decoys is 4.42, against 2.08 with 2 km fixed, at the same
+    place.
+  - `the_heard_ranges_stay_inside_the_reach` is new.
+  - `close_silence_costs_and_far_silence_does_not` now also checks three things. The longest range only scales
+    distance: it charges a silent pass twice as far out what 2 km charges. Silence 3 km out costs 0.8 nats there.
+    And a 10-nat curve 4 km out is worth 1.2 nats more there than at 2 km.
+  - `three_flights_locate_the_observer_and_beat_every_decoy`'s clock tolerance goes from 2 s to 3 s. That scene
+    has two near-tied fits, 79 m at +0.5 s and 150 m at +2.5 s. A fixed 2 km lands on the first; a fixed 1 km
+    or 4 km, and the profile, land on the second, with the decoy margin 6.03 against 6.10. Place and clock trade
+    along the first flight's track at 70 m/s, so the test's 200 m place bound allows about 2.9 s.
+
 ### A medium answer needs the curve match to stand wherever it ran
 
 - **The fault.** With the knot rule (`069c971`, `9087ec4`, `6914ab7`), the osprey cam's 10-31 recording searched
