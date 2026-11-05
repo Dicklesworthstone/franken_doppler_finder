@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Spike pixels in the terrain tiles no longer put an observer under the sea; the air column extends past its grid
+
+- **The fault.** The terrain elevation is only ever the observer's ground. The cached z13 Terrarium tiles near the
+  development sites hold single pixels of −796 to −1,026 m beside pixels of 0 to 3 m (z12 has one of −1,972 m), and
+  `fdop`'s bilinear sample reproduced them. Candidate 5 in the pinned benchmark build's osprey run on 10-31
+  stood at −599 m, and candidates in two osprey runs on 11-01 at −654 m and −722 m. The 8 × 8 median around each spike is
+  0–2 m, and z10 gives about 1 m at the same points. Traced by cc_1 (research session e9).
+- **The second fault, which the first exposed.** `Column::cum` clamped its integrals to the column's −500 m to 15 km
+  grid while `mean` divided by the full height, so any path reaching outside the grid inflated the sound speed:
+  those candidates got 375–432 m/s against about 340. cc_1's fix extends the integral past the grid at the edge
+  cell's rate, which is exact because the column is constant beyond its levels; its test fails without the fix
+  (376.93 against 340.28 m/s) and passes with it. Landed unchanged.
+- **The rule.** A tile pixel below −430 m, lower than the lowest dry land on Earth (the Dead Sea shore), is left out
+  of the bilinear blend and the other corners are renormalised. A cell with no corner left is open water and counts
+  as sea level, 0 m. Every other pixel is sampled exactly as before, so a field down to −430 m (Death Valley is
+  −86 m) is unchanged. Seabed between −430 m and 0 m is still read as ground: a candidate over shallow water stands
+  on the seabed, which this does not fix.
+- **Tests.** `a_spike_pixel_below_any_ground_is_left_out_of_the_blend` (the −895.4 / 1.0 cell from the cache),
+  `a_cell_with_no_ground_is_open_water_at_sea_level`, `real_low_ground_and_values_just_above_the_floor_are_kept`,
+  `a_point_on_an_excluded_corner_takes_the_kept_corners_mean`, and cc_1's
+  `a_path_reaching_past_the_grid_keeps_the_column_mean`.
+- **What it did.**
+  - **Development rows.** Full `locate` on the 15 rows with R2 inputs, on a local Apple M5 Ultra with 256 GiB
+    (`fb1` against `f10`). Every answer, grade and margin is bit-identical. It removed the three stored
+    candidates below −430 m, two on the osprey cam's 10-31 recording and one on 11-01.
+  - **33 more runs with no right answer** (`nb1`). One graded medium. The knot rule caused it, not this change
+    (README Known issues).
+  - **Benchmark machine.** The county reference search is bit-identical to `r_nassau_c1` (`r_nassau_b1`). The
+    state-wide, three-day and wrong-date replays were still running when this was committed.
+
 ### ADS-B points without GNSS height no longer bend a track between GNSS points
 
 - **The fault.** A merged ADS-B leg mixes points that carry a GNSS height with points that do not. The second kind

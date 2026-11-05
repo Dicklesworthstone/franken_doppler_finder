@@ -645,7 +645,7 @@ that day again.
 | ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing |
 | Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Jets are dropped; unknown types are kept |
 | Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. Falls back to a 15 °C standard atmosphere with a warning |
-| Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search; a tile that cannot be fetched counts as 0 m, with a warning giving the number of such tiles |
+| Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search; a tile that cannot be fetched counts as 0 m, with a warning giving the number of such tiles. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
 | Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL; −30 m, with a warning, if unreachable or `--offline` |
 | Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Offline fallback uses the gazetteer's internal points |
 | Basemap | [USGS The National Map](https://www.usgs.gov/programs/national-geospatial-program/national-map) Topo tiles; OSM in the HTML report | |
@@ -1274,6 +1274,14 @@ audio or video recorded somewhere sensitive:
   answer's reverse geocode is in another state.
 - Helicopter passes (rotor tones, speed changes) can fit with confidently wrong speed and distance. They do
   harm only through false pairings, which the margin gate is meant to catch.
+- **With the knot rule, a wrong date can grade medium near the true site.** The development recordings were run
+  with a start given 42 times with no right answer: 20 at wrong dates and 22 at places 90 km or more off.
+  - One graded **medium**: the osprey cam's 10-31 recording searched on 11-01 (`nd_o31_1101`, local run `nb1`). It
+    landed 2.6 km from the cam on 2 core matches, one of them a Sikorsky S-76 helicopter, at 4.98 nats.
+  - On `cb95fbb` the same run is low at 2.49 nats, and with only the knot rule added it is medium at 4.98, so the
+    rule caused it. The pinned benchmark build `7e66501` grades it low.
+  - The curve match ran there and did not stand (−6.87), and the grade ignores a curve match that does not stand.
+  - None of the 22 wrong-place runs graded above low.
 
 ---
 

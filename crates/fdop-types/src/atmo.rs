@@ -141,9 +141,20 @@ impl Column {
         Self { s, we, wn }
     }
 
+    /// Cumulative integral at height `z`. Beyond the grid the column is constant (as
+    /// `from_levels` defines it), so the integral keeps growing at the edge cell's rate. A
+    /// clamp here would drop that part of a path while `mean` still divides by its full
+    /// height: a terrain value of -600 m over water raised c from 338 to 375 m/s.
     #[inline]
     fn cum(v: &[f64], z: f64) -> f64 {
-        let u = ((z - Z0) / DZ).clamp(0.0, (NZ - 1) as f64);
+        let top = Z0 + (NZ - 1) as f64 * DZ;
+        if z < Z0 {
+            return v[0] - (Z0 - z) * (v[1] - v[0]) / DZ;
+        }
+        if z > top {
+            return v[NZ - 1] + (z - top) * (v[NZ - 1] - v[NZ - 2]) / DZ;
+        }
+        let u = (z - Z0) / DZ;
         let i = (u.floor() as usize).min(NZ - 2);
         let w = u - i as f64;
         v[i] * (1.0 - w) + v[i + 1] * w
@@ -511,6 +522,42 @@ mod tests {
         assert_eq!(atm.medium(0.0, 0.0, 0.0, h, z0), m);
         let p = atm.medium(0.0, 0.0, 0.0, z0, z0);
         assert!((p.c - sound_speed(t0, 0.0)).abs() < 0.1);
+    }
+
+    #[test]
+    fn a_path_reaching_past_the_grid_keeps_the_column_mean() {
+        // A uniform column must average to its own c and wind over any path, including heights
+        // below the grid's -500 m floor (terrain values over water reach -722 m) and above
+        // its 15 km top.
+        let col = Column::from_levels(&[Level {
+            z_msl: 0.0,
+            t_c: 15.0,
+            rh: 0.0,
+            wind_e: 3.0,
+            wind_n: -4.0,
+        }]);
+        let c = sound_speed(15.0, 0.0);
+        for (za, zb) in [
+            (-100.0, 900.0),
+            (-599.0, 419.0),
+            (-722.0, 306.0),
+            (-2000.0, -800.0),
+            (100.0, 16_000.0),
+            (-700.0, 20_000.0),
+        ] {
+            let m = col.mean(za, zb);
+            assert!(
+                (m.c / c - 1.0).abs() < 1e-9,
+                "{za}..{zb} m: c {} vs {c}",
+                m.c
+            );
+            assert!(
+                (m.wind_e - 3.0).abs() < 1e-9 && (m.wind_n + 4.0).abs() < 1e-9,
+                "{za}..{zb} m: wind {} {}",
+                m.wind_e,
+                m.wind_n
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,12 @@
 //! Elevation (m) = R*256 + G + B/256 - 32768. Sampling matches the reference oracle exactly:
 //! web-mercator tile coordinates, pixel centres at +0.5, bilinear within one tile (clamped at
 //! the tile edge, no cross-tile blending).
+//!
+//! One exception: a pixel below [`LOWEST_GROUND_M`] is left out of the blend. The elevation
+//! here is only ever the observer's ground, and no ground lies that low, so such a pixel is
+//! seabed or a spike in the tiles. The cached z13 tiles near the development sites have
+//! single pixels of -796 to -1026 m beside pixels of 0 to 3 m, and z12 one of -1972 m. Those
+//! put candidates hundreds of metres under the sea, outside the sound-speed column.
 
 use crate::DataError;
 use fdop_types::{BBox, Elevation};
@@ -15,6 +21,10 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 pub const TERRARIUM_URL: &str = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium";
 const TILE: usize = 256;
+
+/// The lowest dry land on Earth, the Dead Sea shore (about -430 m). A tile value below it is
+/// not a surface anyone records from.
+pub const LOWEST_GROUND_M: f32 = -430.0;
 
 type TileCell = Arc<OnceLock<Option<Arc<Vec<f32>>>>>;
 
@@ -205,6 +215,25 @@ impl TerrariumDem {
     }
 }
 
+/// Bilinear blend of a cell's corners, leaving out any below [`LOWEST_GROUND_M`] and
+/// renormalising the rest. With every corner left out the cell is open water, whose surface is
+/// sea level. A kept corner whose weight is zero (the point sits on the excluded one) still
+/// counts, as the plain mean of the kept corners.
+fn blend_ground(corners: &[(f32, f64); 4]) -> f64 {
+    let kept = corners.iter().filter(|(v, _)| *v >= LOWEST_GROUND_M);
+    let (sum, weight, n, plain) = kept.fold((0.0, 0.0, 0usize, 0.0), |(s, w, n, p), (v, k)| {
+        let v = f64::from(*v);
+        (s + v * k, w + k, n + 1, p + v)
+    });
+    if n == 0 {
+        0.0
+    } else if weight > 1e-9 {
+        sum / weight
+    } else {
+        plain / n as f64
+    }
+}
+
 impl Elevation for TerrariumDem {
     fn elev_m(&self, lat: f64, lon: f64) -> f64 {
         let (xf, yf) = tile_xy(lat, lon, self.zoom);
@@ -216,11 +245,13 @@ impl Elevation for TerrariumDem {
         let py = ((yf - ty) * 256.0 - 0.5).clamp(0.0, 254.999);
         let (x0, y0) = (px.floor() as usize, py.floor() as usize);
         let (wx, wy) = (px - x0 as f64, py - y0 as f64);
-        let g = |y: usize, x: usize| f64::from(tile[y * TILE + x]);
-        g(y0, x0) * (1.0 - wx) * (1.0 - wy)
-            + g(y0, x0 + 1) * wx * (1.0 - wy)
-            + g(y0 + 1, x0) * (1.0 - wx) * wy
-            + g(y0 + 1, x0 + 1) * wx * wy
+        let corners = [
+            (tile[y0 * TILE + x0], (1.0 - wx) * (1.0 - wy)),
+            (tile[y0 * TILE + x0 + 1], wx * (1.0 - wy)),
+            (tile[(y0 + 1) * TILE + x0], (1.0 - wx) * wy),
+            (tile[(y0 + 1) * TILE + x0 + 1], wx * wy),
+        ];
+        blend_ground(&corners)
     }
 
     fn describe(&self) -> String {
@@ -284,5 +315,69 @@ mod tests {
         assert_eq!(dem.elev_m(10.0, 10.0), -999.0);
         assert_eq!(dem.failures(), 1);
         assert_eq!(dem.describe(), "terrarium:z12");
+    }
+
+    const AT: (f64, f64) = (40.876466, -73.524951);
+    const Z: u32 = 13;
+
+    /// The reference point's pixel coordinates in its z13 tile.
+    fn pixel() -> (f64, f64) {
+        let (xf, yf) = tile_xy(AT.0, AT.1, Z);
+        (
+            (xf - xf.floor()) * 256.0 - 0.5,
+            (yf - yf.floor()) * 256.0 - 0.5,
+        )
+    }
+
+    /// A DEM whose only tile, the one holding the reference point, is `elev`.
+    fn one_tile(tag: &str, elev: impl Fn(usize, usize) -> f64) -> TerrariumDem {
+        let dir = std::env::temp_dir().join(format!("fdop-terrain-{tag}-{}", std::process::id()));
+        let (xf, yf) = tile_xy(AT.0, AT.1, Z);
+        let dem = TerrariumDem::new(&dir, Z)
+            .with_offline(true)
+            .with_fallback(-999.0);
+        let p = dem.tile_path(xf as u32, yf as u32);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, encode(elev)).unwrap();
+        dem
+    }
+
+    #[test]
+    fn a_spike_pixel_below_any_ground_is_left_out_of_the_blend() {
+        // The cached tiles near the osprey cam have cells like -895.4, 1.0 / -895.4, 1.0.
+        let (px, py) = pixel();
+        let (sx, sy) = (px.floor() as usize, py.floor() as usize);
+        let spike = |x: usize, y: usize| (x, y) == (sx, sy) || (x, y) == (sx, sy + 1);
+        let dem = one_tile("spike", |x, y| if spike(x, y) { -895.4 } else { 1.0 });
+        let z = dem.elev_m(AT.0, AT.1);
+        assert!((z - 1.0).abs() < 1e-6, "{z}");
+    }
+
+    #[test]
+    fn a_cell_with_no_ground_is_open_water_at_sea_level() {
+        let dem = one_tile("ocean", |x, _| -3000.0 - x as f64);
+        assert_eq!(dem.elev_m(AT.0, AT.1), 0.0);
+    }
+
+    #[test]
+    fn real_low_ground_and_values_just_above_the_floor_are_kept() {
+        // Death Valley is -86 m; a field that dips to just above the floor is blended as before.
+        let (px, py) = pixel();
+        let dem = one_tile("low", |x, y| -429.0 + 0.5 * x as f64 + 0.25 * y as f64);
+        let want = -429.0 + 0.5 * px + 0.25 * py;
+        let z = dem.elev_m(AT.0, AT.1);
+        assert!((z - want).abs() < 0.01, "{z} vs {want}");
+        let dem = one_tile("badwater", |_, _| -86.0);
+        assert!((dem.elev_m(AT.0, AT.1) + 86.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_point_on_an_excluded_corner_takes_the_kept_corners_mean() {
+        let w = |a: f32, b: f32, c: f32, d: f32| [(a, 1.0), (b, 0.0), (c, 0.0), (d, 0.0)];
+        assert_eq!(blend_ground(&w(-900.0, 2.0, 4.0, -900.0)), 3.0);
+        assert_eq!(blend_ground(&w(5.0, -900.0, -900.0, -900.0)), 5.0);
+        assert_eq!(blend_ground(&w(-900.0, -900.0, -900.0, -900.0)), 0.0);
+        let mixed = [(10.0, 0.25), (-900.0, 0.25), (20.0, 0.25), (-900.0, 0.25)];
+        assert_eq!(blend_ground(&mixed), 15.0);
     }
 }
