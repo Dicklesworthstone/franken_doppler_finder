@@ -506,3 +506,50 @@ larger, because eight cases say little. It is chosen by rule, captured and seale
   `dp`, `dp48` and `dpdem` as Addendum 3 requires, and against `dopplertrack`, for each registered build separately. The
   report gives the number of `fdop` builds registered and scores every one. The best of them is not presented as
   `fdop`'s result: each build passes or fails the claim by its own row.
+## Addendum 10, 2026-11-05, a harness fault in the chains' watchdog, its fix and the reruns
+
+Written before any set E result of `9087ec4` or `6914ab7` was read.
+
+### The fault
+
+Each chain had a watchdog meant to stop that chain if the boot disk or swap got tight. It stopped processes with `pkill
+-f` on a pattern, and the patterns matched other chains' processes too: every process of a tool's binary
+(`fdop-9087ec4`, `fdop-7e66501`, `venv-dp/bin`), and job names that are substrings of other job names (`r3_fdop.sh` is
+part of `e2_r3_fdop.sh`). Swap use crossed the line twice, nine watchdogs fired, and four of them stopped runs in other
+chains:
+
+| Time (UTC) | Watchdog | What it stopped |
+|---|---|---|
+| 05:17:12 | `e2_r2_dt` | its own chain: `dopplertrack`'s R2 on `e_harbourgate` (traces step) |
+| 05:17:20-35 | `capx_t0`-`t2` (an old experiment) | nothing: their pattern names only that experiment's binary |
+| 05:17:39 | `e2_r1_fdop_9087ec4` | `9087ec4`'s R2 `c_ref_0909`, and its R3 chain on set E's replacements (`e_tehachapi`) |
+| 05:17:39 | `sd_fdop` | the pinned `fdop` R3 chain (`c_osprey_1031`) |
+| 06:21:29 | `sd_dpdem` | the `dopplerprint` R1 chain (`b3_sapsucker`) |
+| 06:22:10-12 | `e2_r1_fdop_6914ab7`, `r1_fdop_6914ab7` | `6914ab7`'s R2 chains (`a_ref`, `a_ref_opus`, `e_kelso`) and its R3 chain on the replacements (`e_tehachapi`) |
+
+A stopped job script did not stop its chain: the chain went on to its next script, so the rest of a stopped regime never
+ran. Addendum 8's note on `c_ref_0909` said the sender of its SIGTERM was not found. It was the `e2_r1_fdop_9087ec4`
+watchdog, at the same second.
+
+### The fix
+
+The watchdog now gets its chain's loop process and stops that loop and every process under it, and nothing else
+(`lib.sh` and `tools/start_chains.sh`; the old copies are kept as `*.pre_guardfix`). A test on dummy processes
+(`tools/match/guardfix/test_guard.sh`) shows a firing guard stops its loop, the loop does not go on to its next script,
+and a process the old pattern would have matched keeps running. The criterion (5 GB of boot disk, 6 GB of swap growth)
+is unchanged. The watchdog left running on `9087ec4`'s R2 chain still had the old pattern, so it was stopped at
+06:35:51Z; that chain ran on without a watchdog.
+
+### Reruns
+
+Every stopped run's files are kept under `<name>_fault_guard` (or `_fault_term` for `c_ref_0909`), and the run is done
+once more from its job file's own line. The R2 chains run first, in regime `fix1` from 06:41:14Z: `6914ab7`'s R2 on sets
+A, B, C and E, its R2 and then R3 on the replacements, `dopplertrack`'s R2 on the replacements from `e_harbourgate`'s
+traces step, and `9087ec4`'s R3 on the replacements. The pinned `fdop` R3 chain and `dopplerprint`'s R1 chain restart
+from the stopped case once the R2 chains are done. No run that finished is repeated.
+
+### What was seen while finding it
+
+Diagnosing this meant reading exit codes in set E's run directories. `fdop` exits 1 when it gives no location. So one
+set E result was seen early: `fdop-6914ab7`'s R2 run on `e_tehachapi` exited 1, no location. No other set E exit code,
+output or result was read. Nothing about either build or the benchmark was changed after it.
