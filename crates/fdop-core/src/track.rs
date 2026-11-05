@@ -5,11 +5,12 @@
 //! invents geometry across a coverage hole. Within each piece only the longest physically
 //! consistent chain of positions is kept: archived legs can interleave junk positions (MLAT
 //! mis-solutions, another aircraft's position under the same address) that the interpolation
-//! would otherwise fly through.
+//! would otherwise fly through. Points without GNSS height that GNSS-height points bracket closely
+//! are dropped first (`drop_bracketed_non_gnss`).
 
 use fdop_types::engine::EngineClass;
 use fdop_types::geo::{Enu, V3, add, dot, ecef_to_geodetic, geodetic_to_ecef, norm, scale, sub};
-use fdop_types::store::{FlightLeg, pt_flags};
+use fdop_types::store::{FlightLeg, alt_src, pt_flags};
 
 #[derive(Clone, Debug)]
 pub struct TrackModel {
@@ -38,6 +39,9 @@ pub struct BuildParams {
     pub max_vz_mps: f64,
     /// Position noise allowed between two points of one chain (horizontal, vertical; m).
     pub pos_slack_m: (f64, f64),
+    /// Widest stretch between two GNSS-height points across which a point without GNSS height
+    /// is dropped (s); see `drop_bracketed_non_gnss`. Zero keeps every point.
+    pub gnss_bridge_s: f64,
 }
 
 impl Default for BuildParams {
@@ -47,8 +51,40 @@ impl Default for BuildParams {
             vel_consistency_mps: 25.0,
             max_vz_mps: 30.0,
             pos_slack_m: (250.0, 120.0),
+            gnss_bridge_s: 60.0,
         }
     }
+}
+
+/// Drops each point without GNSS height that two GNSS-height points bracket within
+/// `max_span_s`.
+///
+/// Archived legs interleave points of another quality with the aircraft's own reports. On the
+/// legs checked against the raw `prod` archive, the points absent from it were the ones without
+/// GNSS height, likely from the merged `mlatonly` feed (inferred from that absence: the archive
+/// sets no MLAT flag on them). On one day's legs they lie a median 89 m and a 90th percentile
+/// 417 m from the line through the GNSS points. That is inside `pos_slack_m`, so the chain keeps
+/// most of them, and a Hermite knot on one turns the offset into tens of m/s of false velocity:
+/// several Hz of false Doppler, against a trace good to a few tenths of a Hz.
+///
+/// Dropping a point is not free, because the spline must then cross the whole stretch. On a
+/// sustained 3 deg/s turn, the steepest routine manoeuvre, that costs less than keeping the noisy
+/// points up to 60 s and more by 90 s (`the_bridge_stops_where_a_turn_costs_more_than_the_noise`).
+/// A wider stretch keeps its points, and so does a leg with fewer than two GNSS-height points,
+/// since they are all it has.
+fn drop_bracketed_non_gnss(pts: &mut Vec<fdop_types::store::TrackPoint>, max_span_s: f64) {
+    let t_gnss: Vec<f64> = pts
+        .iter()
+        .filter(|p| p.alt_src == alt_src::GEOM)
+        .map(|p| p.t)
+        .collect();
+    pts.retain(|p| {
+        if p.alt_src == alt_src::GEOM {
+            return true;
+        }
+        let i = t_gnss.partition_point(|&t| t < p.t);
+        !(i > 0 && i < t_gnss.len() && t_gnss[i] - t_gnss[i - 1] <= max_span_s)
+    });
 }
 
 /// Indices of the longest chain of points (time-sorted) in which every consecutive pair is
@@ -210,6 +246,7 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
         .collect();
     pts.sort_by(|a, b| a.t.total_cmp(&b.t));
     pts.dedup_by(|b, a| (b.t - a.t).abs() < 1e-3);
+    drop_bracketed_non_gnss(&mut pts, bp.gnss_bridge_s);
     let mut out = Vec::new();
     let mut start = 0;
     let mut part = 0;
@@ -1241,5 +1278,232 @@ mod tests {
             let truth = enu.to_ecef([9000.0, 0.0, 1200.0]);
             assert!(norm(sub(model.pos_at(1090.0), truth)) < 1.0);
         }
+    }
+
+    const NO_BRIDGE: BuildParams = BuildParams {
+        max_gap_s: 180.0,
+        vel_consistency_mps: 25.0,
+        max_vz_mps: 30.0,
+        pos_slack_m: (250.0, 120.0),
+        gnss_bridge_s: 0.0,
+    };
+    // Tone and sound speed for quoting Doppler in Hz.
+    const F0_HZ: f64 = 100.0;
+    const C_MPS: f64 = 343.0;
+    // The best a trace is ever trusted to: sigma_hz at the 100 Hz tone is 0.002 f0 = 0.2 Hz, with
+    // no fit residual. A knot rule must leave the model error well below that.
+    const TRACE_FLOOR_HZ: f64 = 0.2;
+
+    // Points without GNSS height every 7.5 s, between GNSS-height points every `gnss_every` s.
+    // Offsets (east, north; m) repeat a fixed pattern with a median near the measured 89 m, all
+    // inside the chain's slack; reports are coarse, as on the real points. `noisy` false leaves
+    // them exact, so only their dropping is under test.
+    fn mixed_leg(
+        span: (f64, f64),
+        gnss_every: f64,
+        noisy: bool,
+        state: impl Fn(f64) -> (V3, V3),
+    ) -> FlightLeg {
+        const OFFSETS: [(f64, f64); 8] = [
+            (90.0, -40.0),
+            (-120.0, 60.0),
+            (70.0, 110.0),
+            (-60.0, -100.0),
+            (140.0, 30.0),
+            (-30.0, 80.0),
+            (110.0, -70.0),
+            (-150.0, -20.0),
+        ];
+        const REPORTS: [(f32, f32); 4] = [(6.0, 4.0), (-5.0, -3.0), (3.0, 5.0), (-8.0, -4.0)];
+        let count = ((span.1 - span.0) / gnss_every).round() as usize;
+        let gnss: Vec<f64> = (0..=count)
+            .map(|k| span.0 + k as f64 * gnss_every)
+            .collect();
+        let mut times = gnss.clone();
+        let mut t = span.0 + 3.75;
+        while t < span.1 {
+            if gnss.iter().all(|g| (g - t).abs() > 1.0) {
+                times.push(t);
+            }
+            t += 7.5;
+        }
+        times.sort_by(f64::total_cmp);
+        let mut leg = leg_from_states(&times, state);
+        let mut k = 0;
+        for (point, t) in leg.points.iter_mut().zip(&times) {
+            if gnss.contains(t) {
+                continue;
+            }
+            point.alt_src = alt_src::BARO_CORRECTED;
+            if noisy {
+                let (east, north) = OFFSETS[k % OFFSETS.len()];
+                let (gs, track) = REPORTS[k % REPORTS.len()];
+                point.lat += north / 110_540.0;
+                point.lon += east / (111_320.0 * point.lat.to_radians().cos());
+                point.gs_mps += gs;
+                point.track_deg = (point.track_deg + track).rem_euclid(360.0);
+            }
+            k += 1;
+        }
+        leg
+    }
+
+    fn doppler_rms_hz(
+        model: &TrackModel,
+        observer: V3,
+        span: (f64, f64),
+        state: impl Fn(f64) -> (V3, V3),
+    ) -> f64 {
+        let medium = Prop::still(C_MPS);
+        let ratio = |p: V3, v: V3| {
+            let rv = sub(p, observer);
+            medium.ratio(rv, norm(rv), v)
+        };
+        let (mut sum, mut n) = (0.0, 0.0);
+        let mut t = span.0;
+        while t < span.1 {
+            let (p, v) = model.pv(1000.0 + t);
+            let (p_true, v_true) = state(t);
+            sum += (F0_HZ * (ratio(p, v) - ratio(p_true, v_true))).powi(2);
+            n += 1.0;
+            t += 0.25;
+        }
+        (sum / n).sqrt()
+    }
+
+    #[test]
+    fn noisy_points_without_gnss_height_do_not_bend_a_straight_pass() {
+        let enu = Enu::new(40.0, -75.0, 0.0);
+        let state = |t: f64| {
+            (
+                enu.to_ecef([60.0 * t, 0.0, 600.0]),
+                enu.vec_to_ecef([60.0, 0.0, 0.0]),
+            )
+        };
+        let span = (-200.0, 200.0);
+        let leg = mixed_leg(span, 20.0, true, state);
+        let observer = enu.to_ecef([0.0, 1500.0, 0.0]);
+        let inner = (-120.0, 120.0);
+        let without = doppler_rms_hz(&build(&leg, &NO_BRIDGE)[0], observer, inner, state);
+        let with = doppler_rms_hz(
+            &build(&leg, &BuildParams::default())[0],
+            observer,
+            inner,
+            state,
+        );
+        assert!(with < TRACE_FLOOR_HZ, "with the rule: {with:.3} Hz");
+        assert!(
+            without > TRACE_FLOOR_HZ,
+            "without the rule: {without:.3} Hz"
+        );
+    }
+
+    #[test]
+    fn a_real_turn_stays_intact_when_its_points_are_dropped() {
+        let enu = Enu::new(40.0, -75.0, 0.0);
+        let omega = 3.0_f64.to_radians();
+        let state = |t: f64| turn_state(&enu, t, omega);
+        let span = (0.0, 120.0);
+        // Exact points: the rule's whole cost is the wider spline span, not the noise it removes.
+        let leg = mixed_leg(span, 20.0, false, state);
+        let model = &build(&leg, &BuildParams::default())[0];
+        assert_eq!(model.t.len(), 7, "only the GNSS-height points remain");
+        let observer = enu.to_ecef([0.0, 1500.0, 0.0]);
+        let doppler = doppler_rms_hz(model, observer, span, state);
+        assert!(doppler < TRACE_FLOOR_HZ, "turn Doppler {doppler:.3} Hz");
+        let mut t = 0.0;
+        while t < 120.0 {
+            let error = norm(sub(model.pos_at(1000.0 + t), state(t).0));
+            assert!(error < 15.0, "{error:.1} m off the arc at {t} s");
+            t += 0.5;
+        }
+    }
+
+    #[test]
+    fn the_bridge_stops_where_a_turn_costs_more_than_the_noise() {
+        // Sustained standard-rate turn, the worst routine case for crossing a stretch without a
+        // knot. Up to the bridge, dropping the points beats keeping them; past it, it loses.
+        // Several observers, since one sees only one heading. A 120 s stretch would be exactly
+        // one circle at this rate, with both ends agreeing, so it is not a fair comparison.
+        let enu = Enu::new(40.0, -75.0, 0.0);
+        let omega = 3.0_f64.to_radians();
+        let state = |t: f64| turn_state(&enu, t, omega);
+        let span = (0.0, 360.0);
+        let inner = (90.0, 270.0);
+        let observers = [
+            [0.0, 1500.0, 0.0],
+            [0.0, -1500.0, 0.0],
+            [1500.0, 0.0, 0.0],
+            [-2500.0, 2500.0, 0.0],
+            [3000.0, 3000.0, 0.0],
+        ]
+        .map(|p| enu.to_ecef(p));
+        let errors = |gnss_every: f64| {
+            let leg = mixed_leg(span, gnss_every, true, state);
+            let dropped = BuildParams {
+                gnss_bridge_s: gnss_every,
+                ..NO_BRIDGE
+            };
+            let rms = |bp: &BuildParams| {
+                let model = &build(&leg, bp)[0];
+                let sum: f64 = observers
+                    .iter()
+                    .map(|&o| doppler_rms_hz(model, o, inner, state).powi(2))
+                    .sum();
+                (sum / observers.len() as f64).sqrt()
+            };
+            let (drop, keep) = (rms(&dropped), rms(&NO_BRIDGE));
+            println!("{gnss_every} s: dropping {drop:.3} Hz, keeping {keep:.3} Hz");
+            (drop, keep)
+        };
+        for s in [20.0, 30.0, 45.0, 60.0] {
+            let (drop, keep) = errors(s);
+            assert!(
+                drop < keep,
+                "{s} s: dropping {drop:.3} Hz, keeping {keep:.3} Hz"
+            );
+        }
+        let (drop, keep) = errors(90.0);
+        assert!(
+            drop > keep,
+            "90 s: dropping {drop:.3} Hz, keeping {keep:.3} Hz"
+        );
+    }
+
+    #[test]
+    fn points_the_bridge_does_not_cover_are_kept() {
+        let enu = Enu::new(40.0, -75.0, 0.0);
+        let times: Vec<f64> = (0..=20).map(|k| k as f64 * 5.0).collect();
+        let source = |gnss: &[usize]| {
+            let mut leg = straight_leg(&enu, &times);
+            for (k, point) in leg.points.iter_mut().enumerate() {
+                if !gnss.contains(&k) {
+                    point.alt_src = alt_src::BARO_CORRECTED;
+                }
+            }
+            let bp = BuildParams::default();
+            build(&leg, &bp)[0].t.clone()
+        };
+        // No or one GNSS-height point: nothing brackets anything.
+        assert_eq!(source(&[]).len(), times.len());
+        assert_eq!(source(&[10]).len(), times.len());
+        // A 100 s stretch is wider than the bridge.
+        assert_eq!(source(&[0, 20]).len(), times.len());
+        // Exactly the bridge is crossed; points outside the outermost GNSS-height points stay.
+        assert_eq!(source(&[4, 16]).len(), times.len() - 11);
+        // Only one side covered: the stretch from 25 s to 100 s is too wide.
+        assert_eq!(source(&[0, 5, 20]).len(), times.len() - 4);
+    }
+
+    #[test]
+    fn a_leg_of_gnss_height_points_is_untouched() {
+        let enu = Enu::new(40.0, -75.0, 0.0);
+        let times: Vec<f64> = (0..20).map(|k| k as f64 * 7.5).collect();
+        let leg = turning_leg(&enu, &times, 2.0_f64.to_radians());
+        let on = &build(&leg, &BuildParams::default())[0];
+        let off = &build(&leg, &NO_BRIDGE)[0];
+        assert_eq!(on.t, off.t);
+        assert_eq!(on.pos, off.pos);
+        assert_eq!(on.vel, off.vel);
     }
 }

@@ -41,17 +41,18 @@ finding the faint curves in a spectrogram to naming the town.
 ## Honest status
 
 **Real-recording validation baseline:** the reference searches, the reference recording's two wrong dates and
-the Ithaca feeder below were replayed on this code (runs named `*_r5`). Field rows replayed on it so far are in the [CHANGELOG](CHANGELOG.md), and the rest are still running. Every other number in this
+the Ithaca feeder below were replayed on this code (runs named `*_c1`) and on the build before its knot rule (`*_r5`). Field rows replayed on that build so far are in the [CHANGELOG](CHANGELOG.md), and the rest are still running. The row on the knot rule and the curve match names its own runs. Every other number in this
 section comes from the archived `7e5cf3e` replays, which predate the moving-medium propagation correction, spatial
 refinement, frequency calibration and robust tone fit. Those are not measured results for this code.
 
 | Question | Answer |
 |---|---|
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
-| Has it located a real recording? | **One recording, three ways, one area: high on all three.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three match the same aircraft, a Pilatus PC-12 and a Cessna 208 as the core matches and a King Air 350 as a weaker third, and land near the location published in the video. The county search is 270 m off, radius 406 m, margin 17.85 nats (`r_nassau_r5`). The state-wide search is 264 m off, radius 385 m, margin 8.64 nats (`r_ny_r5`). The three-day window is 263 m off, radius 388 m, margin 7.21 nats over a rival 138 km away (`r_md_r5`). The grades have moved between builds on this same recording: `7e5cf3e` gave high, medium and low at 271–306 m with a 304–316 m radius, and `d79d90d` gave high on all three at 221–224 m with a 292 m radius, the results shown in [See it work](#see-it-work). Each answer lies inside its own radius, and one reference point cannot say which of these estimates is best. The margin is not calibrated, so these grades are not a measured error rate ([Known issues](#known-issues)) |
-| Has it been wrong? | **Yes, at low and at medium.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off); `9aeeb9a` put the county search 14.4 km off and the state-wide search 87 km off, both low, until the guided-peak fix. A complete comparison without the ridge check described below put the state-wide search 34.8 km off, low. In the field tests below, five answers are wrong on the validated `7e5cf3e` build, all low, and a sixth lands near its site, probably by chance. On `d55ef79` one of them was **medium**: a bird-feeder cam in Ithaca, NY placed on Long Island. The validated `7e5cf3e` build grades it low, 0.11 nats under the medium line, which is a narrow miss and not a fix. An intermediate build of the current refinement code graded it medium again, margin 3.10 (`f_feederwatch_b8`), because refinement raised the leader's score by 0.95 nats and left its rival's alone. The current code compares the two at the same polish and grades it low, margin 1.81 (`f_feederwatch_r5`). The answer is still wrong. A working-tree experiment that measured more of a 3 h recording's flyovers also graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer. A low grade does not mean wrong either: on `7e5cf3e` the three-day reference search landed 271 m off at low. All five runs with a deliberately wrong date grade low on the validated `7e5cf3e` build, but two came close to medium: one had both core matches and was 0.63 nats short, and one had a 5.49-nat margin but only one core match of two. On the current code the reference recording's two wrong dates stay low, one of them narrowly: 138 km off with both core matches and a 2.95-nat margin, **0.05 under the medium line** (`n_ref_on_0907_r5`), and 73 km off with one core match of two and a 1.07-nat margin (`n_ref_on_0909_r5`). The commit before this one, `a827820`, graded the 09-07 run **medium** at 3.01 (`n_ref_on_0907_a82`), a wrong-date regression that this change removes only narrowly (CHANGELOG). The field rows replayed on this code so far stay low or give no location, though two wrong answers moved much further off: the feeder on a wrong date from 56 km to 326 km (`n_feeder_on_1101_r5`), and Rochelle from 36 km to 371 km (`f_rochelle_r5`). The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points |
+| Has it located a real recording? | **One recording, three ways, one area: high on all three.** The recording is the raw upload colsto published with the video: one hour of audio. Three configurations were tried: the right date across the whole state (`--dates 2026-09-08 --near NY`), a three-day window (`--dates 2026-09-07..2026-09-09 --near NY`), and a county (`--near "Nassau County, NY"`). All three match the same aircraft, a Pilatus PC-12 and a Cessna 208 as the core matches and a King Air 350 as a weaker third, and land near the location published in the video. The county search is 270 m off, radius 406 m, margin 16.00 nats (`r_nassau_c1`). The state-wide search is 263 m off, radius 397 m, margin 8.10 nats (`r_ny_c1`). The three-day window is 263 m off, radius 388 m, margin 8.19 nats over a rival 138 km away (`r_md_c1`). The build before the knot rule landed at the same 263–270 m with margins 17.85, 8.64 and 7.21 nats (`*_r5`). The grades have moved between builds on this same recording: `7e5cf3e` gave high, medium and low at 271–306 m with a 304–316 m radius, and `d79d90d` gave high on all three at 221–224 m with a 292 m radius, the results shown in [See it work](#see-it-work). Each answer lies inside its own radius, and one reference point cannot say which of these estimates is best. The margin is not calibrated, so these grades are not a measured error rate ([Known issues](#known-issues)) |
+| Has it been wrong? | **Yes, at low and at medium.** On the reference recording, earlier builds named Old Lyme, CT (116 km off) and later Southold, NY for the three-day window (102 km off); `9aeeb9a` put the county search 14.4 km off and the state-wide search 87 km off, both low, until the guided-peak fix. A complete comparison without the ridge check described below put the state-wide search 34.8 km off, low. In the field tests below, five answers are wrong on the validated `7e5cf3e` build, all low, and a sixth lands near its site, probably by chance. On `d55ef79` one of them was **medium**: a bird-feeder cam in Ithaca, NY placed on Long Island. The validated `7e5cf3e` build grades it low, 0.11 nats under the medium line, which is a narrow miss and not a fix. An intermediate build of the current refinement code graded it medium again, margin 3.10 (`f_feederwatch_b8`), because refinement raised the leader's score by 0.95 nats and left its rival's alone. `cb95fbb` compares the two at the same polish and grades it low, margin 1.81 (`f_feederwatch_r5`), and with the knot rule 0.75 (`f_feederwatch_c1`). The answer is still wrong. A working-tree experiment that measured more of a 3 h recording's flyovers also graded a wrong answer **medium** (103 km off; see [Known issues](#known-issues)), so medium alone does not prove an answer. A low grade does not mean wrong either: on `7e5cf3e` the three-day reference search landed 271 m off at low. All five runs with a deliberately wrong date grade low on the validated `7e5cf3e` build, but two came close to medium: one had both core matches and was 0.63 nats short, and one had a 5.49-nat margin but only one core match of two. On the current code the reference recording's two wrong dates stay low: 138 km off with both core matches and a 0.61-nat margin (`n_ref_on_0907_c1`), and 73 km off with one core match of two and a 0.35-nat margin (`n_ref_on_0909_c1`). Before the knot rule the first was 2.95, **0.05 under the medium line** (`n_ref_on_0907_r5`), and `a827820` graded it **medium** at 3.01 (`n_ref_on_0907_a82`), a wrong-date regression that `cb95fbb` removed only narrowly (CHANGELOG). The field rows replayed on `cb95fbb` so far stay low or give no location, though two wrong answers moved much further off: the feeder on a wrong date from 56 km to 326 km (`n_feeder_on_1101_r5`; 254 km, low, with no core match with the knot rule, `n_feeder_on_1101_c1`), and Rochelle from 36 km to 371 km (`f_rochelle_r5`). The [CHANGELOG](CHANGELOG.md) has every run. Treat **low** as "unconfirmed", whichever way it points |
 | Is it tested? | **Offline unit tests,** plus two opt-in FFmpeg/FFprobe integration tests: synthetic known-answer checks of detection, fitting, emission-time physics, track models and a two-flyover search, plus parsers, formats and a stalled download resuming over a loopback socket. See [Testing](#testing) for the latest checks and earlier validation. `fdop selftest` runs the real decode, detect, measure and search path on a synthesised recording |
 | Has it located a recording it was not developed on? | **Two right answers, neither a clean test.** One is at the reference site, one is graded low, and both recordings informed the ridge check's line. Nine recordings from public YouTube live cams (2–3 h each, with published locations, and true clocks from the stream timestamps) were searched with only the local date and the state, and all nine were replayed on the validated `7e5cf3e` build. An osprey cam at the reference site, recorded on a different day with different flights, came out **high**: 223 m from the reference recording's published location, just outside its 214 m radius, with a 24.9-nat margin. The same cam on two other days gave wrong answers graded **low**, 152 km and 365 km off. An eagle cam at Duke Farms (Hillsborough, NJ) came out in the right township, about 2.3 km from the town centre, graded **low** (the nest position is not published, so a smaller error cannot be scored). The clock its answer implies is within 6.4 s of the stream's, from a search of the whole day, so that match is real whatever its grade: the low comes from a rival 140 m away. At five other sites, a bird-feeder cam in Ithaca, NY was placed on Long Island (338 km off) and a railcam in Rochelle, IL at Sycamore, IL (36 km off), both **low**, and railcams in Tucson, AZ, Plant City, FL and Fullerton, CA gave no location, because no event passed the quality gates. All but Fullerton held only 0–3 non-jet passes within reach. Fullerton (13 within 3 km) and Duke Farms (16) had more traffic but poor audio. Fullerton's is high-pass filtered at about 125 Hz, which removes or weakens the propeller fundamentals, under broadband wind and road noise; Duke Farms has a wind-saturated microphone. A tenth recording, a public eagle-nest live cam in Lee County, FL, recorded 2024-12-28, is the only one that did not inform the ridge check's line: searched across Florida it is wrong and **low** (135 km off), and searched in the county it lands about 4 km away, **low**, on two events. Its clock there is 55 minutes off the stream's, so the 4 km is probably chance and not a location: at the stream's clock one usable event matches an archived flight within 0.2 s, and at the two answers' clocks and eight other offsets none does. That rests on one event, and it leaves a coincidence unexplained: the state and county answers' clocks agree within about 2 minutes though they are about 135 km apart. Each answer's clock is a check the search cannot make on its own: the two real matches are within 6.4 s of the stream's clock, and the wrong answers are 53 minutes to 9.3 hours off. Using this takes care. `--start` means the exact start, `--clock-tol` defaults to 180 s and the search does not widen past it, so a start 10 minutes off excludes the true clock too. A start known to within 25 minutes with `--clock-tol 1500` would keep the true clock and exclude all of those wrong ones. What the search answers instead has not been measured |
+| Do the knot rule and the curve match change this? | **The knot rule does, on the development recordings with a known start. Neither has had a clean test.** With the start given to the minute (±2 min) and a 25 km region whose centre is 10 km from the truth (the head-to-head benchmark's R2 inputs in [bench/PROTOCOL.md](bench/PROTOCOL.md)), fifteen runs on this code gave four right answers, all graded high, and no wrong one. They were the reference recording at 250 m, the osprey cam at 90 m and 110 m on two of its three days, and Duke Farms within its 5 km limit. None of the nine runs at wrong dates or wrong places was graded above low. On the benchmark machine the trace search gave two right answers on these inputs without the knot rule and four with it, and the pinned benchmark build `7e66501` gave one. The curve match agreed with three of the four and changed no grade. On the osprey cam's third day it stood at 610 m until a review fix gave its decoy clocks their own sound speed; then a decoy beat it, and it no longer does. All fifteen recordings were used to develop both changes, and these runs were on an Apple M5 Ultra with 256 GiB of RAM, not the benchmark machine. The benchmark's labelled rerun and its sealed set E are the tests. Without a start the curve match does not run (CHANGELOG) |
 | What is not validated? | Any site other than the reference one; low-traffic or rural sites (all four tried failed); following real passes steeper than 4 Hz/s (real ridges that steep exist in the recordings, but no event follows one, so that side rests on synthetic tests); CONUS-wide searches on real data; recordings outside the US; phone-call or heavily processed audio |
 | Which code produced these results? | The `*_r5` runs used a release build of the commit that added this sentence, on `a827820`; the only difference is that the margin gate's text now prints two decimals, because 2.95 printed as 3.0 on a gate that failed. They are the three reference runs (`r_ny_r5`, `r_md_r5`, `r_nassau_r5`), two wrong-date runs (`n_ref_on_0907_r5`, `n_ref_on_0909_r5`) and `f_feederwatch_r5`, and the field runs named in the CHANGELOG. They ran one at a time on an Apple M4 with 32 GiB of RAM, with other jobs sharing the machine. The other replays used a local build of `7e5cf3e`, whose code is the same as `4b88d7c`: the earlier reference runs (`r_ny_s7b`, `r_md_s7b`, `r_nassau_s7b`), five wrong-date runs, all nine field recordings and the Lee County recording. The later verdict wording and high-pass warning changes were replayed without changing numbers or grades (CHANGELOG). Those ran on the same machine, two at a time; the Performance timings are separate runs with nothing else running. The older reference runs `ny9`, `md2` and `nassau3` used the second commit, `d79d90d`: the import plus a 5-line change to evidence calibration, which only matters when a region leaves an event fewer than 20 chance samples to calibrate against (CHANGELOG section 11). `ny10` repeated the state-wide run on `1f321cb` with the same answer. The field tests ran first on working-tree builds made just before `e872b1c` was committed, then all six again on `1f321cb`. The last three ran on a build of the tree at `25f12ff`. Before `1f321cb` the osprey-cam answer was the same point graded **medium**, and the four wrong answers named other towns, also graded **low**. See [CHANGELOG.md](CHANGELOG.md) |
 | Is it fast? | **It depends on the search.** On an Apple M4 with the ADS-B days cached, the reference recording took 36 s for a county, 119 s state-wide and 356 s for a three-day window. A busy 3 h recording searched across a state took about 2 hours 40 minutes while another replay ran. Narrowing the region is the way to shorten a search. See [Performance](#performance) |
@@ -102,7 +103,8 @@ the recorder's 1:00:00–2:00:00 window), searched across all of New York State 
 
 This section shows run `ny9` from an early build (`d79d90d`), kept for its complete walk through the stages. **The
 current code does not reproduce these numbers:** the same search matches the same three aircraft, also grades high, and
-lands 264 m off with a 385 m radius and an 8.64-nat margin (`r_ny_r5`). `7e5cf3e` graded it medium, 271 m off, at 5.01 nats
+lands 263 m off with a 397 m radius and an 8.10-nat margin (`r_ny_c1`; 264 m, 385 m and 8.64 nats before the knot
+rule, `r_ny_r5`). `7e5cf3e` graded it medium, 271 m off, at 5.01 nats
 ([Honest status](#honest-status)).
 
 ```console
@@ -225,6 +227,11 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
           6. refine the leader and its best rival below grid spacing; sample the 95 % Δχ² region on a 25 m grid (75 m floor)
       │
       ▼
+ curve match  each logged propeller flight predicts one exact Doppler curve for a (place, clock): score the
+              spectrogram along it against the same curve at other times, then run the same search at 48
+              decoy clocks; the answer stands only if it beats every one
+      │
+      ▼
  gates ─► confidence ─► reverse geocode ─► map.png / report.html / report.md / result.json ─► run ledger
 ```
 
@@ -237,6 +244,7 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
 | margin | no pair, fine or confirmation comparison cut was recorded, and the answer beats the best *different* explanation by ≥ 6 nats or no rival survived. A rival is different if it matches a shared event to another flight, shares no match, or lies more than 5 km away. Both are compared at the same polish (below) |
 | no unheard close pass | no tonal aircraft passed much closer than the heard ones without leaving a detection |
 | radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
+| curve match | listed only when the [curve match](#the-curve-match) stands: the answer is within 3 km of where it stands |
 
 Refinement uses the grid to find a basin, then improves the observer position with a bounded continuous
 search that evaluates the same physical trace model at every proposed point. The grid spacing controls
@@ -298,6 +306,54 @@ floors are unchanged; the extra profiles run once on the final retained trace.
 are in `result.json` and `report.html`. An incomplete comparison still reports its observed numerical gap,
 labelled provisional: an unchecked rival can increase its score or overtake the leader. These gaps are
 evidence-score differences, not calibrated likelihood ratios or a correction for searching many events.
+
+The curve match then reads the recording a second way, independent of the traces. Where it stands it can raise
+a low answer to **medium**: at the trace answer if that lies inside its radius, otherwise at its own place, and
+the verdict then says the answer comes from the curve match. Where it stands more than 3 km from a high or medium
+answer, that answer becomes **low**. It never makes an answer high. Where it does not stand, or does not run,
+the grade is the trace search's.
+
+### The curve match
+
+The trace search can use only a pass whose ridge it measured; a ridge too faint to trace, or one that crosses
+another, adds nothing. The curve match asks the question the other way round. If the recording was made at this
+place with this clock, every logged propeller flight predicts one exact Doppler curve: is there energy along it,
+more than along the same curve at other times? Scoring logged flights along their curves with one shared clock,
+and checking the result against flights from other times, follows
+[`dopplerprint`](https://github.com/Hexay/dopplerprint) (MIT, © 2026 Henry Alexander). `fdop` reimplements it
+in `crates/fdop-core/src/curvematch.rs`:
+
+- **Image.** A 1 s STFT at 0.5 s hops on 48 rows per octave, each row standardised against its own running low
+  quantile over 60 s and clipped, then a weighted comb over the first six harmonics.
+- **Bank of curves.** On a log-frequency axis a constant-speed pass is one fixed path for each (speed, distance),
+  and the emitted tone is only a row shift, so one sweep per path scores every arrival time and tone. That
+  path's scores at all times of the recording are its null: a lookup becomes a p-value, then an e-value. Both
+  halves of a pass must light up.
+- **Tone by type.** For common propeller types a tone the propeller can make (blades × rpm / 60, from typical
+  published figures) earns more and other tones less. The weights are divided by where this recording's best
+  tones fall with no weighting, and scaled to average one over those tones, so they do not favour every flight.
+  Weighing against a flat spread instead credited every flight at every clock on rumbling audio, because the
+  rumble sits where the propeller tones are. The decoy clocks are weighted the same way.
+- **Search.** Flights vote for (place, clock) cells 200 m apart. The best 16 places are rescored with the exact
+  curve (the real trajectory, emission-time solve, modelled wind and sound speed) and the best 4 are climbed to
+  25 m. A close pass with no energy costs evidence, as in the trace search, and one audio event can credit only
+  one flight.
+- **Decoy clocks.** The same search, step for step, runs at 48 other clock windows, each the width of the clock
+  window plus 60 s apart, out to about ±2 hours, on whichever side the fetched days cover. A clock that far off
+  cannot be right, so the best decoy is what this recording and this sky give by chance.
+- **When it stands.** The answer must beat every decoy (margin over the best of them above 0), with at least 40
+  decoys, and every place within 3 nats of it must lie within 5 km. Its radius is that spread, and at least
+  1 km, because its places are 1 km apart. Under exchangeable windows a place beats all 48 decoys by chance
+  about 1 time in 49. On 42 runs with no right answer (six recordings at wrong dates and at places 90 km or more
+  from the truth) none beat every decoy, and the largest margin was −0.6 on this code (−0.8 on the version the
+  line was set on). Those runs share six recordings, so
+  they are not 42 independent trials.
+- **When it runs.** Only when the recording clock is known to 30 min or better and the region holds at most
+  200,000 cells (about 8,000 km²); otherwise it is skipped with a log line. A state-wide search with no start
+  therefore uses the trace search alone. It fetches its own wider ADS-B span, and the trace search's tracks are
+  unchanged. `--no-curve-match` turns it off.
+
+What it did on the development recordings is in the [CHANGELOG](CHANGELOG.md).
 
 ---
 
@@ -422,6 +478,7 @@ or change their Doppler frequencies.
 | `--clock-tol <S>` | `180` | Finite, nonnegative clock tolerance (s) around `--start` or the file's `creation_time` |
 | `--ignore-metadata-time` | off | Ignore the container's `creation_time` |
 | `--max-events <N>` | `12` | Maximum events that drive the pair join; the others can still confirm |
+| `--no-curve-match` | off | Skip the [curve match](#the-curve-match); the answer then comes from the trace search alone |
 | `--json` | off | Print the full result JSON on stdout instead of the summary |
 
 ```bash
@@ -548,6 +605,7 @@ Each `locate` run writes a directory:
 | `survey.png` | Whole-file log-frequency spectrogram with detections and traces marked |
 | `e<N>.png`, `e<N>_trace.csv` | Per-event spectrogram with the fitted curve, and the traced points |
 | `e<N>_match.png` | Each winning event's trace against the ADS-B prediction |
+| `curvematch.json` | The curve match, when it ran: its places with every pass's evidence, each decoy window's best place and score, the margin over the best decoy and its rank p |
 | `detections.json`, `events.json`, `search.json` | Intermediate results. `search.json` keeps the best 10,000 candidates, and `candidates_total` counts them all |
 
 ---
@@ -1031,6 +1089,11 @@ The unit tests check:
 - hypothesis storage respects small-host budgets while preserving exact counts and chance samples;
 - junk positions inside an ADS-B leg are dropped before track models are built, including dense bursts
   between genuine sections whose elapsed gap remains within the configured limit;
+- a point without GNSS height that GNSS-height points bracket within 60 s is dropped, and on a sustained
+  3°/s turn that costs less than the noise it removes up to 60 s and more by 90 s;
+- the curve match finds three synthetic flights' observer and clock, beats every decoy there and not in noise
+  alone, gives a decoy window the same search as the real one, lets one audio event credit one flight only,
+  and moves only its clock when every flight moves in time;
 - a steep pass keeps its ridge through the CPA, a fit with no ridge there is refused, and the ratio-grid time
   sweep matches independent solves, including over a hole in the samples and past both ends of a track;
 - each weather fallback reports its warnings and whether winds aloft are modelled;
@@ -1166,8 +1229,9 @@ audio or video recorded somewhere sensitive:
   4,000 cells. Its margin barely moved (23.29 to 24.93 nats). Narrow the region; the county reference search needs
   under a minute.
 - **Margin is not calibrated to the size of the search, and does not separate right from wrong on these runs.** On the
-  current code the reference recording's right answers have 7.21–17.85 nats and its wrong dates 1.07 and 2.95, the last
-  0.05 under the medium line, with the feeder's wrong answer at 1.81 (`*_r5`). That gap is on the recording every build
+  current code the reference recording's right answers have 8.10–16.00 nats and its wrong dates 0.35 and 0.61, with the
+  feeder's wrong answers at 0.75 and 2.15 (`*_c1`). The build before the knot rule gave 7.21–17.85 against 1.07 and
+  2.95, the last 0.05 under the medium line, and 1.81 for the feeder (`*_r5`). That gap is on the recording every build
   was developed on, and it moved by several nats between builds, so it is not a separation. On `7e5cf3e` the
   true three-day reference answer has 2.92 nats and a false field answer 2.89, both low. The true state-wide
   answer's 5.01 (medium) is below a wrong-date run's 5.49 (low, on one core match of two), and another wrong-date
@@ -1175,10 +1239,12 @@ audio or video recorded somewhere sensitive:
   it can lower a right answer's margin. A small margin can also mean other flights at the same place, because a
   shared event matched to another flight counts as a different explanation at any distance: one field run has 0.11
   nats against a rival 140 m away. A wrong answer can pass the core gate, leaving margin alone to keep it low: three
-  runs on `7e5cf3e` (2.89, 2.37 and 0.47 nats), and on the current code three: the 09-07 wrong date (2.95), the feeder
-  (1.81) and the osprey cam on 11-02 (0.16; `n_ref_on_0907_r5`, `f_feederwatch_r5`, `f_osprey_1102b_r5`). The other
-  way round, a wrong date on the eagle cam clears the medium line at 4.79 nats and is low only on its 1 core match of
-  4 (`n_duke_on_1102_r5`). And no rival passes the gate, however small the search: one county search scored 20 fine
+  runs on `7e5cf3e` (2.89, 2.37 and 0.47 nats), three on `cb95fbb`: the 09-07 wrong date (2.95), the feeder (1.81)
+  and the osprey cam on 11-02 (0.16; `n_ref_on_0907_r5`, `f_feederwatch_r5`, `f_osprey_1102b_r5`), and with the knot
+  rule the first two again (0.61 and 0.75; `n_ref_on_0907_c1`, `f_feederwatch_c1`). The other way round, on `cb95fbb` a
+  wrong date on the eagle cam cleared the medium line at 4.79 nats and was low only on its 1 core match of 4
+  (`n_duke_on_1102_r5`); with the knot rule it is low at 1.36 nats with no core match of 5 (`n_duke_on_1102_c2`).
+  And no rival passes the gate, however small the search: one county search scored 20 fine
   cells, found no rival, and is low only on its other gates. A large margin means nothing when the core gate fails:
   the eagle cam's county search has 26.83 nats with 1 core match of 7, and is low (`f_duke_county_r5`).
 - **Trace evidence past what the chance null measures is extrapolated.** Below the null's 5 % quantile `trace_nats`
@@ -1225,7 +1291,7 @@ not heard counts against it.
 Unknown aircraft types are kept.
 
 **How precise is it?** On the reference recording, the current code lands 263–270 m from the published location with a
-385–406 m radius (`r_ny_r5`, `r_md_r5`, `r_nassau_r5`). The validated `7e5cf3e` build landed 271–306 m away with a
+388–406 m radius (`r_ny_c1`, `r_md_c1`, `r_nassau_c1`). The validated `7e5cf3e` build landed 271–306 m away with a
 304–316 m radius, and earlier builds' high-confidence answers 221–224 m away, inside a 292 m radius. On
 the osprey-cam field recording, the validated `7e5cf3e` build is 223 m from the reference recording's published location, just
 outside its 214 m radius; an early build was about 150 m from the cam's geocoded street address, just outside its
@@ -1261,6 +1327,9 @@ the numerics, networking, tables and ledger without tokio or C solvers.
 ## Acknowledgments
 
 - **colsto**, for the method and the reference recording.
+- **Henry Alexander's [`dopplerprint`](https://github.com/Hexay/dopplerprint)** (MIT), whose scoring of logged
+  flights along their curves on the whole spectrogram the curve match reimplements, and whose check against
+  flights from other times it extends to many decoy clocks.
 - **adsb.lol** and its volunteer feeders, for the open ADS-B archive (ODbL).
 - **Data providers:** the U.S. Census Bureau, USGS The National Map, NOAA NGS, Open-Meteo, the Iowa Environmental
   Mesonet, and AWS Terrain Tiles.

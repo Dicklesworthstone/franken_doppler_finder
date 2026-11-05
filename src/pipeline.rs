@@ -1,5 +1,6 @@
 //! `fdop locate`: media file + dates + coarse US region -> location, radius, map, place.
 
+use fdop_core::curvematch;
 use fdop_core::detect::{self, DetectParams, Detection};
 use fdop_core::measure::{self, MeasureParams, MeasuredEvent};
 use fdop_core::search::{self, SearchEvent, SearchInputs, SearchParams, SearchResult};
@@ -31,6 +32,8 @@ pub struct LocateArgs {
     /// Ignore the container's creation_time metadata.
     pub ignore_metadata_time: bool,
     pub max_events: usize,
+    /// Also score logged flights directly on the spectrogram (see `fdop_core::curvematch`).
+    pub curve_match: bool,
     pub sr: u32,
     pub quiet: bool,
 }
@@ -231,6 +234,159 @@ fn verdict_text(confidence: &str, gates: &[(String, bool, String)], matched: &st
         "medium" => format!("failed: {failed}. {matched}"),
         _ => matched.to_string(),
     }
+}
+
+/// Longest recording-clock window the curve match searches. Decoy clocks are windows of the same
+/// width, and they have to fit inside the days being fetched.
+const CURVE_MAX_CLOCK_S: f64 = 1800.0;
+/// Largest grid the curve match searches. Its time and memory go with cells times windows.
+const CURVE_MAX_CELLS: f64 = 200_000.0;
+/// A trace answer asserted this far from a curve-match answer that stands names another place.
+const CURVE_CONFLICT_M: f64 = 3000.0;
+
+/// What the curve match does to the trace search's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CurveCall {
+    /// No verdict, or one that does not stand: the trace search's answer is untouched.
+    Silent,
+    /// Trace answer asserted, curve match stands at the same place.
+    Agrees,
+    /// Trace answer asserted, curve match stands somewhere else: nobody gets to assert.
+    Conflicts,
+    /// Trace answer low, curve match stands at the same place: asserted at medium, trace position.
+    Confirms,
+    /// Trace answer low or absent, curve match stands elsewhere: asserted at medium, its position.
+    Adopts,
+}
+
+fn curve_call(
+    trace_confidence: &str,
+    trace_at: Option<(f64, f64)>,
+    verdict: Option<&curvematch::CurveVerdict>,
+) -> CurveCall {
+    let Some(v) = verdict.filter(|v| v.stands) else {
+        return CurveCall::Silent;
+    };
+    let apart = trace_at.map(|(la, lo)| fdop_types::geo::haversine_m(la, lo, v.lat, v.lon));
+    if matches!(trace_confidence, "high" | "medium") {
+        if apart.is_some_and(|d| d <= CURVE_CONFLICT_M) {
+            CurveCall::Agrees
+        } else {
+            CurveCall::Conflicts
+        }
+    } else if apart.is_some_and(|d| d <= v.radius_m) {
+        CurveCall::Confirms
+    } else {
+        CurveCall::Adopts
+    }
+}
+
+/// Radius of a trace answer the curve match confirms. The curve match's radius is the spread of its
+/// tied places around its own best one, so from the trace answer the circle must reach that far
+/// beyond the distance between the two.
+fn confirmed_radius(trace_radius_m: f64, at: (f64, f64), v: &curvematch::CurveVerdict) -> f64 {
+    trace_radius_m.max(v.radius_m + fdop_types::geo::haversine_m(at.0, at.1, v.lat, v.lon))
+}
+
+/// The flights the winning curve-match mode heard, for the verdict line.
+fn curve_flights(r: &curvematch::MatchResult) -> String {
+    r.modes.first().map_or_else(String::new, |m| {
+        m.passes
+            .iter()
+            .filter(|p| p.value >= 1.0)
+            .map(|p| {
+                format!(
+                    "{} {}",
+                    if p.reg.is_empty() { &p.icao } else { &p.reg },
+                    p.typ
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
+/// Fetch the flights of the decoy clocks too and run the curve match. Its own ADS-B fetch keeps the
+/// trace search's tracks exactly as they were. Returns None when this recording's clock or region
+/// is too wide for it, which says nothing about the recording.
+#[allow(clippy::too_many_arguments)]
+fn run_curve_match(
+    a: &LocateArgs,
+    p: &curvematch::MatchParams,
+    image: &curvematch::CombImage,
+    bbox: BBox,
+    fetch_box: BBox,
+    clock: (f64, f64),
+    dur: f64,
+    adsb_end: f64,
+    geoid_n_m: f64,
+    coarse: &dyn fdop_types::Elevation,
+    fine: &dyn fdop_types::Elevation,
+    atmo: &dyn fdop_types::atmo::Atmosphere,
+    log: &Arc<Log>,
+) -> Result<Option<curvematch::MatchResult>, String> {
+    let (s_lo, s_hi) = clock;
+    if s_hi - s_lo > CURVE_MAX_CLOCK_S {
+        log.say(&format!(
+            "curve match skipped: the recording clock is known to {:.0} s, and it needs {CURVE_MAX_CLOCK_S:.0} s or better",
+            s_hi - s_lo
+        ));
+        return Ok(None);
+    }
+    let km_ns = (bbox.north - bbox.south) * 111.2;
+    let km_ew =
+        (bbox.east - bbox.west) * 111.2 * (0.5 * (bbox.north + bbox.south)).to_radians().cos();
+    let cells = km_ns * km_ew * 1e6 / (p.cell_m * p.cell_m);
+    if cells > CURVE_MAX_CELLS {
+        log.say(&format!(
+            "curve match skipped: the region needs {cells:.0} cells, and it searches {CURVE_MAX_CELLS:.0} at most"
+        ));
+        return Ok(None);
+    }
+    let day = 86_400.0;
+    let limits = (
+        ((s_lo - 1200.0) / day).floor() * day,
+        (((s_hi + dur + 1200.0) / day).ceil() * day).min(adsb_end),
+    );
+    let (t_start, t_end) = curvematch::catalog_span(p, s_lo, s_hi, dur, limits);
+    let spec = fdop_data::IngestSpec {
+        bbox: fetch_box,
+        t_start,
+        t_end,
+        geoid_n_m,
+        keep_unknown: true,
+    };
+    let lg = log.clone();
+    let opts = fdop_data::FetchOptions {
+        offline: a.offline,
+        allow_missing: false,
+        progress: Some(Arc::new(move |s: &str| lg.say(s))),
+        ..Default::default()
+    };
+    let store =
+        fdop_data::fetch_window(&spec, &a.cache, &opts).map_err(|e| format!("ADS-B fetch: {e}"))?;
+    let bp = track::BuildParams::default();
+    let tracks: Vec<track::TrackModel> = store
+        .legs
+        .par_iter()
+        .filter(|l| l.engine.tonal())
+        .flat_map_iter(|l| track::build(l, &bp))
+        .collect();
+    drop(store);
+    let inp = curvematch::MatchInputs {
+        image,
+        tracks: &tracks,
+        region: bbox,
+        start_lo: s_lo,
+        start_hi: s_hi,
+        duration_s: dur,
+        catalog: (t_start, t_end),
+        dem: coarse,
+        fine_dem: fine,
+        atmo,
+    };
+    let lg = log.clone();
+    Ok(Some(curvematch::run(&inp, p, &move |s: &str| lg.say(s))))
 }
 
 fn stem(p: &Path) -> String {
@@ -533,6 +689,18 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
     warnings.extend(low_band_warning(&x, a.sr));
     timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
+    let curve_params = curvematch::MatchParams::default();
+    let curve_image = if a.curve_match {
+        match curvematch::build_image(&x, a.sr, &curve_params) {
+            Ok(im) => Some(im),
+            Err(e) => {
+                warnings.push(format!("curve match skipped: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     // ---- detection ----------------------------------------------------------------------
     let t = Instant::now();
     let dp = DetectParams::default();
@@ -820,9 +988,50 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             iso_utc(s_hi)
         );
     }
-    let _ = (s_lo, s_hi);
     timings.insert("search_s".into(), json!(t.elapsed().as_secs_f64()));
     warnings.extend(res.warnings.iter().cloned());
+    // ---- curve match --------------------------------------------------------------------
+    let t = Instant::now();
+    let curve = curve_image.as_ref().and_then(|im| {
+        let got = run_curve_match(
+            a,
+            &curve_params,
+            im,
+            region.bbox,
+            fetch_box,
+            (s_lo, s_hi),
+            dur,
+            adsb_end,
+            geoid_n,
+            &coarse,
+            &fine,
+            &*atmo,
+            log,
+        );
+        match got {
+            Ok(r) => r,
+            Err(e) => {
+                warnings.push(format!("curve match skipped: {e}"));
+                None
+            }
+        }
+    });
+    drop(curve_image);
+    let curve_verdict = curve.as_ref().and_then(curvematch::verdict);
+    if let Some(r) = &curve
+        && let Err(e) = write_json(&run_dir.join("curvematch.json"), r)
+    {
+        // the curve match is optional: losing its record must not lose the answer
+        warnings.push(format!("curvematch.json not written: {e}"));
+    }
+    if let Some(v) = &curve_verdict {
+        log.say(&format!(
+            "curve match {}: {}",
+            if v.stands { "stands" } else { "does not stand" },
+            v.why
+        ));
+    }
+    timings.insert("curve_match_s".into(), json!(t.elapsed().as_secs_f64()));
     // a tile that cannot be read or fetched answers 0 m; say how much ground that covered
     let (lost_coarse, lost_fine) = (coarse.failures(), fine.failures());
     if lost_coarse + lost_fine > 0 {
@@ -899,7 +1108,32 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             }
         })
         .collect();
-    let found = !res.candidates.is_empty();
+    let mut found = !res.candidates.is_empty();
+    let mut curve_used = CurveCall::Silent;
+    let draw_map = |report: &mut ReportInput,
+                    warnings: &mut Vec<String>,
+                    headline: String,
+                    (lat, lon, radius): (f64, f64, f64),
+                    markers: Vec<(f64, f64)>| {
+        let mopts = fdop_geo::staticmap::StaticMapOptions {
+            cache_dir: a.cache.clone(),
+            headline: Some(headline),
+            markers,
+            ..Default::default()
+        };
+        match fdop_geo::staticmap::static_map(net.as_ref(), lat, lon, radius, &run_dir, &mopts) {
+            Ok(m) => {
+                report
+                    .figures
+                    .push(("Map: answer and confidence radius".into(), "map.png".into()));
+                if m.offline {
+                    warnings
+                        .push("map basemap tiles unavailable; map shows the circle only".into());
+                }
+            }
+            Err(e) => warnings.push(format!("map: {e}")),
+        }
+    };
     if found {
         let top = &res.candidates[0];
         let (lat, lon, radius, basis, radius_unresolved) = match &res.refine {
@@ -1046,6 +1280,62 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         } else {
             "low"
         };
+        // The curve match is a second, independent reading of the recording: it can confirm a
+        // low trace answer, replace it, or stop an asserted one that names another place.
+        let trace_confidence = confidence;
+        let call = curve_call(confidence, Some((lat, lon)), curve_verdict.as_ref());
+        curve_used = call;
+        let on_trace = call != CurveCall::Adopts;
+        let standing = curve_verdict.as_ref().filter(|v| v.stands);
+        let mut gates = gates;
+        if let Some(v) = standing {
+            let apart = fdop_types::geo::haversine_m(lat, lon, v.lat, v.lon);
+            gates.push((
+                "curve match".to_string(),
+                call != CurveCall::Conflicts,
+                if call == CurveCall::Conflicts {
+                    format!(
+                        "another place stands {:.1} km away: {}",
+                        apart / 1000.0,
+                        v.why
+                    )
+                } else {
+                    v.why.clone()
+                },
+            ));
+        }
+        let (lat, lon, radius, basis, confidence) = match (call, standing) {
+            (CurveCall::Adopts, Some(v)) => (
+                v.lat,
+                v.lon,
+                v.radius_m,
+                format!(
+                    "curve match: places within {:.0} nats of the best span {:.0} m (1 km floor, its modes are 1 km apart)",
+                    curvematch::TIED_NATS,
+                    v.radius_m
+                ),
+                "medium",
+            ),
+            (CurveCall::Confirms, Some(v)) => {
+                // The curve radius is measured from the curve's own best place. Kept at the trace
+                // answer, the circle must still reach every place the curve could not rule out.
+                let apart = fdop_types::geo::haversine_m(lat, lon, v.lat, v.lon);
+                let r = confirmed_radius(radius, (lat, lon), v);
+                (
+                    lat,
+                    lon,
+                    r,
+                    format!(
+                        "trace answer confirmed by the curve match {apart:.0} m away; radius {r:.0} m covers every place within {:.0} nats of the curve match's best ({:.0} m from it)",
+                        curvematch::TIED_NATS,
+                        v.radius_m
+                    ),
+                    "medium",
+                )
+            }
+            (CurveCall::Conflicts, Some(_)) => (lat, lon, radius, basis, "low"),
+            _ => (lat, lon, radius, basis, confidence),
+        };
         log.say(&format!(
             "winner {lat:.6},{lon:.6} radius {radius:.0} m, {} events, confidence {confidence}",
             top.n_explained
@@ -1063,26 +1353,43 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             radius_m: radius,
             radius_basis: basis,
             confidence: confidence.into(),
-            verdict: verdict_text(
-                confidence,
-                &gates,
-                &format!(
-                    "{} flyovers matched to {} at one location and one recording clock (start {})",
-                    top.n_explained,
-                    top.events
-                        .iter()
-                        .map(|m| format!(
-                            "{} {}",
-                            if m.reg.is_empty() { &m.icao } else { &m.reg },
-                            m.typ
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    iso_utc(top.t_start_utc)
-                ),
-            ),
+            verdict: if let (false, Some(v), Some(r)) = (on_trace, standing, curve.as_ref()) {
+                format!(
+                    "from the curve match, not the trace search, which graded its own answer {trace_confidence} {:.1} km away. Logged Doppler curves of {} at one place and one recording clock (start {}): {}",
+                    fdop_types::geo::haversine_m(top.lat, top.lon, v.lat, v.lon) / 1000.0,
+                    curve_flights(r),
+                    iso_utc(v.clock_unix),
+                    v.why
+                )
+            } else {
+                verdict_text(
+                    confidence,
+                    &gates,
+                    &format!(
+                        "{} flyovers matched to {} at one location and one recording clock (start {})",
+                        top.n_explained,
+                        top.events
+                            .iter()
+                            .map(|m| format!(
+                                "{} {}",
+                                if m.reg.is_empty() { &m.icao } else { &m.reg },
+                                m.typ
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        iso_utc(top.t_start_utc)
+                    ),
+                )
+            },
             gates,
         };
+        if !on_trace {
+            // the events and candidates below are the trace search's, not this answer's
+            for e in &mut report.events {
+                e.matched.clear();
+            }
+            warnings.push("The answer comes from the curve match. The candidates table lists what the trace search found on its own, and none of it supports this answer.".into());
+        }
         report.place = Some(place.clone());
         report.candidates = res
             .candidates
@@ -1123,7 +1430,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                     .collect(),
             })
             .collect();
-        if let Some(r) = &res.refine {
+        if let (true, Some(r)) = (on_trace, &res.refine) {
             report.heatmap = Some(Heatmap {
                 lats: r.lats.clone(),
                 lons: r.lons.clone(),
@@ -1145,32 +1452,21 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             });
         }
         // map
-        let mopts = fdop_geo::staticmap::StaticMapOptions {
-            cache_dir: a.cache.clone(),
-            headline: Some(place.headline.clone()),
-            markers: res
-                .candidates
+        draw_map(
+            &mut report,
+            &mut warnings,
+            place.headline.clone(),
+            (lat, lon, radius),
+            res.candidates
                 .iter()
-                .skip(1)
+                .skip(usize::from(on_trace))
                 .take(5)
                 .map(|c| (c.lat, c.lon))
                 .collect(),
-            ..Default::default()
-        };
-        match fdop_geo::staticmap::static_map(net.as_ref(), lat, lon, radius, &run_dir, &mopts) {
-            Ok(m) => {
-                report
-                    .figures
-                    .push(("Map: answer and confidence radius".into(), "map.png".into()));
-                if m.offline {
-                    warnings
-                        .push("map basemap tiles unavailable; map shows the circle only".into());
-                }
-            }
-            Err(e) => warnings.push(format!("map: {e}")),
-        }
+        );
         // event figures with the winning flights' predicted curves
-        for m in &top.events {
+        let drawn: &[search::EventMatch] = if on_trace { &top.events } else { &[] };
+        for m in drawn {
             if let Some(e) = events.iter().find(|e| e.id == m.event)
                 && let Some(tm) = tracks.iter().find(|t| t.key == m.flight)
                 && let Some(sp) = &e.spec
@@ -1214,6 +1510,51 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                 report.figures.push((format!("{}: trace (white), straight-line fit (cyan), ADS-B prediction for {ac} ({}, {}) at the answer (magenta)", e.id, m.flight, m.role), format!("{}_match.png", e.id)));
             }
         }
+    } else if let (CurveCall::Adopts, Some(v), Some(r)) = (
+        curve_call("none", None, curve_verdict.as_ref()),
+        curve_verdict.as_ref(),
+        curve.as_ref(),
+    ) {
+        found = true;
+        curve_used = CurveCall::Adopts;
+        log.say(&format!(
+            "winner {:.6},{:.6} radius {:.0} m from the curve match alone, confidence medium",
+            v.lat, v.lon, v.radius_m
+        ));
+        let place = fdop_geo::geocode::describe_location(net.as_ref(), &gaz, v.lat, v.lon);
+        log.say(&format!("place: {}", place.headline));
+        if let Some(w) =
+            region.outside_states_warning(place.state_abbr.as_deref(), place.source == "census-api")
+        {
+            warnings.push(w);
+        }
+        report.answer = Answer {
+            lat: v.lat,
+            lon: v.lon,
+            radius_m: v.radius_m,
+            radius_basis: format!(
+                "curve match: places within {:.0} nats of the best span {:.0} m (1 km floor, its modes are 1 km apart)",
+                curvematch::TIED_NATS,
+                v.radius_m
+            ),
+            confidence: "medium".into(),
+            verdict: format!(
+                "from the curve match; the trace search found no candidate ({} usable flyover events). Logged Doppler curves of {} at one place and one recording clock (start {}): {}",
+                sevs.len(),
+                curve_flights(r),
+                iso_utc(v.clock_unix),
+                v.why
+            ),
+            gates: vec![("curve match".to_string(), true, v.why.clone())],
+        };
+        report.place = Some(place.clone());
+        draw_map(
+            &mut report,
+            &mut warnings,
+            place.headline.clone(),
+            (v.lat, v.lon, v.radius_m),
+            vec![],
+        );
     } else {
         report.answer = Answer {
             lat: f64::NAN,
@@ -1288,6 +1629,11 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         "region_bbox": region.bbox.as_array(),
         "atmosphere": {"source": atmo.describe(), "c_0_1500m": m1.c, "c_0_5000m": m5.c, "wind_0_5000m": [m5.wind_e, m5.wind_n]},
         "search_events": sevs,
+        "curve_match": curve_verdict.as_ref().map(|v| json!({
+            "call": format!("{curve_used:?}"),
+            "verdict": v,
+            "flights": curve.as_ref().map(curve_flights),
+        })),
         "log": log.lines(),
     });
     write_json(&run_dir.join("result.json"), &report)?;
@@ -1471,5 +1817,66 @@ mod tests {
             None
         );
         assert_eq!(metadata_start_window(full, f64::NAN, 300.0, 10.0), None);
+    }
+
+    fn stands_at(lat: f64, lon: f64, stands: bool) -> curvematch::CurveVerdict {
+        curvematch::CurveVerdict {
+            stands,
+            lat,
+            lon,
+            clock_unix: 0.0,
+            radius_m: 1000.0,
+            evidence: 20.0,
+            margin: 10.0,
+            n_decoys: 48,
+            p: 0.02,
+            n_heard: 3,
+            why: String::new(),
+        }
+    }
+
+    /// Every combination of the trace grade and where the curve match stands. km east of 40 N.
+    #[test]
+    fn curve_call_table() {
+        let east = |km: f64| -73.5 + km / (111.2 * 40f64.to_radians().cos());
+        let v = stands_at(40.0, east(0.0), true);
+        let at = |km: f64| Some((40.0, east(km)));
+        // does not stand, or no verdict: whatever the trace search said holds
+        let weak = stands_at(40.0, east(50.0), false);
+        for conf in ["high", "medium", "low", "none"] {
+            assert_eq!(curve_call(conf, at(0.0), Some(&weak)), CurveCall::Silent);
+            assert_eq!(curve_call(conf, at(0.0), None), CurveCall::Silent);
+        }
+        // asserted answers
+        for conf in ["high", "medium"] {
+            assert_eq!(curve_call(conf, at(0.5), Some(&v)), CurveCall::Agrees);
+            assert_eq!(curve_call(conf, at(2.9), Some(&v)), CurveCall::Agrees);
+            assert_eq!(curve_call(conf, at(3.1), Some(&v)), CurveCall::Conflicts);
+        }
+        // a low answer inside the curve match's radius is confirmed, outside it is replaced
+        assert_eq!(curve_call("low", at(0.9), Some(&v)), CurveCall::Confirms);
+        assert_eq!(curve_call("low", at(1.1), Some(&v)), CurveCall::Adopts);
+        assert_eq!(curve_call("low", at(100.0), Some(&v)), CurveCall::Adopts);
+        // the trace search found nothing
+        assert_eq!(curve_call("none", None, Some(&v)), CurveCall::Adopts);
+    }
+
+    /// A confirmed trace answer 0.9 km west of the curve match's best place, with a place 4 km east
+    /// of that best still tied: the circle around the trace answer must reach 4.9 km.
+    #[test]
+    fn a_confirmed_answer_keeps_every_tied_curve_place_inside_its_radius() {
+        let east = |km: f64| -73.5 + km / (111.2 * 40f64.to_radians().cos());
+        let mut v = stands_at(40.0, east(0.0), true);
+        v.radius_m = 4000.0;
+        let trace = (40.0, east(-0.9));
+        assert_eq!(
+            curve_call("low", Some(trace), Some(&v)),
+            CurveCall::Confirms
+        );
+        let r = confirmed_radius(250.0, trace, &v);
+        let far = fdop_types::geo::haversine_m(trace.0, trace.1, 40.0, east(4.0));
+        assert!(r >= far - 1.0, "radius {r} m, tied place {far} m away");
+        // a trace radius already wider is kept
+        assert_eq!(confirmed_radius(9000.0, trace, &v), 9000.0);
     }
 }

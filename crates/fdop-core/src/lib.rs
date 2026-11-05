@@ -2,6 +2,7 @@
 //! fits, ADS-B track models, flight-centric search and locked multi-event scoring.
 
 pub mod audio;
+pub mod curvematch;
 pub mod detect;
 pub mod fit;
 pub mod measure;

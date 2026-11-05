@@ -88,6 +88,9 @@ pub struct LocateCli {
     /// Maximum number of events that drive the pair join (others can still confirm).
     #[arg(long, default_value_t = 12)]
     pub max_events: usize,
+    /// Skip the curve match, so the answer comes from the trace search alone.
+    #[arg(long)]
+    pub no_curve_match: bool,
     /// Print the result JSON on stdout.
     #[arg(long)]
     pub json: bool,
@@ -171,6 +174,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 clock_tol_s: l.clock_tol,
                 ignore_metadata_time: l.ignore_metadata_time,
                 max_events: l.max_events,
+                curve_match: !l.no_curve_match,
                 sr: 4000,
                 quiet: l.common.quiet,
             };

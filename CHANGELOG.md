@@ -19,6 +19,141 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### ADS-B points without GNSS height no longer bend a track between GNSS points
+
+- **The fault.** A merged ADS-B leg mixes points that carry a GNSS height with points that do not. The second kind
+  sits a median 89 m from the line through the GNSS points around it (p90 417 m: 21,022 points on the 364 mixed legs
+  of 2026-11-01's search box over about four hours). The Hermite track model passes through every point, so each one bends the track,
+  and the bend becomes Doppler that no aircraft made. On one pass in the osprey cam's 11-01 recording, the
+  predicted tone differed from a smoothed track's by 8.99 Hz rms and 92.55 Hz at worst at a 166 Hz tone, against a
+  measurement sigma of 0.36 Hz. Most points without GNSS height are probably multilateration positions. The archive
+  keeps a leg's feed (`source`) and drops it per point. On 2026-11-01's search box, the points with a corrected barometric
+  height and no flags number 687 on legs that came only from `mlatonly`, 19,598 on legs merged from `prod` and
+  `mlatonly`, and 84 on legs from `prod` alone. So
+  the origin is near certain for the leg and inferred for the point.
+- **The rule.** `drop_bracketed_non_gnss` drops a point without GNSS height when GNSS-height points on both sides lie
+  within `BuildParams.gnss_bridge_s` (60 s) of each other. A point outside such a bracket is kept, and so is a leg
+  with no such points. The 60 s span comes from a synthetic test with offsets drawn as measured: on a sustained
+  standard-rate (3°/s) turn, bridging costs less than the noise it removes up to 60 s and more by 90 s. `the_bridge_stops_where_a_turn_costs_more_than_the_noise`,
+  `noisy_points_without_gnss_height_do_not_bend_a_straight_pass`, `a_real_turn_stays_intact_when_its_points_are_dropped`,
+  `points_the_bridge_does_not_cover_are_kept` and `a_leg_of_gnss_height_points_is_untouched` are its tests. The
+  rule and its tests are cc_1's, landed unchanged.
+- **What it did, with the trace search alone.** These runs used the benchmark's R2 inputs: the start to the minute
+  ±2 min, and a 25 km region centred 10 km from the truth (`bench/PROTOCOL.md`). They ran on `cb95fbb` on an Apple
+  M4 with 32 GiB, with the rule off and then on (cc_1's `cb_off`, `cb_on`). Each cell is grade and distance.
+
+  | Recording | Rule off | Rule on |
+  |---|---|---|
+  | Reference | high, 0.25 km | high, 0.25 km |
+  | Osprey cam 10-31 | low, 13.91 km | **high, 0.09 km** |
+  | Osprey cam 11-01 | high, 0.21 km | high, 0.11 km |
+  | Osprey cam 11-02 | low, 14.22 km | low, 14.18 km |
+  | Duke Farms | low, 1.07 km | **high, 0.96 km** |
+  | Sapsucker Woods feeder | no location | no location |
+
+  The nine runs at wrong dates or wrong places stayed low or gave no location with the rule on. The two thinnest
+  are both held low by the core gate alone. The Duke Farms recording searched 90 km from its site is low at a margin
+  of 3.43 refined against refined, with 1 core match; the flight nearest to core (e8) is 0.59 trace nats short of
+  the 2.0 line. The reference recording on 09-07 is low at 2.62 with 1 core match.
+- **Reference and feeder replays** (`*_c1`), with bf's flags and environment, on a release build of `703d232` with
+  this change. They ran one after another on the benchmark machine, an Apple M4 with 32 GiB, with other jobs (the
+  Duke row below among them) sharing it.
+  None gives a start, so the curve match is skipped in every one, and these are the knot rule's effect alone. The
+  build had the curve match before its review fixes, which change nothing on these runs. Each cell is grade,
+  distance from the published point (the feeders' from their town's centre), radius and margin, as in the `cb95fbb`
+  entry:
+
+  | Build (runs) | County | State-wide | Three-day | 09-07, wrong | 09-09, wrong | Feeder, wrong |
+  |---|---|---|---|---|---|---|
+  | `a827820` + `cb95fbb`'s change (`*_r5`) | high, 270 m, r406, 17.85 | high, 264 m, r385, 8.64 | high, 263 m, r388, 7.21 | low, 138 km, 2.95 | low, 73 km, 1.07 | low, 338 km, 1.81 |
+  | `703d232` + this change (`*_c1`) | high, 270 m, r406, 16.00 | high, 263 m, r397, 8.10 | high, 263 m, r388, 8.19 | low, 138 km, 0.61 | low, 73 km, 0.35 | low, 338 km, 0.75 |
+
+  The county and 09-07 margins compare fine cells, because refinement was refused for one side; the others are
+  refined. Every answer is at the same place as before. The three wrong rows' margins fell, by 2.34 (09-07), 0.72
+  (09-09) and 1.06 (feeder). The right ones moved both ways: county down 1.85, state-wide down 0.54, three-day up
+  0.98. The 09-07 run still has both core matches and is low on its margin alone. All of this is on the recording
+  every build was developed on.
+
+  | Recording | Run | Error | Radius | Grade | Margin | Failed gates | On `cb95fbb` (`*_r5`) |
+  |---|---|---|---|---|---|---|---|
+  | wrong date, bird-feeder cam | `n_feeder_on_1101_c1` | 254 km | 300 m nominal | low | 2.15 | core, margin, radius | 326 km, low, 2.07 |
+  | wrong date, eagle cam (Duke Farms) | `n_duke_on_1102_c2` | 63 km | 300 m nominal | low | 1.36 | core, margin, radius | 64 km, low, 4.79 |
+
+  The feeder's error is from its town's centre and Duke Farms' from the cam's site. The Duke run used a second
+  build of the same code (before the review fixes, curve match skipped). On `cb95fbb` it cleared the medium line at
+  4.79 and was low only on its 1 core match of 4. With the knot rule it has no core match of 5 and 1.36 nats.
+
+### A curve match reads the spectrogram along every logged flight, ranked against 48 decoy clocks
+
+- **Why.** The trace search can only use a pass whose ridge it measured. A ridge too faint to trace, or one crossed
+  by another, adds nothing, and the reference recording's answer rests on 3 events (`funnel.events_used`). `dopplerprint` (MIT,
+  © 2026 Henry Alexander) asks the other way round: if the recording was made here at this clock, is there energy
+  along each logged flight's exact curve? `crates/fdop-core/src/curvematch.rs` reimplements that question and
+  attributes it. Three things differ. A bank of (speed, distance) paths scores every arrival time and tone in one
+  sweep per path. Each path's own scores across the recording give the null for that path. And the whole search
+  runs again at 48 decoy clock windows, so an answer is ranked against 48 clocks that cannot be right, not two.
+- **How it grades.** It stands when it beats every decoy (margin above 0 over at least 40 of them) and every place
+  within 3 nats of its answer lies within 5 km. That line was set from runs with no right answer before reading the
+  rows with one. On 42 such runs (six recordings at wrong dates and at places 90 km or more from the truth; curve
+  match only, `v4k`) none was above 0, and the largest margin was −0.8. On this code's defaults, the largest of the
+  same 42 is −0.6 (`v10t`). The runs share six recordings, so they are not 42 independent trials. A verdict
+  that stands can raise a low trace answer to medium, at the trace answer if that lies inside its radius and
+  otherwise at its own place. It can lower a high or medium answer to low when it stands more than 3 km away. It
+  never grades high. It runs only when the start is known to 1800 s or better and the region has at most 200,000
+  cells. A state-wide search with no `--start` uses the trace search alone. `--no-curve-match` turns it off, and
+  `curvematch.json` records it.
+- **The decoys get the real window's search.** In the first versions a decoy window got only the vote, while the
+  real window was also rescored and refined. That made margins look better than they were. It was found by
+  reading the code, before any grade line was set. Every window now goes through one `search_window`, and
+  `a_decoy_window_gets_the_search_the_real_window_gets` is the test.
+- **A fresh review before landing found eight faults, all fixed** (another model, reading the code without the
+  author's conclusions). Lookup e-values could overflow to infinity on a bright curve over quiet audio, and two
+  infinite places then tied without widening the radius; they are now kept in logs, and evidence that is not finite
+  never stands. A pass worth under 1 nat claimed no pixels, so faint copies of one sound could each be credited;
+  every credited pass now claims. The coarse stage took one sound speed at the prior's time for every window, which
+  favoured the real window slightly (about 0.03 s of arrival per 1 °C); each pass now takes the speed at its own
+  time. A place exactly 3 nats down was not counted as tied. A confirmed trace answer kept the curve match's radius
+  without adding the distance between the two centres. Failing to write `curvematch.json` failed the run. The null
+  tests used 10 decoys, too few for any verdict to stand, and checked a margin under 3 rather than the verdict; they
+  now run 80 decoys over a repeated sky and assert refusal. The tone prior's mean was 1 under its smoothed
+  distribution rather than the counted rows; it is now scaled to the counted rows. Each fix has a test: `huge_lookups_stay_finite`,
+  `a_pass_gets_the_same_sound_speed_whichever_window_is_the_prior`, the new stanzas of
+  `a_verdict_needs_margin_decoys_and_one_place`, `a_confirmed_answer_keeps_every_tied_curve_place_inside_its_radius`
+  and the rewritten null tests. Every row below ran after them.
+- **A tone prior, and a first version that failed.** A typed propeller aircraft's tone is weighed by whether its
+  blades × rpm can make it (`TONE_TABLE`, typical figures from general knowledge, not checked against type
+  certificates; helicopters left out). The first version divided by a flat spread over tones. On real audio it
+  added evidence to wrong-date runs (one place's evidence rose from −1.8 to 38.3 nats), because rumble puts chance
+  peaks on the propeller bands, and the osprey cam's 11-01 answer moved from 0.20 km to 20.32 km (`v6t`). It was not adopted.
+  The version that landed divides by where this recording's best tones fall at chance, scaled so its mean over those rows is 1
+  (`the_tone_prior_has_mean_one_under_chance_and_favours_its_bands`,
+  `a_tone_prior_on_a_rumbling_recording_lifts_no_place_over_the_decoys`). That centres it; the decoy windows,
+  weighted the same way, are what the answer is judged against. On the knot rule's base with the prior off and
+  on, the largest of the 42 null margins went from −0.8 to −0.7. The osprey cam's 11-02 recording went from −0.1 to
+  +1.6, so it stood, until the review fixes; 11-01 went from +16.9 to +13.2, 10-31 stayed at +9.8 and Duke Farms went from +44.1 to
+  +44.8 (`v8n`, `v8t`). **The default was turned on after those rows with a right answer were read**, and two
+  table entries were corrected after them (the Meridian's blades, the King Air class's top rpm). The grade line
+  did not move. Its synthetic test shows only the direction: 0.79 nats over three flights.
+- **What it did on the development rows: it changed no grade.** These are full `locate` runs with R2 inputs on this
+  code, run locally on an Apple M5 Ultra with 256 GiB (`f10`). The fifteen rows gave four right answers, all high,
+  and no wrong one: the reference recording at 0.25 km, the osprey cam at 0.09 km on 10-31 and 0.11 km on 11-01, and
+  Duke Farms at 0.96 km. The curve match stood and agreed within 3 km on three of them; on the reference
+  recording it did not stand. On the osprey cam's 11-02 recording it stood at 0.61 km before the review fixes
+  (`f9`, margin +1.62), and the run graded medium from it. After them the same place scores 13.84 nats against
+  13.69, but the best decoy rose from 12.07 to 14.89, so the margin is −1.06 and the trace search's low answer
+  (14.18 km) stands. Across the 48 decoys of that run the median rose 1.03 nats, most for windows over an hour from
+  the prior. That is what giving each window its own sound speed predicts, but the fixes were not run one at a time.
+  On every other row the margin moved by under 0.7 nats. The Sapsucker Woods feeder gave no location: its three
+  passes in reach all sit at track ends on the band floor. The five wrong-date and four wrong-place runs were low or
+  gave no location, and the curve match stood on none of them. The pinned benchmark build `7e66501` gave one right
+  answer on these inputs. All of these recordings were used in development, so the benchmark's labelled rerun and
+  its sealed set E are the tests. The curve match took 4–80 s per run on that machine, up to about half the run.
+- **Interface.** `result.json` gains `extra.curve_match`. It is null when the curve match did not run. Otherwise it
+  holds the call (`Silent`, `Agrees`, `Conflicts`, `Confirms` or `Adopts`), the verdict, and a line naming the passes
+  that gave its best place at least 1 nat. `result.json` also gains `timings.curve_match_s`. When the curve match
+  stands, `answer.gates` gains a sixth gate, `curve match`, which fails only on a conflict. The run directory gains
+  `curvematch.json`, and `locate` gains `--no-curve-match`.
+
 ### The margin compares a leader and its rival at the same polish; refinement survives a bound it sits just past
 
 - **Refinement no longer refuses a match just past a search bound.** On `630bba5` all three reference searches lost
