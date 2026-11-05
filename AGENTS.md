@@ -268,23 +268,28 @@ results in the commit message.
   The upload is the recorder's 1:00:00–2:00:00 window. The published answer is 40.876466, −73.524951. Report the
   distance, the radius, the confidence, the gates and the funnel for each configuration:
 
-  | Configuration | Last recorded result (2026-11-05, `9087ec4`, the terrain-spike fix after the knot rule and the curve match) |
+  | Configuration | Last recorded result (2026-11-05, the measurement change, run before its rebase onto the heard-range profile, which these runs never reach) |
   |---|---|
-  | `--dates 2026-09-08 --near NY` (`r_ny_b1`) | 263 m off, radius 397 m, **high**, margin 8.12 nats against a rival 87 km away, no comparison cut |
-  | `--dates 2026-09-08 --near "Nassau County, NY"` (`r_nassau_b1`) | 270 m off, radius 406 m, **high**, margin 16.00 nats at the fine cells, no comparison cut |
-  | `--dates 2026-09-07..2026-09-09 --near NY` (`r_md_b1`) | 263 m off, radius 388 m, **high**, margin 8.19 nats against a rival 138 km away, no comparison cut |
+  | `--dates 2026-09-08 --near NY` (`r_ny_gc`) | 264 m off, radius 379 m, **high**, margin 12.79 nats at the fine cells against a rival 52 km away, no comparison cut |
+  | `--dates 2026-09-08 --near "Nassau County, NY"` (`r_nassau_gc`) | 270 m off, radius 406 m, **high**, margin 14.78 nats after refinement against a rival 33 km away, no comparison cut |
+  | `--dates 2026-09-07..2026-09-09 --near NY` (`r_md_gc`) | 263 m off, radius 388 m, **high**, margin 8.44 nats after refinement against a rival 119 km away, no comparison cut |
 
-  All three kept 60 of 82 candidate curves and measured 24 of 42 flyovers, the detection and measurement caps, with
-  warnings. All three matched N22NY (PC-12) and N501EX (C208) as the core matches and N93CQ (B350) as a third, at
-  chi 1.29, 0.54 and 2.54 in the county search. In the three-day run N501EX only confirms, because its hypotheses
-  overflow the budget (a warning), and it is still a core match at the answer. The wrong dates are the other half of
-  this check: the same file with `--dates 2026-09-07 --near NY` gives low, 138 km off, core 2 of 2, margin 0.61 at the
-  fine cells on the knot-rule commit and 0.60 after refinement on `9087ec4` (`n_ref_on_0907_c1`, `n_ref_on_0907_b1`; 2.95
-  before the knot rule, 0.05 under the medium line), and `--dates 2026-09-09 --near NY` gives low, 73 km off, core 1 of
-  2, margin 0.35 (`n_ref_on_0909_b1`). A wrong-date medium or high is a regression.
+  All three kept 60 of 82 candidate curves, the detection cap, with a warning. Each measured all 60 from the silence
+  line up and 12 passed the quality gates, so the 24 was not reached. On `9087ec4` (`*_b1`) they measured the
+  strongest 24 of 42 flyover detections and had 3 usable events; now they have 10 (`funnel.events_used`). All three
+  matched N22NY (PC-12) and N501EX (C208) as the core matches, and N93CQ (B350) and an R44 as weaker matches, at chi
+  1.29, 0.54, 2.54 and 3.22 in the county search. The pair that seeded the answer is N22NY with the R44 state-wide,
+  with N501EX in the county and with N93CQ over three days. In the three-day run the hypotheses of N501EX and the R44
+  overflow the budget (warnings), and N501EX is still a core match at the answer. The wrong dates are the other half
+  of this check. The same file with `--dates 2026-09-07 --near NY` gives low, 119 km off, core 1 of 3, margin 2.00 at
+  the fine cells (`n_ref_on_0907_gc`). On `9087ec4` it was 138 km off, core 2 of 2, 0.60 after refinement
+  (`n_ref_on_0907_b1`); 0.61 on the knot-rule commit (`n_ref_on_0907_c1`); 2.95 before the knot rule, 0.05 under the
+  medium line. `--dates 2026-09-09 --near NY` gives low, 104 km off, core 0 of 3, margin 0.15 (`n_ref_on_0909_gc`;
+  73 km, core 1 of 2, 0.35 on `9087ec4`). A wrong-date medium or high is a regression.
   None of these runs gives a start, so the curve match is skipped in all five. After a change to refinement, the margin
   or trace scoring, also replay the Ithaca feeder (CHANGELOG): a margin that credited only the leader with refinement's
-  gain graded its wrong answer medium.
+  gain graded its wrong answer medium. On the measurement change both feeder runs are low, 0.19 and 0.99 nats
+  (`f_feederwatch_gc`, `n_feeder_on_1101_gc`).
 
   The first high results were `ny9` (224 m off, margin 8.5 nats), `nassau3` (221 m, 6.8 nats) and `md2` (224 m,
   7.9 nats), all radius 292 m with N93CQ as the confirmer, on the import commit plus the 5-line
@@ -404,13 +409,15 @@ fdop runs --json                                         # the run ledger
 The pipeline runs end to end. It has offline unit tests, a selftest and one validated reference case (above).
 Field tests on public live-cam recordings are summarised in README "Honest status": the reference site was
 located again from a recording on another day, and four sparse-traffic sites failed, graded low or with no
-location. On the current code the reference recording grades high, medium or low by configuration, and margin
+location. On the current code the reference recording grades high in all three configurations above, and margin
 does not separate right from wrong (README "Known issues"), so read any grade with the wrong-date runs beside it.
 
 Known fixes not landed. Each one changes answers, so it waits until the reference configurations and the
 quoted field tests can be re-run, which needs a Mac build:
 - The medium grade and the margin do not allow for how many events or how large a region were searched (README
-  "Known issues"). Fix it before raising the detection or measurement caps.
+  "Known issues"). Measurement goes past the old line only behind the `measurement line` gate: a medium resting on
+  such an event needs a curve match that judged it. Fix the grade itself before raising the detection cap or the
+  24 that must pass.
 
 `f717f6f` keeps reported ADS-B velocities on sparsely sampled turns, by checking position chords against the arc
 implied by neighbouring headings at the same 25 m/s limit, and `a4df296` stops a wrong heading from moving its own

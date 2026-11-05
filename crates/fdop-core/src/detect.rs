@@ -31,10 +31,12 @@ pub struct DetectParams {
     pub k_tau: Vec<f64>,
     pub min_half_s: f64,
     pub max_half_s: f64,
-    /// Minimum min-halves matched-filter score (robust-z sum / sqrt(n)) for an event
-    /// candidate. Pure noise peaks near 3.
+    /// Min-halves matched-filter score (robust-z sum / sqrt(n)) of a strong curve: strong curves
+    /// are accepted first and their residual searched for weaker ones. Pure noise peaks near 3.
     pub thr_db: f64,
-    /// Lower threshold used only to decide whether a gap between two events is silent.
+    /// Least score a detection keeps. Every primary from here up is a measurement candidate,
+    /// strongest first, and the measurement gates decide which are flyovers; the line also
+    /// decides whether a gap between two events is silent.
     pub thr_silence_db: f64,
     pub max_detections: usize,
     pub c: f64,
@@ -320,7 +322,7 @@ pub struct Detection {
 }
 
 /// Run the template bank. Returns detections with score >= `thr_silence_db`, strongest first;
-/// those with score >= `thr_db` are the event candidates.
+/// the primaries among them are the event candidates.
 pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
     detect_counted(ls, p).0
 }

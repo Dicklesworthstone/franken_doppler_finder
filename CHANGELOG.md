@@ -19,6 +19,62 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Measurement goes down the list until 24 events pass, from the silence line up
+
+- **The fault.** Only primary detections scoring 4.5 or more were measured, and only the strongest 24 of them,
+  passing or not. On the osprey cam's 11-02 recording, 19 of the 24 measured places failed the quality gates while
+  a 568 m pass sat at detection rank 45 (README, Known issues). On the Livermore single-flyover recordings
+  (benchmark set D, pinned `7e66501`, a diagnostic, not blind), 8 of `fdop`'s 14 misses of 40 passes detected
+  under 4.5 and were never measured.
+- **The change** (`crates/fdop-core/src/measure.rs` `measure_ranked`, `src/pipeline.rs`, `src/cli.rs` for `fdop
+  detect`). Every primary from the silence line (`thr_silence_db`, 3.5; pure noise peaks near 3) up is a
+  candidate, strongest first. Each batch measures as many as passes are still missing, until `MAX_MEASURED` (24)
+  pass or the list ends. The first batch is exactly what the old cap measured, and no more than 24 can pass.
+  Detection is unchanged.
+- **The safeguard** (`src/pipeline.rs`, `leans_on_added`). More events give chance alignments more to work
+  with, and the medium margin does not count them. Build C, this front end on `9087ec4` without a safeguard,
+  graded the wrong-date run `nd_o31_1102` medium, 35 km off, on a weak event (detection 2.54 after refinement)
+  and one past the old top 24, and was stopped at its own null gate. Here a medium answer whose core matches
+  include an event the old line would not have measured is low unless a curve match with enough decoy clocks
+  judged it. Where the curve match ran, the medium rule below already requires it to stand (it does not on
+  `nd_o31_1102`: −3.21, and −5.17 before the heard range was profiled), so this adds a `measurement line` gate
+  only for runs without a start or with too few decoys.
+- **Tests.** `measure_ranked_fills_refused_places_and_never_passes_more_than_the_cap`;
+  `a_pass_under_the_old_measure_line_is_measured_and_noise_tones_and_reversed_audio_are_refused`, a synthetic
+  weak pass between the two lines, a flat tone, noise and the same audio reversed in time;
+  `a_medium_on_events_past_the_old_line_needs_a_curve_match_that_judged`.
+- **Effect** (full `locate`, the benchmark's R2 inputs, on the development machine). The runs are `fm` and `nm`,
+  compared with the parent's `r50_dev` and `r50_nulls` (`r50g_confirm` for the two runs its gate regraded). The
+  nulls were read first.
+  - On the 15 development rows, 5 right answers are asserted and no wrong one, as in the parent. The osprey cam's
+    11-02 goes from medium to high, 240 m to 220 m off. The parent's medium rested on the curve match alone: 0 of 2
+    core matches, a trace margin of 0.16. Here 2 of 4 matches are core and the trace margin is 23.16, with the
+    curve match agreeing. The trace margin rose on the osprey cam's other two days (11.69 to 13.88, 24.28 to
+    29.26) and is unchanged at Duke Farms (13.18). Every other right answer keeps its grade and distance.
+  - On the 42 runs with no right answer, none is medium or high and none stands. Seven went from no answer to
+    low, six of them on the reference recording. The curve match's margins are the parent's except on two runs,
+    which moved by at most 0.86 nats, and the largest is still −0.47.
+  - One wrong-date run, `nd_o31_1102`, now has 2 core matches and an 8.07-nat trace margin. It is low only
+    because the curve match does not stand there (−3.21). In the parent the same was true of `nd_o31_1101`.
+  - The `measurement line` gate failed on none of these runs. Each gave a start, and the curve match judged it
+    with 48 decoy clocks.
+  - A median of 59 detections were measured per run (27 to 60), against 24.
+  - Reference replays (`r_*_gc` and four wrong-date and feeder runs). None gives a start, so the curve match does
+    not run. They ran on this change's code before its rebase onto the heard-range profile, the one part they
+    never reach. All three configurations stay high, against `9087ec4`'s `*_b1`:
+    - state-wide, 264 m off, radius 379 m, margin 12.79 (was 263 m, 397 m, 8.12);
+    - county, 270 m, 406 m, 14.78 (was 270 m, 406 m, 16.00);
+    - three days, 263 m, 388 m, 8.44 (was 263 m, 388 m, 8.19).
+
+    Each measured all 60 detections from the silence line up, and 12 passed. That gives 10 usable events where
+    there were 3 (`funnel.events_used`). The core matches are still N22NY and N501EX. A King Air 350 and a
+    Robinson R44 match as weaker events. The wrong dates stay low. On 09-07 the answer is 119 km off, core 1 of 3,
+    margin 2.00 (was 138 km, core 2 of 2, 0.60). On 09-09 it is 104 km off, core 0 of 3, margin 0.15 (was 73 km,
+    core 1 of 2, 0.35). The Ithaca feeder's two runs stay low, at 0.19 and 0.99 nats (were 0.76 and 2.17).
+  - The field recordings quoted in README "Honest status" have not been re-run on this change.
+- **Cost.** A full `locate` takes a median 1.18 times the parent's CPU time (quartiles 1.05 to 1.38, at most 2.13,
+  48 runs).
+
 ### The curve match profiles how far each recording hears
 
 - **The fault.** The curve match credits each pass by its chance of being heard at its slant range. The range

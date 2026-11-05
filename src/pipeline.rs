@@ -295,6 +295,23 @@ fn curve_call(
     }
 }
 
+/// A trace answer graded medium whose core matches include an event the old measurement line would
+/// not have measured, with no curve match able to judge it. Measuring further down the list gives
+/// chance alignments more events to use, and the medium margin does not count how many were
+/// searched; the curve match's decoy test does, so where it cannot judge, such an answer stays low.
+fn leans_on_added(
+    trace_confidence: &str,
+    call: CurveCall,
+    judged: bool,
+    core_events: &[&str],
+    added: &std::collections::HashSet<String>,
+) -> bool {
+    trace_confidence == "medium"
+        && call == CurveCall::Silent
+        && !judged
+        && core_events.iter().any(|id| added.contains(*id))
+}
+
 /// Radius of a trace answer the curve match confirms. The curve match's radius is the spread of its
 /// tied places around its own best one, so from the trace answer the circle must reach that far
 /// beyond the distance between the two.
@@ -744,31 +761,58 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         c,
         ..Default::default()
     };
+    // Every primary detection from the silence line up is a candidate, strongest first: the
+    // detection score does not separate flyovers from tones (pure noise peaks near 3), the
+    // measurement gates do. Measuring goes down the list until MAX_MEASURED events pass.
     let max_measured = measure::MAX_MEASURED;
     let prim: Vec<&Detection> = dets
         .iter()
-        .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
-        .take(max_measured)
+        .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
         .collect();
-    if n_strong > prim.len() {
+    let mut events: Vec<MeasuredEvent> = measure::measure_ranked(
+        prim.len(),
+        max_measured,
+        |ranks| {
+            prim[ranks.clone()]
+                .par_iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let r = detect::refine(&lin, d, c);
+                    measure::measure(&x, a.sr, &r, &format!("e{}", ranks.start + i + 1), &mp)
+                })
+                .collect()
+        },
+        |e| e.quality.ok,
+    );
+    if prim.len() > events.len() {
         warnings.push(format!(
-            "measured the {} strongest of {n_strong} flyover detections; the rest neither drive nor confirm the answer, though they still count as heard",
+            "measured the {} strongest of {} flyover detections, stopping once {max_measured} passed the quality gates; the rest neither drive nor confirm the answer, though they still count as heard",
+            events.len(),
             prim.len(),
         ));
     }
-    let mut events: Vec<MeasuredEvent> = prim
-        .par_iter()
-        .enumerate()
-        .map(|(k, d)| {
-            let r = detect::refine(&lin, d, c);
-            measure::measure(&x, a.sr, &r, &format!("e{}", k + 1), &mp)
-        })
+    // Events the old measurement line would not have measured: past the strongest MAX_MEASURED, or
+    // a primary whose detection scored under `thr_db`. Without a curve match to judge it, an answer
+    // that rests on one of them cannot be medium (`leans_on_added`).
+    let added_ranks: std::collections::HashSet<String> = (0..events.len())
+        .filter(|&k| k >= max_measured || prim[k].score < dp.thr_db)
+        .map(|k| format!("e{}", k + 1))
         .collect();
     drop(x);
     events.sort_by(|p, q| q.quality.score.total_cmp(&p.quality.score));
+    let mut added = std::collections::HashSet::new();
     for (k, e) in events.iter_mut().enumerate() {
-        e.id = format!("e{}", k + 1);
+        let id = format!("e{}", k + 1);
+        if added_ranks.contains(&e.id) {
+            added.insert(id.clone());
+        }
+        e.id = id;
     }
+    log.say(&format!(
+        "{} of them measured past the old line (detection score under {:.1}, or past the strongest {max_measured})",
+        added.len(),
+        dp.thr_db
+    ));
     let n_ok = events.iter().filter(|e| e.quality.ok).count();
     log.say(&format!(
         "measured {} events, {} pass quality gates",
@@ -1339,6 +1383,28 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                 ),
             ));
         }
+        let core_ids: Vec<&str> = top
+            .events
+            .iter()
+            .filter(|m| m.core)
+            .map(|m| m.event.as_str())
+            .collect();
+        let unchecked = leans_on_added(trace_confidence, call, curve_judged, &core_ids, &added);
+        if unchecked {
+            let on: Vec<&str> = core_ids
+                .iter()
+                .copied()
+                .filter(|id| added.contains(*id))
+                .collect();
+            gates.push((
+                "measurement line".to_string(),
+                false,
+                format!(
+                    "a medium answer rests on {}, measured past the old line, and no curve match ran with enough decoy clocks to check it",
+                    on.join(", ")
+                ),
+            ));
+        }
         let (lat, lon, radius, basis, confidence) = match (call, standing) {
             (CurveCall::Adopts, Some(v)) => (
                 v.lat,
@@ -1371,6 +1437,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             (CurveCall::Conflicts, Some(_)) | (CurveCall::Unsupported, _) => {
                 (lat, lon, radius, basis, "low")
             }
+            (CurveCall::Silent, _) if unchecked => (lat, lon, radius, basis, "low"),
             _ => (lat, lon, radius, basis, confidence),
         };
         log.say(&format!(
@@ -1926,6 +1993,49 @@ mod tests {
                 curve_call("none", None, Some(&v), judged),
                 CurveCall::Adopts
             );
+        }
+    }
+
+    /// Events measured past the old line hold up a medium answer only where the curve match judged it.
+    #[test]
+    fn a_medium_on_events_past_the_old_line_needs_a_curve_match_that_judged() {
+        let added: std::collections::HashSet<String> = ["e7".to_string()].into();
+        // rests on an added event and nothing judged it: lowered
+        assert!(leans_on_added(
+            "medium",
+            CurveCall::Silent,
+            false,
+            &["e1", "e7"],
+            &added
+        ));
+        // only events the old line measured: kept
+        assert!(!leans_on_added(
+            "medium",
+            CurveCall::Silent,
+            false,
+            &["e1", "e2"],
+            &added
+        ));
+        assert!(!leans_on_added(
+            "medium",
+            CurveCall::Silent,
+            false,
+            &[],
+            &added
+        ));
+        // the curve match judged it: it stands and agrees, or `Unsupported` already lowered it
+        for call in [CurveCall::Agrees, CurveCall::Unsupported] {
+            assert!(!leans_on_added("medium", call, true, &["e1", "e7"], &added));
+        }
+        // high and low answers are not this rule's
+        for conf in ["high", "low", "none"] {
+            assert!(!leans_on_added(
+                conf,
+                CurveCall::Silent,
+                false,
+                &["e7"],
+                &added
+            ));
         }
     }
 

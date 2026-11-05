@@ -21,10 +21,38 @@ use crate::spectro::{Spec, stft_band_db};
 use crate::trace::{Trace, guided_ridge_peak};
 use serde::Serialize;
 
-/// At most this many events are measured, strongest primary detections first. Measuring more
-/// of a long recording's flyovers can promote a wrong answer (CHANGELOG, Unreleased), so the cap
-/// stays until the grading accounts for how many events were searched.
+/// At most this many measured events pass the quality gates, strongest primary detections first.
+/// More usable events from a long recording can promote a wrong answer (CHANGELOG, Unreleased), so
+/// the cap stays until the grading accounts for how many events were searched. A detection the gates
+/// refuse does not use up a place: [`measure_ranked`] goes on down the list.
 pub const MAX_MEASURED: usize = 24;
+
+/// Measures ranked detections, strongest first, until `max_ok` of them pass the quality gates or
+/// all `n` are measured, and returns every measured item in rank order.
+///
+/// `batch` measures the detections of a range of ranks, in any order internally (the pipeline
+/// runs each batch in parallel), and returns them in rank order; `ok` says whether an item passed.
+/// Each batch holds as many detections as passes are still missing. So the first batch is the
+/// strongest `max_ok`, exactly what a fixed cap of `max_ok` measured, and no batch can take the
+/// number of passing items past `max_ok`. The result does not depend on how a batch is scheduled.
+pub fn measure_ranked<T>(
+    n: usize,
+    max_ok: usize,
+    mut batch: impl FnMut(std::ops::Range<usize>) -> Vec<T>,
+    ok: impl Fn(&T) -> bool,
+) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    let mut n_ok = 0;
+    while n_ok < max_ok && out.len() < n {
+        let start = out.len();
+        let end = (start + max_ok - n_ok).min(n);
+        let got = batch(start..end);
+        assert_eq!(got.len(), end - start, "a batch returns one item per rank");
+        n_ok += got.iter().filter(|t| ok(t)).count();
+        out.extend(got);
+    }
+    out
+}
 
 #[derive(Clone, Debug)]
 pub struct MeasureParams {
@@ -1206,5 +1234,175 @@ mod tests {
             serde_json::to_value(failed.trace).unwrap(),
             serde_json::to_value(first.trace).unwrap()
         );
+    }
+
+    /// `measure_ranked` over ranks that pass where `ok[rank]`; also returns the batches asked for.
+    fn ranked(ok: &[bool], cap: usize) -> (Vec<(usize, bool)>, Vec<std::ops::Range<usize>>) {
+        let mut batches = Vec::new();
+        let got = measure_ranked(
+            ok.len(),
+            cap,
+            |r| {
+                batches.push(r.clone());
+                r.map(|k| (k, ok[k])).collect()
+            },
+            |t: &(usize, bool)| t.1,
+        );
+        (got, batches)
+    }
+
+    #[test]
+    fn measure_ranked_fills_refused_places_and_never_passes_more_than_the_cap() {
+        // When the strongest all pass, it measures exactly what the fixed cap measured, in one batch.
+        let (got, batches) = ranked(&[true; 40], 24);
+        assert_eq!(batches.len(), 1, "{batches:?}");
+        assert_eq!(batches[0], 0..24);
+        assert_eq!(
+            got.iter().map(|t| t.0).collect::<Vec<_>>(),
+            (0..24).collect::<Vec<_>>()
+        );
+
+        // Refusals among the strongest are replaced by the next ranks, in rank order: the passes kept
+        // are the 24 strongest that pass, and what was measured is the prefix ending at the 24th.
+        let ok: Vec<bool> = (0..60).map(|k| k >= 30 || k % 3 == 0).collect();
+        let (got, batches) = ranked(&ok, 24);
+        let passed: Vec<usize> = got.iter().filter(|t| t.1).map(|t| t.0).collect();
+        let strongest: Vec<usize> = (0..60).filter(|&k| ok[k]).take(24).collect();
+        assert_eq!(passed, strongest);
+        let last = *strongest.last().unwrap();
+        assert_eq!(
+            got.iter().map(|t| t.0).collect::<Vec<_>>(),
+            (0..=last).collect::<Vec<_>>()
+        );
+        assert_eq!(batches[0], 0..24);
+        assert!(
+            batches.windows(2).all(|w| w[0].end == w[1].start),
+            "{batches:?}"
+        );
+
+        // Too few passes: every detection is measured once, and an empty list measures nothing.
+        let (got, _) = ranked(&[false; 50], 24);
+        assert_eq!(
+            got.iter().map(|t| t.0).collect::<Vec<_>>(),
+            (0..50).collect::<Vec<_>>()
+        );
+        assert!(ranked(&[], 24).0.is_empty());
+    }
+
+    /// (f0, v, d, emission time of the CPA) of the weak pass in `weak_scene`.
+    const WEAK_PASS: (f64, f64, f64, f64) = (118.0, 70.0, 1500.0, 300.0);
+
+    /// Ten minutes of noise with a flat 250 Hz tone and the weak pass at amplitude `amp`.
+    fn weak_scene(amp: f64) -> Vec<f32> {
+        let (f0, v, d, t0e) = WEAK_PASS;
+        let sr = 4000.0;
+        let (mut seed, mut phase) = (4242u64, 0.0f64);
+        (0..(sr * 600.0) as usize)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr;
+                phase += std::f64::consts::TAU * cv_curve(t, f0, v, d, t0e, 343.0) / sr;
+                (amp * phase.sin()
+                    + 0.06 * (std::f64::consts::TAU * 250.0 * t).sin()
+                    + 0.9 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0)) as f32
+            })
+            .collect()
+    }
+
+    /// Detection, then measurement of every primary at or above the silence line, as `locate` does:
+    /// (detection score, measured event) in rank order.
+    fn measured_down_to_the_silence_line(x: &[f32]) -> Vec<(f64, MeasuredEvent)> {
+        let dp = DetectParams {
+            c: 343.0,
+            ..Default::default()
+        };
+        let (ls, lin) = survey(x, 4000, &dp).unwrap();
+        let dets = detect(&ls, &dp);
+        let cands: Vec<&Detection> = dets
+            .iter()
+            .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+            .collect();
+        let p = MeasureParams {
+            c: 343.0,
+            ..Default::default()
+        };
+        measure_ranked(
+            cands.len(),
+            MAX_MEASURED,
+            |r| {
+                r.map(|k| {
+                    let e = measure(
+                        x,
+                        4000,
+                        &refine(&lin, cands[k], 343.0),
+                        &format!("e{k}"),
+                        &p,
+                    );
+                    (cands[k].score, e)
+                })
+                .collect()
+            },
+            |t| t.1.quality.ok,
+        )
+    }
+
+    #[test]
+    fn a_pass_under_the_old_measure_line_is_measured_and_noise_tones_and_reversed_audio_are_refused()
+     {
+        // Detection keeps curves down to the silence line (3.5; pure noise peaks near 3), but only
+        // those from 4.5 up used to be measured. A pass scoring between the two lines must come out
+        // with the right speed and distance, and the measurement gates, not the detection score,
+        // must refuse what is not a pass: the noise, a flat tone, and the same audio reversed in
+        // time, where every curve rises, which no flyover makes.
+        let dp = DetectParams::default();
+        let (f0, v, d, t0e) = WEAK_PASS;
+        let t0r = t0e + d / 343.0;
+        let is_pass = |e: &MeasuredEvent| {
+            (e.detection.t0r - t0r).abs() < 15.0 && (e.detection.f0 / f0 - 1.0).abs() < 0.03
+        };
+        let mut found = None;
+        for amp in [0.05, 0.04, 0.032, 0.026, 0.021, 0.017, 0.014, 0.011] {
+            let x = weak_scene(amp);
+            let evs = measured_down_to_the_silence_line(&x);
+            let score = evs.iter().find(|(_, e)| is_pass(e)).map(|t| t.0);
+            eprintln!(
+                "amplitude {amp}: {} measured, pass scores {score:?}",
+                evs.len()
+            );
+            if score.is_some_and(|s| (dp.thr_silence_db..dp.thr_db).contains(&s)) {
+                found = Some((amp, x, evs));
+                break;
+            }
+        }
+        let (amp, mut x, evs) = found.expect("no amplitude put the pass between the two lines");
+        let (_, pass) = evs.iter().find(|(_, e)| is_pass(e)).unwrap();
+        assert!(
+            pass.quality.ok,
+            "amplitude {amp}: {:?}",
+            pass.quality.reasons
+        );
+        let b = pass.fit.as_ref().unwrap().best;
+        assert!((b.v / v - 1.0).abs() < 0.1, "v {} against {v}", b.v);
+        assert!((b.d / d - 1.0).abs() < 0.2, "d {} against {d}", b.d);
+        for (s, e) in evs.iter().filter(|(_, e)| !is_pass(e)) {
+            assert!(
+                !e.quality.ok,
+                "score {s:.2} at {:.0} s, {:.0} Hz passed",
+                e.detection.t0r, e.detection.f0
+            );
+        }
+
+        x.reverse();
+        let reversed = measured_down_to_the_silence_line(&x);
+        eprintln!("reversed: {} measured", reversed.len());
+        for (s, e) in &reversed {
+            assert!(
+                !e.quality.ok,
+                "reversed: score {s:.2} at {:.0} s, {:.0} Hz passed",
+                e.detection.t0r, e.detection.f0
+            );
+        }
     }
 }

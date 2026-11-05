@@ -290,34 +290,41 @@ fn run(cli: Cli) -> Result<i32, String> {
                 );
             }
             let mp = fdop_core::measure::MeasureParams::default();
+            // As in `locate`: every primary from the silence line up, strongest first, until
+            // MAX_MEASURED pass the quality gates.
             let max_measured = fdop_core::measure::MAX_MEASURED;
-            let strong: Vec<_> = dets
+            let prim: Vec<_> = dets
                 .iter()
-                .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
+                .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
                 .collect();
-            if strong.len() > max_measured {
+            use rayon::prelude::*;
+            let evs = fdop_core::measure::measure_ranked(
+                prim.len(),
+                max_measured,
+                |ranks| {
+                    prim[ranks.clone()]
+                        .par_iter()
+                        .enumerate()
+                        .map(|(i, det)| {
+                            fdop_core::measure::measure(
+                                &x,
+                                4000,
+                                &fdop_core::detect::refine(&lin, det, dp.c),
+                                &format!("e{}", ranks.start + i + 1),
+                                &mp,
+                            )
+                        })
+                        .collect()
+                },
+                |e| e.quality.ok,
+            );
+            if prim.len() > evs.len() {
                 eprintln!(
-                    "fdop: warning: measuring the {max_measured} strongest of {} flyover detections",
-                    strong.len(),
+                    "fdop: warning: measured the {} strongest of {} flyover detections, stopping once {max_measured} passed the quality gates",
+                    evs.len(),
+                    prim.len(),
                 );
             }
-            use rayon::prelude::*;
-            let evs: Vec<_> = strong
-                .into_iter()
-                .take(max_measured)
-                .collect::<Vec<_>>()
-                .par_iter()
-                .enumerate()
-                .map(|(k, det)| {
-                    fdop_core::measure::measure(
-                        &x,
-                        4000,
-                        &fdop_core::detect::refine(&lin, det, dp.c),
-                        &format!("e{}", k + 1),
-                        &mp,
-                    )
-                })
-                .collect();
             std::fs::write(
                 out.join("events.json"),
                 serde_json::to_string_pretty(&evs).map_err(|e| e.to_string())?,
