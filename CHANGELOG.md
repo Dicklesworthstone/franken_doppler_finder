@@ -19,6 +19,103 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### The margin compares a leader and its rival at the same polish; refinement survives a bound it sits just past
+
+- **Refinement no longer refuses a match just past a search bound.** On `630bba5` all three reference searches lost
+  their refined radius and graded medium at a nominal 300 m (`r_nassau_t630`, `r_ny_t630`, `r_md_t630`). `refine_on`
+  profiles the fit with gates off, so its minimum can land past a bound a nearby grid cell passed, and
+  `refresh_refined_candidate` then required every match inside its bounds with no slack. In the county search the
+  C208's refined distance was 8443 m against a bound of 8379 m, 0.76 % over, inside a 399 m contour. Locating matches
+  now get `LOCATING_GATE_SLACK` (5 %), the value hypotheses already used; optional confirmers keep none, as in
+  `best_confirmer`. `refinement_survives_a_gate_bound_just_inside_its_minimum` and the last stanza of
+  `refined_reporting_recomputes_physics_evidence_and_veto_at_one_fixed_clock` fail without it.
+- **The margin credited the leader alone with refinement's gain.** Since `630bba5` the leader is rescored at its
+  refined point while its rival stayed at its fine cell. Measured on `630bba5` with the slack above, the gain was 0.23,
+  0.80 and 0.90 nats on the county, state-wide and three-day searches and 0.15 and 0.25 on the wrong dates; on the
+  Ithaca feeder it was 0.95, on `b8c0819`. On this code it is 1.21 on the county search and 0.94 on the feeder, the two
+  runs whose margin keeps the fine score (`top_score` minus `margin_top_score` in `r_nassau_r5`, `f_feederwatch_r5`).
+  **The slack fix alone would have added a wrong medium:** it grades the
+  feeder's wrong answer medium at 3.10 (`f_feederwatch_b8`). Without the slack that refinement is refused, by one speed
+  of 37.0 m/s against a bound of 36.8, and the fine cells' margin is 35.12 − 32.97 = 2.15, which is low. That is
+  arithmetic from an instrumented run (`f_feederwatch_diag`); exact `b8c0819` was not replayed on the feeder.
+- **Now both sides are refined, or neither counts.** The best different explanation is refined as well. A rival that
+  overtakes becomes the answer with its own radius, one that falls yields to the next, and no candidate is attempted
+  twice. If either side cannot be refined, the margin compares both at their fine-grid cells. Refining the rival was
+  not enough by itself: on the feeder its refinement was refused, and the margin stayed 3.10 until that case compared
+  fine cells (`f_feederwatch_ri`, then `f_feederwatch_r3`). No threshold or constant changes.
+  `margin_compares_the_leader_and_its_rival_at_the_same_polish` is the metamorphic test. Two mutants of the search code ran against the same tests on `42677a4`: crediting the leader alone fails it and `refinement_reranks_promoted_leaders_without_mixing_candidate_state` (88 passed, 2 failed), and taking the margin from the reported scores fails it at the refined leader's refused rival, `margin_nats` 2.5 for a gain of 0.5 (89 passed, 1 failed).
+- **`result.json`:** `margin` gains `margin_top_score`, `margin_rival_score` and `margin_basis` (`refined` or
+  `fine_grid`). `margin_nats` and `ratio_distinct` follow that pair; `top_score` and `next_distinct_score` stay the
+  reported scores. The margin gate's text prints the compared pair at two decimals, because 2.95 printed as "3.0 nats"
+  on a gate that failed, and names the fine-grid case. The refused-refinement warning now reads "that candidate keeps
+  its fine-grid position and evidence", because it can be about a rival.
+- **The clock at the reported point has a test.** `630bba5` regenerates the winner at its refined point, which removes
+  an outlier: on the code before the wind change, the county search reported a start of +4.66 s from its fine cell while
+  the fit at the refined point gave −0.75 s. Reverting `refine_on`'s `t_start_utc` to the grid centre's clock still
+  passed all 81 runnable core tests on `630bba5`, so `refinement_fits_the_clock_at_the_point_it_reports` now starts
+  seconds off the true clock and fails that mutant at +2.38 s. The reference starts are now −0.40, −0.26 and −0.25 s
+  against 20:17:29.1 UTC, itself known to ±1 s. This removes an outlier and does not make starts exact.
+- **What `e13c7fc`'s gap-aware `n_eff` also moves.** It feeds the profile threshold, so it widens or narrows the distance
+  and speed gates, and it feeds `quality.score`, so events reorder and IDs renumber: match them by `t_rec`. In the
+  three-day search the C208's hypotheses now overflow what the budget has left (64,412,380 against 57,266,230,
+  `r_md_r5`), so that event only confirms, with a warning.
+- **Reference case and wrong dates.** Every row is a replay, on one recording, and the runs ran with other jobs on the
+  machine. Each cell is grade, distance from the published point (the feeder's from its own site), radius and margin.
+
+  | Build (runs) | County | State-wide | Three-day | 09-07, wrong | 09-09, wrong | Feeder, wrong |
+  |---|---|---|---|---|---|---|
+  | `7e5cf3e` (`*_s7*`) | high, 306 m, r316, 12.77 | medium, 271 m, r304, 5.01 | low, 271 m, r304, 2.92 | low, 138 km, 2.37 | low, 73 km, 5.49 | low, 338 km, 2.89 |
+  | `630bba5` (`*_t630`) | medium, 130 m, r300 nominal, 15.68 | medium, 383 m, r300 nominal, 8.25 | medium, 62 m, r300 nominal, 7.63 | low, 138 km, 2.51 | low, 73 km, 6.67 | not run |
+  | `b8c0819` + slack (`*_b8`) | high, 270 m, r407, 19.26 | high, 264 m, r385, 10.03 | high, 264 m, r387, 8.21 | low, 138 km, 2.23 | low, 126 km, 0.90 | **medium**, 338 km, 3.10 |
+  | `42677a4` + this change (`*_r3`) | high, 270 m, r407, 19.29 | high, 264 m, r385, 9.43 | high, 264 m, r387, 7.99 | low, 138 km, 2.18 | low, 126 km, 0.87 | low, 338 km, 2.15 |
+  | `0693e30` + this change (`*_r4`) | high, 270 m, r406, 17.87 | high, 264 m, r385, 8.63 | high, 263 m, r388, 7.23 | low, 138 km, 2.95 | low, 73 km, 1.04 | low, 338 km, 1.81 |
+  | `a827820` + this change (`*_r5`) | high, 270 m, r406, 17.85 | high, 264 m, r385, 8.64 | high, 263 m, r388, 7.21 | low, 138 km, 2.95 | low, 73 km, 1.07 | low, 338 km, 1.81 |
+  | `a827820` as it stood, before this change (`*_a82`) | medium, 130 m, r300 nominal, 17.85 | medium, 383 m, r300 nominal, 8.64 | medium, 73 m, r300 nominal, 7.20 | **medium**, 138 km, 3.01 | low, 73 km, 1.11 | low, 338 km, r300 nominal, 1.81 |
+
+  Refused refinements, by run on `*_r5`: the county's rival and the feeder's rival, neither within a nat of a grade
+  line; the other four compare refined scores. No run recorded a cut. Selftest on the same binary: 2.4 m, radius 75 m,
+  clock +0.02 s. Refinement's distance from the published point is not a score: the fine cells kept when it was refused
+  (`*_t630`, `*_a82`) were nearer on the county and three-day searches, inside that nominal 300 m, and further on the
+  state-wide one, outside it at 383 m. The refined answers lie inside their own radii, and one reference point cannot say
+  which estimate is better. Radii grew from 304–316 m to 385–406 m.
+- **`0693e30`'s first replay: it narrowed the gap between right and wrong on this recording.** Compare the `*_r3` and
+  `*_r4` rows, where only upstream differs. The commit holds the robust tone candidate and cubic interpolation, not
+  separated here. The candidate replaces a fit only when its capped residual is lower, so it can only lower a match's chi,
+  chance matches included. On 09-07 the leader rose from 28.30 to 32.19 and its rival from 26.11 to 29.24, so that wrong
+  date's margin rose from 2.18 to 2.95, **0.05 under the medium line**, with both core matches. Right-date margins fell:
+  state-wide 9.43 to 8.63 and three-day 7.99 to 7.23, both refined against refined. The county fell from 19.29 to 17.87,
+  but its rival changed (34.6 km to 20.1 km) and that rival's refinement is refused, so that pair is not like with like.
+  The feeder's fell from 2.15 to 1.81, at fine cells both times. The 09-09 answer moved from 126 km back to 73 km, with
+  one core match of two instead of none. This is one recording and a few wrong answers, and a near miss is not a
+  regression, but the trend is the wrong way for a margin that has to separate them. **On `a827820` as it stood, 09-07 is a wrong-date medium:** 138.14 km off, core 2 of 2, margin 3.008 (`n_ref_on_0907_a82`), the refined leader's 32.19 against the rival's fine 29.18. The same rival refined scores 29.24, so this change grades it low at 2.95. That removes the regression by 0.05 nats and does not reopen the gap. Its three reference searches and the feeder lose refinement there, so they report a nominal 300 m; the reference margins match this change's within 0.01 nats, and the radius gate alone separates its medium from the high here.
+- **`a827820`'s dedicated profile bounds barely moved these rows.** Compare `*_r4` and `*_r5`: margins moved by 0.03 nats
+  or less. Hypothesis counts per event match on all six rows, compared to 0.1 M, and no new budget
+  warning appears, so the wider `t_tol` it can pass to `SearchEvent` did not visibly grow the search here. One refusal went
+  away: the 09-09 rival refines on `*_r5`, so that margin is refined against refined (1.04 at fine cells, 1.07 now).
+  `measure_s` rose on five of six rows and fell on the three-day, under different load, so that timing says nothing.
+- **Field recordings.**
+
+  Town level or coarser, and only the rows finished when this was written; the rest follow in a later commit. A wrong answer at low
+  is a grading pass and a locating fail. The moves come from every change since `7e5cf3e`, not this one alone.
+
+  | Recording | Run | Error | Radius | Grade | Margin | Failed gates | On `7e5cf3e` |
+  |---|---|---|---|---|---|---|---|
+  | wrong date, bird-feeder cam | `n_feeder_on_1101_r5` | 326 km | 1,002 m | low | 2.07 | core, margin, radius | 56 km, low, 1.31 |
+  | railcam, Rochelle, IL | `f_rochelle_r5` | 371 km | 885 m | low | 1.59 | core, margin | 36 km, low, 0.49 |
+  | railcam, Tucson, AZ | `f_tucson_r5` | no location | | | | | no location |
+  | railcam, Plant City, FL | `f_plantcity_r5` | no location | | | | | no location |
+  | railcam, Fullerton, CA | `f_fullerton_r5` | no location | | | | | no location |
+  | eagle-nest cam, Lee County, FL, state search | `s_swfl_fl_r5` | about 17 km from the county's centre | 487 m | low | 0.07 | core, margin | 135 km from the site, low, 0.20 |
+  | same recording, county search | `s_swfl_lee_r5` | about 17 km from the county's centre | 467 m | low | 1.78, fine cells | core, margin | about 4 km from the site, low, no rival |
+  | eagle cam, Hillsborough, NJ, county search | `f_duke_county_r5` | about 6.5 km from the township's centre | 300 m, nominal | low | 26.83, fine cells | core, unheard, radius | not replayed |
+
+- **Checks.** `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings`
+  exit 0; `cargo test --workspace --locked -j 2` 179 passed, 0 failed, 2 ignored; `cargo run --release --locked -j 2 -- selftest`
+  PASS: 2.4 m error, 75 m radius, +0.02 s clock error, 4 events, both intended aircraft. They ran on a probe commit with this code and `a827820`'s docs, from clean snapshots on remote workers. `ubs` on
+  `search.rs` and `pipeline.rs`: 0 critical, 726 warnings and 355 info items across the two files, not triaged here. Not run on
+  this code: the full decoy bank, and any field row not in the table above. The replays ran on a build that differs only in the
+  margin gate's printed decimals.
+
 ### Profile tone and received CPA directly instead of borrowing speed/range slices
 
 - The fit previously reported tone and received-CPA extrema encountered while profiling speed and distance.

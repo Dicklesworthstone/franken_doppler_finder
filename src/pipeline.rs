@@ -986,10 +986,22 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                                 res.funnel.truncated.join("; ")
                             )
                         };
+                        let compared = |key: &str, otherwise: f64| {
+                            res.margin
+                                .get(key)
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(otherwise)
+                        };
+                        let basis = match res.margin.get("margin_basis").and_then(|v| v.as_str()) {
+                            Some("fine_grid") => {
+                                "; both at their fine-grid cells, because one could not be refined"
+                            }
+                            _ => "",
+                        };
                         format!(
-                            "evidence {:.1} nats vs {:.1} for the best evaluated different explanation{rival}: {m:.1} nats{qualifier}",
-                            top.score,
-                            top.score - m,
+                            "evidence {:.2} nats vs {:.2} for the best evaluated different explanation{rival}: {m:.2} nats{basis}{qualifier}",
+                            compared("margin_top_score", top.score),
+                            compared("margin_rival_score", top.score - m),
                         )
                     }
                     None if !res.margin_passes(6.0) => format!(

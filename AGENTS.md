@@ -268,18 +268,20 @@ results in the commit message.
   The upload is the recorder's 1:00:00–2:00:00 window. The published answer is 40.876466, −73.524951. Report the
   distance, the radius, the confidence, the gates and the funnel for each configuration:
 
-  | Configuration | Last recorded result (2026-11-04, `7e5cf3e`: the code of `4b88d7c`) |
+  | Configuration | Last recorded result (2026-11-04, the commit that added these rows) |
   |---|---|
-  | `--dates 2026-09-08 --near NY` (`r_ny_s7b`) | 271 m off, radius 304 m, **medium**, margin 5.01 nats, no comparison cut |
-  | `--dates 2026-09-08 --near "Nassau County, NY"` (`r_nassau_s7b`) | 306 m off, radius 316 m, **high**, margin 12.77 nats, no comparison cut |
-  | `--dates 2026-09-07..2026-09-09 --near NY` (`r_md_s7b`) | 271 m off, radius 304 m, **low**, margin 2.92 nats against a rival 138 km away, no comparison cut |
+  | `--dates 2026-09-08 --near NY` (`r_ny_r5`) | 264 m off, radius 385 m, **high**, margin 8.64 nats against a rival 87 km away, no comparison cut |
+  | `--dates 2026-09-08 --near "Nassau County, NY"` (`r_nassau_r5`) | 270 m off, radius 406 m, **high**, margin 17.85 nats at the fine cells (its rival's refinement was refused), no comparison cut |
+  | `--dates 2026-09-07..2026-09-09 --near NY` (`r_md_r5`) | 263 m off, radius 388 m, **high**, margin 7.21 nats against a rival 138 km away, no comparison cut |
 
   All three kept 60 of 82 candidate curves and measured 24 of 42 flyovers, the detection and measurement caps, with
-  warnings. All three matched N22NY (PC-12) and N501EX (C208) as the core pair and N93CQ (B350) as confirmer, at
-  chi 8.79 in the county search. Only the margin gate failed on the state-wide and three-day runs, so the wrong dates are the
-  other half of this check: the same file with `--dates 2026-09-07 --near NY` gives low, 138 km off, core 2 of 2,
-  margin 2.37, and `--dates 2026-09-09 --near NY` gives low, 73 km off, core 1 of 2, margin 5.49. A wrong-date
-  medium or high is a regression.
+  warnings. All three matched N22NY (PC-12) and N501EX (C208) as the core matches and N93CQ (B350) as a third, at
+  chi 1.29, 0.54 and 2.54 in the county search. In the three-day run N501EX only confirms, because its hypotheses
+  overflow the budget (a warning), and it is still a core match at the answer. The wrong dates are the other half of
+  this check: the same file with `--dates 2026-09-07 --near NY` gives low, 138 km off, core 2 of 2, margin 2.95, 0.05
+  under the medium line, and `--dates 2026-09-09 --near NY` gives low, 73 km off, core 1 of 2, margin 1.07. A wrong-date
+  medium or high is a regression. After a change to refinement, the margin or trace scoring, also replay the Ithaca
+  feeder (CHANGELOG): a margin that credited only the leader with refinement's gain graded its wrong answer medium.
 
   The first high results were `ny9` (224 m off, margin 8.5 nats), `nassau3` (221 m, 6.8 nats) and `md2` (224 m,
   7.9 nats), all radius 292 m with N93CQ as the confirmer, on the import commit plus the 5-line

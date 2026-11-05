@@ -998,6 +998,9 @@ pub struct Candidate {
     pub(crate) trk: Vec<(usize, u32)>,
     #[serde(skip)]
     pub(crate) lock_checked: bool,
+    /// The score at its fine-grid cell, once refinement has replaced the candidate.
+    #[serde(skip)]
+    pub(crate) fine_score: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1098,6 +1101,11 @@ struct PointEval {
     props: Vec<Prop>,
     total: f64,
 }
+
+/// How far past its distance and speed gates a hypothesis, or a refined locating match, may sit.
+/// The gates bound the search; the trace fit is what scores a match. Refinement profiles the fit
+/// without gates, so its minimum can land just past a bound that a nearby grid cell passed.
+const LOCATING_GATE_SLACK: f64 = 0.05;
 
 /// Gate check of one CPA against an event (fitted v, d rescaled to the true medium).
 fn gates_ok(ev: &SearchEvent, cpa: &crate::track::Cpa, prop: &Prop, slack: f64) -> bool {
@@ -1462,7 +1470,7 @@ fn calibrate(
                     continue;
                 };
                 let prop = prop_for(atmo, &o, tr, cpa.t_e);
-                if !gates_ok(ev, &cpa, &prop, 0.05) {
+                if !gates_ok(ev, &cpa, &prop, LOCATING_GATE_SLACK) {
                     continue;
                 }
                 let ts0 = cpa.t_r_p(&prop) - ev.t_rec;
@@ -2054,6 +2062,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
                 unheard_close_passes: Vec::new(),
                 trk: vec![(j.ei, j.ti), (j.ej, j.tj)],
                 lock_checked: false,
+                fine_score: None,
                 events,
             })
         })
@@ -2133,38 +2142,14 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             Some(updated) => Some((updated, r)),
             None => {
                 warnings.push(format!(
-                    "refinement at {:.6},{:.6} did not preserve the locating matches at its fitted clock; retaining the fine-grid candidate without a refined radius",
+                    "refinement at {:.6},{:.6} did not preserve the locating matches at its fitted clock; that candidate keeps its fine-grid position and evidence",
                     r.lat, r.lon
                 ));
                 None
             }
         }
     });
-    // margin against the best *different explanation*: a place more than 5 km away, or one
-    // that explains the events differently (no shared event-flight match, or a shared event
-    // matched to another flight). The same flights at a nearby worse optimum are positional
-    // ambiguity, which the refinement radius covers.
-    let margin = if let Some(top) = cands.first() {
-        let alt = cands[1..].iter().find(|o| {
-            haversine_m(o.lat, o.lon, top.lat, top.lon) > 5000.0 || !same_explanation(top, o)
-        });
-        let local = cands[1..].iter().find(|o| {
-            same_explanation(top, o) && haversine_m(o.lat, o.lon, top.lat, top.lon) > 1000.0
-        });
-        serde_json::json!({
-            "top_score": top.score,
-            "next_score": cands.get(1).map(|c| c.score),
-            "next_distinct_score": alt.map(|a| a.score),
-            "next_distinct_km": alt.map(|a| haversine_m(a.lat, a.lon, top.lat, top.lon) / 1000.0),
-            "next_distinct_flights": alt.map(|a| a.events.iter().map(|m| format!("{}:{} {}", m.event, if m.reg.is_empty() { &m.icao } else { &m.reg }, m.typ)).collect::<Vec<_>>()),
-            "margin_nats": alt.map(|a| top.score - a.score),
-            "ratio_distinct": alt.map(|a| if top.score > 0.0 { a.score / top.score } else { f64::NAN }),
-            "same_flights_alt_km": local.map(|l| haversine_m(l.lat, l.lon, top.lat, top.lon) / 1000.0),
-            "same_flights_alt_margin_nats": local.map(|l| top.score - l.score),
-        })
-    } else {
-        serde_json::json!({})
-    };
+    let margin = margin_report(&cands);
     if let Some(r) = &refine {
         progress(&format!(
             "refined: {:.6},{:.6} r={:.0} m",
@@ -2181,8 +2166,57 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     }
 }
 
+/// A different explanation: a place more than 5 km away, or one that explains the events
+/// differently (no shared event-flight match, or a shared event matched to another flight). The
+/// same flights at a nearby worse optimum are positional ambiguity, which the radius covers.
+fn is_different_explanation(top: &Candidate, other: &Candidate) -> bool {
+    haversine_m(other.lat, other.lon, top.lat, top.lon) > 5000.0 || !same_explanation(top, other)
+}
+
+/// The two scores a margin compares, at the same level of polish: refined against refined or, when
+/// either could not be refined, both at their fine-grid cells. Refinement usually raises a score,
+/// so anything else credits one side with a gain the other was never given.
+fn compared_scores(top: &Candidate, rival: &Candidate) -> (f64, f64, &'static str) {
+    match (top.fine_score, rival.fine_score) {
+        (Some(_), Some(_)) => (top.score, rival.score, "refined"),
+        (t, r) => (
+            t.unwrap_or(top.score),
+            r.unwrap_or(rival.score),
+            "fine_grid",
+        ),
+    }
+}
+
+/// The margin against the best different explanation. Sorted candidates, leader first.
+fn margin_report(cands: &[Candidate]) -> serde_json::Value {
+    let Some(top) = cands.first() else {
+        return serde_json::json!({});
+    };
+    let alt = cands[1..].iter().find(|o| is_different_explanation(top, o));
+    let local = cands[1..]
+        .iter()
+        .find(|o| same_explanation(top, o) && haversine_m(o.lat, o.lon, top.lat, top.lon) > 1000.0);
+    let compared = alt.map(|a| compared_scores(top, a));
+    serde_json::json!({
+        "top_score": top.score,
+        "next_score": cands.get(1).map(|c| c.score),
+        "next_distinct_score": alt.map(|a| a.score),
+        "next_distinct_km": alt.map(|a| haversine_m(a.lat, a.lon, top.lat, top.lon) / 1000.0),
+        "next_distinct_flights": alt.map(|a| a.events.iter().map(|m| format!("{}:{} {}", m.event, if m.reg.is_empty() { &m.icao } else { &m.reg }, m.typ)).collect::<Vec<_>>()),
+        "margin_nats": compared.map(|(t, r, _)| t - r),
+        "margin_top_score": compared.map(|(t, _, _)| t),
+        "margin_rival_score": compared.map(|(_, r, _)| r),
+        "margin_basis": compared.map(|(_, _, basis)| basis),
+        "ratio_distinct": compared.map(|(t, r, _)| if t > 0.0 { r / t } else { f64::NAN }),
+        "same_flights_alt_km": local.map(|l| haversine_m(l.lat, l.lon, top.lat, top.lon) / 1000.0),
+        "same_flights_alt_margin_nats": local.map(|l| top.score - l.score),
+    })
+}
+
 /// Refinement can reduce a winner's evidence (for example by exposing an unheard close
 /// pass). Recheck newly promoted leaders, keeping each candidate and its radius together.
+/// Refinement usually raises evidence too, so the best different explanation is refined as well:
+/// the margin must not credit the leader alone with a gain every candidate could have had.
 /// Every supplied candidate is attempted at most once; a failed update retains the entire
 /// coherent fine-grid candidate, never a mixture of old evidence and refined coordinates.
 fn refine_candidates(
@@ -2193,27 +2227,33 @@ fn refine_candidates(
     let mut states: Vec<(Candidate, Option<RefineResult>, bool)> =
         cands.into_iter().map(|c| (c, None, false)).collect();
     states.retain(|s| has_distinct_events(&s.0));
-    while let Some((top, radius, attempted)) = states.first_mut() {
+    while let Some(leader) = states.first() {
+        let k = if leader.2 {
+            let rival = states
+                .iter()
+                .position(|s| is_different_explanation(&leader.0, &s.0));
+            let Some(rival) = rival else { break };
+            rival
+        } else {
+            0
+        };
+        let (cand, radius, attempted) = &mut states[k];
         // Refinement can promote a candidate below the original leading 20. Its coarse
         // fallback must pass the same lock/pruning policy before it can become the answer.
-        if !top.lock_checked {
-            check(top);
-            top.lock_checked = true;
+        if !cand.lock_checked {
+            check(cand);
+            cand.lock_checked = true;
             states.retain(|s| has_distinct_events(&s.0));
-            states.sort_by(|a, b| {
-                b.0.score
-                    .total_cmp(&a.0.score)
-                    .then(a.0.pair_chi.total_cmp(&b.0.pair_chi))
-            });
-            continue;
-        }
-        if *attempted {
+        } else if *attempted {
             break;
-        }
-        *attempted = true;
-        if let Some((updated, refined)) = update(top) {
-            *top = updated;
-            *radius = Some(refined);
+        } else {
+            *attempted = true;
+            if let Some((updated, refined)) = update(cand) {
+                let fine_score = cand.score;
+                *cand = updated;
+                cand.fine_score = Some(fine_score);
+                *radius = Some(refined);
+            }
         }
         states.sort_by(|a, b| {
             b.0.score
@@ -2448,7 +2488,13 @@ fn refresh_refined_candidate(
             let tr = inp.tracks.get(ti as usize)?;
             let cpa = tr.cpa_near(o.x, old.t_cpa_heard_utc - old.d / old.c_path, 150.0)?;
             let prop = prop_for(inp.atmo, &o, tr, cpa.t_e);
-            if !gates_ok(ev, &cpa, &prop, 0.0)
+            // An optional confirmer stays under `best_confirmer`'s rule, with no slack.
+            let slack = if required(k) {
+                LOCATING_GATE_SLACK
+            } else {
+                0.0
+            };
+            if !gates_ok(ev, &cpa, &prop, slack)
                 || tr.gap_at(cpa.t_e) > p.max_gap_s
                 || (cpa.t_r_p(&prop) - fresh.t_start_utc - ev.t_rec).abs() > ev.t_tol + 3.0
                 || used_cpas
@@ -2649,6 +2695,7 @@ pub fn explain_at(
         unheard_close_passes: Vec::new(),
         trk: assign.iter().map(|a| (a.0, a.1)).collect(),
         lock_checked: false,
+        fine_score: None,
         events,
     };
     let dts = free_clocks(&cand, &o, evs, inp.tracks, &pp, inp.atmo);
@@ -3592,7 +3639,7 @@ mod tests {
 
     #[test]
     fn refinement_reranks_promoted_leaders_without_mixing_candidate_state() {
-        let candidates: Vec<Candidate> = [("A", 10.0), ("B", 9.0), ("C", 6.0)]
+        let candidates: Vec<Candidate> = [("A", 10.0), ("B", 9.0), ("C", 6.0), ("D", 1.0)]
             .into_iter()
             .enumerate()
             .map(|(i, (flight, score))| Candidate {
@@ -3615,10 +3662,10 @@ mod tests {
             .collect();
         // B wins after rescoring; B's refinement fails; or rescoring B promotes the
         // already-refined A again. A cached radius must always travel with its candidate.
-        for (a_score, b_score, winner, has_radius) in [
-            (5.0, Some(8.0), "B", true),
-            (5.0, None, "B", false),
-            (8.0, Some(7.0), "A", true),
+        for (a_score, b_score, winner, has_radius, tried) in [
+            (5.0, Some(8.0), "B", true, &["A", "B", "C"][..]),
+            (5.0, None, "B", false, &["A", "B", "C"][..]),
+            (8.0, Some(7.0), "A", true, &["A", "B"][..]),
         ] {
             let mut checked = Vec::new();
             let (out, refined) = refine_candidates(candidates.clone(), &|_| {}, |c| {
@@ -3627,7 +3674,8 @@ mod tests {
                 let score = match flight {
                     "A" => a_score,
                     "B" => b_score?,
-                    _ => panic!("a lower-ranked unpromoted candidate need not be refined"),
+                    "C" => c.score,
+                    _ => panic!("a candidate below the best rival need not be refined"),
                 };
                 let updated = Candidate {
                     lat: c.lat + 0.001,
@@ -3638,7 +3686,7 @@ mod tests {
                 let r = refinement_at(updated.lat, updated.lon, updated.t_start_utc);
                 Some((updated, r))
             });
-            assert_eq!(checked, ["A", "B"]);
+            assert_eq!(checked, tried);
             assert_eq!(out[0].events[0].flight, winner);
             assert!(out.windows(2).all(|w| w[0].score >= w[1].score));
             assert_eq!(refined.is_some(), has_radius);
@@ -3651,6 +3699,104 @@ mod tests {
                 assert_eq!(out[0].score, candidates[1].score);
             }
         }
+    }
+
+    /// Metamorphic: a gain only one side could have cannot move the margin, whatever the gain is.
+    /// Refined against refined, or both at their fine cells when either was refused.
+    #[test]
+    fn margin_compares_the_leader_and_its_rival_at_the_same_polish() {
+        let candidate = |flight: &str, score: f64, lat: f64| Candidate {
+            lat,
+            lon: -73.0,
+            t_start_utc: 1000.0,
+            score,
+            lock_checked: true,
+            n_explained: 2,
+            events: ["e1", "e2"]
+                .into_iter()
+                .map(|event| EventMatch {
+                    event: event.into(),
+                    flight: flight.into(),
+                    ..EventMatch::default()
+                })
+                .collect(),
+            ..Candidate::default()
+        };
+        // A's neighbour has the same flights about 1 km away: position ambiguity, not a rival.
+        let candidates = vec![
+            candidate("A", 30.0, 40.0),
+            candidate("A", 29.9, 40.01),
+            candidate("B", 28.0, 41.0),
+            candidate("C", 27.0, 42.0),
+        ];
+        let run = |gains: &[(&str, Option<f64>)]| {
+            let mut tried = Vec::new();
+            let (out, refined) = refine_candidates(candidates.clone(), &|_| {}, |c| {
+                let flight = c.events[0].flight.clone();
+                tried.push(flight.clone());
+                let (_, gain) = gains
+                    .iter()
+                    .find(|(f, _)| *f == flight)
+                    .expect("only the leader and the best rival are refined");
+                let score = c.score + (*gain)?;
+                Some((
+                    Candidate { score, ..c.clone() },
+                    refinement_at(c.lat, c.lon, c.t_start_utc),
+                ))
+            });
+            let leader = out[0].events[0].flight.clone();
+            (tried, leader, margin_report(&out), refined.is_some())
+        };
+        let nats = |report: &serde_json::Value| report["margin_nats"].as_f64().unwrap();
+        for gain in [0.0, 0.5, 2.0] {
+            let (tried, leader, report, has_radius) = run(&[("A", Some(gain)), ("B", Some(gain))]);
+            assert_eq!(tried, ["A", "B"]);
+            assert_eq!(leader, "A");
+            assert!((nats(&report) - 2.0).abs() < 1e-12, "gain {gain}: {report}");
+            assert_eq!(report["margin_basis"], "refined");
+            assert!(has_radius);
+
+            // A refused rival: the leader keeps its radius and reported score, not a margin the
+            // rival never had the chance to answer.
+            let (tried, leader, report, has_radius) = run(&[("A", Some(gain)), ("B", None)]);
+            assert_eq!(tried, ["A", "B"]);
+            assert_eq!(leader, "A");
+            assert!((nats(&report) - 2.0).abs() < 1e-12, "gain {gain}: {report}");
+            assert_eq!(report["margin_basis"], "fine_grid");
+            assert_eq!(report["margin_top_score"], 30.0);
+            assert_eq!(report["margin_rival_score"], 28.0);
+            assert_eq!(report["top_score"], 30.0 + gain);
+            assert!(has_radius);
+
+            // A refused leader: the rival's gain does not count against it either.
+            let (tried, leader, report, has_radius) = run(&[("A", None), ("B", Some(gain))]);
+            assert_eq!(tried, ["A", "B"]);
+            assert_eq!(leader, "A");
+            assert!((nats(&report) - 2.0).abs() < 1e-12, "gain {gain}: {report}");
+            assert_eq!(report["margin_basis"], "fine_grid");
+            assert!(!has_radius);
+        }
+        // A rival that overtakes when refined takes the lead, with its own radius.
+        let (tried, leader, report, has_radius) = run(&[("A", Some(0.0)), ("B", Some(5.0))]);
+        assert_eq!(tried, ["A", "B"]);
+        assert_eq!(leader, "B");
+        assert!((nats(&report) - 3.0).abs() < 1e-12, "{report}");
+        assert_eq!(report["margin_basis"], "refined");
+        assert!(has_radius);
+        // Leading only because the other side was refused is no margin at all.
+        let (tried, leader, report, has_radius) = run(&[("A", None), ("B", Some(5.0))]);
+        assert_eq!(tried, ["A", "B"]);
+        assert_eq!(leader, "B");
+        assert!((nats(&report) + 2.0).abs() < 1e-12, "{report}");
+        assert_eq!(report["margin_basis"], "fine_grid");
+        assert!(has_radius);
+        // A rival that falls when refined yields to the next one, which is then refined too.
+        let (tried, leader, report, _) =
+            run(&[("A", Some(1.0)), ("B", Some(-5.0)), ("C", Some(1.0))]);
+        assert_eq!(tried, ["A", "B", "C"]);
+        assert_eq!(leader, "A");
+        assert!((nats(&report) - 3.0).abs() < 1e-12, "{report}");
+        assert_eq!(report["margin_basis"], "refined");
     }
 
     #[test]
@@ -3712,6 +3858,63 @@ mod tests {
         assert_eq!(out[0].score, 7.0);
         assert!(refined.is_none());
         assert!(out.iter().all(|c| c.events[0].flight != "C"));
+    }
+
+    // Starts from a cell whose clock is seconds off. The searches here cannot tell the clock
+    // fitted at the refined point from the grid centre's: they all pass if `refine_on` reports it.
+    #[test]
+    fn refinement_fits_the_clock_at_the_point_it_reports() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        case.p.refine_half_m = 800.0;
+        case.p.refine_step_m = 50.0;
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let assign = [(0, 0, case.t_s + 1000.0), (1, 1, case.t_s + 1900.0)];
+        let (_, mlon) = fdop_types::geo::m_per_deg(case.obs.0);
+        // A winning cell 600 m along flight A's eastbound path, where the clock reads differently.
+        let lon = case.obs.1 + 600.0 / mlon;
+        let cell = observer(case.obs.0, lon, &dem);
+        let cell_clock = eval_point(
+            &cell,
+            &assign,
+            &case.events,
+            &case.tracks,
+            &case.p,
+            &atmo,
+            true,
+            false,
+            false,
+        )
+        .unwrap()
+        .t_s;
+        assert!(
+            (cell_clock - case.t_s).abs() > 1.0,
+            "test must start from a cell whose clock is off: {:+.2} s",
+            cell_clock - case.t_s
+        );
+        let r = refine_on(
+            case.obs.0,
+            lon,
+            &assign,
+            &case.events,
+            &case.tracks,
+            &case.p,
+            &dem,
+            &atmo,
+            &mut None,
+        )
+        .unwrap();
+        assert!(
+            haversine_m(r.lat, r.lon, case.obs.0, case.obs.1) < 60.0,
+            "refinement must recover the synthetic observer: {r:?}"
+        );
+        assert!(
+            (r.t_start_utc - case.t_s).abs() < 0.5,
+            "the start must be the one fitted at the refined point: {:+.2} s, cell {:+.2} s",
+            r.t_start_utc - case.t_s,
+            cell_clock - case.t_s
+        );
     }
 
     #[test]
@@ -3881,6 +4084,59 @@ mod tests {
         assert!(refresh_refined_candidate(
             &top, &refined, &inputs, &unsupported, &case.p, &nulls, &tix,
         ).is_none(), "losing a locating trace must discard the refined report");
+        // A locating match may sit just past a gate bound that the refined search never applied,
+        // but not far past it. Still air, so the gates are not rescaled and the bound is exact.
+        let d = fresh.events.iter().find(|m| m.event == "e2").unwrap().d;
+        for (overrun, allowed) in [(1.04, true), (1.06, false)] {
+            let mut tight = case.events.clone();
+            tight[1].d_gate[1] = d / overrun;
+            assert_eq!(
+                refresh_refined_candidate(&top, &refined, &inputs, &tight, &case.p, &nulls, &tix)
+                    .is_some(),
+                allowed,
+                "locating match {overrun} times its upper distance bound"
+            );
+        }
+    }
+
+    /// Metamorphic: tightening a gate so the true point sits 1 % past it, while a grid cell still
+    /// passes, must not change the answer. The search reaches the same observer either way.
+    #[test]
+    fn refinement_survives_a_gate_bound_just_inside_its_minimum() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let open = run_case(&two_flyover_case(med), med);
+        let open_refined = open.refine.as_ref().expect("the open case refines");
+        let d = open.candidates[0]
+            .events
+            .iter()
+            .find(|m| m.event == "e2")
+            .unwrap()
+            .d;
+        let mut case = two_flyover_case(med);
+        case.events[1].d_gate[1] = d / 1.01;
+        let res = run_case(&case, med);
+        let r = res
+            .refine
+            .as_ref()
+            .unwrap_or_else(|| panic!("refinement was discarded: {:?}", res.warnings));
+        assert_eq!(
+            (res.candidates[0].lat, res.candidates[0].lon),
+            (r.lat, r.lon)
+        );
+        assert!(
+            haversine_m(r.lat, r.lon, open_refined.lat, open_refined.lon) < 10.0,
+            "same observer expected: {:.6},{:.6} vs {:.6},{:.6}",
+            r.lat,
+            r.lon,
+            open_refined.lat,
+            open_refined.lon
+        );
+        let m = res.candidates[0]
+            .events
+            .iter()
+            .find(|m| m.event == "e2")
+            .unwrap();
+        assert!(m.core && m.d > case.events[1].d_gate[1], "{m:?}");
     }
 
     #[test]
