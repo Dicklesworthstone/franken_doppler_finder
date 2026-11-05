@@ -139,7 +139,15 @@ at that commit, not per-change commits.
   `asupersync 0.6.2` compilation received SIGKILL during shared-host memory exhaustion. A smaller core-only
   retry reached `fsci-stats`, but the host subsequently filled its disk and lost the process handles;
   no runtime test result was recovered. Workspace Clippy, the full workspace tests and the release
-  self-test have no completed result for this change. README's current-check table records the commands.
+  self-test have no completed result for this change.
+- **Checks on the merged tree (2026-11-05).** `a032bf8`, which also holds `32d4e1a`'s merge and the geoid fix, passed
+  `cargo fmt`, clippy with `-D warnings`, the workspace tests (229 passed, 0 failed, 2 ignored, with `--no-fail-fast`)
+  and the release self-test (PASS: error 2.4 m, radius 75 m, clock error +0.02 s, 4 events), direct on the benchmark machine. That run was the first compile of this
+  section's changes and of the comparable-rival correction below. It needed one correction:
+  `margin_compares_the_leader_and_its_rival_at_the_same_polish` failed on every tree with `5ab7f48`, because it kept
+  the old list of attempts. When a rival overtakes the leader, the rule below gives an attempt to each rival closer to
+  it at the fine cells, so the case now lists those attempts. Its assertions on the leader, the margin, the basis and
+  the radius are unchanged, and production code did not change. README's current-check table records the commands.
 
 ### Compare every rival at the same stage after refinement
 

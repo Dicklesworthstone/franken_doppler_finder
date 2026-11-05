@@ -875,21 +875,21 @@ the configured fallback allowance after the preferred request has been tried.
 
 ### Current correction checks (2026-11-05)
 
-These results cover the cache-recovery, comparable-rival and curve-match corrections, using the pinned
-`nightly-2026-08-31` toolchain. Source review and formatting passed; runtime verification remains incomplete.
+These results cover the cache-recovery, comparable-rival and curve-match corrections, merged with `32d4e1a` and the
+geoid fix, on one exact tree (`a032bf8`, extracted from `git archive`), using the pinned `nightly-2026-08-31` toolchain.
+They ran with direct cargo on the benchmark machine, an Apple M4 with 32 GiB, because `rch`'s clean-overlay sync failed
+on two workers. They are the first complete compile and test run of those corrections: the host they were written on
+ran out of memory and then disk.
 
 | Command | Result |
 |---|---|
-| `cargo fmt --all -- --check` | Passed on the final Rust source |
-| `git diff --check` | Passed before the final validation notes were added |
-| `cargo test -p fdop-core -p fdop-data --locked --no-run -j1` | Build exited 101: the compiler for `asupersync 0.6.2` received SIGKILL during shared-host memory exhaustion; no runtime result was obtained |
-| `cargo test -p fdop-core --locked --no-run -j1` | The smaller retry last reported compiling `fsci-stats`; the host then ran out of disk and its process handles became unavailable. No runtime result was recovered |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Not run on this host |
-| `cargo test --workspace --locked` | No completed workspace test result |
-| `cargo run --release --locked -- selftest` | Not run on this host |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed |
+| `cargo test --workspace --locked --no-fail-fast` | 229 passed, 0 failed, 2 ignored |
+| `cargo build --release --locked -p franken_doppler_finder --bin fdop`, then `fdop selftest` | PASS: error 2.4 m, radius 75 m, clock error +0.02 s, 4 events |
 
-The reference audio host also returned "Site Unavailable", so the reference and field recordings were
-not replayed. The historical results below do not validate these corrections.
+The reference and field recordings have not been replayed on this tree. The historical results below do not validate
+these corrections.
 
 ### Earlier recorded checks
 
