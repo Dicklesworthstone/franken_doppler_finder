@@ -553,3 +553,82 @@ from the stopped case once the R2 chains are done. No run that finished is repea
 Diagnosing this meant reading exit codes in set E's run directories. `fdop` exits 1 when it gives no location. So one
 set E result was seen early: `fdop-6914ab7`'s R2 run on `e_tehachapi` exited 1, no location. No other set E exit code,
 output or result was read. Nothing about either build or the benchmark was changed after it.
+## Addendum 11, 2026-11-05, register `fdop-ce02222` for set F; the guards stop the chains again
+
+Written before any set F audio was captured or any tool ran on it, and before any set E result of a later build was read
+(the one exit code disclosed in Addendum 10 aside).
+
+### The build
+
+`ce02222` is `6914ab7`'s code with one change: a trace answer graded medium becomes low when the curve match ran with at
+least 40 decoy clocks and stands nowhere. It was written after `nd_o31_1101` fired falsifier 2 for `9087ec4` and
+`6914ab7` (Addendum 8). Its reason on its own terms is the decoy test: with a wrong date or place, the real window is
+one of at least 41 interchangeable clocks, so it stands about once in 41 at most. Set F's R2 inputs have the right date,
+so there the rule can only cost it: a right answer that the trace search grades medium becomes low where the curve match
+judged and does not stand.
+
+### How it was chosen
+
+There were two candidates: `ce02222`, and `32b7834`, which is `ce02222` plus build C's front end with a gate of its own.
+Build C's front end measures down the detection list from the silence line until 24 events pass the quality gates. The
+gate lowers a medium that rests on an event the old line would not have measured, unless a curve match with enough decoy
+clocks judged it. Before any run of either, the rule was sent to `projects-bf` at about 06:58Z: register at most one of
+them, the one with the most correct asserted development answers among those that assert none of the 42 no-right-answer
+runs at medium or high, and the smaller change on a tie.
+
+Both assert none of the 42, and both give five correct asserted development answers and no wrong one. `ce02222`, the
+smaller change, is registered. `32b7834` is not, whatever it does later.
+
+### What they did on runs they were developed on
+
+All in-sample, with R2 inputs.
+
+- `ce02222`'s rows are its rule applied to `6914ab7`'s saved runs (`disc_dev`, `disc_nulls`). The rule reads only the
+  grade, the curve verdict and the decoy count in `result.json`, so this is exact.
+- `32b7834`'s rows are runs of the binary `6dd7b74` (sha256 `94bff95e`) on an Apple M5 Ultra. `32b7834` differs from it
+  in one test assertion only.
+
+| Row | `6914ab7` | `ce02222` | `32b7834` |
+|---|---|---|---|
+| reference recording | high | high | high, 0.25 km |
+| osprey cam 10-31 | high | high | high, 0.09 km |
+| osprey cam 11-01 | high | high | high, 0.11 km |
+| osprey cam 11-02 | medium (curve match's answer) | medium (curve match's answer) | high, 0.22 km |
+| Duke Farms | high | high | high, 0.96 km |
+| sapsucker cam | no location | no location | no location |
+| 42 no-right-answer runs asserted | 1 (`nd_o31_1101`, medium) | 0 | 0 |
+
+`32b7834` grades `nd_o31_1102` low by the curve-match rule, where build C graded it medium: the curve match judged it
+and does not stand (margin -5.17).
+
+The reference replays have no start, so the curve match does not run on them. `ce02222` keeps `6914ab7`'s grades there.
+On `32b7834`, every grade is unchanged from `b1`. It has three right answers, each high: 270, 264 and 263 m from the
+site. Four runs have wrong answers, each low: the reference recording on two wrong dates, and the Ithaca feeder
+recording on its own date and on a wrong one.
+
+### What set F can and cannot show for it
+
+Set F scores `ce02222` by its own row, as Addendum 9 requires. It cannot show whether the rule lowers wrong answers on
+recordings it has not seen, since R2 has the right date. Its R3 and R1 inputs can.
+
+### The guards stopped the chains again
+
+At 07:57:22Z the swap had grown to 13,988 MB from a baseline of 7,979, and the boot disk had 5 GB free. The guards, as
+fixed in Addendum 10, each stopped only their own chain, and so all four regime `fix1` chains stopped. The interrupted
+steps are kept as `<step>_fault_guard2`:
+
+- `e2_r2_dt`'s `e_harbourgate_detect`
+- `e_tehachapi` in both `e2_r3_fdop_6914ab7` and `e2_r3_fdop_9087ec4`
+- `r2_fdop_6914ab7`'s `b3_duke`
+
+Two steps that Addendum 10's guard stopped before its fix are kept as `<step>_fault_guard`: `r3_fdop`'s `c_osprey_1031`
+and `r1_dp`'s `b3_sapsucker`.
+
+Regime `fix3` started at 16:06:58Z, with three chains at once instead of four:
+
+- `6914ab7`'s R2, running its eight set E steps first, then the full job, which skips them. The first step is a file of
+  the job's own lines.
+- `dopplertrack`'s set E R2.
+- The set E R3 of both builds, then the pinned `fdop` R3 and `dopplerprint` R1.
+
+Each step runs on its own, so order changes no result. A second watchdog follows chain 3 to its last script.
