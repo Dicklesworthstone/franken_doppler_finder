@@ -59,6 +59,13 @@ pub const TIED_NATS: f64 = 3.0;
 pub const RADIUS_FLOOR_M: f64 = 1000.0;
 /// An answer this uncertain is not asserted, whatever its margin.
 pub const MAX_ASSERT_RADIUS_M: f64 = 5000.0;
+/// A pass is heard at this many nats or more (about 1000 to 1).
+const HEARD_NATS: f64 = 6.9;
+/// `along_track_aliases` looks this far apart along each heard flight's track, out to
+/// `ALIAS_REACH_M` either way. One tie past `MAX_ASSERT_RADIUS_M` is enough to stop an answer
+/// standing, so the reach goes one step further.
+const ALIAS_STEP_M: f64 = RADIUS_FLOOR_M;
+const ALIAS_REACH_M: f64 = MAX_ASSERT_RADIUS_M + ALIAS_STEP_M;
 /// A decoy window must sit this far inside the fetched catalogue.
 const CATALOG_PAD_S: f64 = 60.0;
 
@@ -821,6 +828,9 @@ pub struct MatchResult {
     pub timings_s: Vec<(String, f64)>,
     /// See `MatchParams::probe`: at the given place, then after climbing from it.
     pub probe: Vec<MatchMode>,
+    /// The real window's best place moved along the tracks of the flights it heard, with the clock
+    /// moved to match (`along_track_aliases`). They only widen the radius (`verdict`).
+    pub aliases: Vec<MatchMode>,
 }
 
 struct Grid {
@@ -1072,7 +1082,7 @@ fn pass_value(p: &MatchParams, r50: f64, nats: f64, d: f64) -> f64 {
 /// Timing penalties can make even a strong lookup contribute no evidence. Only positive-valued
 /// passes participate in pixel ownership, so only they can count as independent heard flyovers.
 fn counts_as_heard(value: f64, nats: f64, shared: bool) -> bool {
-    value > 0.0 && nats >= 6.9 && !shared
+    value > 0.0 && nats >= HEARD_NATS && !shared
 }
 
 struct Exact {
@@ -1387,6 +1397,82 @@ fn score_exact(
     })
 }
 
+/// Places the evidence may not tell from `top`, along the tracks of the flights it heard.
+///
+/// One heard flight fixes when its closest approach was heard, not where along its track the
+/// observer stood: moving the observer `s` metres along the track and the clock `s / v` later
+/// leaves that flight's curve where it was (exactly, for a straight, level, steady flight). A
+/// second heard flight on a crossing track, or going the other way, breaks the tie. One on a
+/// parallel track going the same way at the same speed slides with it, and every mode can then sit
+/// on the same ridge: modes are at least `nms_m` apart and few, and a climb moves only a little at
+/// a time. So the twin `ALIAS_STEP_M`, 2 `ALIAS_STEP_M`, ... out to `ALIAS_REACH_M` either way is
+/// scored for each flight `top` heard at `HEARD_NATS`, credited or not (a superset of
+/// `counts_as_heard`, so no slide is missed), wherever the place is inside the region and the
+/// clock inside the real window, which `score_exact` keeps every clock inside. Nothing here
+/// changes any evidence or margin, so the decoy calibration holds; the decoys get no such check,
+/// and a check can only widen the real window's radius.
+fn along_track_aliases(
+    inp: &MatchInputs<'_>,
+    p: &MatchParams,
+    bank: &Bank,
+    idx: &[usize],
+    top: &MatchMode,
+) -> Vec<MatchMode> {
+    let z = inp.fine_dem.elev_m(top.lat, top.lon);
+    let x = geodetic_to_ecef(top.lat, top.lon, z + MIC_HEIGHT_M);
+    let enu = Enu::new(top.lat, top.lon, z + MIC_HEIGHT_M);
+    let n_steps = (ALIAS_REACH_M / ALIAS_STEP_M).round() as i32;
+    let mut starts: Vec<(f64, f64, f64)> = Vec::new();
+    for ps in top
+        .passes
+        .iter()
+        .filter(|q| q.nats >= HEARD_NATS && !q.shared)
+    {
+        // emission time near the heard closest approach; `cpa_near` finds the exact one. Keys are
+        // unique per track (`icao_date_n` per leg, plus `#k` per piece), and a track heard twice, a
+        // lap flown again, gives each pass its own time and so its own closest approach.
+        let t_guess = top.clock_unix + ps.t_audio - ps.slant_m / BASE_C;
+        let Some(cpa) = idx
+            .iter()
+            .map(|&i| &inp.tracks[i])
+            .filter(|t| t.key == ps.key)
+            .find_map(|t| t.cpa_near(x, t_guess, 30.0))
+        else {
+            continue;
+        };
+        let v = enu.vec_from_ecef(cpa.vel);
+        let vh = v[0].hypot(v[1]);
+        if vh < 15.0 {
+            continue;
+        }
+        for k in (-n_steps..=n_steps).filter(|&k| k != 0) {
+            let s = k as f64 * ALIAS_STEP_M;
+            let (la, lo, _) = enu.to_geodetic([s * v[0] / vh, s * v[1] / vh, 0.0]);
+            let clock = top.clock_unix + s / vh;
+            if inp.region.contains(la, lo) && clock >= inp.start_lo && clock <= inp.start_hi {
+                starts.push((la, lo, clock));
+            }
+        }
+    }
+    starts
+        .par_iter()
+        .filter_map(|&(la, lo, clock)| {
+            let e = score_exact(inp, p, bank, idx, la, lo, clock)?;
+            Some(MatchMode {
+                lat: la,
+                lon: lo,
+                clock_unix: e.clock,
+                coarse: 0.0,
+                evidence: e.evidence,
+                r50_m: e.r50_m,
+                n_heard: e.n_heard,
+                n_unheard_close: e.n_close,
+                passes: e.passes,
+            })
+        })
+        .collect()
+}
+
 /// Refine a coarse cell: scan the disc it stands for, then climb on successively finer local grids,
 /// moving the clock with the best point.
 ///
@@ -1557,23 +1643,26 @@ pub struct CurveVerdict {
 }
 
 /// Grade one result. The margin line comes from recordings with no right answer: see
-/// `ASSERT_MARGIN_NATS`. Places the evidence cannot rule out widen the radius, and an answer whose
-/// radius would be wider than `MAX_ASSERT_RADIUS_M` does not stand. At least two independently
-/// credited flyovers are required, as in the trace search: one pass's Doppler curve fixes when and how
-/// close it passed, which leaves place and clock free to trade along its track, and the decoy test
-/// asks whether this clock beats the decoys, not whether one curve fixes a place.
+/// `ASSERT_MARGIN_NATS`. Places the evidence cannot rule out (the other modes, and the best place's
+/// along-track aliases) widen the radius, and an answer whose radius would be wider than
+/// `MAX_ASSERT_RADIUS_M` does not stand. At least two independently credited flyovers are
+/// required, as in the trace search.
 pub fn verdict(r: &MatchResult) -> Option<CurveVerdict> {
     let top = r.modes.first()?;
     let (margin, p) = (r.decoy_margin?, r.decoy_p?);
-    // within TIED_NATS, inclusive; a gap that is not a number counts as tied, so it cannot hide a place
+    // within TIED_NATS, inclusive, or better than the best; a gap that is not a number counts as
+    // tied, so it cannot hide a place
+    let tied = |m: &&MatchMode| {
+        let gap = top.evidence - m.evidence;
+        gap <= TIED_NATS || gap.is_nan()
+    };
+    let n_alias_tied = r.aliases.iter().filter(tied).count();
     let radius_m = r
         .modes
         .iter()
         .skip(1)
-        .filter(|m| {
-            let gap = top.evidence - m.evidence;
-            gap <= TIED_NATS || gap.is_nan()
-        })
+        .chain(&r.aliases)
+        .filter(tied)
         .map(|m| haversine_m(top.lat, top.lon, m.lat, m.lon))
         .fold(RADIUS_FLOOR_M, f64::max);
     let enough = r.decoys.len() >= MIN_DECOYS;
@@ -1584,10 +1673,11 @@ pub fn verdict(r: &MatchResult) -> Option<CurveVerdict> {
     let clears = finite && margin > ASSERT_MARGIN_NATS;
     let tight = radius_m <= MAX_ASSERT_RADIUS_M;
     let why = format!(
-        "{:.1} nats at this place and clock, {margin:+.1} over the best of {} decoy clocks (line {ASSERT_MARGIN_NATS:+.1}), {} flights heard, places within {TIED_NATS:.0} nats span {radius_m:.0} m{}{}",
+        "{:.1} nats at this place and clock, {margin:+.1} over the best of {} decoy clocks (line {ASSERT_MARGIN_NATS:+.1}), {} flights heard, places within {TIED_NATS:.0} nats span {radius_m:.0} m ({n_alias_tied} of {} along their tracks){}{}",
         top.evidence,
         r.decoys.len(),
         top.n_heard,
+        r.aliases.len(),
         if enough {
             ""
         } else {
@@ -1630,7 +1720,6 @@ fn track_near_region(tr: &TrackModel, pad: &BBox, span: (f64, f64), sample_s: f6
     })
 }
 
-/// Run the whole match. `say` reports progress.
 /// Grid step of `SoundTable` (s).
 const SOUND_STEP_S: f64 = 600.0;
 
@@ -1667,6 +1756,7 @@ impl SoundTable {
     }
 }
 
+/// Run the whole match. `say` reports progress.
 pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) -> MatchResult {
     let mut timings = Vec::new();
     let im = inp.image;
@@ -1902,6 +1992,11 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
     };
     let modes = search_window(&per_window[n_lo as usize], 0.0);
     timings.push(("exact".to_string(), t.elapsed().as_secs_f64()));
+    let t = std::time::Instant::now();
+    let aliases = modes.first().map_or_else(Vec::new, |top| {
+        along_track_aliases(inp, p, &bank, &keep, top)
+    });
+    timings.push(("aliases".to_string(), t.elapsed().as_secs_f64()));
     // Diagnostic only, on recordings whose place is known: evidence at a given place, best over a
     // wide range of clocks, then after refining from it (`refine_point`: the `nms_m` disc around
     // it, then the climb). Never used to choose anything.
@@ -2005,6 +2100,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         n_passes: passes.len(),
         timings_s: timings,
         probe,
+        aliases,
     }
 }
 
@@ -2141,6 +2237,75 @@ mod tests {
             lon,
             clock,
         }
+    }
+
+    /// Only the given flights, all heard, from one point in noise: (start offset east, north, up in
+    /// m; velocity in m/s; seconds after the recording starts that it passes the start offset). The
+    /// region reaches `half_m` out each way.
+    fn scene(heard: &[(V3, V3, f64)], half_m: f64) -> Case {
+        let tracks: Vec<TrackModel> = heard
+            .iter()
+            .enumerate()
+            .map(|(i, &(p0, v, t0))| {
+                let mut t = scene_track(p0, v, t0, -1500.0, 3000.0);
+                t.key = format!("F{i}");
+                t.icao = t.key.clone();
+                t
+            })
+            .collect();
+        scene_of(tracks, half_m)
+    }
+
+    /// Where and when `scene` records: latitude, longitude, clock.
+    const SCENE_AT: (f64, f64, f64) = (40.8765, -73.525, 1_788_895_000.0);
+
+    /// A straight track for `scene_of`, sampled from `from` to `to` s after the recording starts.
+    fn scene_track(p0: V3, v: V3, t0: f64, from: f64, to: f64) -> TrackModel {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        straight_track(&enu, p0, v, clock + t0, clock + from, clock + to, 4.0)
+    }
+
+    /// `scene` with tracks of any shape, every one of them heard.
+    fn scene_of(tracks: Vec<TrackModel>, half_m: f64) -> Case {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let (sr, dur) = (2800.0, 900.0);
+        let m = Prop::still(BASE_C);
+        let mut buf = noise((sr * dur) as usize, 42, 0.05);
+        for (i, tr) in tracks.iter().enumerate() {
+            add_flight(&mut buf, sr, clock, tr, x, &m, 90.0 + 25.0 * i as f64, 0.5);
+        }
+        let (dlat, dlon) = m_per_deg(lat);
+        Case {
+            x: buf.iter().map(|&v| v as f32).collect(),
+            tracks,
+            region: BBox::new(
+                lat - half_m / dlat,
+                lon - half_m / dlon,
+                lat + half_m / dlat,
+                lon + half_m / dlon,
+            ),
+            lat,
+            lon,
+            clock,
+        }
+    }
+
+    /// Along-track aliases of `r`'s best place at least `min_m` from it, with their gap below it.
+    fn far_aliases(r: &MatchResult, min_m: f64) -> Vec<(f64, f64)> {
+        let top = &r.modes[0];
+        r.aliases
+            .iter()
+            .map(|a| {
+                (
+                    haversine_m(top.lat, top.lon, a.lat, a.lon),
+                    top.evidence - a.evidence,
+                )
+            })
+            .filter(|&(d, _)| d >= min_m)
+            .collect()
     }
 
     fn params() -> MatchParams {
@@ -2332,18 +2497,29 @@ mod tests {
     #[test]
     fn three_flights_locate_the_observer_and_beat_every_decoy() {
         let c = case(0.5, false);
-        let r = run_case(&c, &params(), c.clock - 60.0, c.clock + 60.0);
+        let p = MatchParams {
+            probe: Some((c.lat, c.lon, c.clock)),
+            ..params()
+        };
+        let r = run_case(&c, &p, c.clock - 60.0, c.clock + 60.0);
         let top = r.modes.first().expect("a mode");
         let err = haversine_m(top.lat, top.lon, c.lat, c.lon);
         assert!(err < 200.0, "error {err} m: {top:?}");
-        // Place and clock trade along AAA's track at 70 m/s, so the 200 m above allows about 2.9 s.
         // This scene has two near-tied fits, 79 m at +0.5 s and 150 m at +2.5 s: a fixed heard range
         // of 2 km lands on the first, 1 km or 4 km on the second, and so does the profile (best at
-        // 4 km), with the decoy margin unchanged (6.03 against 6.10).
+        // 4 km), with the decoy margin unchanged (6.03 against 6.10). So the best fit's clock may be
+        // 3 s out, and the truth itself, place and clock, must be one the evidence cannot rule out.
         assert!(
             (top.clock_unix - c.clock).abs() < 3.0,
             "clock off by {}: {top:?}",
             top.clock_unix - c.clock
+        );
+        let truth = r.probe.first().expect("the truth scored");
+        assert!(
+            top.evidence - truth.evidence <= TIED_NATS && (truth.clock_unix - c.clock).abs() < 2.0,
+            "truth {:.2} nats below at {:+.1} s",
+            top.evidence - truth.evidence,
+            truth.clock_unix - c.clock
         );
         assert!(top.n_heard >= 3, "{top:?}");
         assert!(
@@ -2352,6 +2528,111 @@ mod tests {
             r.decoy_margin,
             r.decoys
         );
+        // Crossing tracks stop the slide: every along-track alias 4 km or more out is clearly worse
+        // (4.9 to 8.1 nats down), so the radius stays inside MAX_ASSERT_RADIUS_M. Nearer in, one
+        // alias 3 km along AAA's track is only 2.67 nats down, AAA and the silent EEE (its curve on
+        // another flight's sound) explaining the audio there: a place the evidence does not rule out,
+        // so the radius is 3 km.
+        assert!(r.aliases.len() >= 12, "{} aliases", r.aliases.len());
+        let far = far_aliases(&r, 3900.0);
+        assert!(
+            !far.is_empty() && far.iter().all(|&(_, gap)| gap > TIED_NATS),
+            "{far:?}"
+        );
+        let v = verdict(&r).unwrap();
+        assert!(v.radius_m <= MAX_ASSERT_RADIUS_M, "{v:?}");
+    }
+
+    /// One heard flight places the observer at its closest approach's range, not along its track:
+    /// the place slides with the clock at the flight's speed. Every mode can sit on that one ridge,
+    /// and the along-track check must find it tied far enough out that the answer cannot stand.
+    #[test]
+    fn one_heard_flight_cannot_say_where_along_its_track() {
+        let c = scene(&[([900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 300.0)], 10_000.0);
+        let r = run_case(&c, &params(), c.clock - 120.0, c.clock + 120.0);
+        let far = far_aliases(&r, 5500.0);
+        assert!(far.iter().any(|&(_, gap)| gap <= TIED_NATS), "{far:?}");
+        let v = verdict(&r).unwrap();
+        assert!(v.radius_m > MAX_ASSERT_RADIUS_M && !v.stands, "{v:?}");
+    }
+
+    /// Two heard flights on parallel tracks, the same way at the same speed, slide together: the
+    /// second flight adds evidence but no fix along the track.
+    #[test]
+    fn parallel_flights_the_same_way_still_slide() {
+        let c = scene(
+            &[
+                ([900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 300.0),
+                ([-900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 550.0),
+            ],
+            10_000.0,
+        );
+        let r = run_case(&c, &params(), c.clock - 120.0, c.clock + 120.0);
+        assert!(r.modes[0].n_heard >= 2, "{:?}", r.modes[0]);
+        let far = far_aliases(&r, 5500.0);
+        assert!(far.iter().any(|&(_, gap)| gap <= TIED_NATS), "{far:?}");
+        let v = verdict(&r).unwrap();
+        assert!(v.radius_m > MAX_ASSERT_RADIUS_M && !v.stands, "{v:?}");
+    }
+
+    /// One aircraft flying the same leg twice, the same way at the same speed (a circuit), is one
+    /// track with two heard passes. The second pass fixes nothing along the track, as a second
+    /// aircraft on that line would not; each pass is checked from its own closest approach.
+    #[test]
+    fn a_lap_flown_twice_still_slides() {
+        let mut lap = scene_track([900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 300.0, -1500.0, 450.0);
+        // back south 40 km east, out of reach, then north along the same line again
+        for piece in [
+            scene_track(
+                [40_000.0, 0.0, 700.0],
+                [0.0, -233.0, 0.0],
+                500.0,
+                455.0,
+                545.0,
+            ),
+            scene_track([900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 700.0, 550.0, 3000.0),
+        ] {
+            lap.t.extend(piece.t);
+            lap.pos.extend(piece.pos);
+            lap.vel.extend(piece.vel);
+        }
+        lap.key = "LAP".into();
+        lap.icao = "LAP".into();
+        let c = scene_of(vec![lap], 10_000.0);
+        let r = run_case(&c, &params(), c.clock - 120.0, c.clock + 120.0);
+        let top = &r.modes[0];
+        let heard = top
+            .passes
+            .iter()
+            .filter(|q| q.nats >= HEARD_NATS && !q.shared)
+            .count();
+        assert!(heard >= 2 && top.n_heard >= 2, "{top:?}");
+        let far = far_aliases(&r, 5500.0);
+        assert!(far.iter().any(|&(_, gap)| gap <= TIED_NATS), "{far:?}");
+        let v = verdict(&r).unwrap();
+        assert!(v.radius_m > MAX_ASSERT_RADIUS_M && !v.stands, "{v:?}");
+    }
+
+    /// The same two tracks flown in opposite directions: moving the observer along them needs the
+    /// clock later for one and earlier for the other, so no twin along either survives.
+    #[test]
+    fn parallel_flights_opposite_ways_fix_the_place() {
+        let c = scene(
+            &[
+                ([900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 300.0),
+                ([-900.0, 0.0, 700.0], [0.0, -70.0, 0.0], 550.0),
+            ],
+            10_000.0,
+        );
+        let r = run_case(&c, &params(), c.clock - 120.0, c.clock + 120.0);
+        let top = &r.modes[0];
+        assert!(top.n_heard >= 2, "{top:?}");
+        let err = haversine_m(top.lat, top.lon, c.lat, c.lon);
+        assert!(err < 300.0, "error {err} m: {top:?}");
+        assert!(r.aliases.len() >= 12, "{} aliases", r.aliases.len());
+        let far = far_aliases(&r, 900.0);
+        assert!(far.iter().all(|&(_, gap)| gap > TIED_NATS), "{far:?}");
+        assert!(verdict(&r).unwrap().radius_m <= MAX_ASSERT_RADIUS_M);
     }
 
     /// The same three flights heard 2.8 to 4.6 km out, with the two silent ones still 3.2 and 6.1 km
@@ -2706,7 +2987,38 @@ mod tests {
             n_passes: 1,
             timings_s: vec![],
             probe: vec![],
+            aliases: vec![],
         }
+    }
+
+    /// An along-track alias counts toward the radius exactly as another mode does, and one that
+    /// scores better than the best place counts too.
+    #[test]
+    fn a_tied_alias_widens_the_radius_like_a_mode() {
+        let m = ASSERT_MARGIN_NATS;
+        let mut r = fake_result(m + 1.0, 48, None);
+        let mut alias = r.modes[0].clone();
+        alias.lat += 3.0 / 111.2;
+        alias.evidence -= 1.0;
+        r.aliases.push(alias.clone());
+        let v = verdict(&r).unwrap();
+        assert!(v.stands && (v.radius_m - 3000.0).abs() < 50.0, "{v:?}");
+        assert!(v.why.contains("(1 of 1 along their tracks)"), "{}", v.why);
+        // one tied 6 km off is wider than MAX_ASSERT_RADIUS_M: refused
+        alias.lat = r.modes[0].lat + 6.0 / 111.2;
+        r.aliases.push(alias.clone());
+        assert!(!verdict(&r).unwrap().stands);
+        // clearly worse, it does not count; better than the best, it does
+        r.aliases.truncate(1);
+        alias.evidence = r.modes[0].evidence - TIED_NATS - 0.5;
+        r.aliases.push(alias.clone());
+        let v = verdict(&r).unwrap();
+        assert!(v.stands && v.why.contains("(1 of 2 along"), "{v:?}");
+        r.aliases[1].evidence = r.modes[0].evidence + 2.0;
+        assert!(!verdict(&r).unwrap().stands);
+        // the margin and the best place never move
+        assert_eq!(verdict(&r).unwrap().margin, m + 1.0);
+        assert_eq!(verdict(&r).unwrap().lat, r.modes[0].lat);
     }
 
     /// Each condition can refuse on its own, and a place the evidence cannot rule

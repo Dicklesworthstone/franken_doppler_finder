@@ -376,7 +376,8 @@ in `crates/fdop-core/src/curvematch.rs`:
 - **When it stands.** At least two independently credited passes must be heard: each reaches the 6.9-nat
   heard line and retains positive value after the timing penalty and the shared-pixel check. The answer
   must also beat every decoy (margin over the best of them above 0), with at least 40 decoys, and every
-  place within 3 nats of it must lie within 5 km. Its radius is that spread, and at least
+  place within 3 nats of it must lie within 5 km. Those places are the other modes and the answer's twins
+  along the tracks of the flights it heard (next item). Its radius is that spread, and at least
   1 km, because its places are 1 km apart. Under exchangeable windows a place beats all 48 decoys by chance
   about 1 time in 49. On 42 runs with no right answer (six recordings at wrong dates and at places 90 km or more
   from the truth) none beat every decoy. The largest margin in those logged runs was −0.47, the Ithaca feeder's
@@ -385,6 +386,19 @@ in `crates/fdop-core/src/curvematch.rs`:
   heard range was profiled, −0.6 before each start's whole disc was searched, and −0.8 on the version the line
   was set on. Those runs share six
   recordings, so they are not 42 independent trials.
+- **Twins along a track.** One heard flight fixes when its closest approach was heard, not where along its
+  track the recorder stood. Move the place `s` metres along the track and the clock `s / v` later, and that
+  flight's curve does not move (exactly, for a straight, level, steady flight). A second heard flight with a
+  different velocity breaks the tie: a crossing track, or a parallel one flown the other way. One with the same
+  velocity does not: a parallel track flown the same way at the same speed, or the same leg flown again. The
+  search's modes are at least 1 km apart and few, so nothing made it look along that line. So the answer is
+  also scored every 1 km out to 6 km either way along each heard flight's track, with the clock moved to match,
+  wherever the place is in the region and the clock in the window. A twin within 3 nats of the answer, or
+  better, counts toward the radius as a mode does. It changes no evidence, margin or decoy, so it can only widen
+  the radius, and a radius past 5 km removes the stand. Where the answer still stands with a wider radius, a low
+  trace answer inside it keeps its own place (confirmed, medium) instead of taking the curve match's (adopted,
+  medium). A stand it removes no longer conflicts with the trace answer either. The verdict line says how many
+  twins tied, and `curvematch.json` lists them under `aliases`.
 - **When it runs.** Only when the recording clock is known to 30 min or better and the region holds at most
   200,000 cells (about 8,000 km²); otherwise it is skipped with a log line. A state-wide search with no start
   therefore uses the trace search alone. It fetches its own wider ADS-B span, and the trace search's tracks are
@@ -645,7 +659,7 @@ Each `locate` run writes a directory:
 | `survey.png` | Whole-file log-frequency spectrogram with detections and traces marked |
 | `e<N>.png`, `e<N>_trace.csv` | Per-event spectrogram with the fitted curve, and the traced points |
 | `e<N>_match.png` | Each winning event's trace against the ADS-B prediction |
-| `curvematch.json` | The curve match, when it ran: its places with every pass's evidence, each decoy window's best place and score, the margin over the best decoy and its rank p |
+| `curvematch.json` | The curve match, when it ran: its places with every pass's evidence, the best place's twins along the heard flights' tracks (`aliases`), each decoy window's best place and score, the margin over the best decoy and its rank p |
 | `detections.json`, `events.json`, `search.json` | Intermediate results. `search.json` keeps the best 10,000 candidates, and `candidates_total` counts them all |
 
 ---
