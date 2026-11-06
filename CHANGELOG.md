@@ -19,6 +19,50 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep a steep ridge traced after the guided band narrows
+
+- **The fault.** Frames steeper than the 0.5 s main window holds are read from a shorter window. Their noise
+  reference was twice the ridge's half-width (half a Hann main lobe, 2 / win, plus half the chirp smear). A real
+  tone's skirts are wider than a pure tone's. Once the rounds had narrowed the band to a few fit-RMS, the skirts
+  filled the reference and a ridge standing 8-14 dB up read a robust z of 1.9-2.9, under the line of 4. On set D's
+  N394FX_R20 (135 m/s at 1758 m), a first round started from a curve within 5 % of the pass traced 3.6-54 s and
+  passed every gate (128.4 m/s, 1610 m); the second round, at a 2.5 Hz band, lost every approach frame, and the
+  third ended one-sided at 89 m/s. Doubling the reference raised those frames' z to 3.7-11.
+- **The change.** The steep frames' reference is four times the ridge's half-width, as the main window's already
+  is (`4 x peak_band`). The band, the SNR and z lines and the main window are unchanged.
+- **Evidence.** A new test traces passes whose tone scintillates (amplitude noise low-passed at about 4 Hz, 60 %
+  deep) and wanders (1 Hz RMS) at bands of 12, 2.5 and 1 Hz. With the old reference 70 % and 54 % of the steep
+  frames were traced at 2.5 and 1 Hz; with the new one 97-100 % at every band. Replays of the falsifier-2 nulls,
+  the development rows and set D on this code are recorded in the next entry that reports them.
+- **Also in this code.** `measure_with_fit` is split into `guided_rounds` (trace, fit, narrow the band) and
+  `gate` (the quality gates), with the same arithmetic and order. An experimental second start for refused fits
+  (a free ridge trace from the refused trace's points) was committed with it by an automatic commit of a working
+  tree and is removed here: on set D it rescued no missed pass, and two of the five events it turned into accepted
+  ones were wrong (N4004R_R19 at 55 m/s and 539 m for 82 m/s and 1427 m; N61NG_R37 at 141 m/s and 5211 m for
+  102 m/s and 2786 m). A temporary diagnostic test committed the same way is removed too.
+
+### Score a compressed survey image at the spread its detection lines were set at
+
+- **The fault.** A recording that is loud mostly while one pass goes over (a short clip, a livestream near
+  traffic) inflates every row's MAD with that swell. Noise and ridge shrink together, so the survey image's robust
+  spread (1.4826 x MAD over every cell) falls to 0.18-0.4 on set D's 40 Livermore clips, where the development
+  and null recordings sit at 0.567-0.776. The fixed detection lines (3.5 and 4.5) then ask several times more of
+  the image.
+- **The change.** `survey()` measures the image's spread. Under `DetectParams::min_image_scale` (0.5) the image is
+  multiplied up to it, at most `MAX_IMAGE_GAIN` (4) times, and clamped again to [-3, 8]. At or above 0.5 the image
+  is left exactly as it is. `locate` warns when it raises an image and the detection log line gives the spread;
+  `detect` prints the warning on stderr.
+- **Evidence.** A metamorphic test (an image above the floor is unchanged bit for bit; below it, the unscaled image
+  times floor / spread, clamped) and a known-answer test (a pass inside a 25 dB swell, spread 0.241, scores under
+  the silence line without the floor; with it, gain 2.08, it is detected and measured with the right speed,
+  distance and CPA, and its reversal and the swell alone give nothing that passes the gates). Set D, `fdop detect`
+  on the 40 clips, read with `bench` `tools/score_d.py`: 34 found on `981fad1` (`runs/setd_981fad1`), 36 on
+  `d9dfc88` (`runs/setd_d9dfc88`; N373DF_R06 at 90.5 m/s and 934 m for 91.6 m/s and 941 m, N451EE_R51 at
+  100.7 m/s and 690 m for 84.7 m/s and 704 m). First event right 33 and 34; median errors 4.9 m/s on both,
+  247.5 m and 235.4 m.
+  Every falsifier-2 null and development recording replayed so far on `d9dfc88` logged a spread of 0.567 or more,
+  so their survey, detection and everything after it are as before this change.
+
 ### Keep sparse flight segments that cross a requested data window
 
 - **The fault.** Archive ingestion and cached-track slicing required a reported ADS-B point inside both the

@@ -210,7 +210,8 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
 ```text
  media file ──ffprobe/ffmpeg──► mono f32 @ 4 kHz
       │
-      ▼  detect   1 s STFT, 35–1100 Hz ─► 48 bins/octave robust z-map ─► matched-filter bank of
+      ▼  detect   1 s STFT, 35–1100 Hz ─► 48 bins/octave robust z-map (raised to a robust spread of
+      │           0.5, at most ×4, when one loud pass compressed it) ─► matched-filter bank of
       │           emission-time templates over speed (40–175 m/s) × CPA distance (250 m–12 km);
       │           both halves of a pass must light up, so steady hum and clicks are rejected
       ▼  measure  per event: STFT window ≈ 1/√(slope at the CPA), at least 0.5 s, with a matched shorter
@@ -576,8 +577,8 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 Detects flyovers and measures them strongest first, from the silence line up, until 24 independent aircraft
 events survive the same eligibility and harmonic checks used by `locate`. Refused fits, non-aircraft fits and
 duplicate traces of one pass do not consume that allowance. Every measured result remains in `events.json`,
-including duplicates and refusals. A warning on stderr says when either cap omits candidates or the audio
-looks high-passed. The command writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv` for
+including duplicates and refusals. A warning on stderr says when either cap omits candidates, when the audio
+looks high-passed, or when the survey image was raised because its spread was under 0.5. The command writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv` for
 every fitted event. The default output directory is `fdop_runs/detect`.
 
 `--audio-stream N` and `--audio-channel N` select the same source as in `locate`. For example,
@@ -775,6 +776,10 @@ Design notes:
 - **Detection is a template bank, not peak picking.** On a log-frequency axis, changing `f0` only shifts a
   curve vertically, so one template per (speed, distance) scans every (time, pitch). Scoring takes the
   *minimum* of the approach and recede halves, which rejects flat tones and one-sided transients.
+- **A compressed survey image is scored at the spread its lines were set at.** A recording loud mostly while
+  one pass goes over inflates every row's MAD, so noise and ridge shrink together and the image's robust spread
+  falls (0.18–0.4 on short Livermore clips, against 0.57–0.78 on the development and null recordings). Under
+  0.5 the image is multiplied up to 0.5, at most ×4, and clamped again; at or above it nothing changes.
 - **The search is flight-centric.** It does not grid the whole region. For each event and each flight, every
   moment of the flight is a candidate CPA: the recorder then sits on the perpendicular to the path through that
   point, at a distance that fits the measured CPA distance, and the moment fixes the recording start. A hash join
@@ -810,7 +815,9 @@ Design notes:
 - **Steep passes get a matched window.** A 0.5 s main window stops holding a chirp at 1/win² = 4 Hz/s. Frames
   steeper than that read a second spectrogram, with the window that matches the latest fit's chirp. There the
   peak integrates along the model's curve, the band is at least 0.25 s of chirp to allow for detection's error,
-  and the noise reference clears the chirp's own smear.
+  and the noise reference spans four times the ridge's half-width (half a main lobe plus half the chirp's smear),
+  as the main window's does. A real tone's skirts are wider than a pure tone's; at twice, they filled the
+  reference once the band narrowed, and later rounds dropped steep frames whose ridge stood 8–14 dB up.
 - **A fit needs a ridge through its drop.** Two steady tones at different pitches fit a Doppler curve with nothing
   between them, at an excellent RMS. `drop_traversed` in `events.json` is the share of the central 10–90 % of the
   fitted drop that the trace travels: each continuous stretch adds its net fall, and a stretch ends at a time gap
