@@ -19,6 +19,62 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Trace a one-sided refusal once more without the model
+
+- **The fault.** A detection whose template has the wrong shape meets the pass's ridge over one stretch and
+  leaves it elsewhere by more than the guided band. The trace then holds one side of the pass and the gates
+  refuse the fit, though the trace does lie on the ridge where the curve met it. On set D's N394FX_R20 (135 m/s
+  at 1758 m) the bank's best template sat at its top speed, about 175 m/s at 3650 m; the guided trace held 86 s
+  of approach and no recede, and its fit drifted to 326 m/s at 137 km.
+- **The change.** When the gates refuse a fit whose trace covers less than `min_side_s` (8 s) on either side,
+  `ridge_trace` (strongest-peak rule, 1.5 s integration) follows the ridge by its own slope from the refused
+  trace's first, strongest and last points, inside the event's analysis window. The free trace is fitted on both
+  sides. If that fit is plausible (15 m/s to 0.8 c, 60 m to 25 km), the guided rounds start again from it. The
+  second attempt replaces the first only if every gate accepts it; `EventQuality::reseeded` (`reseeded` in
+  `events.json`) marks it. Accepted fits, refusals whose trace held both sides, and traces too short to fit are
+  measured exactly as before. `MeasureParams::free_reseed` (on by default) turns it off. This is the restricted
+  form of the second start removed in the entry below: that one also retried two-sided refusals, and two of the
+  five events it turned into accepted ones were wrong.
+- **Evidence.** A new test measures three passes from detections of the wrong shape: a clean tone and two
+  scintillating ones, detected 7 and 14 s off with speed 25-34 % and distance 80-107 % too high. Each first
+  attempt is refused one-sided. Each retry is accepted within 0.5 % of f0, 3 % of v, 5 % of d and 0.5 s of the
+  CPA: 367.00 Hz, 135.00 m/s, 1758.0 m; 249.97 Hz, 110.05 m/s, 900.3 m; 300.04 Hz, 90.06 m/s, 1200.4 m. From a
+  detection of the right shape, the event is the same with and without the retry. The reversed audio, a steady
+  tone and noise give nothing accepted or reseeded, and a two-sided refusal is left as it was.
+- **Set D** (`fdop detect` on the 40 Livermore clips, read with `bench` `tools/score_d.py`; local runs of the
+  bench-built binaries). On `44ff60a`: 36 found, 34 first event right, medians 4.9 m/s and 212.2 m. With the
+  retry: 37 found, 35 first event right, 5.5 m/s and 198.2 m. Right at 10/20, 15/30, 20/40, 25/50 and 30/60 % of
+  speed and distance:
+
+  | Tool | Found | Right at the five tolerances |
+  |---|---|---|
+  | fdop `44ff60a` | 36 | 21 / 28 / 29 / 31 / 34 |
+  | fdop with the retry | 37 | 22 / 29 / 30 / 32 / 35 |
+  | dopplerprint | 39 | 13 / 19 / 21 / 24 / 26 |
+  | dopplertrack 60-300 Hz | 37 | 17 / 23 / 27 / 29 / 35 |
+  | dopplertrack 40-450 Hz | 38 | 19 / 23 / 26 / 30 / 36 |
+
+  The retry changed three events, each a one-sided refusal now accepted:
+  - N394FX_R20 at 128.0 m/s and 1599 m: right.
+  - N8085W_R27's second event at 71.8 m/s and 1689 m, for 67.2 m/s and 1490 m: right.
+  - N61NG_R37 at 141.4 m/s and 5211 m, for 102.2 m/s and 2786 m: wrong. Its ranges (128-159 m/s,
+    4136-6878 m) miss the truth. The pass climbs through a clip that starts mid-drop, so speed and distance
+    trade along v²/d: all four tools give 3.8-4.1 against the truth's 3.73. Its refused fit was wrong too
+    (56 m/s, 689 m), and `score_d.py` counts refused fits.
+
+  fdop still finds fewer passes than dopplerprint and the wide dopplertrack. Its three misses are 41-47 s clips
+  in which no detection reaches the silence line: N1387U_R44 (33 m/s at 421 m), N451EE_R45 (64 m/s at 695 m; its
+  ridge crosses f0 about 14 s into the clip, and a 24 s template half needs 16 s on each side) and N958JX_R50
+  (215 m/s at 5 km, past the bank's 175 m/s; no tool gets it right).
+- **Falsifier 2 and the development rows.** `locate` measures exactly as `detect` does: c = 343 m/s and default
+  parameters, before any date or place is read. On ref_raw and osprey_1031 a locate run's events and `detect`'s
+  are identical. The 33 nulls, the 15 development rows and the reference's wrong dates use six recordings. On all
+  six, `detect` gives the same events with and without the retry (47-60 events each, none reseeded). A full
+  `locate` of the reference row (`a_ref`) with the retry matches `44ff60a`'s in every field but wall-clock
+  timings: the same high answer and radius (402 m), gates, log lines, `search.json`, `candidates.csv` and curve
+  match. So no null or development answer can differ from `44ff60a`'s. Those replays are reported in the next
+  entry that reports them.
+
 ### Keep a steep ridge traced after the guided band narrows
 
 - **The fault.** Frames steeper than the 0.5 s main window holds are read from a shorter window. Their noise

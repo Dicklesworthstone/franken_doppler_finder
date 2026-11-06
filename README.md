@@ -218,7 +218,8 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
       │           window for frames steeper than that holds; model-guided ridge trace, bounded
       │           trust-region fit with multistarts and robust loss, profile-likelihood ranges,
       │           manoeuvre / side-disagreement / structured-residual warnings that widen the ranges;
-      │           a fit with no ridge through its frequency drop is refused
+      │           a fit with no ridge through its frequency drop is refused; a fit refused because its
+      │           trace held one side of the pass is traced once more without the model
       ▼
  events (f0, v, d, t0r, each with a "generous" range)
       │
@@ -823,6 +824,15 @@ Design notes:
   fitted drop that the trace travels: each continuous stretch adds its net fall, and a stretch ends at a time gap
   or where the trace steps more than 2 Hz off the model's own step. Under 15 % the event is refused. It still
   counts as heard, but it does not use an independent-event slot.
+- **A one-sided refusal is traced once more, without the model.** A template of the wrong shape (at the edge
+  of the bank, or with speed and distance wrong together) meets the ridge over one stretch and leaves the band
+  elsewhere, so the guided trace holds one side of the pass and the gates refuse the fit. When a fit is refused
+  and its trace covers less than 8 s on either side, the ridge is followed by its own slope from that trace's
+  first, strongest and last points, inside the event's analysis window. The free trace is fitted, and the guided
+  rounds start again from that fit if it is plausible. The second attempt replaces the first only if every gate
+  accepts it; `reseeded` in `events.json` marks it. Accepted fits, and refusals whose trace held both sides, are
+  measured exactly as before. A wrong fit can pass this way too: a climbing pass in a clip that starts mid-drop
+  trades speed against distance, and the retry accepts the wrong pair.
 - **Measurement slots belong to independent aircraft events.** The same measured-curve comparison used by
   the search groups duplicate seeds and harmonics before deciding whether the 24-event allowance is full.
   Fits below the existing aircraft limits (28 m/s or 200 m closest distance) do not fill it either. Later
