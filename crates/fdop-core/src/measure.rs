@@ -298,10 +298,14 @@ fn guided_trace_with_background(
                         // A fit made without these frames can be off here, by a time error that
                         // this slope turns into frequency.
                         let band = band.max(STEEP_TIME_ERROR_S * chirp);
-                        // Twice the ridge's half-width, so most of the reference is not ridge: half
-                        // a Hann main lobe (2 / win) plus half the smear within a window.
+                        // Four times the ridge's half-width (half a Hann main lobe, 2 / win, plus
+                        // half the smear within a window), as the main window's reference, so most
+                        // of the reference is not ridge. A real tone's skirts are wider than a pure
+                        // tone's: at twice, once the band had narrowed to a few fit-RMS they filled
+                        // the reference, and a ridge 8-14 dB up read a robust z under 3.
                         let win = short.meta.win_s;
-                        let reference = (4.0 * band).max(noise_band).max(4.0 / win + chirp * win);
+                        let half_width = 2.0 / win + 0.5 * chirp * win;
+                        let reference = (4.0 * band).max(noise_band).max(4.0 * half_width);
                         let along = |tk: f64| model(tk) - fp;
                         let j = short.frame_index(t);
                         let peak = guided_ridge_peak(
@@ -1989,5 +1993,298 @@ mod tests {
                 assert!(!ev.quality.ok && !ev.quality.reseeded, "{label} {what}");
             }
         }
+    }
+
+    /// `dur` s at 4 kHz of a pass's tone with the skirts of a real one, in uniform noise of
+    /// amplitude 0.3: its amplitude scintillates (noise low-passed at about 4 Hz, 60 % deep) and its
+    /// frequency wanders (1 Hz RMS, 0.1 s correlation time).
+    fn scintillating_pass(f0: f64, v: f64, d: f64, t0r: f64, dur: f64, amp: f64) -> Vec<f32> {
+        let sr = 4000.0;
+        let tone = model_fn(f0, v, d, t0r, 343.0);
+        let mut seed = 77u64;
+        let mut uniform = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            2.0 * seed as f64 / u64::MAX as f64 - 1.0
+        };
+        let (a_am, a_fm) = (
+            (-std::f64::consts::TAU * 4.0 / sr).exp(),
+            (-1.0 / (0.1 * sr)).exp(),
+        );
+        // Uniform noise has variance 1/3: these gains give the AR(1) processes unit variance.
+        let unit = |a: f64| (3.0 * (1.0 - a * a)).sqrt();
+        let (mut am, mut fm, mut phase) = (0.0f64, 0.0f64, 0.0f64);
+        (0..(sr * dur) as usize)
+            .map(|i| {
+                am = a_am * am + unit(a_am) * uniform();
+                fm = a_fm * fm + unit(a_fm) * uniform();
+                phase += std::f64::consts::TAU * (tone(i as f64 / sr) + fm) / sr;
+                let signal = amp * (1.0 + 0.6 * am).max(0.0) * phase.sin();
+                (signal + 0.3 * uniform()) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_steep_ridge_with_real_skirts_stays_traced_once_the_band_narrows() {
+        // Set D's N394FX_R20 (135 m/s at 1758 m, about 10 Hz/s at the CPA): from a fit within 5 %
+        // of the pass, the first round traced both sides; the next, at 3 x its 0.83 Hz RMS, lost
+        // every steep approach frame although their peaks stood 8-14 dB up within 2 Hz of the
+        // curve, because the ridge's skirts filled a noise reference of twice its half-width.
+        let (sr, c, hop, df) = (4000u32, 343.0, 0.1, 0.25);
+        let (dur, t0r) = (120.0, 60.0);
+        for (f0, v, d) in [(355.0, 130.0, 1700.0), (250.0, 110.0, 900.0)] {
+            let x = scintillating_pass(f0, v, d, t0r, dur, 0.15);
+            let model = model_fn(f0, v, d, t0r, c);
+            let r = readouts(f0, v, d, c);
+            let (fmin, fmax) = (r.f_post * 0.9, r.f_pre * 1.1);
+            let mut main = stft_band_db(&x, sr, MIN_MAIN_WIN_S, hop, fmin, fmax, df, 0.0).unwrap();
+            main.normalize_rows_with_offsets(None);
+            let steep_win = window_for_roc(r.max_roc);
+            assert!(steep_win < MIN_MAIN_WIN_S);
+            let mut short = stft_band_db(&x, sr, steep_win, hop, fmin, fmax, df, 0.0).unwrap();
+            short.normalize_rows_with_offsets(None);
+            let held = 1.0 / (MIN_MAIN_WIN_S * MIN_MAIN_WIN_S);
+            let steep_frames: Vec<f64> = main
+                .t
+                .iter()
+                .copied()
+                .filter(|&t| (model(t + 0.125) - model(t - 0.125)).abs() / 0.25 > held)
+                .collect();
+            assert!(steep_frames.len() > 50, "{}", steep_frames.len());
+            let p = MeasureParams::default();
+            for band in [12.0, 2.5, 1.0] {
+                let tr = guided_trace(
+                    &main,
+                    Some(&short),
+                    &model,
+                    0.0,
+                    dur,
+                    band,
+                    p.min_snr,
+                    p.min_z,
+                );
+                let traced = steep_frames
+                    .iter()
+                    .filter(|&&t| tr.t.iter().any(|&u| (u - t).abs() < 0.5 * hop))
+                    .count();
+                let share = traced as f64 / steep_frames.len() as f64;
+                eprintln!(
+                    "pass {f0} Hz {v} m/s {d} m, band {band} Hz: {traced} of {} steep frames traced ({share:.2})",
+                    steep_frames.len()
+                );
+                assert!(share >= 0.7, "pass {f0} {v} {d} band {band}: {share:.2}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn diag_reseed_on_a_real_clip() {
+        let path = std::env::var("FDOP_DIAG_WAV").unwrap();
+        let v: Vec<f64> = std::env::var("FDOP_DIAG_DET")
+            .unwrap()
+            .split(',')
+            .map(|x| x.parse().unwrap())
+            .collect();
+        let det = Detection {
+            id: 0,
+            t0r: v[0],
+            f0: v[1],
+            v: v[2],
+            d: v[3],
+            score: 8.0,
+            score_approach: 8.0,
+            score_recede: 8.0,
+            half_s: 60.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+        };
+        let sr = 4000u32;
+        let x = crate::audio::decode(std::path::Path::new(&path), 0.0, None, sr).unwrap();
+        let p = MeasureParams::default();
+        let c = p.c;
+        let dur = x.len() as f64 / sr as f64;
+        let tau = det.d / det.v.max(10.0);
+        let span = (4.0 * tau).clamp(45.0, 300.0);
+        let (ta, tb) = ((det.t0r - span).max(0.0), (det.t0r + span).min(dur));
+        let v_hi = (det.v * 1.4).min(0.8 * c);
+        let fmin = (det.f0 * c / (c + v_hi) * 0.93 - 3.0).max(15.0);
+        let fmax = (det.f0 * c / (c - v_hi) * 1.07 + 3.0).min(sr as f64 * 0.45);
+        let roc = det.f0 * det.v * det.v / (c * det.d.max(50.0));
+        let win = window_for_roc(roc).clamp(MIN_MAIN_WIN_S, 2.0);
+        let (ca, cb) = ((ta - p.context_s).max(0.0), (tb + p.context_s).min(dur));
+        let s0 = (ca * sr as f64) as usize;
+        let s1 = ((cb * sr as f64) as usize).min(x.len());
+        let mut spec =
+            stft_band_db(&x[s0..s1], sr, win, p.hop_s, fmin, fmax, p.df_max, ca).unwrap();
+        let background = spec.normalize_rows_with_offsets(None);
+        let fr = Frames {
+            x: &x,
+            sr,
+            s0,
+            s1,
+            ca,
+            fmin,
+            fmax,
+            spec: &spec,
+            background: &background,
+            ta,
+            tb,
+        };
+        let mut fit = prepare_constant_velocity;
+        let first = guided_rounds(
+            &fr,
+            (det.f0, det.v, det.d, det.t0r),
+            (0.04 * det.f0).clamp(3.0, 12.0),
+            roc,
+            &p,
+            &mut fit,
+        );
+        let show = |name: &str, g: &Guided| {
+            let b = g.prepared.as_ref().map(|f| f.best());
+            let gated = b.map(|b| gate(&g.trace, &b, det.t0r, span, &p).reasons);
+            eprintln!(
+                "{name}: trace {} pts t {:?}..{:?} reasons {:?} best {:?} gates {:?}",
+                g.trace.len(),
+                g.trace.t.first(),
+                g.trace.t.last(),
+                g.reasons,
+                b.map(|b| (b.f0, b.v, b.d, b.t0r, b.rmse)),
+                gated
+            );
+        };
+        show("first", &first);
+        let n = first.trace.len();
+        let strongest = (0..n)
+            .max_by(|&i, &j| first.trace.snr[i].total_cmp(&first.trace.snr[j]))
+            .unwrap();
+        let seeds = [
+            (first.trace.t[0], first.trace.f[0]),
+            (first.trace.t[strongest], first.trace.f[strongest]),
+            (first.trace.t[n - 1], first.trace.f[n - 1]),
+        ];
+        eprintln!("seeds {seeds:?}");
+        let (a, b) = (spec.frame_index(ta), spec.frame_index(tb) + 1);
+        let window = spec.crop(a, b, 0, spec.nf());
+        for integ in [1.5, 3.0] {
+            let free = ridge_trace(
+                &window,
+                &seeds,
+                &TraceParams {
+                    min_snr: p.min_snr,
+                    min_z: p.min_z,
+                    integ_s: integ,
+                    ..Default::default()
+                },
+            );
+            eprintln!("free trace integ {integ}: {} pts", free.len());
+            for k in (0..free.len()).step_by(10) {
+                eprintln!("  {:.2} {:.1} {:.1}", free.t[k], free.f[k], free.snr[k]);
+            }
+            if let Ok(f) = prepare_constant_velocity(&free.t, &free.f, c, Side::Both) {
+                let b = f.best();
+                eprintln!("  free fit {:?}", (b.f0, b.v, b.d, b.t0r, b.rmse));
+            }
+        }
+        // Guided rounds one at a time from a given curve, with and without the steep spectrogram.
+        let start = std::env::var("FDOP_DIAG_START").ok().map(|s| {
+            let v: Vec<f64> = s.split(',').map(|x| x.parse().unwrap()).collect();
+            (v[0], v[1], v[2], v[3])
+        });
+        if let Some(start) = start {
+            for rounds in 1..=3 {
+                let q = MeasureParams {
+                    rounds,
+                    ..MeasureParams::default()
+                };
+                let roc = readouts(start.0, start.1, start.2, c).max_roc;
+                let g = guided_rounds(
+                    &fr,
+                    start,
+                    (0.04 * start.0).clamp(3.0, 12.0),
+                    roc,
+                    &q,
+                    &mut fit,
+                );
+                show(&format!("from start, {rounds} rounds"), &g);
+                let mut hist = [0usize; 12];
+                for &t in &g.trace.t {
+                    hist[((t / 5.0) as usize).min(11)] += 1;
+                }
+                eprintln!("   points per 5 s: {hist:?}");
+            }
+            // the steep spectrogram's own view at a few approach frames
+            let b = start;
+            let model = model_fn(b.0, b.1, b.2, b.3, c);
+            let roc = readouts(b.0, b.1, b.2, c).max_roc;
+            let steep_win = window_for_roc(roc);
+            let mut short =
+                stft_band_db(&x[s0..s1], sr, steep_win, p.hop_s, fmin, fmax, p.df_max, ca).unwrap();
+            let sb = short.normalize_rows_with_offsets(None);
+            eprintln!(
+                "steep win {steep_win:.3} roc {roc:.2} held {:.2}",
+                1.0 / (win * win)
+            );
+            let round_band: f64 = std::env::var("FDOP_DIAG_BAND")
+                .ok()
+                .map_or(12.0, |b| b.parse().unwrap());
+            let ref_mult: f64 = std::env::var("FDOP_DIAG_REFMULT")
+                .ok()
+                .map_or(1.0, |b| b.parse().unwrap());
+            eprintln!("round band {round_band} ref mult {ref_mult}");
+            for t in [6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0] {
+                let fp = model(t);
+                let chirp = (model(t + 0.125) - model(t - 0.125)).abs() / 0.25;
+                let band = round_band.max(STEEP_TIME_ERROR_S * chirp);
+                let w = short.meta.win_s;
+                let noise_band = (4.0 * round_band).max(8.0);
+                let reference = (4.0 * band)
+                    .max(noise_band)
+                    .max(ref_mult * (4.0 / w + chirp * w));
+                let along = |tk: f64| model(tk) - fp;
+                let j = short.frame_index(t);
+                let half = ((1.5 / short.dt()).round() as usize).max(1);
+                let pk = crate::trace::guided_ridge_peak(
+                    &short,
+                    j,
+                    fp,
+                    along,
+                    band,
+                    reference,
+                    half,
+                    0.0,
+                    0.0,
+                    Some(&sb),
+                );
+                let pk_main = crate::trace::guided_ridge_peak(
+                    &spec,
+                    spec.frame_index(t),
+                    fp,
+                    along,
+                    band,
+                    reference,
+                    half,
+                    0.0,
+                    0.0,
+                    Some(&background),
+                );
+                eprintln!(
+                    "  t {t}: model {fp:.1} chirp {chirp:.1} band {band:.1} ref {reference:.1}: steep peak {pk:?} main peak {pk_main:?}"
+                );
+            }
+        }
+        let second = reseeded_rounds(&fr, &first.trace, &p, &mut fit);
+        if let Some(g) = &second {
+            show("second", g);
+        } else {
+            eprintln!("second: none");
+        }
+        let ev = measure(&x, sr, &det, "e1", &p);
+        eprintln!(
+            "measure: ok {} reseeded {} {:?}",
+            ev.quality.ok, ev.quality.reseeded, ev.quality.reasons
+        );
     }
 }
