@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve alternative recording clocks for repeating flight pairs
+
+- **The fault.** The pair join retained 20 s clock cells, but the quick-to-fine merge then keyed survivors
+  only by the event/flight pair and 1 km spatial cell. Two aircraft repeating their routes could agree at
+  two different recording times, yet only one time reached fine scoring and the later confirming events.
+- **The change.** The merge retains the join's clock-cell identity, with deterministic ordering of equal
+  quick scores. It still merges duplicate seeds inside the same place/clock cell and scores each flight
+  pair's best cell before its next. The existing budgets, truncation warnings, gates and definition of a
+  different location explanation are unchanged.
+- **Regressions.** A focused merge test covers clock-bin boundaries, duplicate seeds, equal-score ordering,
+  invalid clocks and the per-pair ranking order. A full synthetic search test gives two aircraft identical
+  repeated circuits and a third flyover that can only confirm the later clock; it requires both alternatives
+  to survive and the three-event later explanation to win. These are synthetic checks, not field accuracy
+  evidence. Validation results are recorded with this change's commit.
+
 ### Keep curve-only recovery inside a usable recording-clock hint
 
 - **The fault.** When the trace search found no candidate in a metadata-derived clock window, `locate` widened

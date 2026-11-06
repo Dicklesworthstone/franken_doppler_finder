@@ -565,10 +565,17 @@ fn hypotheses(
 
 /// (event i, event j, track i, track j): one flight pair.
 type PairKey = (usize, usize, u32, u32);
-/// A flight pair in one 1 km cell.
-type CellKey = (usize, usize, u32, u32, i32, i32);
+/// A flight pair in one 1 km spatial cell and one recording-clock cell.
+type CellKey = (usize, usize, u32, u32, i32, i32, i64);
+/// Clock resolution already retained by the pair join; later merging must not erase it.
+const CLOCK_CELL_S: f64 = 20.0;
 /// Minimum emission-CPA separation between events assigned to the same flight.
 const SAME_FLIGHT_MIN_DT_S: f64 = 30.0;
+
+fn clock_cell(t_s: f64) -> Option<i64> {
+    let cell = (t_s / CLOCK_CELL_S).floor();
+    (cell.is_finite() && cell >= i64::MIN as f64 && cell < i64::MAX as f64).then_some(cell as i64)
+}
 
 #[derive(Clone, Copy, Debug)]
 struct Joined {
@@ -650,15 +657,75 @@ fn join(
         std::collections::HashSet::new();
     out.into_iter()
         .filter(|j| {
+            let Some(clock) = clock_cell(j.t_s) else {
+                return false;
+            };
             seen.insert((
                 j.ti,
                 j.tj,
                 (j.e / 600.0).floor() as i32,
                 (j.n / 600.0).floor() as i32,
-                (j.t_s / 20.0).floor() as i64,
+                clock,
             ))
         })
         .collect()
+}
+
+/// Merge duplicate place/clock seeds and rank every flight pair's best cell before its next.
+fn ranked_fine_seeds(quick: Vec<(Joined, f64)>) -> Vec<(Joined, f64)> {
+    // Hash-map iteration and exact score ties must not choose which clock or seed survives.
+    let compare = |a: &(Joined, f64), b: &(Joined, f64)| {
+        b.1.total_cmp(&a.1).then_with(|| {
+            let (a, b) = (&a.0, &b.0);
+            (a.ei, a.ej, a.ti, a.tj)
+                .cmp(&(b.ei, b.ej, b.ti, b.tj))
+                .then(a.t_s.total_cmp(&b.t_s))
+                .then(a.e.total_cmp(&b.e))
+                .then(a.n.total_cmp(&b.n))
+                .then(a.te_i.total_cmp(&b.te_i))
+                .then(a.te_j.total_cmp(&b.te_j))
+        })
+    };
+    let mut best_by: HashMap<CellKey, (Joined, f64)> = HashMap::new();
+    for (j, s) in quick {
+        let Some(clock) = clock_cell(j.t_s) else {
+            continue;
+        };
+        let k = (
+            j.ei,
+            j.ej,
+            j.ti,
+            j.tj,
+            (j.e / 1000.0).floor() as i32,
+            (j.n / 1000.0).floor() as i32,
+            clock,
+        );
+        match best_by.get(&k) {
+            Some(o) if !compare(&(j, s), o).is_lt() => {}
+            _ => {
+                best_by.insert(k, (j, s));
+            }
+        }
+    }
+    // Every flight pair's best cell is scored before any pair's second-best cell, so a budget
+    // cut cannot starve the true pair behind many cells of a few look-alike pairs.
+    let mut groups: HashMap<PairKey, Vec<(Joined, f64)>> = HashMap::new();
+    for (j, s) in best_by.into_values() {
+        groups
+            .entry((j.ei, j.ej, j.ti, j.tj))
+            .or_default()
+            .push((j, s));
+    }
+    let mut ranked: Vec<(usize, Joined, f64)> = Vec::new();
+    for (_, mut g) in groups {
+        g.sort_by(compare);
+        ranked.extend(g.into_iter().enumerate().map(|(r, (j, s))| (r, j, s)));
+    }
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| compare(&(a.1, a.2), &(b.1, b.2)))
+    });
+    ranked.into_iter().map(|(_, j, s)| (j, s)).collect()
 }
 
 /// Frequency-ratio curve f/f0 through the propagation medium on a uniform reception-time
@@ -1957,40 +2024,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
         .collect();
     funnel.quick_passed = quick.len();
     progress(&format!("quick check passed: {}", quick.len()));
-    // merge quick survivors that are the same (flights, place) and keep the best few thousand
-    let mut best_by: HashMap<CellKey, (Joined, f64)> = HashMap::new();
-    for (j, s) in quick {
-        let k = (
-            j.ei,
-            j.ej,
-            j.ti,
-            j.tj,
-            (j.e / 1000.0).floor() as i32,
-            (j.n / 1000.0).floor() as i32,
-        );
-        match best_by.get(&k) {
-            Some(o) if o.1 >= s => {}
-            _ => {
-                best_by.insert(k, (j, s));
-            }
-        }
-    }
-    // every flight pair's best cell is scored before any pair's second-best cell, so a budget
-    // cut cannot starve the true pair behind many cells of a few look-alike pairs
-    let mut groups: HashMap<PairKey, Vec<(Joined, f64)>> = HashMap::new();
-    for (j, s) in best_by.into_values() {
-        groups
-            .entry((j.ei, j.ej, j.ti, j.tj))
-            .or_default()
-            .push((j, s));
-    }
-    let mut ranked: Vec<(usize, Joined, f64)> = Vec::new();
-    for (_, mut g) in groups {
-        g.sort_by(|a, b| b.1.total_cmp(&a.1));
-        ranked.extend(g.into_iter().enumerate().map(|(r, (j, s))| (r, j, s)));
-    }
-    ranked.sort_by(|a, b| a.0.cmp(&b.0).then(b.2.total_cmp(&a.2)));
-    let mut fine_in: Vec<(Joined, f64)> = ranked.into_iter().map(|(_, j, s)| (j, s)).collect();
+    let mut fine_in = ranked_fine_seeds(quick);
     if fine_in.len() > p.max_fine {
         funnel
             .truncated
@@ -4871,6 +4905,174 @@ mod tests {
             t_s,
             obs: (lat, lon),
         }
+    }
+
+    #[test]
+    fn fine_seeds_keep_clock_cells_and_merge_same_clock_duplicates_deterministically() {
+        // This Unix time lies exactly on a 20 s boundary. Fractional seconds on either
+        // side must keep the join's distinct clock cells when the spatial cells are merged.
+        let start = 1_788_895_000.0;
+        let seed = Joined {
+            ei: 0,
+            ej: 1,
+            ti: 0,
+            tj: 1,
+            te_i: start + 300.0,
+            te_j: start + 600.0,
+            e: 100.0,
+            n: 100.0,
+            t_s: start + 0.125,
+        };
+        let before = Joined {
+            t_s: start - 0.125,
+            ..seed
+        };
+        let later = Joined {
+            te_i: seed.te_i + 1200.0,
+            te_j: seed.te_j + 1200.0,
+            t_s: seed.t_s + 1200.0,
+            ..seed
+        };
+        let better = Joined { e: 150.0, ..seed };
+        let tied = Joined { e: 200.0, ..seed };
+        let other_pair = Joined { tj: 2, ..seed };
+        let mut input = vec![
+            (seed, 0.4),
+            (tied, 0.9),
+            (before, 0.5),
+            (later, 0.5),
+            (better, 0.9),
+            (other_pair, 0.1),
+        ];
+        let summarize = |seeds: Vec<(Joined, f64)>| {
+            seeds
+                .into_iter()
+                .map(|(j, s)| (j.tj, j.t_s, j.e, s))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (1, seed.t_s, better.e, 0.9),
+            // The other flight pair still gets its first cell before this pair's second.
+            (2, seed.t_s, seed.e, 0.1),
+            (1, before.t_s, seed.e, 0.5),
+            (1, later.t_s, seed.e, 0.5),
+        ];
+        assert_eq!(summarize(ranked_fine_seeds(input.clone())), expected);
+        input.reverse();
+        assert_eq!(summarize(ranked_fine_seeds(input.clone())), expected);
+        for t_s in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300] {
+            input.push((Joined { t_s, ..seed }, 1.0));
+        }
+        assert_eq!(summarize(ranked_fine_seeds(input)), expected);
+    }
+
+    #[test]
+    fn repeated_flight_pair_keeps_both_recording_clocks() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let (lat, lon) = (40.8765, -73.5250);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let t_s = 1_788_895_000.0;
+        let period = 1200.0;
+        let omega = std::f64::consts::TAU / period;
+        let prop = Prop::from_medium(&med, &enu);
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        for (key, radius, distance, altitude, cpa, rotate, f0) in [
+            ("northbound", 10_000.0, 1500.0, 900.0, 300.0, false, 112.7),
+            ("eastbound", 15_000.0, 2500.0, 1200.0, 600.0, true, 129.5),
+        ] {
+            let mut tr = straight_track(
+                &enu,
+                [distance, 0.0, altitude],
+                [0.0, radius * omega, 0.0],
+                t_s + cpa,
+                t_s,
+                t_s + period + 900.0,
+                5.0,
+            );
+            tr.key = key.into();
+            // Identical laps produce the same two curves at two possible recording clocks.
+            // Reduce the phase before sin/cos so the repeated track samples agree exactly.
+            for (i, &t) in tr.t.iter().enumerate() {
+                let (sin, cos) = (omega * (t - t_s - cpa).rem_euclid(period)).sin_cos();
+                let mut position = [distance + radius * (1.0 - cos), radius * sin, altitude];
+                let mut velocity = [radius * omega * sin, radius * omega * cos, 0.0];
+                if rotate {
+                    position.swap(0, 1);
+                    velocity.swap(0, 1);
+                }
+                tr.pos[i] = enu.to_ecef(position);
+                tr.vel[i] = enu.vec_to_ecef(velocity);
+            }
+            events.push(synth_event(key, &tr, x, t_s, f0, 343.0, t_s + cpa, &prop));
+            tracks.push(tr);
+        }
+        // Only the later clock has this third flyover. It may confirm the pair, but cannot
+        // rescue a lost clock by seeding its own pair: the two repeating events drive the join.
+        let mut confirmer = straight_track(
+            &enu,
+            [2000.0, -2000.0, 1200.0],
+            [70.0, 70.0, 0.0],
+            t_s + period + 800.0,
+            t_s + period + 600.0,
+            t_s + period + 1000.0,
+            5.0,
+        );
+        confirmer.key = "later-only".into();
+        let mut event = synth_event(
+            "later-only",
+            &confirmer,
+            x,
+            t_s + period,
+            160.0,
+            343.0,
+            t_s + period + 800.0,
+            &prop,
+        );
+        event.quality = 90.0;
+        events.push(event);
+        tracks.push(confirmer);
+        let region = BBox::new(lat - 0.006, lon - 0.008, lat + 0.006, lon + 0.008);
+        let mut p = SearchParams::new(t_s - 60.0, t_s + period + 60.0, 900.0, region);
+        p.max_events = 2;
+        p.refine_half_m = 100.0;
+        let case = TwoCase {
+            tracks,
+            events,
+            p,
+            t_s,
+            obs: (lat, lon),
+        };
+        let result = run_case(&case, med);
+        assert!(result.funnel.truncated.is_empty(), "{:?}", result.funnel);
+        assert!(result.funnel.hypotheses[2].1.is_none());
+        for start in [t_s, t_s + period] {
+            assert!(
+                result.candidates.iter().any(|candidate| {
+                    (candidate.t_start_utc - start).abs() < 3.0
+                        && haversine_m(candidate.lat, candidate.lon, lat, lon) < 150.0
+                        && candidate.events.len() >= 2
+                }),
+                "lost recording clock {start}, funnel {:?}: {:?}",
+                result.funnel,
+                result
+                    .candidates
+                    .iter()
+                    .map(|c| (c.t_start_utc - t_s, c.lat, c.lon))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let winner = result.candidates.first().unwrap();
+        assert!((winner.t_start_utc - (t_s + period)).abs() < 1.0);
+        assert_eq!(winner.events.len(), 3);
+        let matched = winner
+            .events
+            .iter()
+            .find(|m| m.event == "later-only")
+            .unwrap();
+        assert_eq!(matched.flight, "later-only");
+        assert_eq!(matched.role, "confirmer");
     }
 
     #[test]
