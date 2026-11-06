@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### A machine with more than 32 GiB runs the same search
+
+- **The fault.** The hypothesis budget grew with RAM, up to 2 G, and the budgets of the stages after it did not: 20 M
+  joined points, 2 M fine cells, 2 M confirmations. So a bigger machine built more hypotheses than those
+  stages could take, a comparison was cut, and a cut fails the margin gate. The three-day reference search on 256 GiB
+  (`r_md_gh`) passed 7,477,352 cells through the quick check to a 2 M fine stage, so the cut was certain and the grade could
+  be low at best. It had reached 1.1 M of the 2 M after 4.6 hours when it was paused, and it was stopped unfinished. On 32 GiB
+  (`r_md_gc`) the same search scored 102,247 cells and graded high. More memory gave a worse search, and a result could only
+  be repeated on a machine of the size that gave it.
+- **The change** (`crates/fdop-core/src/search.rs`). `MAX_HYP_TOTAL` caps the budget at what a 32 GiB machine gets, 172 M
+  hypotheses and 57 M per event, about 3.4 GB. Unknown memory uses the same cap, not 200 M. Below 32 GiB the budget is
+  unchanged. On 32 GiB nothing changes, so no registered build's row and no bench row is affected.
+- **Tests.** `budget_scales_with_memory_up_to_32_gib`: 32 GiB, a byte more, 33 GiB, 256 GiB, `u64::MAX` and unknown memory
+  all give the same budget, and 16 GiB and zero give what they did.
+- **Effect.** The reference recording's five configurations and both feeder runs were replayed with this change on
+  `main`'s tip on a 256 GiB machine (`*_cp`). Each equals its 32 GiB row (`*_gc`, AGENTS reference case) in every field
+  but the paths in its log. `r_md_cp` is high, radius 388 m, margin 8.44 nats after refinement, with 102,247 fine cells
+  and no cut, where `r_md_gh`, without the change, was cut on the same machine. None of these runs gives a start, so the
+  curve match is skipped in all of them. No registered build has the change, and set F runs on 32 GiB, where it changes
+  nothing (bench/PROTOCOL.md Addendum 16).
+- **Docs.** Two sections below said `np_o02_p3` moved 5 cm; it moved 4.9 mm. The comparable-rival section's
+  real-recording note now gives the tip's replays.
+
 ### The curve match checks its answer along each heard flight's track
 
 - **The fault.** One heard flight fixes when its closest approach was heard, not where along its track the
@@ -93,7 +116,7 @@ at that commit, not per-change commits.
   requests on 2026-11-05, a point in Georgia came back with a Pennsylvania point's values. `fdop` asked once per run
   and kept nothing, against this project's rule to cache every response. Local runs in parallel lanes crossed:
   `np_o02_p1` got −24.07 m where it had −31.36 m (`nh`, `nm`), which moved its curve-match margin from −1.35 to −1.287
-  nats, and `np_o02_p3` got −33.48 m for −33.66 m, which moved its place 5 cm. No cited row shows one, and none of the
+  nats, and `np_o02_p3` got −33.48 m for −33.66 m, which moved its place 4.9 mm. No cited row shows one, and none of the
   benchmark's 125 `fdop` rows, on 60 pairs of case and region, differs from another of its pair. A lookup that
   hangs costs a run up to 240 s and then the −30 m default for that run. Two local rows did that around 21:10Z on
   2026-11-05 (`x_32d4e1a`, beside `fh`, `nh`): 0.58 m of height kept `b1_osprey_1031` high but moved it 29 m and took
@@ -164,11 +187,11 @@ at that commit, not per-change commits.
   `edf1a09`'s (`nm`), and no curve match stands. The 15 development rows (`fh`), which hold the other 9 of the 42, are
   identical to `edf1a09`'s (`fm`): 5 right, all high, none wrong. `e_harbourgate` gives no location (`eh`).
   `r_nassau_gh` is identical to `r_nassau_gc`: 270 m off, radius 406 m, high, 14.78 nats. Two `nh` rows differ in
-  numbers and not in grade: `np_o02_p3` by 5 cm and `np_o02_p1`'s curve margin from −1.35 to −1.287. Both are the NGS
+  numbers and not in grade: `np_o02_p3` by 4.9 mm and `np_o02_p1`'s curve margin from −1.35 to −1.287. Both are the NGS
   geoid race (README "Known issues"), not this change. The other four reference and wrong-date configurations and
   the two feeder runs give no start, so the curve match is skipped and this rule cannot reach them; their `gc` rows
-  carry over. Replays of those six on a 256 GiB machine were running or queued when this landed. They do not repeat
-  `gc`, which ran on 32 GiB, because the hypothesis budget scales with RAM (AGENTS, reference case).
+  carry over. Replays of those six on a 256 GiB machine were running or queued when this landed. They did not repeat
+  `gc`, which ran on 32 GiB, because the hypothesis budget then grew with RAM. With the cap above, they do (`*_cp`).
   `e13f2d2`'s form has not been replayed. Recounting the best place's passes in the saved `fh`, `eh` and `nh` runs under
   its stricter heard line changes no count, and the four stands among them are on 4 to 14 passes, so its heard rule
   alone changes no stand there. That is a recount, not a run, and it does not cover its clock bounds or track filter.
@@ -231,9 +254,10 @@ at that commit, not per-change commits.
   remains below the second candidate, or overtakes the leader. It checks the margin, comparison basis,
   attempt count, fallback state and winner/radius consistency. Existing equal-stage and promoted-candidate
   regressions retain their numerical and coherence assertions.
-- **Real-recording evidence.** The reference and field recordings have not been replayed for this change;
-  the reference audio host returned "Site Unavailable". Their existing logged results remain evidence for
-  the builds named with those runs.
+- **Real-recording evidence.** Replayed with the later changes on `main`'s tip, `981fad1` (bench/PROTOCOL.md
+  Addendum 16). `r_nassau_gt` has the same funnel as `r_nassau_gc`, 93,179 fine cells with no cut, and the same margin.
+  On the 15 development rows only `c_ref_0907`'s margin moved, 6.32 to 6.30 nats, from this change's choice of rival, and
+  no grade did.
 
 ### Recover from an unreadable or incomplete covering ADS-B cache
 

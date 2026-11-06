@@ -204,12 +204,18 @@ impl SearchParams {
     }
 }
 
+/// Most hypotheses a run stores: a tenth of a 32 GiB machine's RAM, at 20 bytes each. More does
+/// not search better. The pair join and the fine stage have fixed budgets (`max_quick`,
+/// `max_fine`), so more hypotheses overflow them, and a comparison cut fails the margin gate. The
+/// three-day reference search sends 7.5 M cells to a 2 M fine stage on 256 GiB, and scores 0.1 M
+/// on 32 GiB, where it grades high. So every machine from 32 GiB up runs the same search.
+pub const MAX_HYP_TOTAL: u64 = (32 << 30) / 10 / 20;
+
 /// Hypothesis budgets (per event, total) from physical memory: a tenth of RAM for stored
-/// clouds (20 bytes each), at most 2 G in total. Unknown memory uses the 200 M default.
+/// clouds (20 bytes each), at most [`MAX_HYP_TOTAL`], which unknown memory also uses.
 pub fn hyp_budget(mem_bytes: Option<u64>) -> (usize, usize) {
-    let total = mem_bytes.map_or(200_000_000, |m| {
-        ((m / 10) / 20).clamp(1, 2_000_000_000) as usize
-    });
+    let total =
+        mem_bytes.map_or(MAX_HYP_TOTAL, |m| ((m / 10) / 20).clamp(1, MAX_HYP_TOTAL)) as usize;
     ((total / 3).max(1), total)
 }
 
@@ -4577,10 +4583,15 @@ mod tests {
     }
 
     #[test]
-    fn budget_scales_with_memory() {
-        assert_eq!(hyp_budget(None), (66_666_666, 200_000_000));
-        let (per, tot) = hyp_budget(Some(256 << 30));
-        assert!(tot > 1_300_000_000 && per == tot / 3, "{per} {tot}");
+    fn budget_scales_with_memory_up_to_32_gib() {
+        let ceiling = (57_266_230, 171_798_691);
+        assert_eq!(hyp_budget(None), ceiling);
+        // A bigger machine runs the same search as a 32 GiB one, so a result can be repeated on
+        // either. Below that the budget still falls with RAM.
+        for bytes in [32 << 30, (32 << 30) + 1, 33 << 30, 256 << 30, u64::MAX] {
+            assert_eq!(hyp_budget(Some(bytes)), ceiling, "{bytes} bytes");
+        }
+        assert_eq!(hyp_budget(Some(16 << 30)), (28_633_115, 85_899_345));
         assert_eq!(std::mem::size_of::<Hyp>(), 20);
         for bytes in [512 << 20, 2 << 30, 8 << 30, 32 << 30] {
             let (per, total) = hyp_budget(Some(bytes));
@@ -4590,7 +4601,6 @@ mod tests {
                 "{bytes} bytes: {total} hypotheses"
             );
         }
-        assert_eq!(hyp_budget(Some(u64::MAX)), (666_666_666, 2_000_000_000));
         assert_eq!(hyp_budget(Some(0)), (1, 1));
     }
 

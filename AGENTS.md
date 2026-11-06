@@ -268,7 +268,7 @@ results in the commit message.
   The upload is the recorder's 1:00:00–2:00:00 window. The published answer is 40.876466, −73.524951. Report the
   distance, the radius, the confidence, the gates and the funnel for each configuration:
 
-  | Configuration | Last recorded result (2026-11-05, the measurement change, run before its rebase onto the heard-range profile, which these runs never reach) |
+  | Configuration | Last recorded result (2026-11-05, the measurement change, run before its rebase onto the heard-range profile, which these runs never reach; repeated in every field but paths by `main` with the budget cap on 2026-11-06, `*_cp`) |
   |---|---|
   | `--dates 2026-09-08 --near NY` (`r_ny_gc`) | 264 m off, radius 379 m, **high**, margin 12.79 nats at the fine cells against a rival 52 km away, no comparison cut |
   | `--dates 2026-09-08 --near "Nassau County, NY"` (`r_nassau_gc`) | 270 m off, radius 406 m, **high**, margin 14.78 nats after refinement against a rival 33 km away, no comparison cut |
@@ -289,10 +289,12 @@ results in the commit message.
   None of these runs gives a start, so the curve match is skipped in all five. After a change to refinement, the margin
   or trace scoring, also replay the Ithaca feeder (CHANGELOG): a margin that credited only the leader with refinement's
   gain graded its wrong answer medium. On the measurement change both feeder runs are low, 0.19 and 0.99 nats
-  (`f_feederwatch_gc`, `n_feeder_on_1101_gc`). These `gc` rows ran on the 32 GiB benchmark machine. The hypothesis
-  budget scales with RAM and the comparison budgets do not, so a larger machine has a different funnel and does not
-  repeat them: on 256 GiB the three-day run joins 21.1 M points and fills the fine stage's 2 M (`r_md_gh`, still
-  running when this was written), against 102,247 fine cells in `r_md_gc`. Replay on the machine that gave the row.
+  (`f_feederwatch_gc`, `n_feeder_on_1101_gc`). These `gc` rows ran on the 32 GiB benchmark machine. Since the budget
+  cap (CHANGELOG, "A machine with more than 32 GiB runs the same search"), every machine from 32 GiB up has the same
+  funnel: on 256 GiB all seven rows repeat their `gc` rows in every field but paths (`*_cp`). Before it the hypothesis
+  budget grew with RAM and the comparison budgets did not, and on 256 GiB the three-day run joined 21.1 M points and
+  filled the fine stage's 2 M (`r_md_gh`, stopped unfinished). Below 32 GiB the funnel can still differ, so replay these
+  on 32 GiB or more.
 
   The first high results were `ny9` (224 m off, margin 8.5 nats), `nassau3` (221 m, 6.8 nats) and `md2` (224 m,
   7.9 nats), all radius 292 m with N93CQ as the confirmer, on the import commit plus the 5-line

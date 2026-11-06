@@ -41,8 +41,11 @@ finding the faint curves in a spectrogram to naming the town.
 ## Honest status
 
 **Real-recording validation baseline:** the numbers below belong to the archived builds and runs named with
-them. The comparable-rival and curve-match corrections have not been replayed on the reference or field recordings. The reference
-audio download was attempted, but its host returned "Site Unavailable"; no accuracy or grade change is claimed.
+them. `main`'s code with the budget cap was replayed on the reference recording's five configurations and both feeder runs
+(`*_cp`, 2026-11-06), and every row equals the measurement build's (`*_gc`) in every field but paths. None of them gives a start,
+so the curve match is skipped there. `main`'s tip before the cap kept every right answer on the 15 development rows (5, all
+high), gave no wrong one, and put none of the 42 no-answer runs at medium or high ([bench/PROTOCOL.md](bench/PROTOCOL.md)
+Addendum 16). No accuracy or grade change is claimed from these.
 The reference searches, the reference recording's two wrong dates and the Ithaca feeder were replayed on the
 measurement build (`*_gc`), `9087ec4` (runs named `*_b1`), on the commit before it that added the knot rule and the curve match (`*_c1`), and on the build before the knot rule (`*_r5`). Between `*_c1` and `*_b1` no grade changed and no margin moved by more than 0.02 nats. Field rows replayed on those builds are in the [CHANGELOG](CHANGELOG.md). The row on the knot rule and the curve match names its own runs. Every other number in this
 section comes from the archived `7e5cf3e` replays, which predate the moving-medium propagation correction, spatial
@@ -405,8 +408,9 @@ in `crates/fdop-core/src/curvematch.rs`:
   unchanged. `--no-curve-match` turns it off.
 
 What it did on the development recordings is in the [CHANGELOG](CHANGELOG.md). The sparse-track,
-clock-bound and counted-pass changes have synthetic regressions; the reference and field recordings have
-not been replayed for these changes. The logged outcomes describe the builds named with those runs.
+clock-bound and counted-pass changes have synthetic regressions. On `main`'s tip, which has all three, the 15
+development rows kept their 5 right answers, all high, and gave no wrong one ([bench/PROTOCOL.md](bench/PROTOCOL.md)
+Addendum 16). The logged outcomes describe the builds named with those runs.
 
 ---
 
@@ -780,14 +784,15 @@ Design notes:
   or where the trace steps more than 2 Hz off the model's own step. Under 15 % the event is refused. It still
   counts as heard, and it still uses one of the 24 measurement slots.
 - **Hypotheses are compact.** Each is 20 bytes (a `u32` track index and four `f32`). The budgets are sized from
-  physical memory: a tenth of RAM, capped at 2 G hypotheses (40 GB). Smaller machines no longer receive a
-  mandatory 4 GB allowance; an 8 GiB machine budgets about 819 MiB. If memory cannot be detected, the fallback
-  is 200 M hypotheses (4 GB). Generation checks the budget while building a track's cloud, and a confirmer-only
+  physical memory: a tenth of RAM, capped at what a 32 GiB machine gets, 172 M hypotheses (3.4 GB). More would
+  overflow the comparison budgets below and lower the grade, so every machine from 32 GiB up runs the same search.
+  Smaller machines no longer receive a mandatory 4 GB allowance; an 8 GiB machine budgets about 819 MiB. If memory
+  cannot be detected, the cap applies. Generation checks the budget while building a track's cloud, and a confirmer-only
   event keeps its exact hypothesis count and chance sample without materialising the full cloud. Vector
   capacity, temporary collections, audio, tracks and pair joins require additional memory. One event may
   take a third of the total, so a 16 GiB machine gets 86 M hypotheses and 29 M per event, and a 32 GiB machine
   172 M and 57 M. With less than a run needs, the events built last drop to confirmer-only, with a warning, so
-  the answer can depend on RAM. The three reference runs fit in 32 GiB; there the busy osprey-cam search demoted
+  below 32 GiB the answer can depend on RAM. The three reference runs fit in 32 GiB; there the busy osprey-cam search demoted
   four events and two other field searches one each.
   The comparison budgets default to 20 M joined points, 2 M fine cells and 2 M confirmations, above the largest
   searches estimated from real runs (about 11 M and 1 M). A pair-join, fine-stage or confirmation-budget cut is
@@ -842,7 +847,7 @@ RAM, one after another with nothing else running. Treat them as an order of magn
 
 The state-wide run searched 10,542 track models. All three had the ADS-B days already cached. A first run adds the
 archive download (about 4 GB per UTC day) and the store build. One local date usually spans two UTC days. Stored
-hypothesis payload is budgeted to a tenth of RAM, capped at 40 GB; temporary collections and the rest of the
+hypothesis payload is budgeted to a tenth of RAM, capped at 3.4 GB; temporary collections and the rest of the
 pipeline add to process memory.
 
 These runs search only 3 of the recording's events, because the others do not pass the quality gates, so they are
@@ -887,7 +892,21 @@ the configured fallback allowance after the preferred request has been tried.
 
 ## Testing
 
-### Current correction checks (2026-11-05)
+### Current checks (2026-11-06)
+
+These cover the budget cap on `main`'s tip: this commit's code, extracted with `git archive` from a commit with the same
+`search.rs` and older docs, using the pinned `nightly-2026-08-31` toolchain, with direct cargo on the benchmark machine.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed |
+| `cargo test --workspace --locked --no-fail-fast` | 234 passed, 0 failed, 2 ignored |
+| `cargo build --release --locked -p franken_doppler_finder --bin fdop`, then `fdop selftest` | PASS: error 2.4 m, radius 75 m, clock error +0.02 s, 4 events |
+
+The reference recording's five configurations and both feeder runs were replayed on this code (AGENTS, reference case).
+
+### Correction checks (2026-11-05)
 
 These results cover the cache-recovery, comparable-rival and curve-match corrections, merged with `32d4e1a` and the
 geoid fix, on one exact tree (`a032bf8`, extracted from `git archive`), using the pinned `nightly-2026-08-31` toolchain.
