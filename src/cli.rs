@@ -2,6 +2,7 @@
 
 use crate::pipeline::{self, LocateArgs, Log};
 use clap::{Args, Parser, Subcommand};
+use fdop_core::audio::{self, AudioSelection};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -63,6 +64,25 @@ pub struct Common {
     pub quiet: bool,
 }
 
+#[derive(Args, Debug, Clone, Copy)]
+pub struct AudioCli {
+    /// Zero-based audio-stream ordinal (0 is the first audio track).
+    #[arg(long, default_value_t = 0)]
+    pub audio_stream: usize,
+    /// Zero-based channel within the selected audio stream; otherwise downmix all its channels.
+    #[arg(long)]
+    pub audio_channel: Option<usize>,
+}
+
+impl AudioCli {
+    fn selection(self) -> AudioSelection {
+        AudioSelection {
+            stream: self.audio_stream,
+            channel: self.audio_channel,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct LocateCli {
     /// Audio or video file (anything ffmpeg reads).
@@ -95,6 +115,8 @@ pub struct LocateCli {
     #[arg(long)]
     pub json: bool,
     #[command(flatten)]
+    pub audio: AudioCli,
+    #[command(flatten)]
     pub common: Common,
 }
 
@@ -108,6 +130,8 @@ pub struct DetectCli {
     /// Less progress output on stderr.
     #[arg(short, long)]
     pub quiet: bool,
+    #[command(flatten)]
+    pub audio: AudioCli,
 }
 
 #[derive(Args, Debug)]
@@ -164,6 +188,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 .unwrap_or_else(|| pipeline::default_run_dir(&l.media));
             let args = LocateArgs {
                 media: l.media.clone(),
+                audio_selection: l.audio.selection(),
                 dates: l.dates.clone(),
                 near: l.near.clone(),
                 // fixed here, so a run that fails part-way can still name its partial outputs
@@ -266,11 +291,23 @@ fn run(cli: Cli) -> Result<i32, String> {
         }
         Cmd::Detect(d) => {
             let log = Log::new(d.quiet);
+            let selection = d.audio.selection();
+            let info = audio::probe_with_selection(&d.media, selection)?;
+            log.say(&format!(
+                "audio: stream {}, {}, {} {} Hz x{}",
+                selection.stream,
+                selection
+                    .channel
+                    .map_or_else(|| "mono downmix".to_string(), |n| format!("channel {n}")),
+                info.audio_codec,
+                info.sample_rate,
+                info.channels
+            ));
             let out = d
                 .out
                 .unwrap_or_else(|| PathBuf::from("fdop_runs").join("detect"));
             std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-            let x = fdop_core::audio::decode(&d.media, 0.0, None, 4000)?;
+            let x = audio::decode_with_selection(&d.media, 0.0, None, 4000, selection)?;
             if let Some(w) = pipeline::low_band_warning(&x, 4000) {
                 eprintln!("fdop: warning: {w}");
             }
@@ -477,5 +514,38 @@ fn run(cli: Cli) -> Result<i32, String> {
             );
             Ok(if r.ok { 0 } else { 1 })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_commands_accept_audio_selection_and_keep_defaults() {
+        for subcommand in ["locate", "detect"] {
+            let mut args = vec!["fdop", subcommand, "clip.mkv"];
+            if subcommand == "locate" {
+                args.extend(["--dates", "2026-09-08", "--near", "NY"]);
+            }
+            for expected in [
+                AudioSelection::default(),
+                AudioSelection {
+                    stream: 2,
+                    channel: Some(1),
+                },
+            ] {
+                let parsed = match Cli::try_parse_from(&args).unwrap().cmd {
+                    Cmd::Locate(l) => l.audio.selection(),
+                    Cmd::Detect(d) => d.audio.selection(),
+                    _ => panic!("expected media command"),
+                };
+                assert_eq!(parsed, expected);
+                args.extend(["--audio-stream", "2", "--audio-channel", "1"]);
+            }
+        }
+        assert!(
+            Cli::try_parse_from(["fdop", "detect", "clip.mkv", "--audio-channel", "-1"]).is_err()
+        );
     }
 }

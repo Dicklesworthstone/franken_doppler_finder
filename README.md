@@ -508,10 +508,14 @@ fdop selftest           # offline end-to-end known-answer run
 
 `fdop` has six subcommands. Run `fdop <cmd> --help` for the built-in text. The shared options `--cache`,
 `--offline` and `-q/--quiet` belong to `locate` and `fetch`, and go after the subcommand. `detect` needs no data
-and takes only `-o` and `-q`. `runs` and `doctor` take `--cache` too.
+and takes `-o`, `-q` and the audio selection options below. `runs` and `doctor` take `--cache` too.
 
-For media with multiple audio tracks, `locate` and `detect` analyse the first audio track, matching the
-stream described by the media probe. A preferred or higher-channel-count alternate track does not replace it.
+For media with multiple audio tracks, `locate` and `detect` analyse the first audio track by default, matching
+the stream described by the media probe. Select another with `--audio-stream N` (audio tracks counted from 0).
+The selected track is mixed to mono unless `--audio-channel N` selects one channel, also counted from 0. This
+lets an ambient track be used instead of commentary, or one microphone channel be used when a stereo mix
+cancels its tones. An unavailable track or channel is an error. The selected audio retains its timestamps,
+including initial delays and missing-packet gaps; only the container and that track supply `creation_time`.
 Decoding preserves elapsed recording time: missing packet intervals become silence, and audio delayed
 relative to video retains that delay. The container's arbitrary starting timestamp is normalized without
 collapsing internal gaps. Tones are not stretched to repair timing, so a gap does not shift later flyovers
@@ -529,6 +533,8 @@ or change their Doppler frequencies.
 |---|---|---|
 | `<MEDIA>` | required | Audio or video file, anything ffmpeg reads |
 | `--dates <D>` | required | Local date(s) of the recording: `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD` (also `D0 to D1`, `D0,D1`, `YYYY/MM/DD`, `YYYYMMDD`). The year comes first: `09/08/2026` is refused as ambiguous. At most 15 days |
+| `--audio-stream <N>` | `0` | Audio track to analyse, counted from 0 among audio streams |
+| `--audio-channel <N>` | mono mix | One channel of that audio track, counted from 0; avoids mixing other microphone channels |
 | `--near <REGION>` | required | Coarse US region; see [Region syntax](#region-syntax) |
 | `-o, --out <DIR>` | `fdop_runs/<name>_<unix time>` | Output directory |
 | `--start <ISO>` | — | Exact recording start if known, e.g. `2026-09-08T19:17:30-04:00`. Without a zone it is read as **UTC**. Unix seconds also work |
@@ -545,6 +551,7 @@ fdop locate clip.wav --dates 2026-09-08 --near "40.87,-73.52,25" --start 2026-09
 fdop locate clip.m4a --dates 2026-09-08 --near CONUS --json > result.json
 fdop locate clip.m4a --dates 2026-09-08 --near NY --offline        # cached data only
 ```
+fdop locate clip.mov --dates 2026-09-08 --near NY --audio-stream 1 --audio-channel 0
 
 **The time window.** Without `--start`, recording starts are searched from local midnight on the first date to
 local midnight after the last, using every UTC offset the region spans, DST included. If the file's
@@ -563,7 +570,12 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 Detects flyovers and measures them strongest first, from the silence line up, until 24 pass the quality gates,
 with a warning on stderr when the detection or measurement cap cuts
 some or the audio looks high-passed, and writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv`
-for every fitted event. The default output directory is `fdop_runs/detect`. One line per event goes to stdout:
+for every fitted event. The default output directory is `fdop_runs/detect`.
+
+`--audio-stream N` and `--audio-channel N` select the same source as in `locate`. For example,
+`fdop detect clip.mov --audio-stream 1 --audio-channel 0` measures the first channel of the second audio track.
+
+One line per event goes to stdout:
 
 ```text
 e<N>  t_rec <seconds into file> s  f0 <Hz> Hz  v <m/s> m/s  d <m> m  rms <Hz>  ok | <failed quality gates>
@@ -1264,6 +1276,7 @@ audio or video recorded somewhere sensitive:
 | Warning `the audio has little energy below 100 Hz (45-95 Hz is N dB below 150-600 Hz)` | A high-pass filter does this, removing the fundamentals of slower propellers and weakening those near the cut. Speech-heavy audio can also read low | Use the unfiltered recording if you have one. Otherwise expect fewer usable flyovers, and do not read a failed search as evidence about the place |
 | Warning `the answer lies in CT, outside the searched state NY` (or `appears to lie in`, when the state is a gazetteer estimate) | A state search covers the state's bounding box, which takes in parts of its neighbours | If you know the recording was made in the searched state, distrust the answer whatever its grade, unless its radius reaches back across the border. A narrower `--near`, such as a county, takes in less of the neighbours |
 | `needs network or a cached file: Census gazetteer ...` | `--offline` before the gazetteer was cached | Run once online, or use a state, point or box region |
+| Audio is audible in the player but the survey is silent, or the selected track contains commentary | The first track or its mono mix lacks the useful ambient sound; opposite-polarity stereo can cancel | Select the ambient track with `--audio-stream N`, or a microphone channel with `--audio-channel N`; both indices start at 0 |
 | `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days are cached. A day missing from adsb.lol cannot be searched |
 | A download pauses for a minute, then carries on | The server stopped sending with the connection still open. After 60 s with no data, `fdop` reconnects and resumes with an HTTP `Range` request | Nothing. Resumed `206` responses are checked for their byte offset, range boundary and total length before new bytes are accepted. Capped ranges continue until the full object is proved complete; a range's body length is never treated as the archive length. After repeated failures with no new bytes it stops |
 | Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears some hours after it ends | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |

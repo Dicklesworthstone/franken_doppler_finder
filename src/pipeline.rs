@@ -19,6 +19,7 @@ use std::time::Instant;
 #[derive(Clone, Debug)]
 pub struct LocateArgs {
     pub media: PathBuf,
+    pub audio_selection: audio::AudioSelection,
     /// "YYYY-MM-DD" or "YYYY-MM-DD..YYYY-MM-DD" (local dates at the region).
     pub dates: String,
     /// Coarse region: state, "City, ST", county, ZIP, "lat,lon[,km]", "S,W,N,E", "CONUS".
@@ -579,10 +580,17 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     if !a.media.is_file() {
         return Err(format!("{}: not a file", a.media.display()));
     }
-    let info = audio::probe(&a.media)?;
+    let info = audio::probe_with_selection(&a.media, a.audio_selection)?;
     log.say(&format!(
-        "media: {:.1} s, {} {} Hz x{}, creation_time {:?}",
-        info.duration_s, info.audio_codec, info.sample_rate, info.channels, info.creation_time
+        "media: {:.1} s, {} {} Hz x{}, audio stream {}, channel {}, creation_time {:?}",
+        info.duration_s,
+        info.audio_codec,
+        info.sample_rate,
+        info.channels,
+        info.audio_stream,
+        info.audio_channel
+            .map_or_else(|| "mix".into(), |c| c.to_string()),
+        info.creation_time
     ));
     if let Some((la, lo)) = info.location_latlon {
         warnings.push(format!(
@@ -715,7 +723,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
     // ---- audio --------------------------------------------------------------------------
     let t = Instant::now();
-    let x = audio::decode(&a.media, 0.0, None, a.sr)?;
+    let x = audio::decode_with_selection(&a.media, 0.0, None, a.sr, a.audio_selection)?;
     let dur = x.len() as f64 / a.sr as f64;
     log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
     warnings.extend(low_band_warning(&x, a.sr));
@@ -1729,7 +1737,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     report.timings = serde_json::Value::Object(timings);
     report.extra = json!({
         "window": window_note,
-        "media": {"duration_s": info.duration_s, "codec": info.audio_codec, "sample_rate": info.sample_rate, "creation_time": info.creation_time},
+        "media": {"duration_s": info.duration_s, "codec": info.audio_codec, "sample_rate": info.sample_rate, "creation_time": info.creation_time, "audio_stream": info.audio_stream, "audio_channel": info.audio_channel},
         "region_bbox": region.bbox.as_array(),
         "atmosphere": {"source": atmo.describe(), "c_0_1500m": m1.c, "c_0_5000m": m5.c, "wind_0_5000m": [m5.wind_e, m5.wind_n]},
         "search_events": sevs,

@@ -4,6 +4,14 @@ use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
 
+/// Zero-based audio-stream ordinal and optional channel within that stream. With no
+/// channel selected, FFmpeg downmixes the selected stream to mono as before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct AudioSelection {
+    pub stream: usize,
+    pub channel: Option<usize>,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct MediaInfo {
     pub path: String,
@@ -12,7 +20,9 @@ pub struct MediaInfo {
     pub audio_codec: String,
     pub sample_rate: u32,
     pub channels: u32,
-    /// `creation_time` tag (container or stream), verbatim.
+    pub audio_stream: usize,
+    pub audio_channel: Option<usize>,
+    /// `creation_time` tag (container, then selected audio stream), verbatim.
     pub creation_time: Option<String>,
     /// Parsed creation time (unix s) when the tag carries a zone (or `Z`).
     pub creation_unix: Option<f64>,
@@ -24,6 +34,12 @@ pub struct MediaInfo {
 }
 
 pub fn probe(path: &Path) -> Result<MediaInfo, String> {
+    probe_with_selection(path, AudioSelection::default())
+}
+
+/// Describe the selected audio stream and validate its channel before decoding. The
+/// stream ordinal counts audio streams only, matching FFmpeg's `0:a:N` mapping.
+pub fn probe_with_selection(path: &Path, selection: AudioSelection) -> Result<MediaInfo, String> {
     let out = Command::new("ffprobe")
         .args([
             "-v",
@@ -45,8 +61,36 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
     }
     let j: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("ffprobe JSON: {e}"))?;
+    media_info(path, &j, selection)
+}
+
+fn media_info(
+    path: &Path,
+    j: &serde_json::Value,
+    selection: AudioSelection,
+) -> Result<MediaInfo, String> {
+    let streams = j["streams"]
+        .as_array()
+        .ok_or_else(|| format!("{} has no audio stream", path.display()))?;
+    let n_audio = streams
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .count();
+    let a = streams
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .nth(selection.stream)
+        .ok_or_else(|| {
+            format!(
+                "{} has {n_audio} audio stream(s); --audio-stream {} is out of range (indices start at 0)",
+                path.display(),
+                selection.stream
+            )
+        })?;
     let mut info = MediaInfo {
         path: path.display().to_string(),
+        audio_stream: selection.stream,
+        audio_channel: selection.channel,
         ..Default::default()
     };
     let fmt = &j["format"];
@@ -55,6 +99,40 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
         .as_str()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
+    info.audio_codec = a["codec_name"].as_str().unwrap_or("").to_string();
+    info.sample_rate = a["sample_rate"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    info.channels = a["channels"].as_u64().unwrap_or(0) as u32;
+    if let Some(channel) = selection.channel
+        && channel >= info.channels as usize
+    {
+        return Err(format!(
+            "audio stream {} has {} channel(s); --audio-channel {channel} is out of range (indices start at 0)",
+            selection.stream, info.channels
+        ));
+    }
+    if info.duration_s <= 0.0 {
+        info.duration_s = a["duration"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+    }
+    // An unrelated track may have been dubbed or exported at a different time. Only
+    // the container and the selected audio stream can supply the recording-clock hint.
+    for source in [fmt, a] {
+        if let Some(tags) = source["tags"].as_object()
+            && let Some(time) = tags
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("creation_time"))
+                .and_then(|(_, v)| v.as_str())
+        {
+            info.creation_time = Some(time.to_string());
+            info.creation_unix = fdop_types::time::parse_iso_utc(time).ok();
+            break;
+        }
+    }
     let mut collect_tags = |v: &serde_json::Value| {
         if let Some(m) = v["tags"].as_object() {
             for (k, val) in m {
@@ -65,33 +143,11 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
         }
     };
     collect_tags(fmt);
-    if let Some(streams) = j["streams"].as_array() {
-        for s in streams {
-            collect_tags(s);
-        }
-        if let Some(a) = streams.iter().find(|s| s["codec_type"] == "audio") {
-            info.audio_codec = a["codec_name"].as_str().unwrap_or("").to_string();
-            info.sample_rate = a["sample_rate"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            info.channels = a["channels"].as_u64().unwrap_or(0) as u32;
-            if info.duration_s <= 0.0 {
-                info.duration_s = a["duration"]
-                    .as_str()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0);
-            }
-        } else {
-            return Err(format!("{} has no audio stream", path.display()));
-        }
+    for s in streams {
+        collect_tags(s);
     }
     for (k, v) in &info.tags {
         let kl = k.to_ascii_lowercase();
-        if kl == "creation_time" && info.creation_time.is_none() {
-            info.creation_time = Some(v.clone());
-            info.creation_unix = fdop_types::time::parse_iso_utc(v).ok();
-        }
         if (kl.contains("iso6709") || kl == "location" || kl.ends_with(".location"))
             && info.location_iso6709.is_none()
         {
@@ -130,8 +186,29 @@ pub fn parse_iso6709(s: &str) -> Option<(f64, f64)> {
 /// Preserve elapsed time from the container origin: missing packets become silence and
 /// overlapping samples are trimmed, without stretching the tones used for Doppler fitting.
 pub fn decode(path: &Path, start: f64, dur: Option<f64>, sr: u32) -> Result<Vec<f32>, String> {
+    decode_with_selection(path, start, dur, sr, AudioSelection::default())
+}
+
+/// Decode one audio stream, optionally taking one channel instead of downmixing. The
+/// selected channel retains its amplitude and container-relative packet timestamps.
+pub fn decode_with_selection(
+    path: &Path,
+    start: f64,
+    dur: Option<f64>,
+    sr: u32,
+    selection: AudioSelection,
+) -> Result<Vec<f32>, String> {
+    // `pan` can silently fill an unavailable input channel with zeroes. Validate the
+    // source first so an invalid selection cannot look like a silent recording.
+    probe_with_selection(path, selection)?;
     let start = start.max(0.0);
     let start_s = format!("{start:.3}");
+    let stream = format!("0:a:{}", selection.stream);
+    let channel = selection
+        .channel
+        .map(|n| format!("pan=mono|c0=c{n},"))
+        .unwrap_or_default();
+    let filter = format!("{channel}asetpts=PTS-{start_s}/TB,aresample=async=1:first_pts=0");
     let mut cmd = Command::new("ffmpeg");
     // MPEG-TS/HLS otherwise collapse timestamp jumps over ten seconds. Retain them, but
     // remove an arbitrary container start timestamp before interpreting relative seeks.
@@ -149,7 +226,7 @@ pub fn decode(path: &Path, start: f64, dur: Option<f64>, sr: u32) -> Result<Vec<
     cmd.arg("-i").arg(path);
     cmd.args([
         "-map",
-        "0:a:0",
+        &stream,
         "-vn",
         "-ac",
         "1",
@@ -158,7 +235,7 @@ pub fn decode(path: &Path, start: f64, dur: Option<f64>, sr: u32) -> Result<Vec<
         // copyts retains the seek offset. Shift it out before filling initial/internal
         // gaps; async=1 only fills/trims, whereas larger values can stretch the signal.
         "-af",
-        &format!("asetpts=PTS-{start_s}/TB,aresample=async=1:first_pts=0"),
+        &filter,
     ]);
     if let Some(d) = dur {
         // Limit output after gap filling: an input limit can stop before the next packet
@@ -190,6 +267,83 @@ mod tests {
             Some((40.8765, -73.525))
         );
         assert_eq!(parse_iso6709("garbage"), None);
+    }
+
+    #[test]
+    fn selected_audio_supplies_the_probe_and_clock_hint() {
+        let mut j = serde_json::json!({
+            "format": {"format_name": "matroska", "duration": "0"},
+            "streams": [
+                {"codec_type": "video", "tags": {"creation_time": "2026-09-07T10:00:00Z"}},
+                {"codec_type": "audio", "codec_name": "aac", "sample_rate": "4000",
+                 "channels": 1, "duration": "3",
+                 "tags": {"creation_time": "2026-09-08T11:00:00Z"}},
+                {"codec_type": "subtitle"},
+                {"codec_type": "audio", "codec_name": "pcm_f32le", "sample_rate": "8000",
+                 "channels": 2, "duration": "4",
+                 "tags": {"CREATION_TIME": "2026-09-08T12:00:00Z"}}
+            ]
+        });
+        let path = Path::new("tracks.mkv");
+        let first = media_info(path, &j, AudioSelection::default()).unwrap();
+        assert_eq!(
+            (first.audio_stream, first.sample_rate, first.channels),
+            (0, 4000, 1)
+        );
+        assert_eq!(first.creation_time.as_deref(), Some("2026-09-08T11:00:00Z"));
+        let selection = AudioSelection {
+            stream: 1,
+            channel: Some(1),
+        };
+        let second = media_info(path, &j, selection).unwrap();
+        assert_eq!(second.audio_codec, "pcm_f32le");
+        assert_eq!((second.audio_stream, second.audio_channel), (1, Some(1)));
+        assert_eq!((second.sample_rate, second.channels), (8000, 2));
+        assert_eq!(second.duration_s, 4.0);
+        assert_eq!(
+            second.creation_time.as_deref(),
+            Some("2026-09-08T12:00:00Z")
+        );
+        assert_eq!(
+            second.creation_unix,
+            Some(fdop_types::time::parse_iso_utc("2026-09-08T12:00:00Z").unwrap())
+        );
+        // If the selected stream has no clock, another track's time must not replace it.
+        j["streams"][3]["tags"] = serde_json::json!({});
+        assert!(
+            media_info(path, &j, selection)
+                .unwrap()
+                .creation_time
+                .is_none()
+        );
+        j["format"]["tags"] = serde_json::json!({"creation_time": "2026-09-08T13:00:00Z"});
+        assert_eq!(
+            media_info(path, &j, selection)
+                .unwrap()
+                .creation_time
+                .as_deref(),
+            Some("2026-09-08T13:00:00Z")
+        );
+        for bad in [
+            AudioSelection {
+                stream: 2,
+                channel: None,
+            },
+            AudioSelection {
+                stream: 0,
+                channel: Some(1),
+            },
+            AudioSelection {
+                stream: 1,
+                channel: Some(2),
+            },
+        ] {
+            assert!(
+                media_info(path, &j, bad)
+                    .unwrap_err()
+                    .contains("out of range")
+            );
+        }
     }
 
     #[test]
@@ -247,9 +401,9 @@ mod tests {
         assert_eq!(info.sample_rate, 4000);
         let pcm = decode(&path, 0.0, None, 4000).unwrap();
         assert!(!pcm.is_empty());
-        let energy = |hz: f64| {
+        let energy = |samples: &[f32], hz: f64| {
             let (mut re, mut im) = (0.0, 0.0);
-            for (k, &x) in pcm.iter().enumerate() {
+            for (k, &x) in samples.iter().enumerate() {
                 let phase = std::f64::consts::TAU * hz * k as f64 / 4000.0;
                 re += x as f64 * phase.cos();
                 im += x as f64 * phase.sin();
@@ -257,9 +411,122 @@ mod tests {
             re * re + im * im
         };
         assert!(
-            energy(220.0) > 1000.0 * energy(880.0),
+            energy(&pcm, 220.0) > 1000.0 * energy(&pcm, 880.0),
             "decode selected the alternate track instead of the probed first track"
         );
+        let selection = AudioSelection {
+            stream: 1,
+            channel: Some(1),
+        };
+        let info = probe_with_selection(&path, selection).unwrap();
+        assert_eq!(
+            (info.audio_stream, info.channels, info.audio_channel),
+            (1, 2, Some(1))
+        );
+        let alternate = decode_with_selection(&path, 0.0, None, 4000, selection).unwrap();
+        assert_eq!(alternate.len(), pcm.len());
+        assert!(
+            energy(&alternate, 880.0) > 1000.0 * energy(&alternate, 220.0),
+            "explicit selection failed to recover the alternate track"
+        );
+        for bad in [
+            AudioSelection {
+                stream: 2,
+                channel: None,
+            },
+            AudioSelection {
+                stream: 1,
+                channel: Some(2),
+            },
+        ] {
+            let e = decode_with_selection(&path, 0.0, None, 4000, bad).unwrap_err();
+            assert!(e.contains("out of range"), "{e}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn selected_channel_recovers_antiphase_audio_with_its_timestamps() {
+        const SR: u32 = 8000;
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-audio-channel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("antiphase_with_gap.mka");
+        // The first stream establishes a zero container origin. The second starts one
+        // second later and drops packets in [3, 5) on that timeline. Its inverse stereo
+        // channels cancel completely when downmixed but each retains the full tone.
+        let made = Command::new("ffmpeg")
+            .args([
+                "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=110:duration=8:sample_rate=8000",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=6:sample_rate=8000",
+                "-map", "0:a:0", "-map", "1:a:0",
+                "-filter:a:1", "asetnsamples=n=800:p=0,aselect='lt(n,20)+gte(n,40)',pan=stereo|c0=c0|c1=-1*c0,asetpts=PTS+1/TB",
+                "-c:a", "pcm_f32le",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg must be installed to run the media integration test");
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let selection = AudioSelection {
+            stream: 1,
+            channel: None,
+        };
+        let mixed = decode_with_selection(&path, 0.0, None, SR, selection).unwrap();
+        assert_eq!(mixed.len(), 7 * SR as usize);
+        assert!(mixed.iter().all(|&x| x == 0.0));
+        let left = AudioSelection {
+            channel: Some(0),
+            ..selection
+        };
+        let right = AudioSelection {
+            channel: Some(1),
+            ..selection
+        };
+        let pcm = decode_with_selection(&path, 0.0, None, SR, left).unwrap();
+        let inverse = decode_with_selection(&path, 0.0, None, SR, right).unwrap();
+        assert_eq!(pcm.len(), mixed.len());
+        assert_eq!(inverse.len(), pcm.len());
+        assert!(pcm[..SR as usize].iter().all(|&x| x == 0.0));
+        assert!(
+            pcm[3 * SR as usize..5 * SR as usize]
+                .iter()
+                .all(|&x| x == 0.0)
+        );
+        for range in [
+            SR as usize..3 * SR as usize,
+            5 * SR as usize..7 * SR as usize,
+        ] {
+            let samples = &pcm[range];
+            let rms = (samples.iter().map(|&x| (x as f64).powi(2)).sum::<f64>()
+                / samples.len() as f64)
+                .sqrt();
+            assert!(
+                rms > 0.08 && rms < 0.09,
+                "selected tone lost its amplitude: {rms}"
+            );
+        }
+        assert!(pcm.iter().zip(&inverse).all(|(&a, &b)| a == -b));
+        for (start, duration) in [(0.5, 1.0), (2.5, 3.0), (3.5, 1.0), (5.5, 1.0)] {
+            let clip = decode_with_selection(&path, start, Some(duration), SR, left).unwrap();
+            let lo = (start * SR as f64) as usize;
+            let hi = ((start + duration) * SR as f64) as usize;
+            assert_eq!(
+                clip,
+                pcm[lo..hi],
+                "selected channel seek {start} changed timestamps"
+            );
+        }
     }
 
     #[test]

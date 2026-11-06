@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Analyse alternate audio tracks and individual microphone channels
+
+- **The gap.** `locate` and `detect` could read only the first audio track's mono mix. Ambient audio in another
+  track was inaccessible, and opposite-polarity stereo channels could cancel a useful tone to silence.
+- **The change.** Both commands accept zero-based `--audio-stream` and `--audio-channel` selections. The default
+  remains the first audio track mixed to mono. Probing, decoding, progress and `result.json`'s `extra.media` identify
+  the same selected source. Missing tracks or channels fail before analysis. Recording-clock metadata comes from
+  the container or selected audio stream, so an unrelated dubbed track cannot supply the clock hint.
+- **Tests.** `selected_audio_supplies_the_probe_and_clock_hint` checks stream/channel bounds and metadata isolation;
+  `media_commands_accept_audio_selection_and_keep_defaults` checks both CLIs. The real-FFmpeg regressions
+  `multistream_decode_matches_the_probed_audio`, `selected_channel_recovers_antiphase_audio_with_its_timestamps` and
+  `decode_preserves_recording_timestamps` cover alternate-track tones, cancelled stereo, delayed starts, packet gaps
+  and seeks. These use generated audio; they are not real-recording accuracy evidence.
+
 ### A machine with more than 32 GiB runs the same search
 
 - **The fault.** The hypothesis budget grew with RAM, up to 2 G, and the budgets of the stages after it did not: 20 M
