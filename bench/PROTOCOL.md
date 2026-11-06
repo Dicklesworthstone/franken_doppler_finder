@@ -1027,3 +1027,135 @@ checks.
   - The development rows show none of these cases, so set F is its only test.
 - **Every build is reported.** This makes six registered later `fdop` builds: `9087ec4`, `6914ab7`, `ce02222`,
   `3164272`, `32d4e1a` and `5f6348c`. Each passes or fails the claim by its own row, and none is chosen after the fact.
+
+## Addendum 16, 2026-11-06, `main`'s tip under the rule fixed before it was replayed; corrections; bench notes
+
+### `main`'s tip
+
+No registered build contains what `main` ships: both landed changes of Addenda 14 and 15 together, `5ab7f48`'s rival,
+`e13f2d2`'s clock bounds and the geoid fix. A rule for registering it was logged before any replay of it existed, at 22:49Z or
+earlier on 2026-11-05 (the log line's own stamp, 22:56Z, was guessed ahead of the clock, and the log corrects it). The tip's code
+is `981fad1`; `446a2bf` adds Addendum 15 only.
+
+The binary is `fdop-981fad1`, sha256 `208b9dff258733a34d8399dda04ce2e3985089cf876f02893e1d9550cee1572e`, built on the bench
+machine with direct cargo from `git archive` of `981fad1`, 23:53:35Z to 00:00:46Z, six `Compiling` lines from that tree.
+
+| Part of the rule | Result |
+|---|---|
+| 1. The 42 no-answer runs, R2 inputs, local: none at medium or high | **Held.** All finished, the last at 01:30:09Z. `nt`'s 33: 26 low, 7 no location. The 9 among the development rows: low or no location |
+| 2. The 15 development rows: every right answer in `fh` kept, none wrong | **Held.** `ft`, finished 01:06:30Z: 5 right, all high, at 0.25, 0.09, 0.11, 0.22 and 0.96 km, none wrong. 14 rows equal `fh` in grade, place, margin and curve call; `c_ref_0907` differs in margin only, 6.32 to 6.30, from `5ab7f48`'s rival |
+| 3. `r_nassau` high; both wrong dates, if they finish in time, not at medium or high | **Held.** `r_nassau_gt`: high, 0.27 km, radius 406 m, margin 14.78. Wrong dates: `n_ref_on_0909_tb` low; `n_ref_on_0907_tb` did not finish in time (below) |
+| 4. `fmt`, `clippy -D warnings`, workspace tests, `selftest` | **Held.** Run by the agent of Addendum 15 on this tree: 234 passed, 0 failed, 2 ignored with `--no-fail-fast`; `selftest` passes |
+
+`nt` against `nh`: 27 rows equal, 6 differ, all in numbers and none in grade. Five differ in a rival's margin. One, `np_o02_p3`,
+moved 4.9 mm, because `nh`'s row had the crossed geoid height the geoid fix removes (below). All 51 geoid lines in `nt`, `ft`
+and `gt` came from the service and not the default.
+
+The rule's two wrong-date rows ran locally on 256 GiB (`n_ref_on_0907_gt`, `n_ref_on_0909_gt`) and did not finish. A signal from
+outside ended them at about 02:05Z, two hours in, at 200,000 of 1,175,195 and 240,000 of 537,536 fine cells, with every other
+`fdop` process on that machine. Unrelated replays there ended the same way at about 02:11Z, 02:17Z and 02:20Z. The system log
+names two senders: at 02:17:11Z a `kill` from a zsh shell that has since gone, and at 02:20:11Z launchd, which a canary also logged.
+Neither was a command of this session's. The log has no sender line for the 02:05Z or 02:11Z rows. Apps on that machine were
+being quit from the Dock in the same minutes (02:04:59Z, 02:11:27Z, 02:18:52Z, 02:20:12Z), and Claude sessions there were
+restarted in bulk. That the two go together is an inference, and the cause is not established. Parts 1 and 2 had finished by then,
+and the bench was not touched.
+
+The same two dates then ran with the exact binary on the bench's 32 GiB budget, the one set F's R2 uses (`runs/tip_wrong_dates`,
+from 02:09:17Z). These are not the planned rows, and the rule names the binary, not a machine.
+
+- `n_ref_on_0909_tb`: rc 0 at 02:43:54Z, low, radius 300 m, margin 0.15 nats over a rival 59.6 km away. Joined 991,264,
+  quick check 327,799, fine stage 124,819, no cut. That is the same grade, margin and funnel as the bench's row of an earlier
+  build, `n_ref_on_0909_gc` (2026-11-05). Not at medium or high, so it holds.
+- `n_ref_on_0907_tb`: did not finish in time. It had passed its quick check (878,876 of 2,137,607) when it was paused at
+  02:34:30Z so the other could finish, since it needed about 70 more minutes (below). It resumes at about 03:00Z. Its result
+  goes in the next addendum. If it ends at medium or high, that is a wrong-date null asserted by this build and stands against
+  any claim for it. It does not undo a registration the rule allowed.
+
+**Every part held, so `fdop-981fad1` is registered for set F by this addendum**, under every rule of Addendum 9. This makes seven
+registered later `fdop` builds: `9087ec4`, `6914ab7`, `ce02222`, `3164272`, `32d4e1a`, `5f6348c` and `981fad1`, and eight with
+pinned `7e66501`. Each passes or fails the claim by its own rows, and none is chosen after the fact. Its set F jobs are
+`5f6348c`'s commands with this binary, and they run in `5f6348c`'s chains.
+
+`fdop-981fad1`'s known limits are in the next section. `5ab7f48` may refine more rivals in a run. `r_nassau_gt` shows no change from
+that: the same funnel as `r_nassau_gc` (93,179 fine cells, no cut) and the same margin.
+
+### Known before set F runs
+
+These apply to `446a2bf`, whose code is the tip's, and may apply to every build that has a curve match. They are written
+down before any set F run of any tool. All of it comes from a known-answer injection bed built by the agent of Addendum 15,
+on another machine, at levels that are not calibrated: it shows the fault exists, not how often it fires, and 2 in 60 is not
+a field rate. Measured since against 541 real closest approaches, the bed is about as hard as real audio inside 3 km and 3 to 5
+times too easy beyond it. A third seed runs under a rule fixed before it was drawn (2026-11-06T02:02:12Z in the session log), to
+test whether a curve-only answer should assert. It had not been read when this was written.
+
+- **The decoy test does not hold its 1 in 49 when a real flight is in the region.** Two runs of 60 gave a wrong medium (one of
+  seed 1's 12 did not finish):
+  - Seed 1, at the right place's inputs: `s1_000`, 24.7 km off, curve match 10.8 nats, +0.21 over the best of 48 decoys, two
+    flights heard. One was a real rendered M20P, 3.3 km from the truth, and the other a chance fit.
+  - Seed 2, at a wrong place 80 km off: `s2_007`, 76.94 km off, curve match Adopts, +0.10, two heard.
+  A decoy clock cannot earn a real flight's credit, so one real flight plus a chance second beats the decoys more often than
+  the rank says. Seed 2's other rows were right or unasserted: at the right inputs 8 of 24 right at 1 km, 0 wrong, 16 not
+  asserted; at the wrong place 23 of 24 not asserted.
+- **On the same evidence a curve-only answer has not been right.** On every finished R2 row with a curve match (`9087ec4` and
+  `6914ab7`, 36 rows): Agrees 4 right, Confirms 2 right, Silent 4 right and 25 unasserted, Adopts 1 wrong (`e_harbourgate`).
+  With the bed's two, Adopts is 0 right and 3 wrong. The count is small and was taken after these rows were seen, so it tests
+  nothing, and no build is changed for it.
+- **Falsifier 2 and `s2_007`.** The session's falsifier 2 says "any wrong-date or wrong-place null run is asserted at high or
+  medium". It does not limit that to real recordings, and `s2_007` is such a run, on a build holding the changes this
+  benchmark tests. This addendum's rule names its own 42 rows, so `s2_007` does not stop registration. It does stand against
+  any claim made for this build, and whether the falsifier fired is put to the user, not settled here.
+- **The line has not moved.** It was frozen at `margin > 0` on 2026-11-05, and moving it after seeing wrong answers is the
+  user's decision. A line at +3 nats was tested on seed 2 under rules written first (2026-11-06T00:59:58Z): it removes 2 right
+  stands and 1 wrong one, so by those rules it is dropped. Both right stands were Agrees on high trace answers, so no final
+  answer would have changed, which the rule did not weigh. Later leads were selected on these rows and cannot be tested on them.
+
+### Corrections to Addendum 14
+
+Addendum 14 stands as committed; these correct it.
+
+- "every `result.json` on the volume parsed": `tools/audit_usb.py` read the finished rows under `bench/runs`. Nothing else on
+  the volume was audited.
+- "reached `main` while `32d4e1a` was being checked": they reached it while `32d4e1a` was being checked and landed.
+- "R3 and R1 of set E are still running": that was true of `9087ec4` and `6914ab7` only. Those of `dp` and pinned `fdop` had
+  never started. `dp`'s R3 ran on 2026-11-06 (below).
+- "`np_o02_p3` by 5 cm": it moved 4.9 mm. `nt` and `nm` give the same place, and `nh`, with the crossed geoid height, is 4.9 mm
+  from both. The row is low, so no grade depended on it.
+
+### Bench notes since Addendum 15
+
+- **Two guard stops, one of them the operator's error.** Swap files live on the boot disk, so free space plus swap is about
+  15 GB there, and the 5 GB disk floor trips near 10 GB of swap, before the swap limit of 15.6 GB.
+  - At 00:05:12Z swap reached 10.1 GB. Chains 7150 and 41694 stopped, with `r2_fdop_6914ab7/c_osprey_1031` and
+    `e2_r3_fdop_9087ec4/e_tehachapi` running. The cause was not recorded.
+  - At 00:29:41Z swap reached 11.9 GB. The operator had started `r1_dp` at 00:12:40Z on `dp`'s R3 peak of 2.8 GB; its R1 rows
+    peak at 12 to 14.5 GB. Beside the R3 row `b1_osprey_1101`, `c_osprey_1031` took swap from 4.7 to 11.9 GB in about 80 s.
+    Chains 7155 and 10916 stopped.
+  - The interrupted rows are kept as `*_fault_guard3` and `*_fault_guard4`, and run again under the same commands. The
+    chain holding R2's unfinished rows was requeued alone at 00:09:30Z. `runs/mem_log.txt` now samples every 20 s.
+- **`r1_dp/c_ref_0909` is an infrastructure fault.** It ended rc 133 at 00:28:19Z, after 214 s, with no output. The crash report
+  (`python3.12-2026-11-05-193238.ips`, capture 00:28:20Z) reads `BUG IN LIBMALLOC: malloc assertion "err ==
+  VM_RECLAIM_SUCCESS" failed`, in `realloc`, on a machine under memory pressure. That is the macOS allocator, not a decision of
+  the tool, so the row is kept as `*_fault_libmalloc` and runs again under the same command.
+- **Set E, R3, `dp`** (ran 00:32:22Z to 00:36:04Z): `e_tehachapi` wrong at high, 3,561 km off; the other seven declined.
+- **Older binaries' hashes**, which no addendum stated:
+  - `fdop-7e66501`: sha256 `af1ef5d79eae80461352ad301fb2cbd158e86c3e580faa308d6575b587995d89`
+  - `fdop-9087ec4`: sha256 `faf2a40e7bcc5f6088e30ef1a948a5b3cbff40a566d71d13cefcaf067b6e7293`
+  - `fdop-6914ab7`: sha256 `5d62ac432f9d133f940ae6d39b08edabf43591fe62ca4866aa0906a32d3f658d`
+  The hashes of `ce02222`, `3164272`, `32d4e1a` and `5f6348c` on the bench match this file's.
+- **`start_chains.sh`.** Set F's R2 had no way to start. Regime `fr2` runs pinned `fdop` first, as on set E, with chains started 120 s
+  apart because the geoid service can cross simultaneous requests, and it refuses to start if a registered binary is missing.
+  `fr3` then runs R3 and R1, newest builds first inside each chain, so a stop leaves the most informative rows, and it refuses to
+  start before every registered build's R2 is done. `fr3dem` follows, once every run without the national ground model is done.
+- **Rows that are not scored.** `score.py` reads neither directory.
+  - `runs/diag_tip_e`: `fdop-981fad1` with R2's commands on the two set E cases that gave the search anything to work with, after
+    the seal was lifted. `e_olympia` medium, 0.066 km, radius 2,706 m, curve match Confirms at +3.2 with two flights heard and 0 of
+    23 twins along their tracks. `e_tehachapi` low, 35.47 km. In-sample, since set E shaped these rules: it shows the rules kept
+    that right answer and tests nothing.
+  - `runs/tip_wrong_dates`, above.
+- **Two R1 rows paused.** `r1_fdop_9087ec4` and `r1_fdop_6914ab7`, on `b1_osprey_1101`, were paused by SIGSTOP from 02:27Z so the
+  wrong-date rows could finish, with a timer to resume them at about 03:06Z. Their wall times are inflated by that. A wall time is
+  not a result. `n_ref_on_0907_tb`, which could not finish before registration closed, was paused the same way from 02:34:30Z to
+  about 03:00Z, so that `n_ref_on_0909_tb` could.
+- **A search defect, not in any registered build, and with no effect here.** The hypothesis budget grew with RAM while the budgets
+  after it did not, so a machine over 32 GiB could cut a comparison and fail the margin gate where 32 GiB does not (`r_md_gh`).
+  Every bench row ran on 32 GiB, the fix changes nothing there, and it lands on `main` separately.
