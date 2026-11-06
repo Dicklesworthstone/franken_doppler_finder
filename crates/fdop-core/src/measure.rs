@@ -13,12 +13,15 @@
 //!    and the band shrinks to a few fit-RMS. Three rounds.
 //! 4. Quality gates: points, coverage of both sides of the CPA, a ridge through the fitted drop,
 //!    fit RMS, plausible v and d.
+//! 5. A fit the gates refuse is followed afresh once: from its own trace, the ridge is traced
+//!    without the model, fitted, and the guided rounds start again from that fit. The second
+//!    attempt replaces the first only if every gate accepts it.
 
 use crate::detect::Detection;
-use crate::fit::{FitResult, PreparedFit, Side, prepare_constant_velocity};
+use crate::fit::{Best, FitResult, PreparedFit, Side, prepare_constant_velocity};
 use crate::physics::{cv_curve, readouts, window_for_roc};
 use crate::spectro::{Spec, stft_band_db};
-use crate::trace::{Trace, guided_ridge_peak};
+use crate::trace::{Trace, TraceParams, guided_ridge_peak, ridge_trace};
 use serde::Serialize;
 
 /// At most this many independent aircraft-like events enter the search, with primary detections
@@ -98,6 +101,9 @@ pub struct MeasureParams {
     pub min_drop_traversed: f64,
     pub max_rmse_hz: f64,
     pub rounds: usize,
+    /// Follow the ridge of a fit the gates refuse without the model, and measure again from
+    /// what that finds ([`reseeded_rounds`]).
+    pub free_reseed: bool,
 }
 
 impl Default for MeasureParams {
@@ -114,6 +120,7 @@ impl Default for MeasureParams {
             min_drop_traversed: 0.15,
             max_rmse_hz: 1.5,
             rounds: 3,
+            free_reseed: true,
         }
     }
 }
@@ -131,6 +138,9 @@ pub struct EventQuality {
     /// Ranking value: median SNR (dB) x sqrt(effective independent points).
     pub score: f64,
     pub ok: bool,
+    /// The detection's curve was refused and this event was measured from a free trace of the
+    /// ridge its guided trace had found ([`MeasureParams::free_reseed`]).
+    pub reseeded: bool,
     pub reasons: Vec<String>,
 }
 
@@ -347,6 +357,252 @@ pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams)
     measure_with_fit(x, sr, det, id, p, prepare_constant_velocity)
 }
 
+/// Least number of points a guided trace needs to be fitted (and so to be followed afresh).
+const MIN_GUIDED_POINTS: usize = 20;
+
+/// Integration half-length (s) of a free trace along its own slope: the guided trace's, since a
+/// straight line held longer leaves a curving ridge (about 1 Hz at 1 Hz/s^2 over this length).
+const FREE_INTEG_S: f64 = 1.5;
+
+/// What every measurement attempt of one event reads: the recording slice its spectrograms come
+/// from, the main spectrogram with its row background, and the analysis window.
+struct Frames<'a> {
+    x: &'a [f32],
+    sr: u32,
+    s0: usize,
+    s1: usize,
+    ca: f64,
+    fmin: f64,
+    fmax: f64,
+    spec: &'a Spec,
+    background: &'a [f32],
+    ta: f64,
+    tb: f64,
+}
+
+/// What a run of guided rounds produced: the last fitted trace (or, without a fit, the trace that
+/// failed to fit), its fit, and why the rounds stopped short.
+struct Guided {
+    trace: Trace,
+    prepared: Option<PreparedFit>,
+    reasons: Vec<String>,
+}
+
+/// Guided rounds from the curve `start` = (f0, v, d, t0r) and the band `band`: trace within the
+/// band, fit, make the fit the next curve and narrow the band to a few fit-RMS.
+fn guided_rounds(
+    fr: &Frames,
+    start: (f64, f64, f64, f64),
+    mut band: f64,
+    roc: f64,
+    p: &MeasureParams,
+    fit_trace: &mut impl FnMut(&[f64], &[f64], f64, Side) -> Result<PreparedFit, String>,
+) -> Guided {
+    let c = p.c;
+    let (s0, s1) = (fr.s0, fr.s1);
+    let mut model: Box<dyn Fn(f64) -> f64 + Sync> =
+        Box::new(model_fn(start.0, start.1, start.2, start.3, c));
+    let mut out = Guided {
+        trace: Trace::default(),
+        prepared: None,
+        reasons: Vec::new(),
+    };
+    // From the latest fit, since a detection can rate a steep pass far too gently.
+    let mut fitted_roc = roc;
+    for round in 0..p.rounds {
+        let steep_win = window_for_roc(fitted_roc);
+        let steep = (steep_win < MIN_MAIN_WIN_S)
+            .then(|| {
+                stft_band_db(
+                    &fr.x[s0..s1],
+                    fr.sr,
+                    steep_win,
+                    p.hop_s,
+                    fr.fmin,
+                    fr.fmax,
+                    p.df_max,
+                    fr.ca,
+                )
+                .ok()
+            })
+            .flatten()
+            .map(|mut short| {
+                let background = short.normalize_rows_with_offsets(None);
+                (short, background)
+            });
+        let tr = guided_trace_with_background(
+            fr.spec,
+            Some(fr.background),
+            steep
+                .as_ref()
+                .map(|(short, offsets)| (short, Some(offsets.as_slice()))),
+            &*model,
+            fr.ta,
+            fr.tb,
+            band,
+            p.min_snr,
+            p.min_z,
+        );
+        if tr.len() < MIN_GUIDED_POINTS {
+            if round == 0 {
+                out.reasons
+                    .push(format!("guided trace found only {} ridge points", tr.len()));
+            }
+            break;
+        }
+        match fit_trace(&tr.t, &tr.f, c, Side::Both) {
+            Ok(prepared) => {
+                let b = prepared.best();
+                model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
+                fitted_roc = readouts(b.f0, b.v, b.d, c).max_roc;
+                band = (3.0 * b.rmse).clamp(1.0, band);
+                out.trace = tr;
+                out.prepared = Some(prepared);
+            }
+            Err(e) => {
+                out.reasons.push(format!("fit: {e}"));
+                // Keep a successful fit paired with its own trace if a later round fails.
+                if out.prepared.is_none() {
+                    out.trace = tr;
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The quality gates' reading of a fitted trace: the traced span on each side of the CPA, the
+/// share of the drop traversed, and every gate it fails.
+struct Gated {
+    span_approach_s: f64,
+    span_recede_s: f64,
+    drop_traversed: f64,
+    reasons: Vec<String>,
+}
+
+fn gate(trace: &Trace, b: &Best, det_t0r: f64, span: f64, p: &MeasureParams) -> Gated {
+    let c = p.c;
+    let (mut amin, mut rmax) = (b.t0r, b.t0r);
+    for &t in &trace.t {
+        amin = amin.min(t);
+        rmax = rmax.max(t);
+    }
+    let asymptotes = readouts(b.f0, b.v, b.d, c);
+    let mut g = Gated {
+        span_approach_s: b.t0r - amin,
+        span_recede_s: rmax - b.t0r,
+        drop_traversed: drop_traversed(
+            &trace.t,
+            &trace.f,
+            asymptotes.f_pre,
+            asymptotes.f_post,
+            model_fn(b.f0, b.v, b.d, b.t0r, c),
+        ),
+        reasons: Vec::new(),
+    };
+    if trace.len() < p.min_points {
+        g.reasons
+            .push(format!("{} trace points < {}", trace.len(), p.min_points));
+    }
+    if g.span_approach_s < p.min_side_s || g.span_recede_s < p.min_side_s {
+        g.reasons.push(format!(
+            "one-sided trace (approach {:.0}s, recede {:.0}s): CPA not observed",
+            g.span_approach_s, g.span_recede_s
+        ));
+    }
+    if g.drop_traversed < p.min_drop_traversed {
+        g.reasons.push(format!(
+            "trace follows only {:.0} % of the central frequency drop: no ridge through the CPA",
+            100.0 * g.drop_traversed
+        ));
+    }
+    if b.rmse > p.max_rmse_hz {
+        g.reasons
+            .push(format!("fit RMS {:.2} Hz > {:.2}", b.rmse, p.max_rmse_hz));
+    }
+    if !(15.0..=0.8 * c).contains(&b.v) {
+        g.reasons.push(format!("implausible speed {:.0} m/s", b.v));
+    }
+    if !(60.0..=25_000.0).contains(&b.d) {
+        g.reasons
+            .push(format!("implausible CPA distance {:.0} m", b.d));
+    }
+    if (b.t0r - det_t0r).abs() > (0.5 * span).max(20.0) {
+        g.reasons.push(format!(
+            "fit CPA {:.1}s drifted from detection {:.1}s",
+            b.t0r, det_t0r
+        ));
+    }
+    g
+}
+
+/// Whether guided rounds ended in a fit that every gate accepts.
+fn passes(g: &Guided, det_t0r: f64, span: f64, p: &MeasureParams) -> bool {
+    g.reasons.is_empty()
+        && g.prepared.as_ref().is_some_and(|f| {
+            gate(&g.trace, &f.best(), det_t0r, span, p)
+                .reasons
+                .is_empty()
+        })
+}
+
+/// A second start for an event whose guided rounds the gates refused. The detection's curve can
+/// meet the pass's ridge over one stretch and leave it elsewhere by more than the band: a detection
+/// at the edge of the template bank, or one that rates the speed and distance together wrongly,
+/// has the wrong shape, and the band then holds only one side of the pass. The trace still lies
+/// on the ridge where the curve met it. From its first, strongest and last points this follows
+/// the ridge without the model, by its own local slope ([`ridge_trace`]), inside the analysis
+/// window, and fits what it finds; guided rounds then start from that fit. A steady tone, a
+/// rising one or noise gives a fit the gates refuse again, and the first rounds stand.
+fn reseeded_rounds(
+    fr: &Frames,
+    trace: &Trace,
+    p: &MeasureParams,
+    fit_trace: &mut impl FnMut(&[f64], &[f64], f64, Side) -> Result<PreparedFit, String>,
+) -> Option<Guided> {
+    let c = p.c;
+    let n = trace.len();
+    let strongest = (0..n).max_by(|&i, &j| trace.snr[i].total_cmp(&trace.snr[j]))?;
+    let mut seeds: Vec<(f64, f64)> = Vec::with_capacity(3);
+    for i in [0, strongest, n - 1] {
+        if !seeds.iter().any(|s| s.0 == trace.t[i]) {
+            seeds.push((trace.t[i], trace.f[i]));
+        }
+    }
+    let spec = fr.spec;
+    let (a, b) = (spec.frame_index(fr.ta), spec.frame_index(fr.tb) + 1);
+    let window = spec.crop(a, b, 0, spec.nf());
+    let free = ridge_trace(
+        &window,
+        &seeds,
+        &TraceParams {
+            min_snr: p.min_snr,
+            min_z: p.min_z,
+            integ_s: FREE_INTEG_S,
+            ..Default::default()
+        },
+    );
+    if free.len() < MIN_GUIDED_POINTS {
+        return None;
+    }
+    let b = fit_trace(&free.t, &free.f, c, Side::Both).ok()?.best();
+    let plausible = b.f0.is_finite()
+        && b.t0r.is_finite()
+        && (15.0..=0.8 * c).contains(&b.v)
+        && (60.0..=25_000.0).contains(&b.d);
+    plausible.then(|| {
+        guided_rounds(
+            fr,
+            (b.f0, b.v, b.d, b.t0r),
+            (0.04 * b.f0).clamp(3.0, 12.0),
+            readouts(b.f0, b.v, b.d, c).max_roc,
+            p,
+            fit_trace,
+        )
+    })
+}
+
 fn measure_with_fit(
     x: &[f32],
     sr: u32,
@@ -375,6 +631,7 @@ fn measure_with_fit(
         rmse_hz: f64::NAN,
         score: 0.0,
         ok: false,
+        reseeded: false,
         reasons: Vec::new(),
     };
     let s0 = (ca * sr as f64) as usize;
@@ -395,64 +652,48 @@ fn measure_with_fit(
         }
     };
     let background = spec.normalize_rows_with_offsets(None);
-    let mut model: Box<dyn Fn(f64) -> f64 + Sync> =
-        Box::new(model_fn(det.f0, det.v, det.d, det.t0r, c));
-    let mut band = (0.04 * det.f0).clamp(3.0, 12.0);
-    let mut prepared: Option<PreparedFit> = None;
-    let mut trace = Trace::default();
-    // From the latest fit, since a detection can rate a steep pass far too gently.
-    let mut fitted_roc = roc;
-    for round in 0..p.rounds {
-        let steep_win = window_for_roc(fitted_roc);
-        let steep = (steep_win < MIN_MAIN_WIN_S)
-            .then(|| {
-                stft_band_db(&x[s0..s1], sr, steep_win, p.hop_s, fmin, fmax, p.df_max, ca).ok()
-            })
-            .flatten()
-            .map(|mut short| {
-                let background = short.normalize_rows_with_offsets(None);
-                (short, background)
-            });
-        let tr = guided_trace_with_background(
-            &spec,
-            Some(&background),
-            steep
-                .as_ref()
-                .map(|(short, offsets)| (short, Some(offsets.as_slice()))),
-            &*model,
-            ta,
-            tb,
-            band,
-            p.min_snr,
-            p.min_z,
-        );
-        if tr.len() < 20 {
-            if round == 0 {
-                quality
-                    .reasons
-                    .push(format!("guided trace found only {} ridge points", tr.len()));
-            }
-            break;
-        }
-        match fit_trace(&tr.t, &tr.f, c, Side::Both) {
-            Ok(fr) => {
-                let b = fr.best();
-                model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
-                fitted_roc = readouts(b.f0, b.v, b.d, c).max_roc;
-                band = (3.0 * b.rmse).clamp(1.0, band);
-                trace = tr;
-                prepared = Some(fr);
-            }
-            Err(e) => {
-                quality.reasons.push(format!("fit: {e}"));
-                // Keep a successful fit paired with its own trace if a later round fails.
-                if prepared.is_none() {
-                    trace = tr;
-                }
-                break;
-            }
-        }
+    let frames = Frames {
+        x,
+        sr,
+        s0,
+        s1,
+        ca,
+        fmin,
+        fmax,
+        spec: &spec,
+        background: &background,
+        ta,
+        tb,
+    };
+    let first = guided_rounds(
+        &frames,
+        (det.f0, det.v, det.d, det.t0r),
+        (0.04 * det.f0).clamp(3.0, 12.0),
+        roc,
+        p,
+        &mut fit_trace,
+    );
+    // Only a fit the gates refused is followed afresh: a trace too short to fit, or a fit that
+    // failed, has nothing to follow.
+    let refused = p.free_reseed
+        && first.reasons.is_empty()
+        && first.trace.len() >= MIN_GUIDED_POINTS
+        && first.prepared.is_some()
+        && !passes(&first, det.t0r, span, p);
+    let mut chosen = first;
+    if refused
+        && let Some(second) = reseeded_rounds(&frames, &chosen.trace, p, &mut fit_trace)
+        && passes(&second, det.t0r, span, p)
+    {
+        chosen = second;
+        quality.reseeded = true;
     }
+    let Guided {
+        trace,
+        prepared,
+        reasons,
+    } = chosen;
+    quality.reasons = reasons;
     // Only the final accepted trace needs uncertainty profiles and manoeuvre diagnostics.
     let fit = prepared.map(PreparedFit::complete);
     // Keep only the analysis window plus a scoring margin in memory.
@@ -461,66 +702,16 @@ fn measure_with_fit(
     let spec = spec.crop(keep_a, keep_b, 0, spec.nf());
     quality.n_points = trace.len();
     if let Some(fr) = &fit {
-        let t0r = fr.best.t0r;
-        let (mut amin, mut rmax) = (t0r, t0r);
-        for &t in &trace.t {
-            amin = amin.min(t);
-            rmax = rmax.max(t);
-        }
-        quality.span_approach_s = t0r - amin;
-        quality.span_recede_s = rmax - t0r;
         let mut snr = trace.snr.clone();
         quality.median_snr_db = crate::spectro::median_f64(&mut snr);
         quality.rmse_hz = fr.best.rmse;
         let n_eff = fr.diagnostics.n_eff.max(1.0);
         quality.score = quality.median_snr_db.max(0.0) * n_eff.sqrt();
-        let b = fr.best;
-        let asymptotes = readouts(b.f0, b.v, b.d, c);
-        quality.drop_traversed = drop_traversed(
-            &trace.t,
-            &trace.f,
-            asymptotes.f_pre,
-            asymptotes.f_post,
-            model_fn(b.f0, b.v, b.d, b.t0r, c),
-        );
-        if trace.len() < p.min_points {
-            quality
-                .reasons
-                .push(format!("{} trace points < {}", trace.len(), p.min_points));
-        }
-        if quality.span_approach_s < p.min_side_s || quality.span_recede_s < p.min_side_s {
-            quality.reasons.push(format!(
-                "one-sided trace (approach {:.0}s, recede {:.0}s): CPA not observed",
-                quality.span_approach_s, quality.span_recede_s
-            ));
-        }
-        if quality.drop_traversed < p.min_drop_traversed {
-            quality.reasons.push(format!(
-                "trace follows only {:.0} % of the central frequency drop: no ridge through the CPA",
-                100.0 * quality.drop_traversed
-            ));
-        }
-        if b.rmse > p.max_rmse_hz {
-            quality
-                .reasons
-                .push(format!("fit RMS {:.2} Hz > {:.2}", b.rmse, p.max_rmse_hz));
-        }
-        if !(15.0..=0.8 * c).contains(&b.v) {
-            quality
-                .reasons
-                .push(format!("implausible speed {:.0} m/s", b.v));
-        }
-        if !(60.0..=25_000.0).contains(&b.d) {
-            quality
-                .reasons
-                .push(format!("implausible CPA distance {:.0} m", b.d));
-        }
-        if (b.t0r - det.t0r).abs() > (0.5 * span).max(20.0) {
-            quality.reasons.push(format!(
-                "fit CPA {:.1}s drifted from detection {:.1}s",
-                b.t0r, det.t0r
-            ));
-        }
+        let g = gate(&trace, &fr.best, det.t0r, span, p);
+        quality.span_approach_s = g.span_approach_s;
+        quality.span_recede_s = g.span_recede_s;
+        quality.drop_traversed = g.drop_traversed;
+        quality.reasons.extend(g.reasons);
     } else if quality.reasons.is_empty() {
         quality.reasons.push("no fit".into());
     }
@@ -1663,6 +1854,140 @@ mod tests {
                 "reversed: score {s:.2} at {:.0} s, {:.0} Hz passed",
                 e.detection.t0r, e.detection.f0
             );
+        }
+    }
+
+    /// `dur` s at 4 kHz: uniform noise of amplitude 0.3 and, unless `pass` is None, the tone of a
+    /// constant-velocity pass (f0, v, d) heard at its CPA at `t0r`, or a steady tone at `steady`.
+    fn wrong_shape_audio(
+        pass: Option<(f64, f64, f64)>,
+        steady: Option<f64>,
+        t0r: f64,
+        dur: f64,
+        tone_amp: f64,
+    ) -> Vec<f32> {
+        let sr = 4000.0;
+        let (mut seed, mut phase) = (4242u64, 0.0f64);
+        let tone = pass.map(|(f0, v, d)| model_fn(f0, v, d, t0r, 343.0));
+        (0..(sr * dur) as usize)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr;
+                let f = match (&tone, steady) {
+                    (Some(tone), _) => tone(t),
+                    (None, Some(f)) => f,
+                    (None, None) => 0.0,
+                };
+                phase += std::f64::consts::TAU * f / sr;
+                let signal = if f > 0.0 { tone_amp * phase.sin() } else { 0.0 };
+                (signal + 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0)) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pass_detected_with_the_wrong_shape_is_measured_from_a_free_trace_of_its_ridge_and_tones_are_not()
+     {
+        // Set D's N394FX_R20: the bank's best template sat at its top speed, 181 m/s at 3646 m,
+        // for a pass of 135 m/s at 1758 m. That curve meets the ridge only on the recede side, 31
+        // to 46 Hz off it around the CPA where the band holds 12, so the guided trace held only
+        // the tail and its fit drifted to an implausible pass. Each case here is a pass and a
+        // detection of that kind: (pass f0, v, d), (detection f0, v, d, CPA offset s).
+        let (dur, t0r) = (240.0, 120.0);
+        let cases = [
+            ((367.0, 135.0, 1758.0), (342.7, 181.0, 3646.0, 7.0)),
+            ((200.0, 90.0, 900.0), (190.0, 140.0, 2400.0, -6.0)),
+            ((150.0, 110.0, 1200.0), (142.0, 60.0, 500.0, 5.0)),
+        ];
+        let off = MeasureParams {
+            free_reseed: false,
+            ..Default::default()
+        };
+        let on = MeasureParams::default();
+        let det_of = |(f0, v, d, dt): (f64, f64, f64, f64), t0r: f64| Detection {
+            id: 0,
+            t0r: t0r + dt,
+            f0,
+            v,
+            d,
+            score: 8.0,
+            score_approach: 8.0,
+            score_recede: 8.0,
+            half_s: 60.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+        };
+        for ((f0, v, d), shape) in cases {
+            let label = format!("pass {f0} Hz {v} m/s {d} m, detection {shape:?}");
+            let x = wrong_shape_audio(Some((f0, v, d)), None, t0r, dur, 0.15);
+            let det = det_of(shape, t0r);
+            let first = measure(&x, 4000, &det, "e1", &off);
+            assert!(
+                !first.quality.ok,
+                "{label}: the detection's curve alone was accepted"
+            );
+            let ev = measure(&x, 4000, &det, "e1", &on);
+            let b = ev.fit.as_ref().map(|f| f.best);
+            eprintln!(
+                "{label}: first {:?}; second ok {} reseeded {} {:?} drop {:.2} reasons {:?}",
+                first.quality.reasons,
+                ev.quality.ok,
+                ev.quality.reseeded,
+                b.map(|b| (b.f0, b.v, b.d, b.t0r)),
+                ev.quality.drop_traversed,
+                ev.quality.reasons
+            );
+            assert!(
+                ev.quality.ok && ev.quality.reseeded,
+                "{label}: {:?}",
+                ev.quality.reasons
+            );
+            let b = b.unwrap();
+            assert!((b.v - v).abs() <= 0.05 * v, "{label}: v {}", b.v);
+            assert!((b.d - d).abs() <= 0.10 * d, "{label}: d {}", b.d);
+            assert!((b.t0r - t0r).abs() <= 1.0, "{label}: t0r {}", b.t0r);
+            assert!((b.f0 - f0).abs() <= 0.01 * f0, "{label}: f0 {}", b.f0);
+            // The event keeps the detection it was measured from.
+            assert_eq!(ev.detection.v, det.v);
+
+            // A detection with the right shape is measured exactly as without a second start.
+            let right = det_of((f0, v, d, 0.0), t0r);
+            let (a, b) = (
+                measure(&x, 4000, &right, "e1", &on),
+                measure(&x, 4000, &right, "e1", &off),
+            );
+            assert!(
+                a.quality.ok && !a.quality.reseeded,
+                "{label}: {:?}",
+                a.quality.reasons
+            );
+            assert_eq!(
+                serde_json::to_value((&a.fit, &a.trace, &a.quality)).unwrap(),
+                serde_json::to_value((&b.fit, &b.trace, &b.quality)).unwrap()
+            );
+
+            // Its reversal (a rising tone), a steady tone where the curve crosses the ridge, and
+            // noise give nothing the gates accept, from either start.
+            let mut reversed = x.clone();
+            reversed.reverse();
+            let mirrored = det_of((shape.0, shape.1, shape.2, 0.0), dur - t0r - shape.3);
+            let crossing = model_fn(f0, v, d, t0r, 343.0)(t0r + 15.0);
+            let steady = wrong_shape_audio(None, Some(crossing), t0r, dur, 0.15);
+            let noise = wrong_shape_audio(None, None, t0r, dur, 0.15);
+            for (what, y, dt) in [
+                ("reversed", &reversed, &mirrored),
+                ("steady tone", &steady, &det),
+                ("noise", &noise, &det),
+            ] {
+                let ev = measure(y, 4000, dt, "e1", &on);
+                eprintln!(
+                    "{label} {what}: ok {} reseeded {} points {} reasons {:?}",
+                    ev.quality.ok, ev.quality.reseeded, ev.quality.n_points, ev.quality.reasons
+                );
+                assert!(!ev.quality.ok && !ev.quality.reseeded, "{label} {what}");
+            }
         }
     }
 }
