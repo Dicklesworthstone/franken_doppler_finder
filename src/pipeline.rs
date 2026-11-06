@@ -334,6 +334,13 @@ fn curve_call(
     }
 }
 
+/// Whether the measurement at rank `k`, of detection `d`, is one the old measurement line would not
+/// have made: past the strongest `max_measured`, a primary whose detection scored under `thr_db`, or
+/// one found only on the contrast image (`Detection::from_contrast`), which no null run has tested.
+fn past_the_old_line(k: usize, d: &Detection, max_measured: usize, thr_db: f64) -> bool {
+    k >= max_measured || d.score < thr_db || d.from_contrast
+}
+
 /// A trace answer graded medium whose core matches include an event the old measurement line would
 /// not have measured, with no curve match able to judge it. Measuring further down the list gives
 /// chance alignments more events to use, and the medium margin does not count how many were
@@ -841,11 +848,11 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             prim.len(),
         ));
     }
-    // Events the old measurement line would not have measured: past the strongest MAX_MEASURED, or
-    // a primary whose detection scored under `thr_db`. Without a curve match to judge it, an answer
-    // that rests on one of them cannot be medium (`leans_on_added`).
+    // Events the old measurement line would not have measured (`past_the_old_line`). Without a
+    // curve match to judge it, an answer that rests on one of them cannot be medium
+    // (`leans_on_added`).
     let added_ranks: std::collections::HashSet<String> = (0..events.len())
-        .filter(|&k| k >= max_measured || prim[k].score < dp.thr_db)
+        .filter(|&k| past_the_old_line(k, prim[k], max_measured, dp.thr_db))
         .map(|k| format!("e{}", k + 1))
         .collect();
     drop(x);
@@ -859,7 +866,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         e.id = id;
     }
     log.say(&format!(
-        "{} of them measured past the old line (detection score under {:.1}, or past the strongest {max_measured})",
+        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, or found only on the contrast image)",
         added.len(),
         dp.thr_db
     ));
@@ -1489,7 +1496,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                 "measurement line".to_string(),
                 false,
                 format!(
-                    "a medium answer rests on {}, measured past the old line, and no curve match ran with enough decoy clocks to check it",
+                    "a medium answer rests on {}, measured past the old line or found only on the contrast image, and no curve match ran with enough decoy clocks to check it",
                     on.join(", ")
                 ),
             ));
@@ -2149,6 +2156,31 @@ mod tests {
                 CurveCall::Adopts
             );
         }
+    }
+
+    /// The old line measured the strongest `max_measured` primaries scoring `thr_db` or more on the
+    /// survey image; anything else, including a contrast-stage find however strong, is added.
+    #[test]
+    fn contrast_stage_finds_are_measured_past_the_old_line() {
+        let det = |score: f64, from_contrast: bool| Detection {
+            id: 0,
+            t0r: 30.0,
+            f0: 200.0,
+            v: 60.0,
+            d: 900.0,
+            score,
+            score_approach: score,
+            score_recede: score,
+            half_s: 30.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+            from_contrast,
+        };
+        assert!(!past_the_old_line(0, &det(6.0, false), 24, 4.5));
+        assert!(!past_the_old_line(23, &det(4.5, false), 24, 4.5));
+        assert!(past_the_old_line(24, &det(9.0, false), 24, 4.5));
+        assert!(past_the_old_line(0, &det(4.4, false), 24, 4.5));
+        assert!(past_the_old_line(0, &det(9.0, true), 24, 4.5));
     }
 
     /// Events measured past the old line hold up a medium answer only where the curve match judged it.

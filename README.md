@@ -215,7 +215,8 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
       │           emission-time templates over speed (40–175 m/s) × CPA distance (250 m–12 km);
       │           both halves of a pass must light up, so steady hum and clicks are rejected;
       │           a short pass heard too near the start or end for the 24 s templates gets a
-      │           10 s one, on what the full bank left unexplained
+      │           10 s one, on what the full bank left unexplained; a compressed image is scored
+      │           once more, contrast first, for strong curves the rest left unexplained
       ▼  measure  per event: STFT window ≈ 1/√(slope at the CPA), at least 0.5 s, with a matched shorter
       │           window for frames steeper than that holds; model-guided ridge trace, bounded
       │           trust-region fit with multistarts and robust loss, profile-likelihood ranges,
@@ -256,7 +257,7 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
 | no unheard close pass | no tonal aircraft passed much closer than the heard ones without leaving a detection |
 | radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
 | curve match | listed when the [curve match](#the-curve-match) stands: the answer is within 3 km of where it stands. Also listed, failed, on a medium answer when the curve match ran with enough decoy clocks to judge (40) and stands nowhere |
-| measurement line | listed, failed, only on a medium answer that rests on a core match measured past the old line (a detection score under 4.5, or past the strongest 24) when no curve match ran with enough decoy clocks to judge it |
+| measurement line | listed, failed, only on a medium answer that rests on a core match measured past the old line (a detection score under 4.5, past the strongest 24, or found only on the contrast image) when no curve match ran with enough decoy clocks to judge it |
 
 Refinement uses the grid to find a basin, then improves the observer position with a bounded continuous
 search that evaluates the same physical trace model at every proposed point. The grid spacing controls
@@ -581,8 +582,10 @@ Detects flyovers and measures them strongest first, from the silence line up, un
 events survive the same eligibility and harmonic checks used by `locate`. Refused fits, non-aircraft fits and
 duplicate traces of one pass do not consume that allowance. Every measured result remains in `events.json`,
 including duplicates and refusals. A warning on stderr says when either cap omits candidates, when the audio
-looks high-passed, or when the survey image was raised because its spread was under 0.5. The command writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv` for
-every fitted event. The default output directory is `fdop_runs/detect`.
+looks high-passed, or when the survey image was raised because its spread was under 0.5. A detection found
+only on the contrast image of such a recording has `"from_contrast": true` in `events.json`. The command
+writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv` for every fitted event. The default
+output directory is `fdop_runs/detect`.
 
 `--audio-stream N` and `--audio-channel N` select the same source as in `locate`. For example,
 `fdop detect clip.mov --audio-stream 1 --audio-channel 0` measures the first channel of the second audio track.
@@ -811,6 +814,17 @@ Design notes:
   suppression, residual and marking rules, so every detection the passes accept is the same with or
   without it. `refine` keeps the 10 s half. The stage runs only on the frames near each end, and not at
   all when the passes stop at three times the detection cap.
+- **A compressed image is scored once more, contrast first.** The swell that compresses an image also
+  shrinks the ridges of the pass that made it. It raises every row together, which inflates each row's MAD
+  before the frame contrast can take the swell out. On Livermore's N1387U_R44, a 157 Hz tone 33 dB over its
+  neighbours at the CPA had a row z of 1 to 1.5, and nothing on it scored over 2.88. An image under the 0.5
+  floor therefore gets a second one from the same levels, with the frame contrast taken first and each row's
+  robust z after it (`LogSpec::contrast`). After everything else, the full bank scores it on what the accepted
+  curves left, at the strong line, 4.5, since the lines were not set on this image. Its detections follow all
+  the others, which keep their order, harmonic grouping and measurement, and carry `from_contrast`. No null
+  recording is under the floor, so no null run tests them, and an answer resting on one counts as measured
+  past the old line. On swells of noise alone the stage adds nothing up to 30 dB. From 35 dB it adds strong
+  curves of its own, and the measurement gates refuse them.
 - **Guided measurement follows the predicted ridge.** It selects the nearest qualified local spectral
   peak within the existing model band, using the existing SNR and robust-z requirements. A brighter
   neighbouring aircraft no longer automatically takes over the trace when both tones enter that band.

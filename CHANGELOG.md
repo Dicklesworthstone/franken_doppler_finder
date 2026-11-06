@@ -19,6 +19,66 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Score a compressed survey image once more, contrast first
+
+- **The fault.** A loud nearby pass swells a short clip's level by 20 dB or more around its CPA. The survey
+  image takes each row's robust z before the frame contrast removes the swell, so the swell inflates every row's
+  MAD and compresses the pass's own ridges. The spread floor (`min_image_scale`) raises the whole image, but it
+  cannot restore a ridge's contrast against its row. On set D's N1387U_R44 (33 m/s at 421 m), a 157 Hz tone
+  33 dB over its neighbours at the CPA had a row z of 1 to 1.5, and nothing on it scored over 2.88.
+- **The change.** When the floor raises an image, `survey` also builds a second one from the same pooled and
+  clamped levels: each frame's contrast over +-1/3 octave first, then each row's robust z, raised to the floor
+  (`LogSpec::contrast`). After the passes and the edge stage, the full bank scores it on the residual of every
+  accepted curve at the strong line, 4.5 (the lines were set on the survey image, not this one). Its candidates
+  go through the same suppression and marking rules. Its detections follow all the others, strongest first, in
+  the room left under the detection cap, and carry `from_contrast` (`"from_contrast": true` in `events.json`).
+  Every other detection keeps its order, id, harmonic grouping and measurement; a primary may gain harmonic
+  ratios, which nothing in measurement reads. No null recording is under the floor, so no null run tests the
+  stage. An answer resting on a contrast detection therefore counts as measured past the old line: the
+  measurement-line gate lowers a medium answer on one unless a curve match judged it.
+- **What did not work.** Replacing the survey image with the contrast image found 39 passes but was right at
+  22 / 29 / 29 / 31 / 33, under `3f408f4`. Scoring the second image from the silence line gave the same
+  answers as the strong line with 101 added events on set D instead of 54. Taking it from the levels without
+  the 20 dB ceiling made fewer strong curves of its own on swells of noise alone (top added scores 4.07 at 35 dB
+  and 4.82 at 40 dB, against 5.26 and 9.58), but N814SR_R07's first event became 91 m/s at 565 m, wrong at
+  15/30 and 20/40 %. The strong line and the ceiling were chosen on this development set.
+- **Evidence.**
+  - Metamorphic, on 11 scenes: an image at or above the floor has no contrast image and detects exactly as
+    before. Under it, every detection without the stage is in the result with it, first and in order, field for
+    field. Each added one is flagged, has a half of at least 24 s and a score of at least 4.5, and they are
+    sorted. Swells of noise alone add nothing at 20, 25 and 30 dB. At 35 dB they add two curves (5.26 and 4.56)
+    and at 40 dB 18 (up to 9.58).
+  - A faint 300 Hz pass (90 m/s, 900 m, CPA 22 s) swelling by 20 or 25 dB with its noise is on no detection of
+    the survey image, raised or not. The contrast stage finds it at 21.5 s, its refined seed within 1 % of the
+    curve. Measured from that detection it passes every gate at 90.02 m/s and 901.0 m, CPA 22.00 s, and
+    nothing else passes. The same audio reversed, and swells of 30, 35 and 40 dB alone (1, 4 and 17 measured,
+    up to 16 from the contrast stage), give nothing that passes.
+- **Set D** (`fdop detect` on the 40 Livermore clips, read with `bench` `tools/score_d.py`; local runs of the
+  bench-built binary `e93a269d`). With the stage: 39 found (38), 37 first event right (36), medians 5.5 m/s
+  (6.2 %) and 164.1 m (11.5 %), against 212.2 m. Right at 10/20, 15/30, 20/40, 25/50 and 30/60 % of speed and
+  distance:
+
+  | Tool | Found | Right at the five tolerances |
+  |---|---|---|
+  | fdop `3f408f4` | 38 | 22 / 29 / 31 / 33 / 36 |
+  | fdop with the contrast stage | 39 | 23 / 30 / 31 / 34 / 37 |
+  | dopplerprint | 39 | 13 / 19 / 21 / 24 / 26 |
+  | dopplertrack 60-300 Hz | 37 | 17 / 23 / 27 / 29 / 35 |
+  | dopplertrack 40-450 Hz | 38 | 19 / 23 / 26 / 30 / 36 |
+
+  The stage adds 54 events on 11 of the 12 clips under the floor; 18 pass the gates, 15 of them within 15 s of
+  the true CPA. Three clips' answers changed. N1387U_R44 is found, 41.4 m/s at 476 m, right from 25/50 %. On
+  N814SR_R07 (90 m/s, 1166 m) a new 249 Hz line comes first, 98.2 m/s at 1142 m, right from 10/20 %.
+  N451EE_R45's first event is now a contrast detection on a 271 Hz line, 61.1 m/s at 531 m for 64 m/s and
+  695 m, right from 15/30 % (54.5 m/s at 431 m, right from 20/40 %, before). Every other clip's answer is the
+  same. fdop now has more right answers than every rival at every tolerance and finds as many passes as
+  `dopplerprint`. Its one miss is N958JX_R50 (215 m/s at 5 km, past the bank's 175 m/s; no tool gets it right).
+- **Falsifier 2 and the development rows.** On the six recordings the nulls, development rows and wrong dates
+  use (ref_raw, osprey_1031, osprey_1101, osprey_1102b, duke_1101b, feederwatch), none is under the floor, and
+  `detect` writes byte-identical `events.json`, traces, stdout and stderr (46-60 events each) with and without
+  the stage. `locate` measures exactly as `detect` does, so no null or development answer can differ from
+  `3f408f4`'s.
+
 ### Score a pass heard near a recording's start or end with a short template
 
 - **The fault.** A short transition (shortest 1.25 d/v at or under `min_half_s`, 24 s) is scored by a 24 s

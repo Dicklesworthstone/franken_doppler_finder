@@ -781,6 +781,7 @@ mod tests {
             half_s: 60.0,
             harmonic_of: None,
             harmonics: Vec::new(),
+            from_contrast: false,
         };
         let asymptotes = readouts(f0, v, d, c);
         let tone = model_fn(f0, v, d, t0r, c);
@@ -906,6 +907,7 @@ mod tests {
                     half_s: 60.0,
                     harmonic_of: None,
                     harmonics: Vec::new(),
+                    from_contrast: false,
                 };
                 let event = measure(&x, sr, &det, "sub_bin", &p);
                 eprintln!(
@@ -1146,6 +1148,7 @@ mod tests {
             half_s: 60.0,
             harmonic_of: None,
             harmonics: Vec::new(),
+            from_contrast: false,
         };
         let mut seed = 789u64;
         let mut phase = 0.0;
@@ -1434,6 +1437,7 @@ mod tests {
             half_s: 75.0,
             harmonic_of: None,
             harmonics: Vec::new(),
+            from_contrast: false,
         };
         let mut p = MeasureParams {
             hop_s: 0.25,
@@ -1572,6 +1576,7 @@ mod tests {
             half_s: 60.0,
             harmonic_of: None,
             harmonics: Vec::new(),
+            from_contrast: false,
         };
         let duplicate = Detection {
             id: 1,
@@ -1810,6 +1815,76 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_a_loud_swell_hides_is_measured_from_its_contrast_detection_and_swell_noise_is_refused()
+     {
+        // A faint pass in a 20 dB swell is on no detection of the survey image; the contrast stage
+        // finds it (detect.rs). Measured from that detection, it passes the gates with the right
+        // speed, distance and CPA, and nothing else passes. The same audio reversed, and swells
+        // of 30 to 40 dB with no pass (where the contrast image adds strong curves of its own),
+        // give nothing that passes.
+        use crate::detect::{SWELL_PASS, swell_scene};
+        let (f0, v, d, t0r) = SWELL_PASS;
+        let on_pass = |t: f64, f: f64| (t - t0r).abs() < 6.0 && (f / f0 - 1.0).abs() < 0.03;
+        let x = swell_scene(0.08, 20.0);
+        let evs = measured_down_to_the_silence_line(&x);
+        for (s, e) in &evs {
+            let b = e.fit.as_ref().map(|f| f.best);
+            eprintln!(
+                "score {s:.2} contrast {} t0r {:.1} f0 {:.1}: {:?} {:?}",
+                e.detection.from_contrast,
+                e.detection.t0r,
+                e.detection.f0,
+                b.map(|b| (b.v, b.d, b.t0r)),
+                e.quality.reasons
+            );
+        }
+        let (_, pass) = evs
+            .iter()
+            .find(|(_, e)| on_pass(e.detection.t0r, e.detection.f0))
+            .expect("the pass was not detected");
+        assert!(pass.detection.from_contrast);
+        assert!(pass.quality.ok, "{:?}", pass.quality.reasons);
+        let b = pass.fit.as_ref().unwrap().best;
+        assert!((b.v / v - 1.0).abs() < 0.1, "v {} against {v}", b.v);
+        assert!((b.d / d - 1.0).abs() < 0.2, "d {} against {d}", b.d);
+        assert!((b.t0r - t0r).abs() < 1.0, "t0r {} against {t0r}", b.t0r);
+        for (s, e) in evs
+            .iter()
+            .filter(|(_, e)| !on_pass(e.detection.t0r, e.detection.f0))
+        {
+            assert!(
+                !e.quality.ok,
+                "score {s:.2} at {:.0} s, {:.0} Hz passed",
+                e.detection.t0r, e.detection.f0
+            );
+        }
+        let mut rev = x.clone();
+        rev.reverse();
+        let mut cases = vec![("reversed".to_string(), rev)];
+        for db in [30.0, 35.0, 40.0] {
+            cases.push((format!("{db} dB swell alone"), swell_scene(0.0, db)));
+        }
+        for (name, y) in cases {
+            let got = measured_down_to_the_silence_line(&y);
+            let n_contrast = got
+                .iter()
+                .filter(|(_, e)| e.detection.from_contrast)
+                .count();
+            eprintln!(
+                "{name}: {} measured, {n_contrast} from the contrast stage",
+                got.len()
+            );
+            for (s, e) in &got {
+                assert!(
+                    !e.quality.ok,
+                    "{name}: score {s:.2} at {:.0} s, {:.0} Hz passed",
+                    e.detection.t0r, e.detection.f0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_short_pass_in_a_clip_too_short_for_the_bank_is_measured_from_its_edge_detection() {
         // In a 30 s clip the 24 s templates cannot score any cell; an edge template finds a short
         // pass heard 9 s in (detect.rs). Measured from that detection, it passes the gates with
@@ -2004,6 +2079,7 @@ mod tests {
             half_s: 60.0,
             harmonic_of: None,
             harmonics: Vec::new(),
+            from_contrast: false,
         };
         let audio = |kind: &str, amp: f64, (f0, v, d): (f64, f64, f64)| {
             if kind == "clean" {

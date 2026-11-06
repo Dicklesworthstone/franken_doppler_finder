@@ -101,6 +101,13 @@ pub struct LogSpec {
     pub scale: f64,
     /// Factor the image was multiplied by to reach `DetectParams::min_image_scale` (1 = none).
     pub gain: f64,
+    /// Only for an image under `DetectParams::min_image_scale`: the survey image built contrast
+    /// first (each frame's pooled level minus its median over +-1/3 octave, then each row's robust
+    /// z), raised to the same floor. A loud pass that raises every row together inflates each
+    /// row's MAD before the frame contrast can remove the swell, which shrinks its own ridge;
+    /// taking the frame contrast first keeps the swell out of the row statistics.
+    /// [`detect_counted`] scores it after everything else, on what `data` left unexplained.
+    pub contrast: Option<Vec<f32>>,
 }
 
 /// 1.4826 x the median absolute deviation from the median, over every value.
@@ -175,19 +182,10 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
             }
         }
     });
+    let pooled = data.clone();
     // Max-pooling k linear bins raises the noise floor by an amount that grows with k (i.e. with
     // frequency), so put every log row on a common robust z scale before matched filtering.
-    data.par_chunks_mut(nt).for_each(|row| {
-        let mut tmp = row.to_vec();
-        let med = crate::spectro::median_f32(&mut tmp);
-        for v in tmp.iter_mut() {
-            *v = (*v - med).abs();
-        }
-        let mad = 1.4826 * crate::spectro::median_f32(&mut tmp) + 0.05;
-        for v in row.iter_mut() {
-            *v = ((*v - med) / mad).clamp(-3.0, 8.0);
-        }
-    });
+    data.par_chunks_mut(nt).for_each(robust_z_row);
     // Broadband events (traffic, wind gusts, handling noise) raise whole columns; a Doppler ridge
     // is 1-3 log-rows wide. Subtract each frame's running median across +-1/3 octave so only
     // narrowband structure survives.
@@ -216,11 +214,13 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
     // lines' meaning, not the evidence; an image at or above the floor is untouched.
     let scale = robust_scale(&data);
     let gain = image_gain(scale, p.min_image_scale);
-    if gain > 1.0 {
-        let g = gain as f32;
-        data.par_iter_mut()
-            .for_each(|v| *v = (*v * g).clamp(-3.0, 8.0));
-    }
+    raise(&mut data, gain);
+    let contrast = (gain > 1.0).then(|| {
+        let mut c = contrast_first(&pooled, n_rows, nt, half_w);
+        let g = image_gain(robust_scale(&c), p.min_image_scale);
+        raise(&mut c, g);
+        c
+    });
     Ok((
         LogSpec {
             t: lin.t.clone(),
@@ -230,9 +230,59 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
             hop_s: lin.dt(),
             scale,
             gain,
+            contrast,
         },
         lin,
     ))
+}
+
+/// A row on its robust z scale (MAD + 0.05), clamped to [-3, 8].
+fn robust_z_row(row: &mut [f32]) {
+    let mut tmp = row.to_vec();
+    let med = crate::spectro::median_f32(&mut tmp);
+    for v in tmp.iter_mut() {
+        *v = (*v - med).abs();
+    }
+    let mad = 1.4826 * crate::spectro::median_f32(&mut tmp) + 0.05;
+    for v in row.iter_mut() {
+        *v = ((*v - med) / mad).clamp(-3.0, 8.0);
+    }
+}
+
+/// Multiply an image by `gain` (from [`image_gain`]) and clamp it again; a gain of 1 leaves it
+/// exactly as it is.
+fn raise(data: &mut [f32], gain: f64) {
+    if gain > 1.0 {
+        let g = gain as f32;
+        data.par_iter_mut()
+            .for_each(|v| *v = (*v * g).clamp(-3.0, 8.0));
+    }
+}
+
+/// [`LogSpec::contrast`] from the max-pooled image `pooled` (`n_rows` x `nt`, row-major): each
+/// frame's level minus its median over +-`half_w` rows, then each row on its robust z scale.
+fn contrast_first(pooled: &[f32], n_rows: usize, nt: usize, half_w: usize) -> Vec<f32> {
+    let mut cols = vec![0f32; n_rows * nt];
+    cols.par_chunks_mut(n_rows)
+        .enumerate()
+        .for_each(|(ti, col)| {
+            let src: Vec<f32> = (0..n_rows).map(|r| pooled[r * nt + ti]).collect();
+            let mut win = Vec::with_capacity(2 * half_w + 1);
+            for (r, out) in col.iter_mut().enumerate() {
+                let (a, b) = (r.saturating_sub(half_w), (r + half_w + 1).min(n_rows));
+                win.clear();
+                win.extend_from_slice(&src[a..b]);
+                *out = src[r] - crate::spectro::median_f32(&mut win);
+            }
+        });
+    let mut data = vec![0f32; n_rows * nt];
+    data.par_chunks_mut(nt).enumerate().for_each(|(r, row)| {
+        for (ti, v) in row.iter_mut().enumerate() {
+            *v = cols[ti * n_rows + r];
+        }
+        robust_z_row(row);
+    });
+    data
 }
 
 /// A template's part in scoring ([`score_bank`]).
@@ -454,10 +504,15 @@ pub struct Detection {
     pub harmonic_of: Option<usize>,
     /// For primaries: frequency ratios (to this f0) of the other family members.
     pub harmonics: Vec<f64>,
+    /// Found by the contrast stage ([`LogSpec::contrast`]): on no image the detection lines were
+    /// set on, so no null run has tested what it adds. Written only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_contrast: bool,
 }
 
-/// Run the template bank. Returns detections with score >= `thr_silence_db`, strongest first;
-/// the primaries among them are the event candidates.
+/// Run the template bank. Returns detections with score >= `thr_silence_db`, strongest first (the
+/// contrast stage's, `from_contrast`, follow all the rest, strongest first among themselves); the
+/// primaries among them are the event candidates.
 pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
     detect_counted(ls, p).0
 }
@@ -540,6 +595,7 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
             .collect();
         cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
         cand.truncate(remaining_candidates);
+        remaining_candidates -= cand.len();
         accept_candidates(
             ls,
             p,
@@ -552,8 +608,57 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
         );
     }
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
-    let cut = out.len().saturating_sub(p.max_detections);
+    let mut cut = out.len().saturating_sub(p.max_detections);
     out.truncate(p.max_detections);
+    // Contrast stage (`LogSpec::contrast`, only for an image under the spread floor): the full
+    // bank on the contrast-first image, with every cell the curves above explain counted as zero,
+    // with the same suppression and marking. The lines were not set on this image, so it adds
+    // strong curves only (`thr_db`), not weak ones down to the silence line. Its detections follow
+    // every detection above, strongest first among themselves, in the room the cap leaves: so each
+    // detection above keeps its place, its harmonic grouping and its measurement order.
+    if let Some(contrast) = ls.contrast.as_deref() {
+        let room = p.max_detections - out.len();
+        if room > 0 && remaining_candidates > 0 {
+            let view = LogSpec {
+                t: ls.t.clone(),
+                freqs: ls.freqs.clone(),
+                data: contrast.to_vec(),
+                bins_per_octave: ls.bins_per_octave,
+                hop_s: ls.hop_s,
+                scale: ls.scale,
+                gain: ls.gain,
+                contrast: None,
+            };
+            let mut lc = view.data.clone();
+            zero_known(&mut lc, &known);
+            let (bs, bi) = score_bank(&view, &tmpls, &lc, &[(0, nt)]);
+            let threshold = p.thr_db.max(p.thr_silence_db);
+            let mut cand: Vec<usize> = (0..nr * nt)
+                .filter(|&k| bs[k] as f64 >= threshold)
+                .collect();
+            cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
+            cand.truncate(remaining_candidates);
+            let before = out.len();
+            accept_candidates(
+                &view,
+                p,
+                &tmpls,
+                (&bs, &bi),
+                &cand,
+                threshold,
+                &mut known,
+                &mut out,
+            );
+            let mut added = out.split_off(before);
+            for d in added.iter_mut() {
+                d.from_contrast = true;
+            }
+            added.sort_by(|a, b| b.score.total_cmp(&a.score));
+            cut += added.len().saturating_sub(room);
+            added.truncate(room);
+            out.extend(added);
+        }
+    }
     for (i, d) in out.iter_mut().enumerate() {
         d.id = i;
     }
@@ -608,6 +713,7 @@ fn accept_candidates(
             half_s: half,
             harmonic_of: None,
             harmonics: Vec::new(),
+            from_contrast: false,
         };
         let suppressed = out.iter().any(|o| {
             let dt_lim = (0.5 * tau.min(o.d / o.v)).max(10.0);
@@ -940,6 +1046,7 @@ mod tests {
                 hop_s: 1.0,
                 scale: 1.0,
                 gain: 1.0,
+                contrast: None,
             };
             let tmpls = build_templates(&p, ls.hop_s);
             for residual in [false, true] {
@@ -1051,6 +1158,7 @@ mod tests {
                 hop_s: 1.0,
                 scale: 1.0,
                 gain: 1.0,
+                contrast: None,
             };
             let edge = build_edge_templates(&p, ls.hop_s);
             // 1.25 d / v is at most 24 s for (40, 250), (100, 250), (100, 1000), (175, 250),
@@ -1282,6 +1390,161 @@ mod tests {
         }
     }
 
+    /// `ls` without its contrast image: what [`detect_counted`] scores without the contrast stage.
+    fn without_contrast(ls: &LogSpec) -> LogSpec {
+        LogSpec {
+            t: ls.t.clone(),
+            freqs: ls.freqs.clone(),
+            data: ls.data.clone(),
+            bins_per_octave: ls.bins_per_octave,
+            hop_s: ls.hop_s,
+            scale: ls.scale,
+            gain: ls.gain,
+            contrast: None,
+        }
+    }
+
+    /// Whether `d` is a primary on [`SWELL_PASS`]'s curve near its CPA.
+    fn on_swell_pass(d: &Detection) -> bool {
+        let (f0, v, dist, t0r) = SWELL_PASS;
+        let f = cv_curve(d.t0r, f0, v, dist, t0r - dist / 343.0, 343.0);
+        d.harmonic_of.is_none() && (d.t0r - t0r).abs() <= 4.0 && (d.f0 / f - 1.0).abs() < 0.02
+    }
+
+    #[test]
+    fn contrast_stage_keeps_every_detection_of_the_survey_image() {
+        // Metamorphic: an image at or above the spread floor has no contrast image, so detection
+        // is exactly as before. Under it, every detection without the contrast stage comes first
+        // with it, field for field (a primary may gain harmonic ratios); each added one follows,
+        // flagged, from the full bank, at the strong line, strongest first. A swell of noise
+        // without a pass adds nothing up to 30 dB.
+        let p = DetectParams::default();
+        let cases: Vec<(&str, Vec<f32>)> = vec![
+            ("no swell", swell_scene(0.16, 0.0)),
+            ("interior pass and flat tone", synth(4000, 600.0)),
+            (
+                "noise, 30 s",
+                edge_clip(30.0, EDGE_PASS, 0.0, (0.0, 0.0, 0.0)),
+            ),
+            ("faint pass in a 20 dB swell", swell_scene(0.08, 20.0)),
+            ("pass in a 25 dB swell", swell_scene(0.16, 25.0)),
+            ("pass in a 35 dB swell", swell_scene(0.12, 35.0)),
+            ("20 dB swell", swell_scene(0.0, 20.0)),
+            ("25 dB swell", swell_scene(0.0, 25.0)),
+            ("30 dB swell", swell_scene(0.0, 30.0)),
+            ("35 dB swell", swell_scene(0.0, 35.0)),
+            ("40 dB swell", swell_scene(0.0, 40.0)),
+        ];
+        let key = |d: &Detection| {
+            (
+                d.id,
+                [
+                    d.t0r,
+                    d.f0,
+                    d.v,
+                    d.d,
+                    d.score,
+                    d.score_approach,
+                    d.score_recede,
+                    d.half_s,
+                ]
+                .map(f64::to_bits),
+                d.harmonic_of,
+                d.from_contrast,
+            )
+        };
+        for (name, x) in cases {
+            let (ls, _) = survey(&x, 4000, &p).unwrap();
+            assert_eq!(ls.contrast.is_some(), ls.gain > 1.0, "{name}");
+            if let Some(c) = &ls.contrast {
+                assert_eq!(c.len(), ls.data.len(), "{name}");
+            }
+            let (without, cut_without) = detect_counted(&without_contrast(&ls), &p);
+            let (with, cut_with) = detect_counted(&ls, &p);
+            assert!(with.len() >= without.len(), "{name}");
+            for (a, b) in without.iter().zip(&with) {
+                assert_eq!(key(a), key(b), "{name}");
+                assert!(b.harmonics.starts_with(&a.harmonics), "{name}: {b:?}");
+                assert!(!a.from_contrast, "{name}: {a:?}");
+            }
+            assert!(cut_with >= cut_without, "{name}");
+            let added = &with[without.len()..];
+            if ls.contrast.is_none() {
+                assert!(added.is_empty(), "{name}: {added:?}");
+            }
+            for d in added {
+                assert!(d.from_contrast, "{name}: {d:?}");
+                assert!(d.half_s >= p.min_half_s, "{name}: {d:?}");
+                assert!(d.score >= p.thr_db, "{name}: {d:?}");
+            }
+            assert!(
+                added.windows(2).all(|w| w[0].score >= w[1].score),
+                "{name}: {added:?}"
+            );
+            eprintln!(
+                "{name}: spread {:.3}, gain {:.2}: {} detections, {} added {:?}",
+                ls.scale,
+                ls.gain,
+                without.len(),
+                added.len(),
+                added
+                    .iter()
+                    .map(|d| (d.t0r, d.f0.round(), (d.score * 100.0).round() / 100.0))
+                    .collect::<Vec<_>>()
+            );
+            if ["20 dB swell", "25 dB swell", "30 dB swell"].contains(&name) {
+                assert!(added.is_empty(), "{name}: {added:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_stage_finds_a_pass_a_loud_swell_hides_from_the_survey_image() {
+        // A faint pass whose tone and roar swell together by 20 or 25 dB: the swell inflates each
+        // row's MAD before the frame contrast removes it, so even raised to the spread floor the
+        // survey image holds no detection on the pass. Taking the frame contrast first, the
+        // contrast stage finds it on its curve, and the refined seed (what measure.rs measures)
+        // stays on the curve.
+        let (f0, v, d, t0r) = SWELL_PASS;
+        let on_curve = |t: f64| cv_curve(t, f0, v, d, t0r - d / 343.0, 343.0);
+        let p = DetectParams::default();
+        for swell_db in [20.0, 25.0] {
+            let x = swell_scene(0.08, swell_db);
+            let (ls, lin) = survey(&x, 4000, &p).unwrap();
+            assert!(ls.gain > 1.0, "{swell_db} dB: spread {}", ls.scale);
+            let without = detect(&without_contrast(&ls), &p);
+            assert!(
+                !without.iter().any(on_swell_pass),
+                "{swell_db} dB: the survey image already holds the pass: {without:?}"
+            );
+            let with = detect(&ls, &p);
+            let found = with
+                .iter()
+                .find(|d| on_swell_pass(d))
+                .unwrap_or_else(|| panic!("{swell_db} dB: no detection on the pass: {with:?}"));
+            eprintln!("{swell_db} dB: {found:?}");
+            assert!(found.from_contrast);
+            assert!(found.score >= p.thr_db, "score {}", found.score);
+            let r = refine(&lin, found, 343.0);
+            eprintln!(
+                "refined t0r={:.2} f0={:.1} (curve {:.1}) v={:.1} d={:.0} s={:.2}",
+                r.t0r,
+                r.f0,
+                on_curve(r.t0r),
+                r.v,
+                r.d,
+                r.score
+            );
+            assert!(r.from_contrast);
+            assert!(
+                (r.f0 / on_curve(r.t0r) - 1.0).abs() < 0.01,
+                "refined f0 {}",
+                r.f0
+            );
+            assert!((r.t0r - t0r).abs() <= 4.0, "refined t0r {}", r.t0r);
+        }
+    }
+
     fn harmonic_detection(id: usize, f0: f64, d: f64) -> Detection {
         Detection {
             id,
@@ -1295,6 +1558,7 @@ mod tests {
             half_s: 120.0,
             harmonic_of: None,
             harmonics: Vec::new(),
+            from_contrast: false,
         }
     }
 
