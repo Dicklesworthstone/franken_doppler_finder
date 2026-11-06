@@ -1407,3 +1407,72 @@ The output is kept as `runs_f/SCORE_r1_setF_20261106.txt` (sha256
 ### Bench notes
 
 - The copies of Addendum 19 were complete at 08:01Z, when `sha256sum -c` passed on the receiving machine for all 39 files.
+
+## Addendum 21, 2026-11-06, set E's R3 read for `fdop-6914ab7`; the order of the runs still to come
+
+### Set E's R3 for `fdop-6914ab7`
+
+At 16:26:11Z `runs/r3_fdop_6914ab7` (last row ended 13:15:24Z), `e2_r3_fdop_6914ab7`, `r3_dp` and `e2_r3_dp` each had
+`CHAIN_DONE`, and `tools/match/guardfix/inventory.sh` showed no fault on them. Every row that ended rc 1 has a `result.json`
+and no "command terminated abnormally" in its `.err` (Addendum 20), so each 1 is `fdop`'s "no location". R3 was then read
+once with `score.py jobs/cases.json runs r3`. The output is kept as `runs/SCORE_r3_6914ab7_20261106.txt` (sha256
+`c9f1b5b6a327114f8a94715a3f3ebd9f3fc5b921263799d5835162515065700d`). It prints every tool with an R3 directory. No set E row
+of the pinned build or of `fdop-9087ec4` had started, so the read showed nothing of theirs on set E. `dpdem`'s R3 has not
+run.
+
+| Tool, set E's eight counted cases | Correct asserted | Wrong asserted | Not asserted | Error |
+|---|---|---|---|---|
+| `fdop-6914ab7` | 0 | 0 | 8: 2 low, 6 no location | 0 |
+| `dopplerprint` (`dp`), as Addendum 16 gave it | 0 | **1** | 7 declined | 0 |
+| `fdop` `7e66501` (pinned), `fdop-9087ec4` | | | 8 pending each | |
+
+- **The claim.** Against `dp` on set E's R3, `fdop-6914ab7` meets the rule: the same number correct, none, and one wrong
+  answer fewer. It meets it by `dp`'s wrong answer (`e_tehachapi`, 3,561 km off at "high"), not by a right one of its own.
+  The claim on R3 for this build is stated only once `dpdem`'s R3 is read. Falsifier 3 does not fire: no fewer correct
+  answers than `dp`, and no wrong answer asserted.
+- **`e_olympia`.** `fdop-6914ab7` put it 67 m from the truth (1 km limit) and graded it low, because the core-match gate
+  failed: of its two matches, `e9` located the observer (chi 0.16) and `e12` missed at chi 4.28, where the gate's line is 4,
+  though its trace beat chance by 4.0 nats and its own clock was within 4 s. This is reported, not used. A gate changed
+  after seeing it could not be tested on set E.
+- **`e_tehachapi`.** Both tools named a place about 3,560 km off, the row Addendum 19 reported. `dp` called it high; `fdop`
+  graded it low, failing core matches, margin (2.67 nats) and radius.
+- **The other six** gave no location. At `e_fortmadison` every detected event failed its checks; at `e_porthenry` nothing
+  was detected.
+- **Terrain in R3.** With the national box, `fdop`'s terrain prefetch needs more tiles than its limit (15,272 and 15,792 at
+  zoom 10 against 4,000, at `e_olympia` and `e_tehachapi`), so those searches take 0 m where tiles are missing, and each
+  result says so in its warnings. That holds for every build's R3 and is not changed now. `dp`'s R3 has no ground model
+  either.
+- **Development cases.** On A+B+C (12 cases), `fdop-6914ab7` gave 3 correct and 0 wrong (`a_ref` 288 m, `b1_osprey_1101` 105
+  m, `b3_duke` 963 m, all high), and `dp` 1 correct and 2 wrong, with one error. The pinned build stands at 1 and 0 with 7
+  rows pending, and `fdop-9087ec4` at 2 and 0 with 3 pending. These are development cases, and falsifier 2 has already fired
+  for both later builds (Addenda 8 and 11).
+
+### The order of the runs still to come
+
+What is left: `dopplerprint`'s R1 on the development cases and set E, and set F's eight R1 rows again (Addendum 20); every
+`dpdem` R3 and R1 run; the pinned build's R3 and R1 rows not yet run, and its set E R3 and R1; `fdop-9087ec4`'s set E R3 and
+the rest of its R3; and the two `c_osprey_1031` R1 rows set aside at 08:06:43Z. `dopplerprint`'s R1 rows peak at 12 to 14.5
+GB, so they run with no `fdop` row beside them, and every run without the national ground model ends before the first that
+installs it. Regime `dpwin` in `tools/start_chains.sh` (patched by `tools/fix15.py`, temp file and rename; the old file kept
+as `start_chains.sh.pre15`) does this in stages, each waiting for the last to write `CHAIN_DONE`:
+
+1. once both `fdop` R1 chains and `fix6f` (below) are done and no `fdop` row runs: `dopplerprint`'s R1, development cases
+   and set E, alone;
+2. once 2026-11-06's archive is complete: set F's R1 rows for `dopplerprint` again, with the same commands, alone.
+   `tools/adsb_day_ready.sh` decides this, every 15 minutes. It checks the release page first, then makes one anonymous API
+   call, and it needs every `.tar` part uploaded and the last under 2,000,000,000 bytes, since the page exists before its
+   parts;
+3. `dpdem`'s set F R3 and R1, alone, so that set F can be read first;
+4. `dpdem`'s other R3 rows, about 2.8 GB each, beside two `fdop` chains. Each of those starts with one `c_osprey_1031` R1
+   row, then runs the pinned build's and `fdop-9087ec4`'s rows that have not run;
+5. `dpdem`'s other R1 rows, alone.
+
+A chain a guard stops never writes `CHAIN_DONE`, so `dpwin` then waits and starts nothing more. Regimes `fix6b`, `fix6c` and
+`fix6e` are not started; `dpwin` runs their scripts. Each tool's rows in a regime are read once, when its jobs have
+`CHAIN_DONE`, as above. A later read of the same regime goes to a new file, and only the rows pending here are new in it.
+
+### Bench notes
+
+- At 16:34:09Z `fix6f` started set E's R3 replacements for `fdop-9087ec4`, alone, beside the two `fdop` R1 chains. Its first
+  row, `e_tehachapi`, is the one stopped at 00:05:12Z and kept as `*_fault_guard3` (Addendum 16), run again with the same
+  command.
