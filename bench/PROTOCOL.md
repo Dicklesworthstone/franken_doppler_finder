@@ -1231,3 +1231,24 @@ The agent of Addendum 15 ran these on another machine, under rules logged before
 - The budget cap of Addendum 16 landed on `main` as `c1cfa61`. It is not registered, and it changes nothing on 32 GiB, where
   every bench row runs.
 - `runs/start_chains.before16.sh` keeps `start_chains.sh` as it was before Addendum 16's changes to it.
+
+## Addendum 18, 2026-11-06, corrections to Addenda 16 and 17; two checks made stricter
+
+Written while set F's R2 ran. Nothing here comes from set F.
+
+### Corrections
+
+- **Addendum 17:** set F has 10 cases, not 12 (`data/set_f/cases.json`: 10, none void; each set F R2 job lists 10 rows). 12 is
+  the number of set F R2 jobs: eight `fdop` builds, `dp`, `dp48`, `dpdem` and `dt`.
+- **Addendum 17:** "Six R2 chains would not have fit" overstates what was measured. `fr2` starts three chains, and three more
+  when pinned `fdop` is done. What was measured is the memory then held (9.2, 6.5, 6.3 and 6.2 GB), the swap and the disk.
+- **Addendum 16:** `n_ref_on_0907_tb` resumed at 02:54:10Z, once registration was settled, not at about 03:00Z.
+
+### Two checks made stricter
+
+- **`fr3` now waits for all 12 set F R2 jobs.** It checked the last job of each R2 chain only, and a chain goes on to its next job
+  even when one exits early, so R3 could have started before every registered build's R2 was done. It now checks each job's
+  `CHAIN_DONE` (`tools/fix14.py`; the file before it is `runs/start_chains.before14.sh`). `fr3` has not run.
+- **The sealed inventory flags an `fdop` step's rc 2.** For `fdop`, 2 is an error, such as a failed download, and not a result
+  (0 found, 1 no location), so a row that needs running again is seen at once. Other tools' codes stay unprinted, because their
+  meaning is not established here.

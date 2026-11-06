@@ -894,8 +894,9 @@ the configured fallback allowance after the preferred request has been tried.
 
 ### Current checks (2026-11-06)
 
-These cover the budget cap on `main`'s tip: this commit's code, extracted with `git archive` from a commit with the same
-`search.rs` and older docs, using the pinned `nightly-2026-08-31` toolchain, with direct cargo on the benchmark machine.
+These cover `c1cfa61`, the budget cap on `main`'s tip. They ran on its code: a `git archive` of an unpushed commit with the
+same code and older docs, built with the pinned `nightly-2026-08-31` toolchain and direct cargo on the benchmark machine, an
+Apple M4 with 32 GiB.
 
 | Command | Result |
 |---|---|
