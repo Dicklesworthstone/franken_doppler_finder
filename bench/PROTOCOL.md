@@ -1159,3 +1159,75 @@ Addendum 14 stands as committed; these correct it.
 - **A search defect, not in any registered build, and with no effect here.** The hypothesis budget grew with RAM while the budgets
   after it did not, so a machine over 32 GiB could cut a comparison and fail the margin gate where 32 GiB does not (`r_md_gh`).
   Every bench row ran on 32 GiB, the fix changes nothing there, and it lands on `main` separately.
+
+## Addendum 17, 2026-11-06, the tip's second wrong date; set F's R2 started; rows held for it; corrections
+
+Nothing here comes from set F. It was written while set F's R2 ran, and states only what was known outside it.
+
+### The tip's second wrong date
+
+`n_ref_on_0907_tb` (`fdop-981fad1` on the bench, `--dates 2026-09-07 --near "New York"`, `runs/tip_wrong_dates`) ended rc 0
+at 03:53:33Z: low, radius 348 m, margin 2.00 nats over a rival 110 km away. Joined 2,137,607, quick check 878,876, fine stage
+324,380, no cut. That is the same grade, margin and funnel as `n_ref_on_0907_gc` (an earlier build, 2026-11-05) and
+`n_ref_on_0907_cp` (`main` with the budget cap, on 256 GiB). It is not at medium or high, so part 3 of the rule in Addendum 16
+now holds in full: both of the reference's wrong dates are low on `fdop-981fad1`.
+
+### Set F's R2 started
+
+At 03:36:46Z, with `start_chains.sh fr2`, after registration closed at 03:00Z and once 2026-11-05's prod release was
+complete: published 03:30:59Z, parts `.tar.aa` of 2,000,000,000 bytes and `.tar.ab` of 1,803,473,920 bytes, the last updated
+at 03:34:10Z (mlatonly published 03:23:04Z). A release page appears before its parts, so the parts were checked and not the page.
+No set F run of any tool existed before. It covers eight `fdop` builds (pinned `7e66501` and seven later ones), `dp`, `dp48`,
+`dpdem` and `dt`, on 12 cases. Until every registered build's R2 is done, only counts and infrastructure faults are read
+(`tools/match/guardfix/inventory_f.sh`, which prints no exit code that could carry a result).
+
+### Rows held for set F's R2
+
+The protocol's order is R2, then R3 and R1 as time allows.
+
+- At 03:25Z the bench held 9.2 GB in `e2_r3_fdop_6914ab7/e_tehachapi`, 6.5 GB in `n_ref_on_0907_tb`, and 6.3 and 6.2 GB in the
+  two paused R1 rows, mostly compressed, with 5.7 GB of swap and 10 GB free on the boot disk. Six R2 chains would not have fit.
+- So the two paused R1 rows were ended by SIGKILL at 03:25:35Z. Each was about 25 minutes of CPU into 640,962 fine cells, with
+  no result. Their resume timer had been cancelled at 03:04Z.
+- The job shells of `r1_fdop_9087ec4`, `r1_fdop_6914ab7` and `e2_r3_fdop_6914ab7` have been stopped since 03:04Z, so none starts a
+  new row before set F's R2 is done.
+- `e2_r3_fdop_6914ab7/e_tehachapi` runs to its end. Its shell writes the status line when it resumes, so the end time there will
+  be late. Its wall time is in `/usr/bin/time`'s footer.
+- After set F's R2, the two ended rows are kept as `*_fault_hold` and run again under the same commands, as rows interrupted by
+  the guards were.
+
+### Corrections to Addendum 16
+
+- The two R1 rows paused from 02:27Z were `r1_fdop_9087ec4/c_osprey_1031` and `r1_fdop_6914ab7/c_osprey_1031`, the osprey
+  recording of 2026-11-01 searched on 2026-10-31, not `b1_osprey_1101`. They were not resumed at about 03:06Z (above).
+- "On the same evidence a curve-only answer has not been right" no longer holds on the injection bed (next section).
+
+### Known before set F's R2 is read: two fresh seeds of the injection bed
+
+The agent of Addendum 15 ran these on another machine, under rules logged before each seed existed: seed 3 at
+2026-11-06T02:02:12Z and seed 4 at 02:53:58Z in the session log. Both used a build of `446a2bf`'s tree, whose code is
+`fdop-981fad1`'s. They are synthetic scenes at virtual sites, at levels that are not calibrated, and are not field rates.
+
+| Seed | Bed | Finished | R2 right within 1 km | R2 wrong | Wrong place asserted |
+|---|---|---|---|---|---|
+| 3 | as seeds 1 and 2 (3 to 5 times too easy beyond 3 km) | 96 of 96 | 7 of 48 (6 high, 1 medium) | 0 | 0 of 48 |
+| 4 | 4 dB/km of extra loss past 2 km, as real audio past 5 km | 41 of 48 | 1 of 24 (medium, 0.20 km) | 0 | 0 of 17 |
+
+- **Unfinished runs.** Seed 4's stop rule, fewer than 20 GB free on that machine, ended its last 7 runs. All 7 were wrong-place
+  runs, and they are counted apart, not as declines.
+- **The two curve rules.** The question was whether a curve-only answer (the curve match Adopts) should assert. Rule A says an
+  Adopts never asserts. Rule A25 says an Adopts under +0.25 nats never asserts.
+  - Seed 3 called no Adopts, so it tests neither rule.
+  - Seed 4's one right answer, `s4_020`, is a curve-only Adopts at +22.21. That refutes rule A, on seed 4 alone and pooled with
+    seed 3.
+  - Rule A25 has no fresh test: there was no Adopts under +0.25 in 89 fresh runs. Seeds 1 and 2 selected it, and its two wrong
+    answers there sat at +0.21 and +0.10. It stays a lead.
+  - No build is changed for either rule, and the line is not moved. That is the user's decision.
+- **Totals.** On the two fresh seeds, `fdop-981fad1`'s code gave 8 right and 0 wrong in 72 R2 runs, and asserted nothing in
+  65 finished wrong-place runs.
+
+### Bench notes
+
+- The budget cap of Addendum 16 landed on `main` as `c1cfa61`. It is not registered, and it changes nothing on 32 GiB, where
+  every bench row runs.
+- `runs/start_chains.before16.sh` keeps `start_chains.sh` as it was before Addendum 16's changes to it.
