@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep sparse flight segments that cross a requested data window
+
+- **The fault.** Archive ingestion and cached-track slicing required a reported ADS-B point inside both the
+  region and time window. A valid segment could cross the window between reports and be discarded entirely,
+  removing a flight before the acoustic search could consider it.
+- **The change.** Both paths retain original bracketing samples when a linear segment intersects space and
+  time together, with the existing two-neighbour padding. Ingestion respects restart and ground reports,
+  including ground markers on malformed rows; cache slicing respects stored flight-leg boundaries. Dateline
+  crossings follow the shorter longitude arc. Track gap, geometry, scoring and confidence rules are unchanged.
+- **Cache scope.** Existing wider stores benefit when they still contain the bracketing samples. An older
+  narrow store that already omitted the aircraft needs fresh ingestion; no automatic cache invalidation or
+  redownload was added.
+- **Evidence.** The pre-fix cached-store regression discarded a valid 120 s crossing. Tests cover the same
+  crossing after filtering and a gzip-JSON/tar ingestion through track construction, store save/load and time
+  slicing, with wrong-time and separated-flight controls. Validation outcomes are recorded in the commit;
+  these synthetic tests make no reference-recording or field accuracy claim.
+
 ### Let later flyovers fill slots lost to duplicate or non-aircraft fits
 
 - **The fault.** Ranked measurement stopped after 24 fits passed its quality gates. Only afterward did the

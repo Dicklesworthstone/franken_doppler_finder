@@ -224,16 +224,32 @@ impl TrackStore {
         Ok(Self { meta, legs })
     }
 
-    /// Keep only points inside `bbox` and `[t0, t1]`, plus two neighbours on each side of every
-    /// kept run (so interpolation at the edges stays anchored). Legs left with < 2 points go.
+    /// Keep points inside `bbox` and `[t0, t1]`, or bracketing a segment that crosses both,
+    /// plus two neighbours on each side (so interpolation at the edges stays anchored).
+    /// Existing leg boundaries are never crossed. Legs left with < 2 points go.
     pub fn filtered(&self, bbox: &BBox, t0: f64, t1: f64) -> TrackStore {
         let mut legs = Vec::new();
         for leg in &self.legs {
-            let keep: Vec<bool> = leg
+            let inside: Vec<bool> = leg
                 .points
                 .iter()
                 .map(|p| p.t >= t0 && p.t <= t1 && bbox.contains(p.lat, p.lon))
                 .collect();
+            let mut keep = inside.clone();
+            for (i, pair) in leg.points.windows(2).enumerate() {
+                let (a, b) = (pair[0], pair[1]);
+                if !inside[i]
+                    && !inside[i + 1]
+                    && bbox.intersects_timed_segment(
+                        (a.t, a.lat, a.lon),
+                        (b.t, b.lat, b.lon),
+                        (t0, t1),
+                    )
+                {
+                    keep[i] = true;
+                    keep[i + 1] = true;
+                }
+            }
             let n = keep.len();
             let mut grown = vec![false; n];
             for (i, _) in keep.iter().enumerate().filter(|(_, k)| **k) {
@@ -270,6 +286,89 @@ impl TrackStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filtered_keeps_bracketing_track_segments() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let points: Vec<_> = [
+            (0.0, -0.125),
+            (30.0, -0.1),
+            (60.0, -0.075),
+            (90.0, -0.05),
+            (210.0, 0.05),
+            (240.0, 0.075),
+            (270.0, 0.1),
+            (300.0, 0.125),
+        ]
+        .into_iter()
+        .map(|(t, dx)| TrackPoint {
+            t,
+            lat,
+            lon: lon + dx,
+            alt_m: 1200.0,
+            gs_mps: 70.0,
+            track_deg: 90.0,
+            vrate_mps: 0.0,
+            alt_src: alt_src::GEOM,
+            flags: 0,
+        })
+        .collect();
+        let store = TrackStore {
+            meta: StoreMeta {
+                version: 1,
+                bbox: BBox::new(lat - 1.0, lon - 1.0, lat + 1.0, lon + 1.0),
+                t_start: 0.0,
+                t_end: 300.0,
+                geoid_n_m: -30.0,
+                sources: vec!["synthetic".into()],
+                stats: serde_json::json!({}),
+                created_unix: 0.0,
+            },
+            legs: vec![FlightLeg {
+                key: "synthetic_0".into(),
+                icao: "000001".into(),
+                reg: String::new(),
+                typ: "C172".into(),
+                source: "prod".into(),
+                engine: EngineClass::Piston,
+                points,
+            }],
+        };
+        let bbox = BBox::new(lat - 0.002, lon - 0.002, lat + 0.002, lon + 0.002);
+        assert!(
+            store.legs[0]
+                .points
+                .iter()
+                .all(|p| !bbox.contains(p.lat, p.lon))
+        );
+        let got = store.filtered(&bbox, 145.0, 155.0);
+        assert_eq!(got.legs.len(), 1, "the 120 s crossing segment was dropped");
+        assert_eq!(got.legs[0].points, store.legs[0].points[1..7]);
+        assert_eq!(got.meta.bbox, bbox);
+        assert_eq!((got.meta.t_start, got.meta.t_end), (145.0, 155.0));
+        // Time and space must overlap on the same portion of the segment.
+        assert!(store.filtered(&bbox, 100.0, 110.0).legs.is_empty());
+        // A time-only crop between knots also needs both interpolation anchors.
+        let timed = store.filtered(&store.meta.bbox, 145.0, 155.0);
+        assert_eq!(timed.legs[0].points, store.legs[0].points[1..7]);
+        // Existing two-neighbour behavior for a crop containing a knot stays unchanged.
+        let existing = store.filtered(&store.meta.bbox, 55.0, 65.0);
+        assert_eq!(existing.legs[0].points, store.legs[0].points[..5]);
+        let split = TrackStore {
+            legs: vec![
+                FlightLeg {
+                    points: store.legs[0].points[..4].to_vec(),
+                    ..store.legs[0].clone()
+                },
+                FlightLeg {
+                    points: store.legs[0].points[4..].to_vec(),
+                    ..store.legs[0].clone()
+                },
+            ],
+            ..store.clone()
+        };
+        assert!(split.filtered(&bbox, 145.0, 155.0).legs.is_empty());
+    }
 
     #[test]
     fn roundtrip() {

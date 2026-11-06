@@ -73,6 +73,62 @@ impl BBox {
     pub fn contains(&self, lat: f64, lon: f64) -> bool {
         lat >= self.south && lat <= self.north && lon >= self.west && lon <= self.east
     }
+    /// Whether a line between two `(time, latitude, longitude)` samples enters both this
+    /// box and the inclusive time window at the same fraction of the segment. This keeps
+    /// interpolation anchors when neither reported point is inside a data-selection window;
+    /// it does not create positions or replace the acoustic track interpolation.
+    /// Longitudes follow the short way across the dateline; boxes themselves do not wrap.
+    pub fn intersects_timed_segment(
+        &self,
+        a: (f64, f64, f64),
+        b: (f64, f64, f64),
+        time: (f64, f64),
+    ) -> bool {
+        if ![a.0, a.1, a.2, b.0, b.1, b.2]
+            .into_iter()
+            .all(f64::is_finite)
+            || b.0 <= a.0
+            || !(b.0 - a.0).is_finite()
+            || !(-90.0..=90.0).contains(&a.1)
+            || !(-90.0..=90.0).contains(&b.1)
+            || !(-180.0..=180.0).contains(&a.2)
+            || !(-180.0..=180.0).contains(&b.2)
+            || !(self.south <= self.north && self.west <= self.east && time.0 <= time.1)
+        {
+            return false;
+        }
+        let clip = |span: &mut (f64, f64), start: f64, delta: f64, lo: f64, hi: f64| {
+            if delta == 0.0 {
+                return start >= lo && start <= hi;
+            }
+            let (u, v) = ((lo - start) / delta, (hi - start) / delta);
+            span.0 = span.0.max(u.min(v));
+            span.1 = span.1.min(u.max(v));
+            span.0 <= span.1
+        };
+        let mut span = (0.0, 1.0);
+        if !clip(&mut span, a.0, b.0 - a.0, time.0, time.1)
+            || !clip(&mut span, a.1, b.1 - a.1, self.south, self.north)
+        {
+            return false;
+        }
+        let mut dlon = b.2 - a.2;
+        if dlon > 180.0 {
+            dlon -= 360.0;
+        } else if dlon < -180.0 {
+            dlon += 360.0;
+        }
+        [-360.0, 0.0, 360.0].into_iter().any(|shift| {
+            let mut shifted = span;
+            clip(
+                &mut shifted,
+                a.2,
+                dlon,
+                self.west + shift,
+                self.east + shift,
+            )
+        })
+    }
     pub fn center(&self) -> (f64, f64) {
         (
             0.5 * (self.south + self.north),
@@ -109,5 +165,43 @@ impl BBox {
             self.north.max(o.north),
             self.east.max(o.east),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timed_segment_intersects_space_and_time_together() {
+        let bbox = BBox::new(-1.0, -1.0, 1.0, 1.0);
+        let (a, b) = ((0.0, 0.0, -2.0), (4.0, 0.0, 2.0));
+        assert!(bbox.intersects_timed_segment(a, b, (1.0, 3.0)));
+        assert!(bbox.intersects_timed_segment(a, b, (1.0, 1.0)));
+        assert!(bbox.intersects_timed_segment(a, b, (f64::NEG_INFINITY, f64::INFINITY)));
+        assert!(!bbox.intersects_timed_segment(a, b, (0.0, 0.9)));
+        assert!(!bbox.intersects_timed_segment(a, b, (3.1, 4.0)));
+        assert!(!bbox.intersects_timed_segment((0.0, -3.0, 0.0), (4.0, 0.0, 3.0), (0.0, 4.0)));
+        assert!(!bbox.intersects_timed_segment((0.0, 2.0, -2.0), (4.0, 2.0, 2.0), (0.0, 4.0)));
+        assert!(!bbox.intersects_timed_segment(b, a, (0.0, 4.0)));
+        assert!(!bbox.intersects_timed_segment(a, (0.0, 0.0, 2.0), (0.0, 4.0)));
+        assert!(!bbox.intersects_timed_segment(a, b, (3.0, 1.0)));
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for point in [(bad, b.1, b.2), (b.0, bad, b.2), (b.0, b.1, bad)] {
+                assert!(!bbox.intersects_timed_segment(a, point, (0.0, 4.0)));
+            }
+        }
+    }
+
+    #[test]
+    fn timed_segment_crosses_the_dateline_without_crossing_the_country() {
+        let (a, b) = ((0.0, 0.0, 179.0), (4.0, 0.0, -179.0));
+        assert!(!BBox::new(-1.0, -125.0, 1.0, -66.0).intersects_timed_segment(a, b, (0.0, 4.0)));
+        let east = BBox::new(-1.0, 179.5, 1.0, 180.0);
+        let west = BBox::new(-1.0, -180.0, 1.0, -179.5);
+        assert!(east.intersects_timed_segment(a, b, (1.0, 2.0)));
+        assert!(west.intersects_timed_segment(a, b, (2.0, 3.0)));
+        assert!(!east.intersects_timed_segment(a, b, (3.0, 4.0)));
+        assert!(!west.intersects_timed_segment(a, b, (0.0, 1.0)));
     }
 }

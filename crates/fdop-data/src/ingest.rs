@@ -3,8 +3,8 @@
 //! The tar is walked sequentially on one thread (it is a network stream); member bytes are
 //! batched and decoded + parsed on the rayon pool. Each member is gunzipped by magic
 //! (`1f 8b`, despite the `.json` name) and parsed with typed visitors (no `serde_json::Value`
-//! per row). Rows are filtered to the bbox and time window, keeping two neighbour points on
-//! each side of every kept run so interpolation at the edges stays anchored.
+//! per row). Rows inside the bbox and time window, or bracketing a segment that crosses
+//! both, are kept with two neighbours on each side so interpolation stays anchored.
 //!
 //! readsb row: `[dt, lat, lon, alt_baro|"ground"|null, gs_kt, track, flags, vrate_fpm,
 //! details|null, source, alt_geom_ft, geom_rate_fpm, ias, roll]` (fields from index 9 only in
@@ -55,7 +55,7 @@ pub struct RawPoint {
     pub vrate_mps: f32,
     /// `fdop_types::store::pt_flags` bits.
     pub flags: u8,
-    /// A readsb new-leg marker fell on this point or on a dropped row just before it.
+    /// A readsb new-leg marker or ground report fell on this point or a dropped row before it.
     pub new_leg: bool,
 }
 
@@ -80,7 +80,7 @@ pub struct IngestStats {
     /// `trace_full_*` members seen.
     pub members: u64,
     pub parse_errors: u64,
-    /// Aircraft with >= 1 point inside bbox + window.
+    /// Aircraft with a point or a bracketing airborne segment inside bbox + window.
     pub aircraft_overlap: u64,
     pub jets_dropped: u64,
     pub unknown_kept: u64,
@@ -455,7 +455,7 @@ fn parse_member(bytes: &[u8], name_hint: &str, feed: &str, spec: &IngestSpec) ->
     let mut pts: Vec<RawPoint> = Vec::with_capacity(tf.trace.len());
     let mut pending_leg = false;
     for row in &tf.trace {
-        if row.flags & 2 != 0 {
+        if row.flags & 2 != 0 || row.alt == Alt::Ground {
             pending_leg = true;
         }
         let (Some(dt), Some(lat), Some(lon)) = (row.dt, row.lat, row.lon) else {
@@ -494,10 +494,26 @@ fn parse_member(bytes: &[u8], name_hint: &str, feed: &str, spec: &IngestSpec) ->
             new_leg: std::mem::take(&mut pending_leg),
         });
     }
-    let keep: Vec<bool> = pts
+    let inside: Vec<bool> = pts
         .iter()
         .map(|p| p.t >= spec.t_start && p.t <= spec.t_end && spec.bbox.contains(p.lat, p.lon))
         .collect();
+    let mut keep = inside.clone();
+    for (i, pair) in pts.windows(2).enumerate() {
+        let (a, b) = (pair[0], pair[1]);
+        if !inside[i]
+            && !inside[i + 1]
+            && !b.new_leg
+            && spec.bbox.intersects_timed_segment(
+                (a.t, a.lat, a.lon),
+                (b.t, b.lat, b.lon),
+                (spec.t_start, spec.t_end),
+            )
+        {
+            keep[i] = true;
+            keep[i + 1] = true;
+        }
+    }
     if !keep.iter().any(|k| *k) {
         return Parsed::NoOverlap;
     }
@@ -919,6 +935,89 @@ pub(crate) mod tests {
         let (air, st) = ingest_reader(std::io::Cursor::new(tarb), "prod", &sp, &|_| {}).unwrap();
         assert!(air.is_empty());
         assert_eq!(st.unknown_dropped, 1);
+    }
+
+    #[test]
+    fn ingest_and_cache_keep_sparse_crossing_segments() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let rows: Vec<_> = [(0.0, -0.09), (30.0, -0.06), (150.0, 0.06), (180.0, 0.09)]
+            .into_iter()
+            .map(|(t, dx)| {
+                serde_json::json!([
+                    t,
+                    lat,
+                    lon + dx,
+                    4000,
+                    165,
+                    90,
+                    0,
+                    0,
+                    null,
+                    "adsb_icao",
+                    4100,
+                    0
+                ])
+            })
+            .collect();
+        let make = |rows: &[serde_json::Value]| {
+            let json =
+                serde_json::json!({"icao":"000001", "t":"C172", "timestamp":T0, "trace":rows});
+            tar_of(&[("trace_full_000001.json", gz(&json.to_string()))])
+        };
+        let sp = IngestSpec {
+            bbox: BBox::new(lat - 0.002, lon - 0.002, lat + 0.002, lon + 0.002),
+            t_start: T0,
+            t_end: T0 + 300.0,
+            ..spec()
+        };
+        let read = |rows: &[serde_json::Value], sp: &IngestSpec| {
+            ingest_reader(std::io::Cursor::new(make(rows)), "prod", sp, &|_| {}).unwrap()
+        };
+        let (aircraft, stats) = read(&rows, &sp);
+        assert_eq!(stats.kept_aircraft, 1, "no reported knot is inside the box");
+        assert_eq!(aircraft[0].points.len(), 4);
+        let store =
+            crate::build::build_store(vec![(aircraft, stats)], &sp, vec!["synthetic".into()]);
+        assert_eq!(store.legs.len(), 1);
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-crossing-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("day.fdtrk");
+        store.save(&path).unwrap();
+        let cached = fdop_types::store::TrackStore::load(&path).unwrap();
+        let cropped = cached.filtered(&sp.bbox, T0 + 89.0, T0 + 91.0);
+        assert_eq!(cropped.legs.len(), 1, "cache slicing lost the crossing");
+        assert_eq!(cropped.legs[0].points, store.legs[0].points);
+        assert!(
+            cached
+                .filtered(&sp.bbox, T0 + 35.0, T0 + 45.0)
+                .legs
+                .is_empty()
+        );
+        let missed_time = IngestSpec {
+            t_start: T0 + 35.0,
+            t_end: T0 + 45.0,
+            ..sp
+        };
+        assert!(read(&rows, &missed_time).0.is_empty());
+
+        // A restart or an intervening ground report is not an airborne crossing.
+        let mut restart = rows.clone();
+        restart[2][6] = serde_json::json!(2);
+        assert!(read(&restart, &sp).0.is_empty());
+        let mut grounded = rows.clone();
+        grounded.insert(2, serde_json::json!([90, lat, lon, "ground", 0, 90, 0, 0]));
+        assert!(read(&grounded, &sp).0.is_empty());
+        grounded[2][1] = serde_json::Value::Null;
+        assert!(read(&grounded, &sp).0.is_empty());
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        assert!(read(&reversed, &sp).0.is_empty());
     }
 
     #[test]

@@ -720,6 +720,15 @@ or incomplete cache is identified in the progress output, and other eligible cac
 downloading again or failing in `--offline` mode. Partial feeds retain their missing-feed warnings. A larger
 region on the same day downloads that day again if no usable cache covers it.
 
+Archive ingestion and cached-window slicing retain the original samples bracketing a sparse segment that
+crosses the requested region and time window, even when neither sample is inside. The segment must enter
+both at the same time. Ingestion does not infer a crossing across a ground report or restart marker;
+cached-window slicing does not cross stored flight-leg boundaries. Two neighbouring samples on each side
+still anchor interpolation, and the track model's existing gap and geometry checks still apply. No positions
+are invented. Older narrow caches that already discarded an aircraft need fresh ingestion to recover it;
+the fix can use bracketing
+samples in an existing wider cache, but cannot restore samples absent from the stored data.
+
 `locate` and `fetch` reuse the agreed NGS geoid height cached for the region's centre in both online and
 `--offline` mode. Offline mode uses the −30 m default only when that height is absent, unreadable or invalid,
 and warns when it does. Going offline therefore preserves the altitude reference of a valid cached run.
