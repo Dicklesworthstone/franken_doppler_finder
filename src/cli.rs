@@ -404,11 +404,22 @@ fn run(cli: Cli) -> Result<i32, String> {
                 fdop_geo::region::parse_region(&f.near, &ctx).map_err(|e| e.to_string())?;
             let (d0, d1) = pipeline::parse_dates(&f.dates)?;
             let (lo, hi) = pipeline::start_window(d0, d1, region.utc_offset_h);
-            let n = if f.common.offline {
-                -30.0
-            } else {
-                fdop_data::geoid_height_or_default(&cache, region.center.0, region.center.1).0
-            };
+            let (n, geoid_src) = fdop_data::geoid_height_with_options(
+                &cache,
+                region.center.0,
+                region.center.1,
+                f.common.offline,
+            );
+            if geoid_src != "ngs" {
+                eprintln!(
+                    "fdop: warning: using default geoid height N = {n:.0} m ({})",
+                    if f.common.offline {
+                        "no usable cached height in --offline mode"
+                    } else {
+                        "the NGS GEOID lookup failed"
+                    }
+                );
+            }
             let mut spec = fdop_data::IngestSpec {
                 bbox: region.bbox.padded_km(f.pad_km),
                 t_start: lo - 1200.0,

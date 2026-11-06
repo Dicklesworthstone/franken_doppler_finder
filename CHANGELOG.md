@@ -19,6 +19,32 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep curve-only recovery inside a usable recording-clock hint
+
+- **The fault.** When the trace search found no candidate in a metadata-derived clock window, `locate` widened
+  to the full date before running the independent curve match. That widened clock usually made the curve match
+  ineligible, precisely when untraceable ridges needed its alternative reading of the recording.
+- **The change.** The curve match now gets its attempt in the original window before fallback. A standing result
+  uses the existing curve-only adoption gates. Otherwise the trace search widens; the matcher retries too when
+  publication clipping leaves the widened window eligible. A narrow attempt cannot grade a wider trace search.
+  `extra.curve_match.clock_window` and `judged_search_window` describe that scope in `result.json`.
+- **Work avoided.** Clock and region eligibility are checked before building the whole-file harmonic image;
+  date-only and oversized-region searches no longer allocate that unused second spectrogram. `curve_match_s`
+  now includes image construction and any eligible fallback attempt.
+- **Tests.** Pipeline regressions cover curve-only adoption, absent/failed curve results, explicit-start behavior,
+  decoy-count and clock-scope requirements, and both eligibility limits. Scientific scoring and thresholds are
+  unchanged. No new real-recording accuracy or timing claim is made here.
+
+### Offline searches reuse the agreed cached geoid height
+
+- `locate --offline` and `fetch --offline` now resolve the validated exact-point cache before using the −30 m
+  default. Previously they bypassed that cache, so loading the same `.fdtrk` offline could shift its GNSS-derived
+  altitudes from the agreed online height to the default. Missing, unreadable or invalid heights still fall back
+  with a warning; offline mode never opens a geoid connection.
+- `offline_uses_the_agreed_height_and_defaults_only_without_a_valid_cache` covers valid, absent, malformed,
+  nonfinite, implausible and unreadable caches. `offline_cache_roundtrip_and_geoid_adjust` loads a real synthetic
+  track-store file with the cached height and requires its original GNSS altitude to remain exactly unchanged.
+
 ### Analyse alternate audio tracks and individual microphone channels
 
 - **The gap.** `locate` and `detect` could read only the first audio track's mono mix. Ambient audio in another

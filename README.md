@@ -405,7 +405,8 @@ in `crates/fdop-core/src/curvematch.rs`:
 - **When it runs.** Only when the recording clock is known to 30 min or better and the region holds at most
   200,000 cells (about 8,000 km²); otherwise it is skipped with a log line. A state-wide search with no start
   therefore uses the trace search alone. It fetches its own wider ADS-B span, and the trace search's tracks are
-  unchanged. `--no-curve-match` turns it off.
+  unchanged. Eligibility is checked before constructing its harmonic image, so a skipped match does not build
+  an unused whole-file spectrogram. `--no-curve-match` turns it off.
 
 What it did on the development recordings is in the [CHANGELOG](CHANGELOG.md). The sparse-track,
 clock-bound and counted-pass changes have synthetic regressions. On `main`'s tip, which has all three, the 15
@@ -532,9 +533,9 @@ or change their Doppler frequencies.
 | Option | Default | Meaning |
 |---|---|---|
 | `<MEDIA>` | required | Audio or video file, anything ffmpeg reads |
-| `--dates <D>` | required | Local date(s) of the recording: `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD` (also `D0 to D1`, `D0,D1`, `YYYY/MM/DD`, `YYYYMMDD`). The year comes first: `09/08/2026` is refused as ambiguous. At most 15 days |
 | `--audio-stream <N>` | `0` | Audio track to analyse, counted from 0 among audio streams |
 | `--audio-channel <N>` | mono mix | One channel of that audio track, counted from 0; avoids mixing other microphone channels |
+| `--dates <D>` | required | Local date(s) of the recording: `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD` (also `D0 to D1`, `D0,D1`, `YYYY/MM/DD`, `YYYYMMDD`). The year comes first: `09/08/2026` is refused as ambiguous. At most 15 days |
 | `--near <REGION>` | required | Coarse US region; see [Region syntax](#region-syntax) |
 | `-o, --out <DIR>` | `fdop_runs/<name>_<unix time>` | Output directory |
 | `--start <ISO>` | — | Exact recording start if known, e.g. `2026-09-08T19:17:30-04:00`. Without a zone it is read as **UTC**. Unix seconds also work |
@@ -550,13 +551,18 @@ fdop locate clip.mov --dates 2026-09-07..2026-09-09 --near "Oyster Bay, NY" -o r
 fdop locate clip.wav --dates 2026-09-08 --near "40.87,-73.52,25" --start 2026-09-08T15:17:30-04:00 --clock-tol 60
 fdop locate clip.m4a --dates 2026-09-08 --near CONUS --json > result.json
 fdop locate clip.m4a --dates 2026-09-08 --near NY --offline        # cached data only
-```
 fdop locate clip.mov --dates 2026-09-08 --near NY --audio-stream 1 --audio-channel 0
+```
 
 **The time window.** Without `--start`, recording starts are searched from local midnight on the first date to
 local midnight after the last, using every UTC offset the region spans, DST included. If the file's
 `creation_time` falls inside that window, the search first narrows to it, allowing for both start and end
-conventions. If that finds nothing, it widens to the full window and says so in the warnings.
+conventions. Both the trace search and, when eligible, the independent curve match try that window. A standing
+curve match can locate the recording even when no trace candidate survives. Only when there is neither a trace
+candidate nor a standing curve match does the search widen to the full window, with a warning. The curve match
+retries too if the wider window is still eligible. A curve test from the earlier narrow window does not grade
+that wider search. Its original `clock_window` and
+`judged_search_window` flag are recorded in `result.json` under `extra.curve_match` when it has a verdict.
 
 With `--start`, its clock window is intersected with the local dates before checking archive availability or
 fetching weather and tracks. Only the UTC days needed by that window, the recording duration and track padding
@@ -711,6 +717,10 @@ can be read and its stored box and time interval cover the requested slice of th
 or incomplete cache is identified in the progress output, and other eligible caches are tried before
 downloading again or failing in `--offline` mode. Partial feeds retain their missing-feed warnings. A larger
 region on the same day downloads that day again if no usable cache covers it.
+
+`locate` and `fetch` reuse the agreed NGS geoid height cached for the region's centre in both online and
+`--offline` mode. Offline mode uses the −30 m default only when that height is absent, unreadable or invalid,
+and warns when it does. Going offline therefore preserves the altitude reference of a valid cached run.
 
 ### Data sources
 
@@ -1266,6 +1276,7 @@ audio or video recorded somewhere sensitive:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `ffprobe not runnable (...); install ffmpeg` (or `ffmpeg not runnable`) | ffmpeg is not on `PATH` | Install ffmpeg; check with `fdop doctor` |
+| Audio is audible in the player but the survey is silent, or the selected track contains commentary | The first track or its mono mix lacks the useful ambient sound; opposite-polarity stereo can cancel | Select the ambient track with `--audio-stream N`, or a microphone channel with `--audio-channel N`; both indices start at 0 |
 | `GitHub API refused ... limited to 60/hour, set GITHUB_TOKEN` | Unauthenticated GitHub API quota | `export GITHUB_TOKEN=$(gh auth token)` or any read-only token |
 | `no location: no location found: N usable flyover events; need at least two clear propeller flyovers` | Fewer than two usable passes | Look at `survey.png` for faint falling curves the detector missed. One flyover cannot be located; a longer recording may hold more |
 | `no location: ...; no ADS-B flight pair explains two events at one place and clock (...)` | Wrong date or region, or the aircraft had no ADS-B | Check `--dates` (local dates) and widen `--near`; try `--ignore-metadata-time` if the file's `creation_time` is wrong |
@@ -1276,7 +1287,6 @@ audio or video recorded somewhere sensitive:
 | Warning `the audio has little energy below 100 Hz (45-95 Hz is N dB below 150-600 Hz)` | A high-pass filter does this, removing the fundamentals of slower propellers and weakening those near the cut. Speech-heavy audio can also read low | Use the unfiltered recording if you have one. Otherwise expect fewer usable flyovers, and do not read a failed search as evidence about the place |
 | Warning `the answer lies in CT, outside the searched state NY` (or `appears to lie in`, when the state is a gazetteer estimate) | A state search covers the state's bounding box, which takes in parts of its neighbours | If you know the recording was made in the searched state, distrust the answer whatever its grade, unless its radius reaches back across the border. A narrower `--near`, such as a county, takes in less of the neighbours |
 | `needs network or a cached file: Census gazetteer ...` | `--offline` before the gazetteer was cached | Run once online, or use a state, point or box region |
-| Audio is audible in the player but the survey is silent, or the selected track contains commentary | The first track or its mono mix lacks the useful ambient sound; opposite-polarity stereo can cancel | Select the ambient track with `--audio-stream N`, or a microphone channel with `--audio-channel N`; both indices start at 0 |
 | `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days are cached. A day missing from adsb.lol cannot be searched |
 | A download pauses for a minute, then carries on | The server stopped sending with the connection still open. After 60 s with no data, `fdop` reconnects and resumes with an HTTP `Range` request | Nothing. Resumed `206` responses are checked for their byte offset, range boundary and total length before new bytes are accepted. Capped ranges continue until the full object is proved complete; a range's body length is never treated as the archive length. After repeated failures with no new bytes it stops |
 | Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears some hours after it ends | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |

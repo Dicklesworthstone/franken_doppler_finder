@@ -621,6 +621,29 @@ mod tests {
         assert_eq!(got.meta.stats["cache_hits"], 1);
         // GNSS heights move by N_old - N_new = -2 m
         assert!((got.legs[0].points[2].alt_m - (geom_alt - 2.0)).abs() < 1e-3);
+        // An offline rerun with an agreed height cached at the region centre must
+        // retain the original altitude reference instead of requesting the default.
+        let geoid_dir = dir.join("geoid");
+        std::fs::create_dir_all(&geoid_dir).unwrap();
+        std::fs::write(
+            geoid_dir.join("40.876466_-73.524951.txt"),
+            sp.geoid_n_m.to_string(),
+        )
+        .unwrap();
+        let (cached_n, source) =
+            crate::geoid_height_with_options(&dir, 40.876466, -73.524951, true);
+        assert_eq!(source, "ngs");
+        let cached = fetch_window(
+            &IngestSpec {
+                geoid_n_m: cached_n,
+                ..sp
+            },
+            &dir,
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(cached.meta.geoid_n_m, store.meta.geoid_n_m);
+        assert_eq!(cached.legs[0].points[2].alt_m, geom_alt);
         // a day that is not cached fails offline unless allow_missing
         let mut later = want;
         later.t_end += 86_400.0;

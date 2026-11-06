@@ -87,9 +87,23 @@ fn write_cached(path: &Path, n: f64) {
 /// Geoid height and its source: ("ngs") from the cache or from two NGS reads that agree, else
 /// ("default") -30 m, which the caller reports as a warning.
 pub fn geoid_height_or_default(cache_dir: &Path, lat: f64, lon: f64) -> (f64, &'static str) {
+    geoid_height_with_options(cache_dir, lat, lon, false)
+}
+
+/// Resolve the same agreed, cached height online and offline. Offline mode never opens a
+/// connection; only an absent or invalid cache falls back to the documented default.
+pub fn geoid_height_with_options(
+    cache_dir: &Path,
+    lat: f64,
+    lon: f64,
+    offline: bool,
+) -> (f64, &'static str) {
     let path = cache_path(cache_dir, lat, lon);
     if let Some(n) = read_cached(&path) {
         return (n, "ngs");
+    }
+    if offline {
+        return (DEFAULT_GEOID_M, "offline-default");
     }
     let read = Net::new().map_err(DataError::from).and_then(|net| {
         let net = net.with_retries(1);
@@ -177,5 +191,35 @@ mod tests {
             std::fs::write(&path, bad).unwrap();
             assert_eq!(read_cached(&path), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn offline_uses_the_agreed_height_and_defaults_only_without_a_valid_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-geoid-offline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (lat, lon) = (40.876466, -73.524951);
+        let lookup = || geoid_height_with_options(&dir, lat, lon, true);
+        assert_eq!(lookup(), (DEFAULT_GEOID_M, "offline-default"));
+        let path = cache_path(&dir, lat, lon);
+        write_cached(&path, -31.364);
+        assert_eq!(lookup(), (-31.364, "ngs"));
+        assert_eq!(lookup(), geoid_height_or_default(&dir, lat, lon));
+        for bad in ["", "not a number", "-999.0", "NaN", "inf"] {
+            std::fs::write(&path, bad).unwrap();
+            assert_eq!(lookup(), (DEFAULT_GEOID_M, "offline-default"), "{bad:?}");
+        }
+        // A directory at the cache path is unreadable as a height, too.
+        let other = cache_path(&dir, lat + 1.0, lon);
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(
+            geoid_height_with_options(&dir, lat + 1.0, lon, true),
+            (DEFAULT_GEOID_M, "offline-default")
+        );
     }
 }

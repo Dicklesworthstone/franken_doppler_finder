@@ -245,6 +245,44 @@ const CURVE_MAX_CELLS: f64 = 200_000.0;
 /// A trace answer asserted this far from a curve-match answer that stands names another place.
 const CURVE_CONFLICT_M: f64 = 3000.0;
 
+/// Check eligibility before building the whole-file harmonic image. A skipped curve match
+/// must not spend time and memory preparing a second spectrogram it will never read.
+fn curve_match_skip_reason(
+    p: &curvematch::MatchParams,
+    bbox: BBox,
+    clock: (f64, f64),
+) -> Option<String> {
+    let width = clock.1 - clock.0;
+    if width > CURVE_MAX_CLOCK_S {
+        return Some(format!(
+            "the recording clock is known to {width:.0} s, and it needs {CURVE_MAX_CLOCK_S:.0} s or better"
+        ));
+    }
+    let km_ns = (bbox.north - bbox.south) * 111.2;
+    let km_ew =
+        (bbox.east - bbox.west) * 111.2 * (0.5 * (bbox.north + bbox.south)).to_radians().cos();
+    let cells = km_ns * km_ew * 1e6 / (p.cell_m * p.cell_m);
+    (cells > CURVE_MAX_CELLS).then(|| {
+        format!("the region needs {cells:.0} cells, and it searches {CURVE_MAX_CELLS:.0} at most")
+    })
+}
+
+/// A failed trace is not a failed metadata window: the independent curve match can still
+/// locate passes whose ridges could not be measured. Only widen once both have had a chance.
+fn metadata_needs_fallback(
+    meta_window: bool,
+    trace_has_candidate: bool,
+    curve: Option<&curvematch::CurveVerdict>,
+) -> bool {
+    meta_window && !trace_has_candidate && !curve.is_some_and(|v| v.stands)
+}
+
+/// Decoys calibrate one searched clock window. A verdict retained from an earlier metadata
+/// attempt remains diagnostic after widening, until the matcher has searched that window too.
+fn curve_judges_window(curve_clock: (f64, f64), search_clock: (f64, f64), n_decoys: usize) -> bool {
+    curve_clock == search_clock && n_decoys >= curvematch::MIN_DECOYS
+}
+
 /// What the curve match does to the trace search's answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CurveCall {
@@ -358,21 +396,8 @@ fn run_curve_match(
     log: &Arc<Log>,
 ) -> Result<Option<curvematch::MatchResult>, String> {
     let (s_lo, s_hi) = clock;
-    if s_hi - s_lo > CURVE_MAX_CLOCK_S {
-        log.say(&format!(
-            "curve match skipped: the recording clock is known to {:.0} s, and it needs {CURVE_MAX_CLOCK_S:.0} s or better",
-            s_hi - s_lo
-        ));
-        return Ok(None);
-    }
-    let km_ns = (bbox.north - bbox.south) * 111.2;
-    let km_ew =
-        (bbox.east - bbox.west) * 111.2 * (0.5 * (bbox.north + bbox.south)).to_radians().cos();
-    let cells = km_ns * km_ew * 1e6 / (p.cell_m * p.cell_m);
-    if cells > CURVE_MAX_CELLS {
-        log.say(&format!(
-            "curve match skipped: the region needs {cells:.0} cells, and it searches {CURVE_MAX_CELLS:.0} at most"
-        ));
+    if let Some(why) = curve_match_skip_reason(p, bbox, clock) {
+        log.say(&format!("curve match skipped: {why}"));
         return Ok(None);
     }
     let day = 86_400.0;
@@ -694,7 +719,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         s_hi = hi;
         meta_window = true;
         window_note = format!(
-            "recording start in [{}, {}] from the file's creation_time {} (start or end convention, +-{:.0} s); full-day fallback if nothing is found",
+            "recording start in [{}, {}] from the file's creation_time {} (start or end convention, +-{:.0} s); full-day fallback if neither search finds an answer",
             iso_utc(s_lo),
             iso_utc(s_hi),
             iso_utc(ct),
@@ -729,7 +754,15 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     warnings.extend(low_band_warning(&x, a.sr));
     timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
     let curve_params = curvematch::MatchParams::default();
-    let curve_image = if a.curve_match {
+    let mut curve_clock = (s_lo, s_hi);
+    let curve_skip = curve_match_skip_reason(&curve_params, region.bbox, curve_clock);
+    if a.curve_match
+        && let Some(why) = &curve_skip
+    {
+        log.say(&format!("curve match skipped: {why}"));
+    }
+    let t = Instant::now();
+    let curve_image = if a.curve_match && curve_skip.is_none() {
         match curvematch::build_image(&x, a.sr, &curve_params) {
             Ok(im) => Some(im),
             Err(e) => {
@@ -740,6 +773,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     } else {
         None
     };
+    let curve_image_s = t.elapsed().as_secs_f64();
     // ---- detection ----------------------------------------------------------------------
     let t = Instant::now();
     let dp = DetectParams::default();
@@ -935,16 +969,13 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     // aircraft within d_gate of an observer inside the region, plus ~2 minutes of flight on
     // each side of the CPA for the curve; capped so a state-wide search stays one cache box
     let fetch_box: BBox = region.bbox.padded_km((d_max / 1000.0 + 15.0).min(30.0));
-    let (geoid_n, geoid_src) = if a.offline {
-        (-30.0, "offline-default")
-    } else {
-        fdop_data::geoid_height_or_default(&a.cache, region.center.0, region.center.1)
-    };
+    let (geoid_n, geoid_src) =
+        fdop_data::geoid_height_with_options(&a.cache, region.center.0, region.center.1, a.offline);
     if geoid_src != "ngs" {
         warnings.push(format!(
             "geoid height N = {geoid_n:.0} m is a default ({}); across CONUS N runs from about -10 to -35 m, so ADS-B GNSS altitudes can be off by up to about 20 m",
             if a.offline {
-                "--offline"
+                "--offline and no valid cached NGS height"
             } else {
                 "the NGS GEOID lookup failed"
             }
@@ -1040,32 +1071,20 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         search::run(&inp, &sp, &move |s: &str| lg.say(s))
     };
     let mut res = run_search(s_lo, s_hi);
-    if res.candidates.is_empty() && meta_window {
-        log.say("nothing found inside the metadata window; widening to the full date window");
-        warnings.push(
-            "creation_time window gave no candidate; the full date window was searched".into(),
-        );
-        res = run_search(full_window.0, full_window.1);
-        s_lo = full_window.0;
-        s_hi = full_window.1;
-        window_note = format!(
-            "recording start between {} and {} (full date window after the creation_time hint gave no candidate)",
-            iso_utc(s_lo),
-            iso_utc(s_hi)
-        );
-    }
-    timings.insert("search_s".into(), json!(t.elapsed().as_secs_f64()));
-    warnings.extend(res.warnings.iter().cloned());
+    let mut search_s = t.elapsed().as_secs_f64();
     // ---- curve match --------------------------------------------------------------------
     let t = Instant::now();
-    let curve = curve_image.as_ref().and_then(|im| {
-        let got = run_curve_match(
+    let run_curve = |clock| {
+        let Some(im) = curve_image.as_ref() else {
+            return Ok(None);
+        };
+        run_curve_match(
             a,
             &curve_params,
             im,
             region.bbox,
             fetch_box,
-            (s_lo, s_hi),
+            clock,
             dur,
             adsb_end,
             geoid_n,
@@ -1073,21 +1092,64 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             &fine,
             &*atmo,
             log,
-        );
-        match got {
-            Ok(r) => r,
-            Err(e) => {
-                warnings.push(format!("curve match skipped: {e}"));
-                None
-            }
+        )
+    };
+    let mut curve = match run_curve(curve_clock) {
+        Ok(r) => r,
+        Err(e) => {
+            warnings.push(format!("curve match skipped: {e}"));
+            None
         }
-    });
+    };
+    let mut curve_verdict = curve.as_ref().and_then(curvematch::verdict);
+    let mut curve_match_s = curve_image_s + t.elapsed().as_secs_f64();
+    let metadata_fallback = metadata_needs_fallback(
+        meta_window,
+        !res.candidates.is_empty(),
+        curve_verdict.as_ref(),
+    );
+    if metadata_fallback {
+        log.say("neither search located the recording inside the metadata window; widening to the full date window");
+        warnings.push(
+            "creation_time window gave no trace candidate or standing curve match; the full date window was searched. A curve match in the metadata window does not judge the wider search".into(),
+        );
+        let t = Instant::now();
+        res = run_search(full_window.0, full_window.1);
+        search_s += t.elapsed().as_secs_f64();
+        s_lo = full_window.0;
+        s_hi = full_window.1;
+        window_note = format!(
+            "recording start between {} and {} (full date window after neither search found an answer inside the creation_time window)",
+            iso_utc(s_lo),
+            iso_utc(s_hi)
+        );
+        // Usually the full date is too wide. Publication clipping can leave a shorter
+        // window, in which case the curve match must try it too, with its own decoys.
+        if curve_image.is_some()
+            && curve_match_skip_reason(&curve_params, region.bbox, full_window).is_none()
+        {
+            let t = Instant::now();
+            curve_clock = full_window;
+            curve = match run_curve(curve_clock) {
+                Ok(r) => r,
+                Err(e) => {
+                    warnings.push(format!("curve match in the full date window skipped: {e}"));
+                    None
+                }
+            };
+            curve_verdict = curve.as_ref().and_then(curvematch::verdict);
+            curve_match_s += t.elapsed().as_secs_f64();
+        }
+    }
     drop(curve_image);
-    let curve_verdict = curve.as_ref().and_then(curvematch::verdict);
+    timings.insert("search_s".into(), json!(search_s));
+    timings.insert("curve_match_s".into(), json!(curve_match_s));
+    warnings.extend(res.warnings.iter().cloned());
     // the curve match ran and had decoy clocks enough to judge, whether or not it found a place
+    // Its narrow clock test says nothing about a trace answer found only after widening.
     let curve_judged = curve
         .as_ref()
-        .is_some_and(|r| r.decoys.len() >= curvematch::MIN_DECOYS);
+        .is_some_and(|r| curve_judges_window(curve_clock, (s_lo, s_hi), r.decoys.len()));
     if let Some(r) = &curve
         && let Err(e) = write_json(&run_dir.join("curvematch.json"), r)
     {
@@ -1101,7 +1163,6 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             v.why
         ));
     }
-    timings.insert("curve_match_s".into(), json!(t.elapsed().as_secs_f64()));
     // a tile that cannot be read or fetched answers 0 m; say how much ground that covered
     let (lost_coarse, lost_fine) = (coarse.failures(), fine.failures());
     if lost_coarse + lost_fine > 0 {
@@ -1743,6 +1804,8 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         "search_events": sevs,
         "curve_match": curve_verdict.as_ref().map(|v| json!({
             "call": format!("{curve_used:?}"),
+            "clock_window": [curve_clock.0, curve_clock.1],
+            "judged_search_window": curve_judged,
             "verdict": v,
             "flights": curve.as_ref().map(curve_flights),
         })),
@@ -1945,6 +2008,70 @@ mod tests {
             n_heard: 3,
             why: String::new(),
         }
+    }
+
+    #[test]
+    fn a_standing_curve_match_rescues_an_empty_metadata_trace_search() {
+        let good = stands_at(40.876466, -73.524951, true);
+        let weak = stands_at(40.876466, -73.524951, false);
+        // A usable metadata clock must reach the independent matcher even when no trace
+        // survived measurement. Its standing answer follows the existing adoption gates.
+        assert!(!metadata_needs_fallback(true, false, Some(&good)));
+        assert_eq!(
+            curve_call("none", None, Some(&good), true),
+            CurveCall::Adopts
+        );
+        for curve in [None, Some(&weak)] {
+            assert!(metadata_needs_fallback(true, false, curve));
+            assert!(!metadata_needs_fallback(true, true, curve));
+            // An explicit --start never widens, whether or not either search succeeded.
+            assert!(!metadata_needs_fallback(false, false, curve));
+        }
+        // A negative curve test inside the old metadata window cannot veto a medium
+        // trace answer that was found only after widening to the full date window.
+        let judged = curve_judges_window((1000.0, 1200.0), (0.0, 86_400.0), weak.n_decoys);
+        assert_eq!(
+            curve_call("medium", Some((40.876466, -73.524951)), Some(&weak), judged),
+            CurveCall::Silent
+        );
+    }
+
+    #[test]
+    fn only_a_new_curve_attempt_can_judge_the_widened_clock() {
+        let narrow = (1000.25, 1100.25);
+        let wider = (900.25, 1200.25);
+        assert!(curve_judges_window(narrow, narrow, 40));
+        assert!(!curve_judges_window(narrow, narrow, 39));
+        assert!(!curve_judges_window(narrow, wider, 48));
+        assert!(curve_judges_window(wider, wider, 48));
+        // A rerun that failed or had too few decoys has no authority to grade it.
+        assert!(!curve_judges_window(wider, wider, 0));
+        assert!(!curve_judges_window(wider, wider, 39));
+        assert!(!curve_judges_window(narrow, (1001.25, 1101.25), 48));
+    }
+
+    #[test]
+    fn curve_image_is_only_needed_inside_the_clock_and_region_limits() {
+        let p = curvematch::MatchParams::default();
+        let small = BBox::new(40.8, -73.6, 40.9, -73.5);
+        assert!(curve_match_skip_reason(&p, small, (1000.0, 1000.0)).is_none());
+        assert!(curve_match_skip_reason(&p, small, (1000.0, 2800.0)).is_none());
+        assert!(
+            curve_match_skip_reason(&p, small, (1000.0, 2800.1))
+                .unwrap()
+                .contains("recording clock")
+        );
+        assert!(
+            curve_match_skip_reason(&p, small, (0.0, 86_400.0))
+                .unwrap()
+                .contains("recording clock")
+        );
+        let large = BBox::new(40.0, -74.0, 42.0, -72.0);
+        assert!(
+            curve_match_skip_reason(&p, large, (1000.0, 1000.0))
+                .unwrap()
+                .contains("cells")
+        );
     }
 
     /// Every combination of the trace grade and where the curve match stands. km east of 40 N.
