@@ -120,3 +120,65 @@ few cases every case is listed and no significance is claimed. On the unsolvable
 assertion, and an assertion there is scored like any other.
 
 Recordings, coordinates and aircraft identifiers stay out of this repository.
+
+## 2026-11-06, the screens and the one run
+
+### Result
+
+Set G has **no solvable case**. Its one case is the unsolvable one, and on it every registered build declined:
+
+| Build | Binary (sha256) | Outcome | Wall time |
+|---|---|---|---|
+| `7e66501` | `3f52bf10dec34fa3` | declined: 0 usable flyover events | 182 s |
+| `6914ab7` | `b00978baa982386b` | declined: 0 usable flyover events | 150 s |
+| `981fad1` | `ed7b8547362138e1` | declined: 0 usable flyover events | 151 s |
+| `37a156b` | `855a7b6d48c583ad` | declined: 0 usable flyover events | 165 s |
+
+The case is `g_mackinawcity`, the Riviera Motel, Mackinaw City, MI (`Mf_qId_7mlM`, level -38.4 dB, limit 1 km, R2
+circle bearing 141°). Each build has 0 correct and 0 confident wrong. That is all set G shows: no registered build
+asserts where no aircraft passed. It cannot compare accuracy, because no case could be solved.
+
+### How the screens ended
+
+All 312 search rows from the 47 places were screened in order (13 of the 60 cells mapped to a place already taken).
+
+| Stopped at | Streams | Why, mostly |
+|---|---|---|
+| 3, title and description | 239 | excluded operators (55 on the title), not a camera of one site, outside the US, bans, radio feeds, music, private homes, a second stream at a site |
+| 4, truth | 4 | no OpenStreetMap feature, and no published address that fixes the site within its limit |
+| 5, traffic | 30 | fewer than 6 passes within 3 km |
+| 6, level | 32 | 28 at or near digital silence (26 at -91.0 dB), one at -71.3 dB; 3 not taken (the fetch failed twice) |
+| 7, pilot and hearing | 6 | 5 heard nothing; Carlsbad's pilot not taken (its clock held 875 s, under the outage rule) |
+| 9, the unsolvable case | 1 | Riviera Motel |
+
+The five that reached the hearing screen (band-level method; n close passes, k above the chance lines' 90th
+percentile, m their mean chance percentile): St. Augustine Beach pier n 19, k 0, m 0.35; Mersea, Treasure Island n 20,
+k 2, m 0.48; Fremont Street (LV Tattoo) n 15, k 0, m 0.42; South Ponte Vedra (Serenata) n 40, k 3, m 0.51; Venice
+boardwalk, North Cam n 43, k 2, m 0.53. Robbie's, Islamorada, met before the Riviera Motel, had no track within 15 km
+but was at -91.0 dB. Every row's step and reason are kept with the screen files.
+
+### Readings of the rule, given here because the rule did not settle them
+
+- **Same site.** From row 171 on, a later stream whose truth is within 1 km of an earlier description pass is the same
+  site (Las Vegas City Hall, three Reno city cameras, Hollywood Beach Theatre). Earlier rows were judged by name.
+- **Truth.** Where Nominatim matched nothing, or the wrong place, the published address was used, placed by Nominatim
+  or by the Census geocoder. Every replaced first match is kept with the truth file. A lighthouse the camera looks at
+  takes 5 km, as Addendum 13 does for a small feature in view.
+- **Hearing.** n counts the close passes that bband could score. The chance lines come from passes within 15 km, as
+  the rule says, where set F's lists used 5 km.
+- **Retries.** A fetch fault (HTTP 403 or 404) was retried once.
+
+### A build fault, caught before any run
+
+The first build of the four shared one target directory, and the `git archive` trees carried old file times, so cargo
+reused `7e66501`'s artifacts: the other three came out byte-identical to it. The identical hashes gave this away. All
+four were rebuilt after touching each tree's files. Each binary's debug information names its own tree, and each passes
+`fdop selftest`. The rebuilt `7e66501` reproduces its first hash. Only the rebuilt binaries ran.
+
+### Found after the screens, and not used by set G
+
+fdop's tonal oracle was run on the five pilots afterwards, as a diagnostic: the detector's own matched filter at each
+ADS-B pass, against the same chance lines. It hears St. Augustine Beach pier at 8 of 19 close passes, mean percentile
+0.79, where the band-level method heard none. South Ponte Vedra came out at 6 of 40, 0.67; the other three show
+nothing. So the band-level screen misses propeller tones that fdop's method can use, and set G's "no solvable case" is
+partly a property of that screen. Set G is not changed; `SET_H.md` is a new set.
