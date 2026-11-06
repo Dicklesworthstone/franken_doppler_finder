@@ -213,7 +213,9 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
       ▼  detect   1 s STFT, 35–1100 Hz ─► 48 bins/octave robust z-map (raised to a robust spread of
       │           0.5, at most ×4, when one loud pass compressed it) ─► matched-filter bank of
       │           emission-time templates over speed (40–175 m/s) × CPA distance (250 m–12 km);
-      │           both halves of a pass must light up, so steady hum and clicks are rejected
+      │           both halves of a pass must light up, so steady hum and clicks are rejected;
+      │           a short pass heard too near the start or end for the 24 s templates gets a
+      │           10 s one, on what the full bank left unexplained
       ▼  measure  per event: STFT window ≈ 1/√(slope at the CPA), at least 0.5 s, with a matched shorter
       │           window for frames steeper than that holds; model-guided ridge trace, bounded
       │           trust-region fit with multistarts and robust loss, profile-likelihood ranges,
@@ -800,6 +802,15 @@ Design notes:
   original coverage counts and score normalization. Weak-only recordings keep their ordinary scan.
   Both passes share the existing candidate allowance and detection cap. This lets different curves
   with the same tone and CPA reach measurement; their initial cell winner no longer has the only chance.
+- **A pass heard near the start or end gets a short template.** A short transition (1.25 d/v at most
+  24 s) is scored by a 24 s template, which needs 8 of its 12 path samples on each side, about 16 s of
+  recording before and after the CPA. A nearer CPA cannot be scored however loud the pass, and a clip
+  under about 32 s gives the bank no cell at all. After both passes, a 10 s edge template
+  (`DetectParams::edge_half_s`) scores exactly the cells its 24 s template cannot cover within 24 s of
+  either end. It works on the evidence the accepted curves left, from the silence line, under the passes'
+  suppression, residual and marking rules, so every detection the passes accept is the same with or
+  without it. `refine` keeps the 10 s half. The stage runs only on the frames near each end, and not at
+  all when the passes stop at three times the detection cap.
 - **Guided measurement follows the predicted ridge.** It selects the nearest qualified local spectral
   peak within the existing model band, using the existing SNR and robust-z requirements. A brighter
   neighbouring aircraft no longer automatically takes over the trace when both tones enter that band.

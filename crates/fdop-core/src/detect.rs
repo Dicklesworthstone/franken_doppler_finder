@@ -31,6 +31,13 @@ pub struct DetectParams {
     pub k_tau: Vec<f64>,
     pub min_half_s: f64,
     pub max_half_s: f64,
+    /// Half-length (s) of the edge templates; 0 (or anything from `min_half_s` up) turns them
+    /// off. A short transition (shortest k * d / v at or under `min_half_s`) has a `min_half_s`
+    /// template, which needs 60 % of each half on the recording, so a CPA nearer than that to
+    /// the start or end cannot be scored however loud it is. After both passes, an edge
+    /// template of this half scores exactly those cells, on the residual of every accepted
+    /// curve: it explains only what the full-length bank left unexplained.
+    pub edge_half_s: f64,
     /// Min-halves matched-filter score (robust-z sum / sqrt(n)) of a strong curve: strong curves
     /// are accepted first and their residual searched for weaker ones. Pure noise peaks near 3.
     pub thr_db: f64,
@@ -73,6 +80,7 @@ impl Default for DetectParams {
             k_tau: vec![1.25, 2.0, 3.0],
             min_half_s: 24.0,
             max_half_s: 240.0,
+            edge_half_s: 10.0,
             thr_db: 4.5,
             thr_silence_db: 3.5,
             max_detections: 60,
@@ -227,6 +235,19 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
     ))
 }
 
+/// A template's part in scoring ([`score_bank`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EdgeRole {
+    /// An ordinary bank template.
+    Plain,
+    /// Scores nothing itself: records, per cell, whether it is covered, for the edge template
+    /// that follows it.
+    Base,
+    /// Scores a cell only where the base template before it is not covered and the cell lies
+    /// within `base_half` of the recording's first or last frame.
+    Edge { base_half: f64 },
+}
+
 struct Template {
     v: f64,
     d: f64,
@@ -235,12 +256,20 @@ struct Template {
     path: Vec<(i32, i32, bool)>,
     n_a: usize,
     n_r: usize,
+    edge: EdgeRole,
 }
 
 /// Score each row independently so a worker keeps only one row's sums in cache. Coverage
 /// comes from intervals of valid frames, rather than summing a full padded mask per sample.
-/// The evidence additions retain path order, including when scoring the residual pass.
-fn score_bank(ls: &LogSpec, tmpls: &[Template], evidence: &[f32]) -> (Vec<f32>, Vec<u16>) {
+/// The evidence additions retain path order, including when scoring the residual pass. Only
+/// the cells (frames) in `windows` are scored, from the whole evidence image; every other cell
+/// keeps -inf. A full window scores exactly as one without windows.
+fn score_bank(
+    ls: &LogSpec,
+    tmpls: &[Template],
+    evidence: &[f32],
+    windows: &[(usize, usize)],
+) -> (Vec<f32>, Vec<u16>) {
     let (nt, nr) = (ls.nt(), ls.nr());
     let mut best = vec![f32::NEG_INFINITY; nr * nt];
     let mut indices = vec![0u16; nr * nt];
@@ -256,49 +285,72 @@ fn score_bank(ls: &LogSpec, tmpls: &[Template], evidence: &[f32]) -> (Vec<f32>, 
                     vec![0f32; nt],
                     vec![0i32; nt + 1],
                     vec![0i32; nt + 1],
+                    vec![false; nt],
                 )
             },
-            |(sa, sr, ca, cr), (r, (bs, bi))| {
-                for (ti, tm) in tmpls.iter().enumerate() {
-                    sa.fill(0.0);
-                    sr.fill(0.0);
-                    ca.fill(0);
-                    cr.fill(0);
-                    for &(dt, dr, app) in &tm.path {
-                        let source_row = r as i64 + dr as i64;
-                        if source_row < 0 || source_row >= nr as i64 {
-                            continue;
-                        }
-                        let a = (-(dt as i64)).clamp(0, nt as i64) as usize;
-                        let b = (nt as i64 - dt as i64).clamp(0, nt as i64) as usize;
-                        if a >= b {
-                            continue;
-                        }
-                        let (s, counts) = if app {
-                            (&mut *sa, &mut *ca)
-                        } else {
-                            (&mut *sr, &mut *cr)
-                        };
-                        let src = source_row as usize * nt + (a as i64 + dt as i64) as usize;
-                        for (sum, &z) in s[a..b].iter_mut().zip(&evidence[src..src + b - a]) {
-                            *sum += z;
-                        }
-                        counts[a] += 1;
-                        counts[b] -= 1;
+            |(sa, sr, ca, cr, base_covered), (r, (bs, bi))| {
+                for &(c0, c1) in windows {
+                    let (c0, c1) = (c0.min(nt), c1.min(nt));
+                    if c0 >= c1 {
+                        continue;
                     }
-                    let (mut na, mut nrr) = (0i32, 0i32);
-                    for k in 0..nt {
-                        na += ca[k];
-                        nrr += cr[k];
-                        if (na as f32) < 0.6 * tm.n_a as f32 || (nrr as f32) < 0.6 * tm.n_r as f32 {
-                            continue;
+                    for (ti, tm) in tmpls.iter().enumerate() {
+                        sa[c0..c1].fill(0.0);
+                        sr[c0..c1].fill(0.0);
+                        ca[c0..=c1].fill(0);
+                        cr[c0..=c1].fill(0);
+                        for &(dt, dr, app) in &tm.path {
+                            let source_row = r as i64 + dr as i64;
+                            if source_row < 0 || source_row >= nr as i64 {
+                                continue;
+                            }
+                            let a = (-(dt as i64)).clamp(c0 as i64, c1 as i64) as usize;
+                            let b = (nt as i64 - dt as i64).clamp(c0 as i64, c1 as i64) as usize;
+                            if a >= b {
+                                continue;
+                            }
+                            let (s, counts) = if app {
+                                (&mut *sa, &mut *ca)
+                            } else {
+                                (&mut *sr, &mut *cr)
+                            };
+                            let src = source_row as usize * nt + (a as i64 + dt as i64) as usize;
+                            for (sum, &z) in s[a..b].iter_mut().zip(&evidence[src..src + b - a]) {
+                                *sum += z;
+                            }
+                            counts[a] += 1;
+                            counts[b] -= 1;
                         }
-                        // Keep sum/sqrt(n), including zeroed known samples in n: removing
-                        // those samples from coverage would inflate residual detections.
-                        let s = (sa[k] / roots[na as usize]).min(sr[k] / roots[nrr as usize]);
-                        if s > bs[k] || (s == bs[k] && ti < bi[k] as usize) {
-                            bs[k] = s;
-                            bi[k] = ti as u16;
+                        let (mut na, mut nrr) = (0i32, 0i32);
+                        for k in c0..c1 {
+                            na += ca[k];
+                            nrr += cr[k];
+                            let uncovered = (na as f32) < 0.6 * tm.n_a as f32
+                                || (nrr as f32) < 0.6 * tm.n_r as f32;
+                            match tm.edge {
+                                EdgeRole::Plain => {}
+                                EdgeRole::Base => {
+                                    base_covered[k] = !uncovered;
+                                    continue;
+                                }
+                                EdgeRole::Edge { base_half } => {
+                                    let near_edge = ls.t[k] - ls.t[0] < base_half
+                                        || ls.t[nt - 1] - ls.t[k] < base_half;
+                                    if base_covered[k] || !near_edge {
+                                        continue;
+                                    }
+                                }
+                            }
+                            if uncovered {
+                                continue;
+                            }
+                            // Keep sum/sqrt(n), including zeroed known samples in n: removing
+                            // those samples from coverage would inflate residual detections.
+                            let s = (sa[k] / roots[na as usize]).min(sr[k] / roots[nrr as usize]);
+                            if s > bs[k] || (s == bs[k] && ti < bi[k] as usize) {
+                                bs[k] = s;
+                                bi[k] = ti as u16;
+                            }
                         }
                     }
                 }
@@ -307,8 +359,36 @@ fn score_bank(ls: &LogSpec, tmpls: &[Template], evidence: &[f32]) -> (Vec<f32>, 
     (best, indices)
 }
 
-fn build_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
+fn template(p: &DetectParams, hop: f64, v: f64, d: f64, half: f64, edge: EdgeRole) -> Template {
     let b = p.bins_per_octave as f64;
+    let n = (half / p.path_dt).floor() as i64;
+    let mut path = Vec::new();
+    for k in -n..=n {
+        if k == 0 {
+            continue;
+        }
+        let u = k as f64 * p.path_dt;
+        let r = cv_ratio_rel_t0r(u, v, d, p.c);
+        path.push((
+            (u / hop).round() as i32,
+            (r.log2() * b).round() as i32,
+            k < 0,
+        ));
+    }
+    let n_a = path.iter().filter(|x| x.2).count();
+    let n_r = path.len() - n_a;
+    Template {
+        v,
+        d,
+        half,
+        path,
+        n_a,
+        n_r,
+        edge,
+    }
+}
+
+fn build_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
     let mut out = Vec::new();
     for &v in &p.v_grid {
         for &d in &p.d_grid {
@@ -320,31 +400,37 @@ fn build_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
             halves.sort_by(f64::total_cmp);
             halves.dedup_by(|a, b| (*a - *b).abs() < 0.15 * *b);
             for half in halves {
-                let n = (half / p.path_dt).floor() as i64;
-                let mut path = Vec::new();
-                for k in -n..=n {
-                    if k == 0 {
-                        continue;
-                    }
-                    let u = k as f64 * p.path_dt;
-                    let r = cv_ratio_rel_t0r(u, v, d, p.c);
-                    path.push((
-                        (u / hop).round() as i32,
-                        (r.log2() * b).round() as i32,
-                        k < 0,
-                    ));
-                }
-                let n_a = path.iter().filter(|x| x.2).count();
-                let n_r = path.len() - n_a;
-                out.push(Template {
-                    v,
-                    d,
-                    half,
-                    path,
-                    n_a,
-                    n_r,
-                });
+                out.push(template(p, hop, v, d, half, EdgeRole::Plain));
             }
+        }
+    }
+    out
+}
+
+/// The edge bank: for each (v, d) whose shortest half is the `min_half_s` floor, that template
+/// as a [`EdgeRole::Base`] followed by its `edge_half_s` edge template. Empty when
+/// `edge_half_s` is not in (0, `min_half_s`).
+fn build_edge_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
+    let mut out = Vec::new();
+    if !(p.edge_half_s > 0.0 && p.edge_half_s < p.min_half_s) {
+        return out;
+    }
+    let k_min = p.k_tau.iter().copied().fold(f64::INFINITY, f64::min);
+    for &v in &p.v_grid {
+        for &d in &p.d_grid {
+            if k_min * d / v > p.min_half_s {
+                continue;
+            }
+            let base = p.min_half_s.min(p.max_half_s);
+            out.push(template(p, hop, v, d, base, EdgeRole::Base));
+            out.push(template(
+                p,
+                hop,
+                v,
+                d,
+                p.edge_half_s,
+                EdgeRole::Edge { base_half: base },
+            ));
         }
     }
     out
@@ -390,11 +476,10 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
     // those cells counted as zero, so a template that merely rides an already detected ridge
     // with a different (v, d) cannot become a second event.
     let mut known = vec![false; nr * nt];
-    let bpo = p.bins_per_octave as f64;
     let mut out: Vec<Detection> = Vec::new();
     let mut remaining_candidates = 400_000usize;
     for pass in 0..2 {
-        let (bs, bi) = score_bank(ls, &tmpls, &lp);
+        let (bs, bi) = score_bank(ls, &tmpls, &lp, &[(0, nt)]);
         // Weak detections excuse unheard passes; they must not erase a measurable curve
         // before its template gets a chance to win. Accept strong curves first, then search
         // their residual for both strong and weak curves. A weak-only recording keeps the
@@ -411,62 +496,16 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
         cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
         cand.truncate(remaining_candidates);
         remaining_candidates -= cand.len();
-        for k in cand {
-            if out.len() >= p.max_detections * 3 {
-                break;
-            }
-            let (r, i) = (k / nt, k % nt);
-            let tm = &tmpls[bi[k] as usize];
-            let t0r = ls.t[i];
-            let f0 = ls.freqs[r];
-            let tau = tm.d / tm.v;
-            let half = tm.half;
-            let mut candidate = Detection {
-                id: out.len(),
-                t0r,
-                f0,
-                v: tm.v,
-                d: tm.d,
-                score: bs[k] as f64,
-                score_approach: 0.0,
-                score_recede: 0.0,
-                half_s: half,
-                harmonic_of: None,
-                harmonics: Vec::new(),
-            };
-            let suppressed = out.iter().any(|o| {
-                let dt_lim = (0.5 * tau.min(o.d / o.v)).max(10.0);
-                let same_line = ((f0 / o.f0).log2() * bpo).abs() < 4.0;
-                // Separate aircraft can share a tone and CPA. Suppress a neighbouring seed only
-                // when its transition also agrees at the accepted-curve mask resolution.
-                (t0r - o.t0r).abs() < dt_lim && same_line && harmonic_shapes(&candidate, o, p)
-            });
-            if suppressed {
-                continue;
-            }
-            let (ra, rr) = residual_halves(ls, r, i, tm, &known);
-            if (ra.min(rr) as f64) < threshold {
-                continue;
-            }
-            // mark this curve
-            let (j0, j1) = (
-                ls.t.partition_point(|&x| x < t0r - half),
-                ls.t.partition_point(|&x| x <= t0r + half),
-            );
-            for j in j0..j1 {
-                let fr = f0 * cv_ratio_rel_t0r(ls.t[j] - t0r, tm.v, tm.d, p.c);
-                let row = ((fr / ls.freqs[0]).log2() * bpo).round() as i64;
-                for rr2 in
-                    (row - RIDGE_HALF_ROWS).max(0)..=(row + RIDGE_HALF_ROWS).min(nr as i64 - 1)
-                {
-                    known[rr2 as usize * nt + j] = true;
-                }
-            }
-            candidate.score = ra.min(rr) as f64;
-            candidate.score_approach = ra as f64;
-            candidate.score_recede = rr as f64;
-            out.push(candidate);
-        }
+        accept_candidates(
+            ls,
+            p,
+            &tmpls,
+            (&bs, &bi),
+            &cand,
+            threshold,
+            &mut known,
+            &mut out,
+        );
         if !strong_pass
             || out.is_empty()
             || out.len() >= p.max_detections * 3
@@ -478,11 +517,39 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
         // Search the residual evidence once so its template can become a cell winner.
         // Keep the original coverage mask and denominator: known samples contribute zero,
         // exactly as in residual_halves, rather than making short fragments look stronger.
-        for (z, &seen) in lp.iter_mut().zip(&known) {
-            if seen {
-                *z = 0.0;
-            }
-        }
+        zero_known(&mut lp, &known);
+    }
+    // Edge stage (`DetectParams::edge_half_s`): after both passes, so every detection they
+    // accepted is the one they accept without it, on the residual of every accepted curve and
+    // from the silence line, with the passes' suppression, residual and marking rules.
+    let edge = build_edge_templates(p, ls.hop_s);
+    if !edge.is_empty() && out.len() < p.max_detections * 3 && remaining_candidates > 0 {
+        // Edge templates score only cells within the base half of the first or last frame.
+        let head = ls.t.partition_point(|&x| x - ls.t[0] < p.min_half_s);
+        let tail = ls.t.partition_point(|&x| ls.t[nt - 1] - x >= p.min_half_s);
+        let windows = if tail <= head {
+            vec![(0, nt)]
+        } else {
+            vec![(0, head), (tail, nt)]
+        };
+        zero_known(&mut lp, &known);
+        let (bs, bi) = score_bank(ls, &edge, &lp, &windows);
+        let threshold = p.thr_silence_db;
+        let mut cand: Vec<usize> = (0..nr * nt)
+            .filter(|&k| bs[k] as f64 >= threshold)
+            .collect();
+        cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
+        cand.truncate(remaining_candidates);
+        accept_candidates(
+            ls,
+            p,
+            &edge,
+            (&bs, &bi),
+            &cand,
+            threshold,
+            &mut known,
+            &mut out,
+        );
     }
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     let cut = out.len().saturating_sub(p.max_detections);
@@ -492,6 +559,87 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
     }
     group_harmonics(&mut out, p);
     (out, cut)
+}
+
+/// Known samples contribute zero to a later bank scan.
+fn zero_known(lp: &mut [f32], known: &[bool]) {
+    for (z, &seen) in lp.iter_mut().zip(known) {
+        if seen {
+            *z = 0.0;
+        }
+    }
+}
+
+/// Accept `cand` (cells, strongest first) in order: a candidate is kept unless an accepted
+/// detection on its line, near its CPA and of its shape suppresses it, or its residual halves
+/// (known cells counted as zero) fall under `threshold`; a kept curve marks its cells known.
+#[allow(clippy::too_many_arguments)]
+fn accept_candidates(
+    ls: &LogSpec,
+    p: &DetectParams,
+    tmpls: &[Template],
+    (bs, bi): (&[f32], &[u16]),
+    cand: &[usize],
+    threshold: f64,
+    known: &mut [bool],
+    out: &mut Vec<Detection>,
+) {
+    let (nt, nr) = (ls.nt(), ls.nr());
+    let bpo = p.bins_per_octave as f64;
+    for &k in cand {
+        if out.len() >= p.max_detections * 3 {
+            break;
+        }
+        let (r, i) = (k / nt, k % nt);
+        let tm = &tmpls[bi[k] as usize];
+        let t0r = ls.t[i];
+        let f0 = ls.freqs[r];
+        let tau = tm.d / tm.v;
+        let half = tm.half;
+        let mut candidate = Detection {
+            id: out.len(),
+            t0r,
+            f0,
+            v: tm.v,
+            d: tm.d,
+            score: bs[k] as f64,
+            score_approach: 0.0,
+            score_recede: 0.0,
+            half_s: half,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+        };
+        let suppressed = out.iter().any(|o| {
+            let dt_lim = (0.5 * tau.min(o.d / o.v)).max(10.0);
+            let same_line = ((f0 / o.f0).log2() * bpo).abs() < 4.0;
+            // Separate aircraft can share a tone and CPA. Suppress a neighbouring seed only
+            // when its transition also agrees at the accepted-curve mask resolution.
+            (t0r - o.t0r).abs() < dt_lim && same_line && harmonic_shapes(&candidate, o, p)
+        });
+        if suppressed {
+            continue;
+        }
+        let (ra, rr) = residual_halves(ls, r, i, tm, known);
+        if (ra.min(rr) as f64) < threshold {
+            continue;
+        }
+        // mark this curve
+        let (j0, j1) = (
+            ls.t.partition_point(|&x| x < t0r - half),
+            ls.t.partition_point(|&x| x <= t0r + half),
+        );
+        for j in j0..j1 {
+            let fr = f0 * cv_ratio_rel_t0r(ls.t[j] - t0r, tm.v, tm.d, p.c);
+            let row = ((fr / ls.freqs[0]).log2() * bpo).round() as i64;
+            for rr2 in (row - RIDGE_HALF_ROWS).max(0)..=(row + RIDGE_HALF_ROWS).min(nr as i64 - 1) {
+                known[rr2 as usize * nt + j] = true;
+            }
+        }
+        candidate.score = ra.min(rr) as f64;
+        candidate.score_approach = ra as f64;
+        candidate.score_recede = rr as f64;
+        out.push(candidate);
+    }
 }
 
 /// Matched-filter halves of template `tm` anchored at (row `r`, frame `i`), with samples on
@@ -604,12 +752,15 @@ pub fn path_score(
     (ma, mr)
 }
 
-/// Coordinate-descent refinement of a detection on a finer linear spectrogram.
+/// Coordinate-descent refinement of a detection on a finer linear spectrogram, over the path
+/// half 3 d / v (24 to 240 s). A detection whose half is under 24 s (an edge template's, whose
+/// CPA lies too near the recording's start or end for a 24 s path) keeps its own half.
 pub fn refine(spec: &Spec, det: &Detection, c: f64) -> Detection {
     let mut best = det.clone();
     let step = spec.dt().max(0.25);
+    let fixed_half = (det.half_s < 24.0).then_some(det.half_s);
     let score = |t0r: f64, f0: f64, v: f64, d: f64| {
-        let half = (3.0 * d / v).clamp(24.0, 240.0);
+        let half = fixed_half.unwrap_or_else(|| (3.0 * d / v).clamp(24.0, 240.0));
         let (a, r) = path_score(spec, t0r, f0, v, d, half, step, c);
         (a.min(r), a, r)
     };
@@ -661,7 +812,7 @@ pub fn refine(spec: &Spec, det: &Detection, c: f64) -> Detection {
     best.score = s;
     best.score_approach = sa;
     best.score_recede = sr;
-    best.half_s = (3.0 * best.d / best.v).clamp(24.0, 240.0);
+    best.half_s = fixed_half.unwrap_or_else(|| (3.0 * best.d / best.v).clamp(24.0, 240.0));
     best
 }
 
@@ -688,6 +839,36 @@ pub(crate) fn swell_scene(amp: f64, swell_db: f64) -> Vec<f32> {
                 10f64.powf(swell_db / 20.0 * (-0.5 * ((t - t0r) / (0.22 * dur)).powi(2)).exp());
             phase += std::f64::consts::TAU * crate::physics::cv_curve(t, f0, v, d, t0e, c) / sr;
             (env * ((2.0 * seed as f64 / u64::MAX as f64 - 1.0) + amp * phase.sin())) as f32
+        })
+        .collect()
+}
+
+/// (f0, v, d, received CPA time t0r) of a short pass heard 9 s into [`edge_clip`]'s 30 s clip.
+#[cfg(test)]
+pub(crate) const EDGE_PASS: (f64, f64, f64, f64) = (600.0, 64.0, 700.0, 9.0);
+
+/// `dur` s at 4 kHz of uniform noise carrying a pass (f0, v, d) at amplitude `amp` whose received
+/// CPA is at `t0r`, and a flat tone (Hz, amplitude) sounding until `tone.2` s.
+#[cfg(test)]
+pub(crate) fn edge_clip(
+    dur: f64,
+    (f0, v, d, t0r): (f64, f64, f64, f64),
+    amp: f64,
+    tone: (f64, f64, f64),
+) -> Vec<f32> {
+    let (sr, c) = (4000.0, 343.0);
+    let t0e = t0r - d / c;
+    let (mut seed, mut phase) = (4242u64, 0.0f64);
+    (0..(sr * dur) as usize)
+        .map(|i| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let t = i as f64 / sr;
+            phase += std::f64::consts::TAU * crate::physics::cv_curve(t, f0, v, d, t0e, c) / sr;
+            let on = if t < tone.2 { tone.1 } else { 0.0 };
+            let flat = on * (std::f64::consts::TAU * tone.0 * t).sin();
+            ((2.0 * seed as f64 / u64::MAX as f64 - 1.0) + amp * phase.sin() + flat) as f32
         })
         .collect()
 }
@@ -812,7 +993,7 @@ mod tests {
                         .num_threads(threads)
                         .build()
                         .unwrap();
-                    let actual = pool.install(|| score_bank(&ls, &tmpls, &evidence));
+                    let actual = pool.install(|| score_bank(&ls, &tmpls, &evidence, &[(0, nt)]));
                     for (k, (&a, &b)) in actual.0.iter().zip(&expected.0).enumerate() {
                         assert_eq!(
                             actual.1[k], expected.1[k],
@@ -824,7 +1005,279 @@ mod tests {
                             "nt={nt} cell={k} residual={residual}"
                         );
                     }
+                    // Windows score their cells exactly as the full window does and leave every
+                    // other cell at -inf.
+                    for windows in [vec![(0, nt / 3), (nt - nt / 4, nt)], vec![(nt / 2, nt / 2)]] {
+                        let part = pool.install(|| score_bank(&ls, &tmpls, &evidence, &windows));
+                        for k in 0..nr * nt {
+                            let i = k % nt;
+                            if windows.iter().any(|&(c0, c1)| (c0..c1).contains(&i)) {
+                                assert_eq!(part.1[k], expected.1[k], "nt={nt} cell={k}");
+                                assert_eq!(part.0[k].to_bits(), expected.0[k].to_bits());
+                            } else {
+                                assert_eq!(part.0[k], f32::NEG_INFINITY, "nt={nt} cell={k}");
+                            }
+                        }
+                    }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn edge_bank_matches_scalar() {
+        // Each edge template scores a cell only where its base (the template before it) lacks
+        // coverage and the cell is within the base half of the first or last frame; bases score
+        // nothing. Checked cell by cell against a direct oracle, bit for bit.
+        let p = DetectParams {
+            v_grid: vec![40.0, 100.0, 175.0, 100.0],
+            d_grid: vec![250.0, 1000.0, 12_000.0],
+            ..DetectParams::default()
+        };
+        let off = DetectParams {
+            edge_half_s: 0.0,
+            ..p.clone()
+        };
+        assert!(build_edge_templates(&off, 1.0).is_empty());
+        for nt in [8, 61, 251] {
+            let nr = 37;
+            let ls = LogSpec {
+                t: (0..nt).map(|i| i as f64).collect(),
+                freqs: (0..nr).map(|r| 35.0 * 2f64.powf(r as f64 / 48.0)).collect(),
+                data: (0..nr * nt)
+                    .map(|k| (((k * 37 + 11) % 101) as f32 - 50.0) / 17.0)
+                    .collect(),
+                bins_per_octave: 48,
+                hop_s: 1.0,
+                scale: 1.0,
+                gain: 1.0,
+            };
+            let edge = build_edge_templates(&p, ls.hop_s);
+            // 1.25 d / v is at most 24 s for (40, 250), (100, 250), (100, 1000), (175, 250),
+            // (175, 1000) and the duplicate 100s; (40, 1000) and every 12 km template are longer.
+            assert_eq!(edge.len(), 2 * 7);
+            for pair in edge.chunks(2) {
+                assert_eq!(pair[0].edge, EdgeRole::Base);
+                assert_eq!(pair[0].half, p.min_half_s);
+                assert_eq!(
+                    pair[1].edge,
+                    EdgeRole::Edge {
+                        base_half: p.min_half_s
+                    }
+                );
+                assert_eq!(
+                    (pair[1].half, pair[1].v, pair[1].d),
+                    (p.edge_half_s, pair[0].v, pair[0].d)
+                );
+            }
+            let cell = |tm: &Template, r: usize, i: usize| {
+                let (mut a, mut b, mut na, mut nb) = (0f32, 0f32, 0f32, 0f32);
+                for &(dt, dr, approach) in &tm.path {
+                    let row = r as i64 + dr as i64;
+                    let frame = i as i64 + dt as i64;
+                    if row < 0 || row >= nr as i64 || frame < 0 || frame >= nt as i64 {
+                        continue;
+                    }
+                    let z = ls.data[row as usize * nt + frame as usize];
+                    if approach {
+                        a += z;
+                        na += 1.0;
+                    } else {
+                        b += z;
+                        nb += 1.0;
+                    }
+                }
+                let covered = !(na < 0.6 * tm.n_a as f32 || nb < 0.6 * tm.n_r as f32);
+                (covered, (a / na.sqrt()).min(b / nb.sqrt()))
+            };
+            let mut expected = (vec![f32::NEG_INFINITY; nr * nt], vec![0u16; nr * nt]);
+            let mut scored = 0usize;
+            for r in 0..nr {
+                for i in 0..nt {
+                    let k = r * nt + i;
+                    for (ti, tm) in edge.iter().enumerate() {
+                        let EdgeRole::Edge { base_half } = tm.edge else {
+                            continue;
+                        };
+                        let near = (i as f64) < base_half || ((nt - 1 - i) as f64) < base_half;
+                        let (base_covered, _) = cell(&edge[ti - 1], r, i);
+                        let (covered, s) = cell(tm, r, i);
+                        if !near || base_covered || !covered {
+                            continue;
+                        }
+                        if s > expected.0[k] {
+                            expected.0[k] = s;
+                            expected.1[k] = ti as u16;
+                        }
+                    }
+                    scored += expected.0[k].is_finite() as usize;
+                }
+            }
+            eprintln!(
+                "nt={nt}: {scored} of {} cells scored by an edge template",
+                nr * nt
+            );
+            if nt >= 61 {
+                assert!(scored > 0);
+            }
+            let head = (p.min_half_s as usize).min(nt);
+            let tail = nt.saturating_sub(p.min_half_s as usize).max(head);
+            for windows in [vec![(0, nt)], vec![(0, head), (tail, nt)]] {
+                let actual = score_bank(&ls, &edge, &ls.data, &windows);
+                for k in 0..nr * nt {
+                    assert_eq!(actual.1[k], expected.1[k], "nt={nt} cell={k} {windows:?}");
+                    assert_eq!(
+                        actual.0[k].to_bits(),
+                        expected.0[k].to_bits(),
+                        "nt={nt} cell={k}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Without the edge stage, as `p` with `edge_half_s` 0.
+    fn no_edge(p: &DetectParams) -> DetectParams {
+        DetectParams {
+            edge_half_s: 0.0,
+            ..p.clone()
+        }
+    }
+
+    #[test]
+    fn edge_stage_finds_a_short_pass_in_a_clip_too_short_for_the_bank() {
+        // A 24 s template needs 8 of its 12 path samples on each side, 16 s before and after
+        // the CPA, so a 30 s clip leaves the passes no cell to score at all. A short transition
+        // (d / v = 11 s) heard 9 s into it is found by an edge template, on its curve, and the
+        // refined seed stays on the curve (measure.rs measures the event from it).
+        let (f0, v, d, t0r) = EDGE_PASS;
+        let x = edge_clip(30.0, EDGE_PASS, 0.3, (0.0, 0.0, 0.0));
+        let on_curve = |t: f64| cv_curve(t, f0, v, d, t0r - d / 343.0, 343.0);
+        let p = DetectParams::default();
+        let (ls, lin) = survey(&x, 4000, &p).unwrap();
+        let without = detect(&ls, &no_edge(&p));
+        assert!(without.is_empty(), "{without:?}");
+        let with = detect(&ls, &p);
+        for d in with.iter().take(6) {
+            eprintln!(
+                "det t0r={:.1} f0={:.1} (curve {:.1}) v={:.0} d={:.0} s={:.2} half={} h={:?}",
+                d.t0r,
+                d.f0,
+                on_curve(d.t0r),
+                d.v,
+                d.d,
+                d.score,
+                d.half_s,
+                d.harmonic_of
+            );
+        }
+        let found = with
+            .iter()
+            .find(|d| {
+                d.harmonic_of.is_none()
+                    && (d.t0r - t0r).abs() <= 4.0
+                    && (d.f0 / on_curve(d.t0r) - 1.0).abs() < 0.02
+            })
+            .expect("the edge stage found no detection on the pass");
+        assert_eq!(found.half_s, p.edge_half_s);
+        assert!(found.score >= p.thr_silence_db, "score {}", found.score);
+        let r = refine(&lin, found, 343.0);
+        eprintln!(
+            "refined t0r={:.2} f0={:.1} (curve {:.1}) v={:.1} d={:.0} s={:.2}",
+            r.t0r,
+            r.f0,
+            on_curve(r.t0r),
+            r.v,
+            r.d,
+            r.score
+        );
+        assert!(r.score.is_finite(), "refined score {}", r.score);
+        assert_eq!(r.half_s, p.edge_half_s);
+        assert!(
+            (r.f0 / on_curve(r.t0r) - 1.0).abs() < 0.01,
+            "refined f0 {}",
+            r.f0
+        );
+        assert!((r.t0r - t0r).abs() <= 4.0, "refined t0r {}", r.t0r);
+    }
+
+    #[test]
+    fn edge_stage_keeps_every_detection_the_passes_accept() {
+        // Metamorphic: every detection without the edge stage is in the result with it, bit for
+        // bit; each added one is an edge template's, within the base half of an edge. Noise and
+        // a flat tone at the edges add nothing strong.
+        let p = DetectParams::default();
+        let near_edge = |ls: &LogSpec, d: &Detection| {
+            d.t0r - ls.t[0] < p.min_half_s || ls.t[ls.nt() - 1] - d.t0r < p.min_half_s
+        };
+        let cases: Vec<(&str, Vec<f32>)> = vec![
+            (
+                "pass at 9 s",
+                edge_clip(40.0, EDGE_PASS, 0.25, (0.0, 0.0, 0.0)),
+            ),
+            (
+                "pass at 31 s",
+                edge_clip(40.0, (420.0, 90.0, 900.0, 31.0), 0.25, (0.0, 0.0, 0.0)),
+            ),
+            ("interior pass and flat tone", synth(4000, 600.0)),
+            ("noise", edge_clip(40.0, EDGE_PASS, 0.0, (0.0, 0.0, 0.0))),
+            (
+                "noise, 30 s",
+                edge_clip(30.0, EDGE_PASS, 0.0, (0.0, 0.0, 0.0)),
+            ),
+            (
+                "flat tone",
+                edge_clip(40.0, EDGE_PASS, 0.0, (250.0, 0.1, 40.0)),
+            ),
+            (
+                "tone for 12 s",
+                edge_clip(40.0, EDGE_PASS, 0.0, (250.0, 0.1, 12.0)),
+            ),
+        ];
+        for (name, x) in cases {
+            let (ls, _) = survey(&x, 4000, &p).unwrap();
+            let (without, cut_without) = detect_counted(&ls, &no_edge(&p));
+            let (with, cut_with) = detect_counted(&ls, &p);
+            let key = |d: &Detection| {
+                [
+                    d.t0r,
+                    d.f0,
+                    d.v,
+                    d.d,
+                    d.score,
+                    d.score_approach,
+                    d.score_recede,
+                    d.half_s,
+                ]
+                .map(f64::to_bits)
+            };
+            let kept: Vec<_> = with.iter().map(key).collect();
+            for d in &without {
+                assert!(kept.contains(&key(d)), "{name}: lost {d:?}");
+            }
+            assert!(cut_with >= cut_without);
+            let added: Vec<&Detection> = with
+                .iter()
+                .filter(|d| !without.iter().any(|o| key(o) == key(d)))
+                .collect();
+            for d in &added {
+                assert_eq!(d.half_s, p.edge_half_s, "{name}: {d:?}");
+                assert!(near_edge(&ls, d), "{name}: {d:?}");
+            }
+            let top = added
+                .iter()
+                .map(|d| d.score)
+                .fold(f64::NEG_INFINITY, f64::max);
+            eprintln!(
+                "{name}: {} detections, {} added, strongest added {top:.2}",
+                without.len(),
+                added.len()
+            );
+            if !name.starts_with("pass at") {
+                assert!(
+                    added.iter().all(|d| d.score < p.thr_db),
+                    "{name}: {added:?}"
+                );
             }
         }
     }

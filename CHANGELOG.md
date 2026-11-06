@@ -19,6 +19,74 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Score a pass heard near a recording's start or end with a short template
+
+- **The fault.** A short transition (shortest 1.25 d/v at or under `min_half_s`, 24 s) is scored by a 24 s
+  template, which needs 8 of its 12 path samples on each side: about 16 s of recording before and after the
+  CPA. A nearer CPA has no template that can score it, however loud the pass, and a clip under about 32 s gives
+  the bank no cell at all. On set D's N451EE_R45 (64 m/s at 695 m, its ridge crossing f0 about 14 s into a
+  40.6 s clip) no detection reached the silence line.
+- **The change.** `DetectParams::edge_half_s`, 10 s by default (0 turns it off). Each (v, d) whose shortest
+  half is the 24 s floor gets an edge template of that half. After both passes, the edge templates score only
+  the cells within 24 s of the first or last frame that their 24 s template cannot cover. They score on the
+  residual of every accepted curve, from the silence line, and their candidates go through the passes'
+  suppression, residual and marking rules. Every detection the passes accept is the same with or without the
+  stage, which only adds detections. Only the frames within 24 s of each end are scored, and the stage does not
+  run when the passes stop at three times the detection cap. `refine` keeps a detection's half when it is under
+  24 s, so an edge detection's refined score stays finite (over the 3 d/v half it was -inf at the edge, written
+  as null in `events.json`).
+- **What did not work.** Edge templates inside the passes, scoring wherever their template lacked coverage, ran
+  over most of a short clip for long transitions (a template half up to 240 s). The events of 31 of the 40 clips
+  changed (26 with 10 s templates), and N451EE_R51 lost its right answer: a steep wrong edge template took its
+  ridge first. Restricted to short transitions but still inside the passes, they changed three or four clips and
+  cost N451EE_R51 the same way. After the passes, 12 s edge
+  templates found N451EE_R45 but listed a wrong steep fit (37 m/s, 204 m) first, and 8 s ones lost N500MG_R17
+  at 10/20 %. 10 s was the one half that gained without a loss. It was chosen on this development set.
+- **Evidence.**
+  - A direct per-cell oracle matches the edge bank bit for bit, score and template index, for 8-, 61- and
+    251-frame images. The edge templates score 824 cells near the ends of the longer two and none of 8 frames.
+    Partial windows score their cells exactly as the full window and leave the rest at -inf.
+  - In a 30 s clip the passes return nothing. A short pass heard 9 s in (600 Hz, 64 m/s, 700 m) is found by an
+    edge template at 11.5 s and 584.8 Hz, 1.4 % above its curve there. Measured from that detection it
+    passes every gate at 599.99 Hz, 64.00 m/s and 700.1 m, CPA 9.00 s. The same audio reversed gives one
+    candidate, refused, and the noise gives none.
+  - Metamorphic: every detection without the stage is in the result with it, bit for bit, and each added one is
+    an edge template's within 24 s of an end. In a 40 s clip a pass heard 9 s in is found by the passes with a
+    wrong shape (21.5 s, 40 m/s, 823 m), and the stage adds nothing on its marked ridge. A pass heard 9 s
+    before the end gets an added detection at 4.96. A 600 s interior pass with a flat tone, 40 s and 30 s of
+    noise, a flat tone, and a tone sounding for the first 12 s add none.
+- **Set D** (`fdop detect` on the 40 Livermore clips, read with `bench` `tools/score_d.py`; local runs of the
+  bench-built binary `5ec57458`). With the stage: 38 found (37), 36 first event right (35), medians 5.5 m/s and
+  212.2 m (198.2 m). Right at 10/20, 15/30, 20/40, 25/50 and 30/60 % of speed and distance:
+
+  | Tool | Found | Right at the five tolerances |
+  |---|---|---|
+  | fdop `4c30cd1` | 37 | 22 / 29 / 30 / 32 / 35 |
+  | fdop with the edge stage | 38 | 22 / 29 / 31 / 33 / 36 |
+  | dopplerprint | 39 | 13 / 19 / 21 / 24 / 26 |
+  | dopplertrack 60-300 Hz | 37 | 17 / 23 / 27 / 29 / 35 |
+  | dopplertrack 40-450 Hz | 38 | 19 / 23 / 26 / 30 / 36 |
+
+  Two clips changed. N451EE_R45 now has four events. The first listed, at 54.5 m/s and 431 m for 64 m/s and
+  695 m, is right from 20/40 % up; `dopplertrack` gives 57 m/s and 455 m, and `dopplerprint` 33 m/s and 174 m.
+  N563FX_R21 gains a fifth event (29.1 m/s, 147 m) after its first. At every tolerance fdop has at least as
+  many right answers as any rival, and more except at 30/60 %, where it ties the wide `dopplertrack`. It still
+  finds one pass fewer than `dopplerprint`. Its two misses are N1387U_R44 (33 m/s at 421 m; nothing scores over
+  2.88 in fdop's image) and N958JX_R50 (215 m/s at 5 km, past the bank's 175 m/s; no tool gets it right).
+- **Falsifier 2 and the development rows.** On the six recordings the nulls, development rows and wrong dates
+  use, `detect` gives the same events (46-60 each) and the same candidate count with and without the stage. On
+  osprey_1031, osprey_1101, duke_1101b and feederwatch the passes stop at the cap (180+ candidates), so the
+  stage never runs. On ref_raw (82) and osprey_1102b (125) it runs and adds none. `locate` measures exactly as
+  `detect` does, so no null or development answer can differ from `4c30cd1`'s.
+- **The replays the entry below promised** (`44ff60a`, whose locate output `4c30cd1` matches; local runs on an
+  Apple M5 Ultra, the later rows written to NFS when the local disk filled). Of the 33 nulls, none is high or
+  medium: 27 are low, 6 give no location, and the curve match stands on none. The 15 development rows have the
+  same grades and distances as `d9dfc88`'s. The reference row and the osprey cam's three days are high, 250 m,
+  90 m, 110 m and 220 m off, and Duke Farms is high 0.96 km off. Sapsucker Woods gives no location, and the c
+  and wrong-date rows are low or give none. The reference recording's two wrong dates are low: `n_ref_on_0907_gv` has one core match of three
+  and a 1.70-nat margin, and `n_ref_on_0909_gv` has both core matches and a 0.54-nat margin, under the medium
+  line. The Nassau reference configuration is high (`r_nassau_gv`, margin 14.43).
+
 ### Trace a one-sided refusal once more without the model
 
 - **The fault.** A detection whose template has the wrong shape meets the pass's ridge over one stretch and

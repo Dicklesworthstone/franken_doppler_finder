@@ -1810,6 +1810,65 @@ mod tests {
     }
 
     #[test]
+    fn a_short_pass_in_a_clip_too_short_for_the_bank_is_measured_from_its_edge_detection() {
+        // In a 30 s clip the 24 s templates cannot score any cell; an edge template finds a short
+        // pass heard 9 s in (detect.rs). Measured from that detection, it passes the gates with
+        // the right speed, distance and CPA. The same audio reversed (every curve rises) and the
+        // noise alone give nothing that passes.
+        use crate::detect::{EDGE_PASS, edge_clip};
+        let (f0, v, d, t0r) = EDGE_PASS;
+        let on_pass = |t: f64, f: f64| (t - t0r).abs() < 6.0 && (f / f0 - 1.0).abs() < 0.06;
+        let x = edge_clip(30.0, EDGE_PASS, 0.3, (0.0, 0.0, 0.0));
+        let evs = measured_down_to_the_silence_line(&x);
+        for (s, e) in &evs {
+            let b = e.fit.as_ref().map(|f| f.best);
+            eprintln!(
+                "detection {s:.2} at {:.1} s, {:.0} Hz, half {}: ok {} {:?} fit {:?}",
+                e.detection.t0r,
+                e.detection.f0,
+                e.detection.half_s,
+                e.quality.ok,
+                e.quality.reasons,
+                b.map(|b| (b.f0, b.v, b.d, b.t0r))
+            );
+        }
+        let (_, pass) = evs
+            .iter()
+            .find(|(_, e)| on_pass(e.detection.t0r, e.detection.f0))
+            .expect("the edge pass was not measured");
+        assert!(pass.quality.ok, "{:?}", pass.quality.reasons);
+        let b = pass.fit.as_ref().unwrap().best;
+        assert!((b.v / v - 1.0).abs() < 0.1, "v {} against {v}", b.v);
+        assert!((b.d / d - 1.0).abs() < 0.2, "d {} against {d}", b.d);
+        assert!((b.t0r - t0r).abs() < 1.0, "t0r {} against {t0r}", b.t0r);
+        assert!((b.f0 / f0 - 1.0).abs() < 0.01, "f0 {} against {f0}", b.f0);
+        for (s, e) in evs
+            .iter()
+            .filter(|(_, e)| !on_pass(e.detection.t0r, e.detection.f0))
+        {
+            assert!(
+                !e.quality.ok,
+                "score {s:.2} at {:.0} s, {:.0} Hz passed",
+                e.detection.t0r, e.detection.f0
+            );
+        }
+        let mut rev = x.clone();
+        rev.reverse();
+        let noise = edge_clip(30.0, EDGE_PASS, 0.0, (0.0, 0.0, 0.0));
+        for (name, y) in [("reversed", rev), ("noise", noise)] {
+            let got = measured_down_to_the_silence_line(&y);
+            eprintln!("{name}: {} measured", got.len());
+            for (s, e) in &got {
+                assert!(
+                    !e.quality.ok,
+                    "{name}: score {s:.2} at {:.0} s, {:.0} Hz passed",
+                    e.detection.t0r, e.detection.f0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_pass_under_the_old_measure_line_is_measured_and_noise_tones_and_reversed_audio_are_refused()
      {
         // Detection keeps curves down to the silence line (3.5; pure noise peaks near 3), but only
