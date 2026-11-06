@@ -1252,3 +1252,113 @@ Written while set F's R2 ran. Nothing here comes from set F.
 - **The sealed inventory flags an `fdop` step's rc 2.** For `fdop`, 2 is an error, such as a failed download, and not a result
   (0 found, 1 no location), so a row that needs running again is seen at once. Other tools' codes stay unprinted, because their
   meaning is not established here.
+
+## Addendum 19, 2026-11-06, set F's R2 and R3 scored; known before its R3 ran; corrections to Addendum 18
+
+### Set F's R2
+
+At 07:14:28Z every one of the 12 set F R2 jobs had `CHAIN_DONE`, with no infrastructure fault in
+`tools/match/guardfix/inventory_f.sh` and no guard log under `runs_f`. They were then read once, at 07:14:37Z, with
+`score.py data/set_f/cases.json runs_f r2`. The output is kept on the benchmark machine as `runs_f/SCORE_r2_setF_20261106.txt`
+(sha256 `4767a6a158f0acb07df58f7cd02dcf74c6802a95c7850a5a43e879ccba2fa90a`). Ten cases count, and none is void.
+
+| Tool | Correct asserted | Wrong asserted | Not asserted | Error |
+|---|---|---|---|---|
+| `fdop` `7e66501` (pinned) | 0 | 0 | 10, no location | 0 |
+| `fdop-9087ec4`, `-6914ab7`, `-ce02222`, `-3164272`, `-32d4e1a`, `-5f6348c`, `-981fad1` | 0 | 0 | 10 each, no location | 0 |
+| `dopplerprint` (`dp`) | 0 | 0 | 2 low, 8 declined | 0 |
+| `dp48` | 0 | 0 | 1 low, 9 declined | 0 |
+| `dpdem` | 0 | 0 | 1 low, 9 declined | 0 |
+| `dopplertrack` | 0 | **1** | 0 | 9 |
+
+- **The claim.** No `fdop` build meets it on set F. Against `dp`, `dp48` and `dpdem` every build ties at 0 correct and 0
+  wrong, where the claim needs it strictly better on one count. Against `dopplertrack` it is met, by that tool's one wrong
+  answer (`f_bergenfield`, 19 km, 5 km limit) and nothing else. Its other nine rows are its own refine step failing (rc 1).
+- **The falsifiers** (the session's question of record). Falsifier 3 does not fire on set F for any build: none has fewer
+  correct asserted answers than a rival, and none asserted a wrong answer. That clears no build, because set F shows no build
+  more accurate either. On the two sealed sets, no `fdop` build meets the claim against all four rivals.
+- **`dopplerprint`'s near miss.** `dpdem` put `f_chehalis` 697 m from the truth (1 km limit) at its level "high", with the
+  truth outside its own 90 % region and its status "inconclusive", so it declined by its exit code, and the scorer, unchanged
+  since set E was scored (`tools/score.py`, last changed 2026-11-05T18:23Z), counts that as a decline. `dp` and `dp48` put the
+  same case 1,310 m off, low and declined. At `f_bergenfield` all three gave a place 28 to 30 km off at "high", also with
+  status "inconclusive" and declined.
+- **Why `fdop` declined everywhere.** Read from each run's `result.json`. Cells give events detected, of usable quality, and
+  used by the search:
+
+  | Case | `7e66501` to `3164272` | `32d4e1a`, `5f6348c`, `981fad1` | ADS-B tracks in the region |
+  |---|---|---|---|
+  | `f_kingman` | 1 / 0 / 0 | 7 / 4 / 3 | 19 |
+  | `f_chehalis` | 10 / 0 / 0 | 19 / 0 / 0 | 31 |
+  | `f_santamonica` | 0 / 0 / 0 | 0 / 0 / 0 | 732 |
+  | `f_easthampton` | 0 / 0 / 0 | 0 / 0 / 0 | 54 |
+  | `f_ftlauderdale` | 24 / 0 / 0 | 59 / 0 / 0 | 602 |
+  | `f_porthuron` | 24 / 0 / 0 | 43 / 0 / 0 | 28 |
+  | `f_brooksfalls` | 0 / 0 / 0 | 0 / 0 / 0 | 2 |
+  | `f_charlevoix` | 0 / 0 / 0 | 0 / 0 / 0 | 5 |
+  | `f_dossin` | 24 / 0 / 0 | 54 / 0 / 0 | 61 |
+  | `f_bergenfield` | 4 / 1 / 1 | 18 / 2 / 2 | 133 |
+
+  On eight of the ten cases no build had one event of usable quality. Four had no detection at all, and on four every
+  detected event failed its checks, mostly with no ridge through the closest approach. The measurement change of
+  `b0a9424`, in the last three builds, detects more. Its search uses three events at `f_kingman`, none of which gives a single
+  hypothesis on any track, and two at `f_bergenfield`, which give 2,707 and 3,655 hypotheses and 50 joined points, with no
+  flight pair explaining both at one place and clock. The curve match is `Silent` wherever it ran; it did not run on
+  `f_brooksfalls` or `f_charlevoix`.
+- **What set F tests.** Almost nothing. As on set E, the recordings give the search too little to work with, and no tool
+  has a correct answer. The count says nothing about which tool is more accurate, and it is reported as that.
+
+### Set F's R3, without `dpdem`
+
+At 07:40:24Z, with the eight `fdop` R3 jobs and `dopplerprint`'s each at `CHAIN_DONE` and no infrastructure fault in the same
+inventory, they were read once with `score.py data/set_f/cases.json runs_f r3`. The output is kept as
+`runs_f/SCORE_r3_setF_20261106.txt` (sha256 `a2d6e77b91f4de4d79c9689e0e615ca3c4d223fd0e426c2ab4605c0cf1ff91c1`). `dpdem`'s R3
+runs in `fr3dem`, which starts only when every `dopplerprint` run without the ground model is done, and is read then.
+
+| Tool | Correct asserted | Wrong asserted | Not asserted | Error |
+|---|---|---|---|---|
+| `fdop` `7e66501` (pinned), `-9087ec4`, `-6914ab7`, `-ce02222`, `-3164272` | 0 | 0 | 10 each, no location | 0 |
+| `fdop-32d4e1a`, `-5f6348c`, `-981fad1` | 0 | 0 | 10 each: 2 low, 8 no location | 0 |
+| `dopplerprint` (`dp`) | 0 | 0 | 10 declined | 0 |
+
+- **The claim.** No build meets it: each ties `dp` at 0 correct and 0 wrong. Falsifier 3 does not fire.
+- **The three newest builds' low answers.** Each put `f_kingman` 159 km from the truth and `f_bergenfield` 2,622 km from it,
+  both graded low, so neither is asserted. Both places are wrong, and the grade kept them from counting.
+- **`dopplerprint`.** Eight rows end with status "needs_input": it searched the whole country, could match only one pass at
+  a time, and asks for `--near`, a narrower start or a longer recording, listing candidate places. The other two
+  (`f_santamonica`, `f_easthampton`) end "inconclusive".
+- **`f_brooksfalls`.** Every build declined there, so R3's region leaving Alaska out (below) changed no count.
+
+### Known before set F's R3 ran
+
+Written in this addendum's draft by 05:17:32Z (the draft file's modification time), before `fr3` started at 07:17:58Z,
+and committed after it. It is a fact of the inputs, not a result.
+
+- **`f_brooksfalls` is in Alaska.** R3 gives `fdop` the region `CONUS` ("R3: start known, no area" above), the box 24.4 to
+  49.5° N, 125.0 to 66.9° W (`crates/fdop-geo/src/states.rs`, `CONUS_BBOX`), which leaves Alaska out. So no `fdop` build can
+  be right there in R3, and an asserted answer there is wrong. `dopplerprint`'s R3 has no region. This is R3 as the
+  protocol wrote it for every set, and it is not changed now. The R3 score is read with it stated beside it. R1 gives that
+  case `--near AK`, which holds it.
+
+### Corrections to Addendum 18
+
+- "`fr3` now waits for all 12 set F R2 jobs": it does not wait. It refuses to start, with exit 2, until each of the 12 jobs has
+  `CHAIN_DONE`, and it is started by hand.
+
+### Bench notes
+
+- **`fr3` started** at 07:17:58Z (`nohup sh tools/start_chains.sh fr3`, log `runs_f/fr3.out`). The job shells held since 03:04Z
+  (`r1_fdop_9087ec4`, `r1_fdop_6914ab7`, `e2_r3_fdop_6914ab7`) stay held until set F's R3 and R1 rows are done,
+  since those come first. The two R1 rows ended at 03:25:35Z run again later, as Addendum 17 says.
+- **`e2_r3_fdop_6914ab7/e_tehachapi`**, the set E R3 row that ran through set F's R2, ended at about 05:14Z: low, radius
+  300 m, 3,560 km from the truth, so not asserted. Wall time 8,734 s and peak memory 6.09 GB, from `/usr/bin/time`'s footer.
+  Its status line is written when its job shell resumes, so its end time there will be late.
+- **`fdop-6914ab7`'s A+B+C R2 rows**, still running at Addendum 14, are done: 5 correct and 0 wrong, meeting the rule against
+  all four rivals on those 12 in-sample cases (`runs/SCORE_r2_open_20261106.txt`, read 2026-11-06). `fdop-9087ec4` stays at
+  4 and 0. These are development cases, and falsifier 2 has already fired for both builds (Addenda 8 and 11).
+- **Copies for a registered test.** After the R2 score, the audio each pinned R2 row used, the cached ADS-B store for its
+  region (for `e_porthenry`, which has none of that size, the smallest that covers it), both case files and the R2 score file,
+  for set E's eight counted cases and set F's ten, are being copied, from 07:22Z, to the machine of the agent of Addendum 15,
+  for its live-cam test logged before any live-cam data (session log, 2026-11-06T05:25:57Z). Nothing from them is in this
+  repository.
+- **After registration.** `main` has three commits after Addendum 18 (`3ea2b69`, `d07a869`, `37a156b`). None is registered,
+  and no sealed set tests them.
