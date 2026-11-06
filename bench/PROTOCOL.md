@@ -1362,3 +1362,48 @@ and committed after it. It is a fact of the inputs, not a result.
   repository.
 - **After registration.** `main` has three commits after Addendum 18 (`3ea2b69`, `d07a869`, `37a156b`). None is registered,
   and no sealed set tests them.
+
+## Addendum 20, 2026-11-06, set F's R1 read; `dopplerprint`'s R1 ran before its ADS-B day; held rows resumed
+
+### Set F's R1
+
+At 08:03:04Z the eight `fdop` R1 jobs and `dopplerprint`'s each had `CHAIN_DONE`, and the same inventory showed no
+infrastructure fault (it prints no `dopplerprint` codes). They were read once with `score.py data/set_f/cases.json runs_f r1`.
+The output is kept as `runs_f/SCORE_r1_setF_20261106.txt` (sha256
+`cf6b1ba82df5987ad2720b9b65af4ccb64057632759500cb75caaf89f67fe941`).
+
+| Tool | Correct asserted | Wrong asserted | Not asserted | Error |
+|---|---|---|---|---|
+| `fdop` `7e66501` (pinned), `-9087ec4`, `-6914ab7`, `-ce02222`, `-3164272` | 0 | 0 | 10 each, no location | 0 |
+| `fdop-32d4e1a`, `-5f6348c`, `-981fad1` | 0 | 0 | 10 each: 2 low, 8 no location | 0 |
+| `dopplerprint` (`dp`) | 0 | 0 | 2 declined | 8, a fault of the chains (below) |
+
+- **`fdop`'s R1 is final.** No build asserted an answer. The three newest builds put `f_kingman` 248 km and `f_bergenfield`
+  140 km from the truth, all graded low. `f_brooksfalls`, given `--near AK`, gave no location on every build. Falsifier 3
+  does not fire. The claim against `dp` on R1 is read when its eight rows have run again.
+
+### `dopplerprint`'s R1 ran before its ADS-B day was published
+
+- R1 gives `dopplerprint` the local day's midpoint and ±12 h ("R1: date and state only" above), which for every set F case
+  reaches into 2026-11-06 UTC. adsb.lol publishes a day at about 03:35Z on the next, so when `fr3` started `f_r1_dp.sh` at
+  08:00:58Z that day did not exist. Eight rows stopped after 5 to 9 s with "error: adsb.lol has no archive for 2026-11-06
+  (yet)" (rc 1). The other two, `f_santamonica` and `f_easthampton`, found no pass in the audio before they needed ADS-B, and
+  stand. `fdop`'s R1 (`--dates 2026-11-05`) needs only 11-05. `fr3` should have waited for the next day's archive, so this is
+  a fault of the chains, not a result. The read above saw only the error.
+- At 08:05:17Z the eight rows were renamed `<case>_fault_adsbday.{err,out,status}` and `runs_f/r1_dp/CHAIN_DONE` was renamed
+  `CHAIN_DONE_before_adsbday`. Nothing was deleted. With that file renamed, `fr3dem` cannot start; its R1 would meet the
+  same day. The eight rows run again with the same commands, with no other heavy row beside them, once the 11-06 archive is
+  complete. `dopplerprint`'s R1 is then read once, into a new score file.
+
+### Held rows resumed
+
+- At 08:06:03Z the three job shells held since 03:04Z were resumed with `kill -CONT`. Their guard logs had no stop since
+  00:29:41Z, and none of those stops named these shells. The two `c_osprey_1031` development R1 rows ended at 03:25:35Z
+  (Addendum 17) then wrote `rc=1`. Their `.err` ends "time: command terminated abnormally" with the fine grid unfinished, and
+  their `.out` is empty, so that 1 is `/usr/bin/time`'s code for a killed command, not `fdop`'s "no location". Both were
+  renamed `c_osprey_1031_fault_hold{,.status,.err,.out}` at 08:06:43Z and run again when their chains finish.
+- `e2_r3_fdop_6914ab7/e_tehachapi` got its end line at 08:06:03Z (rc 0), late as Addendum 19 says.
+
+### Bench notes
+
+- The copies of Addendum 19 were complete at 08:01Z, when `sha256sum -c` passed on the receiving machine for all 39 files.
