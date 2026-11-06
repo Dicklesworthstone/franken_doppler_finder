@@ -314,6 +314,12 @@ fn run(cli: Cli) -> Result<i32, String> {
             let dp = fdop_core::detect::DetectParams::default();
             let (ls, lin) = fdop_core::detect::survey(&x, 4000, &dp)?;
             let (dets, det_cut) = fdop_core::detect::detect_counted(&ls, &dp);
+            if ls.gain > 1.0 {
+                eprintln!(
+                    "fdop: warning: survey image spread {:.2} is under {:.2}: raised x{:.2} before detection",
+                    ls.scale, dp.min_image_scale, ls.gain
+                );
+            }
             if det_cut > 0 {
                 eprintln!(
                     "fdop: warning: kept the {} strongest of {}{} candidate curves",

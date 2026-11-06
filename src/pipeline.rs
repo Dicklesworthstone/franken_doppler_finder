@@ -784,10 +784,17 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         .filter(|d| d.score >= dp.thr_db && d.harmonic_of.is_none())
         .count();
     log.say(&format!(
-        "detection: {} candidates, {} strong primaries",
+        "detection: {} candidates, {} strong primaries; survey image spread {:.3}",
         dets.len(),
-        n_strong
+        n_strong,
+        ls.scale
     ));
+    if ls.gain > 1.0 {
+        warnings.push(format!(
+            "the survey image's spread is {:.2}, under the {:.2} the detection lines were set at (a recording loud mostly while a pass goes over): its image was raised x{:.2} before detection",
+            ls.scale, dp.min_image_scale, ls.gain
+        ));
+    }
     if det_cut > 0 {
         warnings.push(format!(
             "detection kept the {} strongest of {}{} candidate curves; the weaker ones cannot explain an event or mark a pass as heard",

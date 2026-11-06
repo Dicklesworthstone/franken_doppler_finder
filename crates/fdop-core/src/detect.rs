@@ -39,8 +39,20 @@ pub struct DetectParams {
     /// decides whether a gap between two events is silent.
     pub thr_silence_db: f64,
     pub max_detections: usize,
+    /// Least robust spread (1.4826 x MAD over every cell) the survey image is scored at. The two
+    /// lines above were set on recordings whose image spread is 0.57 to 0.78. A recording that is
+    /// loud only while a pass goes over (a short clip, a livestream near traffic) inflates each
+    /// row's MAD with that swell, which shrinks noise and ridge alike (Livermore clips: 0.18 to
+    /// 0.7), so a fixed line asks several times more of it. An image under this spread is
+    /// multiplied up to it (at most `MAX_IMAGE_GAIN` times) and clamped again; an image at or
+    /// above it is left exactly as it is.
+    pub min_image_scale: f64,
     pub c: f64,
 }
+
+/// Largest factor the survey image is raised by. An image with almost no spread holds almost no
+/// structure; raising it without bound would turn rounding into ridges.
+pub const MAX_IMAGE_GAIN: f64 = 4.0;
 
 impl Default for DetectParams {
     fn default() -> Self {
@@ -64,6 +76,7 @@ impl Default for DetectParams {
             thr_db: 4.5,
             thr_silence_db: 3.5,
             max_detections: 60,
+            min_image_scale: 0.5,
             c: fdop_types::C_SOUND,
         }
     }
@@ -76,6 +89,30 @@ pub struct LogSpec {
     pub data: Vec<f32>,
     pub bins_per_octave: usize,
     pub hop_s: f64,
+    /// Robust spread of the image as surveyed (1.4826 x MAD over every cell), before any gain.
+    pub scale: f64,
+    /// Factor the image was multiplied by to reach `DetectParams::min_image_scale` (1 = none).
+    pub gain: f64,
+}
+
+/// 1.4826 x the median absolute deviation from the median, over every value.
+fn robust_scale(v: &[f32]) -> f64 {
+    let mut tmp = v.to_vec();
+    let m = crate::spectro::median_f32(&mut tmp);
+    for x in tmp.iter_mut() {
+        *x = (*x - m).abs();
+    }
+    1.4826 * crate::spectro::median_f32(&mut tmp) as f64
+}
+
+/// Gain that brings an image of robust spread `scale` up to `floor`: 1 at or above it, and at
+/// most `MAX_IMAGE_GAIN`. An image with no spread at all (silence) is left alone.
+fn image_gain(scale: f64, floor: f64) -> f64 {
+    if scale > 0.0 && scale < floor {
+        (floor / scale).min(MAX_IMAGE_GAIN)
+    } else {
+        1.0
+    }
 }
 
 impl LogSpec {
@@ -166,6 +203,16 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
             *v = cols[ti * n_rows + r];
         }
     });
+    // Put a compressed image back on the spread the detection lines were set at (see
+    // `DetectParams::min_image_scale`). Noise and ridge scale together, so this changes the
+    // lines' meaning, not the evidence; an image at or above the floor is untouched.
+    let scale = robust_scale(&data);
+    let gain = image_gain(scale, p.min_image_scale);
+    if gain > 1.0 {
+        let g = gain as f32;
+        data.par_iter_mut()
+            .for_each(|v| *v = (*v * g).clamp(-3.0, 8.0));
+    }
     Ok((
         LogSpec {
             t: lin.t.clone(),
@@ -173,6 +220,8 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
             data,
             bins_per_octave: p.bins_per_octave,
             hop_s: lin.dt(),
+            scale,
+            gain,
         },
         lin,
     ))
@@ -616,10 +665,79 @@ pub fn refine(spec: &Spec, det: &Detection, c: f64) -> Detection {
     best
 }
 
+/// (f0, v, d, received CPA time t0r) of the pass in [`swell_scene`].
+#[cfg(test)]
+pub(crate) const SWELL_PASS: (f64, f64, f64, f64) = (300.0, 90.0, 900.0, 22.0);
+
+/// 48 s at 4 kHz of uniform noise whose level swells by `swell_db` around the CPA, as one loud
+/// nearby pass makes a short clip, carrying [`SWELL_PASS`]'s tone at amplitude `amp`, which
+/// swells with it (tone and roar come from the same aircraft).
+#[cfg(test)]
+pub(crate) fn swell_scene(amp: f64, swell_db: f64) -> Vec<f32> {
+    let (f0, v, d, t0r) = SWELL_PASS;
+    let (sr, dur, c) = (4000.0, 48.0, 343.0);
+    let t0e = t0r - d / c;
+    let (mut seed, mut phase) = (2026u64, 0.0f64);
+    (0..(sr * dur) as usize)
+        .map(|i| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let t = i as f64 / sr;
+            let env =
+                10f64.powf(swell_db / 20.0 * (-0.5 * ((t - t0r) / (0.22 * dur)).powi(2)).exp());
+            phase += std::f64::consts::TAU * crate::physics::cv_curve(t, f0, v, d, t0e, c) / sr;
+            (env * ((2.0 * seed as f64 / u64::MAX as f64 - 1.0) + amp * phase.sin())) as f32
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::physics::cv_curve;
+
+    #[test]
+    fn image_scale_floor_leaves_a_spread_image_alone_and_raises_a_compressed_one_exactly() {
+        // Metamorphic: the floor is a no-op on an image at or above it (bit for bit, so every
+        // recording the lines were set on is surveyed as before), and below it the image is the
+        // unscaled one times floor / spread, clamped again.
+        let off = DetectParams {
+            min_image_scale: 0.0,
+            ..DetectParams::default()
+        };
+        let on = DetectParams::default();
+        let x = swell_scene(0.16, 0.0);
+        let (a, _) = survey(&x, 4000, &off).unwrap();
+        let (b, _) = survey(&x, 4000, &on).unwrap();
+        eprintln!("no swell: spread {:.3}, gain {}", b.scale, b.gain);
+        assert!(a.scale > on.min_image_scale, "spread {}", a.scale);
+        assert_eq!((a.gain, b.gain), (1.0, 1.0));
+        assert!(a.data == b.data, "an image above the floor changed");
+
+        let x = swell_scene(0.16, 25.0);
+        let (a, _) = survey(&x, 4000, &off).unwrap();
+        let (b, _) = survey(&x, 4000, &on).unwrap();
+        eprintln!("25 dB swell: spread {:.3}, gain {:.3}", b.scale, b.gain);
+        assert!(a.scale < 0.4, "the swell left spread {}", a.scale);
+        assert_eq!(a.scale, b.scale);
+        let g = on.min_image_scale / a.scale;
+        assert!(
+            g < MAX_IMAGE_GAIN && (b.gain - g).abs() < 1e-12,
+            "gain {}",
+            b.gain
+        );
+        for (&u, &w) in a.data.iter().zip(&b.data) {
+            assert_eq!(w, (u * g as f32).clamp(-3.0, 8.0));
+        }
+
+        // Bounded, and silence (no spread) is left alone.
+        assert_eq!(image_gain(0.01, 0.5), MAX_IMAGE_GAIN);
+        assert_eq!(image_gain(0.0, 0.5), 1.0);
+        assert_eq!(image_gain(0.5, 0.5), 1.0);
+        assert_eq!(image_gain(0.2, 0.0), 1.0);
+        assert_eq!(robust_scale(&[0.0; 9]), 0.0);
+    }
 
     #[test]
     fn template_bank_matches_scalar_with_edges_and_residuals() {
@@ -639,6 +757,8 @@ mod tests {
                     .collect(),
                 bins_per_octave: 48,
                 hop_s: 1.0,
+                scale: 1.0,
+                gain: 1.0,
             };
             let tmpls = build_templates(&p, ls.hop_s);
             for residual in [false, true] {

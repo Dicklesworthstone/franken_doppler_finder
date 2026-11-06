@@ -1534,6 +1534,81 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_inside_a_loud_swell_is_found_through_the_scale_floor_and_its_reversal_and_noise_are_refused()
+     {
+        // One loud pass over a short clip: its tone and its broadband roar rise together by 25 dB.
+        // The swell inflates every row's MAD, so the survey image's spread falls near 0.25 and the
+        // pass scores under the silence line: without the scale floor it is never measured. With
+        // the floor it is detected, measured, and passes the gates with the right speed and
+        // distance. The same audio reversed, and the swell without the pass, give nothing that
+        // passes the gates.
+        use crate::detect::{SWELL_PASS, swell_scene};
+        let (f0, v, d, t0r) = SWELL_PASS;
+        let on_pass = |t: f64, f: f64| (t - t0r).abs() < 6.0 && (f / f0 - 1.0).abs() < 0.03;
+        let x = swell_scene(0.16, 25.0);
+
+        let off = DetectParams {
+            c: 343.0,
+            min_image_scale: 0.0,
+            ..Default::default()
+        };
+        let (ls, _) = survey(&x, 4000, &off).unwrap();
+        let unscaled = detect(&ls, &off)
+            .iter()
+            .filter(|d| on_pass(d.t0r, d.f0))
+            .map(|d| d.score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        eprintln!(
+            "spread {:.3}: pass scores {unscaled:.2} without the floor",
+            ls.scale
+        );
+        assert!(
+            unscaled < off.thr_silence_db,
+            "the pass already clears the silence line without the floor ({unscaled:.2})"
+        );
+
+        let evs = measured_down_to_the_silence_line(&x);
+        eprintln!("with the floor: {} measured", evs.len());
+        let (score, pass) = evs
+            .iter()
+            .find(|(_, e)| on_pass(e.detection.t0r, e.detection.f0))
+            .expect("the pass was not detected with the floor");
+        eprintln!(
+            "pass: detection {score:.2}, gates {:?}",
+            pass.quality.reasons
+        );
+        assert!(pass.quality.ok, "{:?}", pass.quality.reasons);
+        let b = pass.fit.as_ref().unwrap().best;
+        assert!((b.v / v - 1.0).abs() < 0.1, "v {} against {v}", b.v);
+        assert!((b.d / d - 1.0).abs() < 0.2, "d {} against {d}", b.d);
+        assert!((b.t0r - t0r).abs() < 1.0, "t0r {} against {t0r}", b.t0r);
+        for (s, e) in evs
+            .iter()
+            .filter(|(_, e)| !on_pass(e.detection.t0r, e.detection.f0))
+        {
+            assert!(
+                !e.quality.ok,
+                "score {s:.2} at {:.0} s, {:.0} Hz passed",
+                e.detection.t0r, e.detection.f0
+            );
+        }
+
+        let mut rev = x.clone();
+        rev.reverse();
+        for (name, y) in [("reversed", rev), ("swell alone", swell_scene(0.0, 25.0))] {
+            let got = measured_down_to_the_silence_line(&y);
+            eprintln!("{name}: {} measured", got.len());
+            for (s, e) in &got {
+                assert!(
+                    !e.quality.ok,
+                    "{name}: score {s:.2} at {:.0} s, {:.0} Hz passed",
+                    e.detection.t0r, e.detection.f0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_pass_under_the_old_measure_line_is_measured_and_noise_tones_and_reversed_audio_are_refused()
      {
         // Detection keeps curves down to the silence line (3.5; pure noise peaks near 3), but only
