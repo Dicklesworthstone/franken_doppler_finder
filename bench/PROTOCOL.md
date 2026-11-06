@@ -1476,3 +1476,45 @@ A chain a guard stops never writes `CHAIN_DONE`, so `dpwin` then waits and start
 - At 16:34:09Z `fix6f` started set E's R3 replacements for `fdop-9087ec4`, alone, beside the two `fdop` R1 chains. Its first
   row, `e_tehachapi`, is the one stopped at 00:05:12Z and kept as `*_fault_guard3` (Addendum 16), run again with the same
   command.
+
+## Addendum 22, 2026-11-06, set E's R1 read for `fdop-6914ab7`, `fdop-9087ec4` and `dopplerprint`
+
+### Set E's R1
+
+At 23:40:44Z `runs/r1_fdop_6914ab7`, `r1_fdop_9087ec4`, `e2_r1_fdop_6914ab7`, `e2_r1_fdop_9087ec4`, `r1_dp` and `e2_r1_dp`
+each had `CHAIN_DONE`, and `tools/match/guardfix/inventory.sh` showed no fault on them: no step without an rc, none ended 137
+or 143. No guard had stopped a chain since 00:29:41Z (Addendum 16). None of the 24 set E rows of these three tools has "command
+terminated abnormally" or another abnormal ending in its `.err`, and each of the 16 `fdop` rows has a `result.json`, so each
+rc 1 is `fdop`'s "no location" (Addendum 20). R1 was then read once with `score.py jobs/cases.json runs r1`. The output is kept
+as `runs/SCORE_r1_20261106.txt` (sha256 `c8c9329b93de9ff4ef1d086f99526f6e065ae687388455025430fb82e5e3d90c`). It prints every
+tool with an R1 directory. No set E row of the pinned build had started, so the read showed nothing of its set E rows.
+`dpdem`'s R1 has not run.
+
+| Tool, set E's eight counted cases | Correct asserted | Wrong asserted | Not asserted | Error |
+|---|---|---|---|---|
+| `fdop-6914ab7` | 0 | 0 | 8: 2 low, 6 no location | 0 |
+| `fdop-9087ec4` | 0 | 0 | 8: 2 low, 6 no location | 0 |
+| `dopplerprint` (`dp`) | 0 | 0 | 8 declined: 7 "needs_input" (Addendum 19), 1 "inconclusive" | 0 |
+| `fdop` `7e66501` (pinned) | | | 8 pending | |
+
+- **The claim.** Neither build meets the rule against `dp` on set E's R1: each ties it at no correct and no wrong answer.
+  Falsifier 3 does not fire: no build has fewer correct answers than `dp` or any wrong answer asserted.
+- **`e_olympia`.** Both builds put it 65 m from the truth (1 km limit) and graded it low, failing the core-match gate as in R3
+  (Addendum 21): of the two matches, `e9` located the observer (chi 0.17, its trace 11.0 nats over chance) and `e12` missed at
+  chi 4.25, where the line is 4 (trace 2.7 nats). Every other gate passed, with a 6.58-nat margin over the best different
+  explanation, 46 km away. This is reported, not used.
+- **`e_tehachapi`.** Both builds put it 153 km off (5 km limit), graded low.
+- **The other six** gave no location from either build. `dp` gave no answer on any of the eight.
+- **Development cases.** On A+B+C (12 cases), `fdop-6914ab7` and `fdop-9087ec4` each gave 4 correct and 1 wrong: `a_ref`
+  263 m, `b1_osprey_1101` 115 m and `b3_duke` 964 m at high, `b1_osprey_1031` 48 m at medium, and `b1_osprey_1102b` 180 km
+  off at **medium**. Each has one row pending, its `c_osprey_1031` set aside at 08:06:43Z (Addendum 20). `dp` gave none
+  correct and 3 wrong, all at high: `a_ref` 3,494 km off, and two runs at wrong dates, `c_osprey_1031` (3,487 km) and
+  `c_duke_1102` (3,123 km). It declined 6, gave 2 errors and left 1 unasserted. Every `fdop` run at a wrong date was low.
+  The pinned build stands at 1 correct (`a_ref` 271 m, medium) and 0 wrong, with 4 rows pending. These are development
+  cases, and falsifier 2 has already fired for both later builds (Addenda 8 and 11).
+
+### What is left
+
+`dpwin` is at stage 2 (Addendum 21): at 23:38:26Z the release page of 2026-11-06's archive did not exist yet. Stages 3 to 5
+follow it. The pinned build's set E R3 and R1, `fdop-9087ec4`'s set E R3, and every `dpdem` row are read as their chains
+finish, each once, into a new file.
