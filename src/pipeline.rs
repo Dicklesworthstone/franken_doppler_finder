@@ -805,13 +805,14 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     };
     // Every primary detection from the silence line up is a candidate, strongest first: the
     // detection score does not separate flyovers from tones (pure noise peaks near 3), the
-    // measurement gates do. Measuring goes down the list until MAX_MEASURED events pass.
+    // measurement gates do. Duplicate or non-aircraft fits do not use up the allowance:
+    // measuring goes down the list until MAX_MEASURED independent aircraft events survive.
     let max_measured = measure::MAX_MEASURED;
     let prim: Vec<&Detection> = dets
         .iter()
         .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
         .collect();
-    let mut events: Vec<MeasuredEvent> = measure::measure_ranked(
+    let mut events: Vec<MeasuredEvent> = measure::measure_ranked_counted(
         prim.len(),
         max_measured,
         |ranks| {
@@ -824,11 +825,11 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                 })
                 .collect()
         },
-        |e| e.quality.ok,
+        |events| search::independent_measured_events(events, 0.0).len(),
     );
     if prim.len() > events.len() {
         warnings.push(format!(
-            "measured the {} strongest of {} flyover detections, stopping once {max_measured} passed the quality gates; the rest neither drive nor confirm the answer, though they still count as heard",
+            "measured the {} strongest of {} flyover detections, reaching the limit of {max_measured} independent aircraft events; the rest neither drive nor confirm the answer, though they still count as heard",
             events.len(),
             prim.len(),
         ));
@@ -856,10 +857,12 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         dp.thr_db
     ));
     let n_ok = events.iter().filter(|e| e.quality.ok).count();
+    let n_independent = search::independent_measured_events(&events, 0.0).len();
     log.say(&format!(
-        "measured {} events, {} pass quality gates",
+        "measured {} events, {} pass quality gates, {} independent aircraft events",
         events.len(),
-        n_ok
+        n_ok,
+        n_independent
     ));
     for e in &events {
         if let Some(f) = &e.fit {
@@ -945,15 +948,23 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     // fitted speeds are mapped to ground speeds through the modelled wind; without wind
     // data the gates must absorb it
     let wind = if has_wind { 3.0 } else { 10.0 };
-    let sevs: Vec<SearchEvent> = events
+    let mut sevs: Vec<SearchEvent> = search::independent_measured_events(&events, wind);
+    // A newly measured, better representative can change the greedy harmonic grouping of
+    // earlier events. Enforce the same independent-event limit even if that last batch
+    // releases more than its number of new slots; keep every measurement in the report.
+    let excluded_by_event_limit: std::collections::HashSet<String> = sevs
         .iter()
-        .filter(|e| {
-            e.fit
-                .as_ref()
-                .is_some_and(|f| f.best.v >= 28.0 && f.best.d >= 200.0)
-        })
-        .filter_map(|e| SearchEvent::from_measured(e, wind))
+        .skip(max_measured)
+        .map(|e| e.id.clone())
         .collect();
+    if sevs.len() > max_measured {
+        warnings.push(format!(
+            "measurement produced {} independent aircraft events after regrouping; the {max_measured} strongest were searched and {} omitted by the event limit",
+            sevs.len(),
+            sevs.len() - max_measured,
+        ));
+        sevs.truncate(max_measured);
+    }
     log.say(&format!(
         "{} aircraft-like events go to the search",
         sevs.len()
@@ -1231,8 +1242,10 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                     .unwrap_or_else(|| {
                         if sevs.iter().any(|s| s.id == e.id) {
                             String::new()
+                        } else if excluded_by_event_limit.contains(&e.id) {
+                            format!("not searched ({max_measured}-event limit)")
                         } else {
-                            "not searched (not aircraft-like)".into()
+                            "not searched (not an independent aircraft event)".into()
                         }
                     }),
                 figure: f.map(|_| format!("{}.png", e.id)),

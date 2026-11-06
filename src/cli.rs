@@ -328,14 +328,14 @@ fn run(cli: Cli) -> Result<i32, String> {
             }
             let mp = fdop_core::measure::MeasureParams::default();
             // As in `locate`: every primary from the silence line up, strongest first, until
-            // MAX_MEASURED pass the quality gates.
+            // MAX_MEASURED independent aircraft events survive the search's existing checks.
             let max_measured = fdop_core::measure::MAX_MEASURED;
             let prim: Vec<_> = dets
                 .iter()
                 .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
                 .collect();
             use rayon::prelude::*;
-            let evs = fdop_core::measure::measure_ranked(
+            let evs = fdop_core::measure::measure_ranked_counted(
                 prim.len(),
                 max_measured,
                 |ranks| {
@@ -353,11 +353,11 @@ fn run(cli: Cli) -> Result<i32, String> {
                         })
                         .collect()
                 },
-                |e| e.quality.ok,
+                |events| fdop_core::search::independent_measured_events(events, 0.0).len(),
             );
             if prim.len() > evs.len() {
                 eprintln!(
-                    "fdop: warning: measured the {} strongest of {} flyover detections, stopping once {max_measured} passed the quality gates",
+                    "fdop: warning: measured the {} strongest of {} flyover detections, reaching the limit of {max_measured} independent aircraft events",
                     evs.len(),
                     prim.len(),
                 );

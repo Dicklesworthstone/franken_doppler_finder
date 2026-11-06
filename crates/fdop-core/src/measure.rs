@@ -21,10 +21,11 @@ use crate::spectro::{Spec, stft_band_db};
 use crate::trace::{Trace, guided_ridge_peak};
 use serde::Serialize;
 
-/// At most this many measured events pass the quality gates, strongest primary detections first.
+/// At most this many independent aircraft-like events enter the search, with primary detections
+/// measured strongest first. Repeated seeds of one pass and non-aircraft fits do not use a place.
 /// More usable events from a long recording can promote a wrong answer (CHANGELOG, Unreleased), so
 /// the cap stays until the grading accounts for how many events were searched. A detection the gates
-/// refuse does not use up a place: [`measure_ranked`] goes on down the list.
+/// refuse does not use up a place either: [`measure_ranked_counted`] goes on down the list.
 pub const MAX_MEASURED: usize = 24;
 
 /// Measures ranked detections, strongest first, until `max_ok` of them pass the quality gates or
@@ -50,6 +51,33 @@ pub fn measure_ranked<T>(
         assert_eq!(got.len(), end - start, "a batch returns one item per rank");
         n_ok += got.iter().filter(|t| ok(t)).count();
         out.extend(got);
+    }
+    out
+}
+
+/// Measure a ranked prefix until `count` finds at least `max_ok` usable, independent events.
+/// Unlike [`measure_ranked`], the count can compare every measured item to its neighbours, so
+/// duplicate passes and otherwise unusable fits do not consume slots needed by later flyovers.
+/// All measured items remain in their original rank order, including rejected and duplicate ones.
+///
+/// A batch holds only the number of places still missing. Grouping can nevertheless change when
+/// a better representative arrives: its count need not be monotonic, and can jump over the cap.
+/// The caller must apply `max_ok` to its final selected events, reporting any such cut separately.
+pub fn measure_ranked_counted<T>(
+    n: usize,
+    max_ok: usize,
+    mut batch: impl FnMut(std::ops::Range<usize>) -> Vec<T>,
+    count: impl Fn(&[T]) -> usize,
+) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    let mut n_ok = 0;
+    while n_ok < max_ok && out.len() < n {
+        let start = out.len();
+        let end = (start + max_ok - n_ok).min(n);
+        let got = batch(start..end);
+        assert_eq!(got.len(), end - start, "a batch returns one item per rank");
+        out.extend(got);
+        n_ok = count(&out);
     }
     out
 }
@@ -1026,13 +1054,13 @@ mod tests {
         assert!((fr.best.d / d - 1.0).abs() < 0.08, "d {}", fr.best.d);
     }
 
-    fn measure_simultaneous_same_tone_passes(amplitudes: [f64; 2]) -> Vec<MeasuredEvent> {
+    fn simultaneous_same_tone_audio(amplitudes: [f64; 2]) -> Vec<f32> {
         let sr = 4000u32;
         let (f0, v, t0r, c) = (118.0, 120.0, 180.0, 343.0);
         let distances = [1000.0, 7000.0];
         let mut phases = [0.0f64; 2];
         let mut seed = 99u64;
-        let x: Vec<f32> = (0..sr as usize * 360)
+        (0..sr as usize * 360)
             .map(|i| {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
@@ -1047,7 +1075,12 @@ mod tests {
                 }
                 sample as f32
             })
-            .collect();
+            .collect()
+    }
+
+    fn measure_simultaneous_same_tone_passes(amplitudes: [f64; 2]) -> Vec<MeasuredEvent> {
+        let (sr, c) = (4000u32, 343.0);
+        let x = simultaneous_same_tone_audio(amplitudes);
         let dp = DetectParams::default();
         let (ls, lin) = survey(&x, sr, &dp).unwrap();
         let started = std::time::Instant::now();
@@ -1106,9 +1139,17 @@ mod tests {
         let (lat, lon) = (40.876466, -73.524951);
         let region = BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01);
         let params = SearchParams::new(0.0, 0.0, 360.0, region);
-        crate::search::run(&input, &params, &|_| {})
+        let searched = crate::search::run(&input, &params, &|_| {})
             .funnel
-            .events_used
+            .events_used;
+        let selected = crate::search::independent_measured_events(events, 0.0);
+        let windy = crate::search::independent_measured_events(events, 10.0);
+        assert_eq!(selected.len(), searched);
+        assert_eq!(
+            selected.iter().map(|e| &e.id).collect::<Vec<_>>(),
+            windy.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        searched
     }
 
     #[test]
@@ -1287,6 +1328,150 @@ mod tests {
             (0..50).collect::<Vec<_>>()
         );
         assert!(ranked(&[], 24).0.is_empty());
+        assert!(ranked(&[true; 10], 0).0.is_empty());
+    }
+
+    #[test]
+    fn measure_ranked_counted_rechecks_groups_and_stops_after_a_count_jump() {
+        let mut batches = Vec::new();
+        let got = measure_ranked_counted(
+            8,
+            3,
+            |r| {
+                batches.push(r.clone());
+                r.collect::<Vec<_>>()
+            },
+            |items| match items.len() {
+                // A better representative can regroup earlier fits; the scheduler must
+                // recount the complete prefix, retain it, and stop even if the count jumps.
+                3 => 2,
+                4 => 1,
+                6 => 4,
+                n => panic!("unexpected measured prefix of length {n}"),
+            },
+        );
+        assert_eq!(batches, [0..3, 3..4, 4..6]);
+        assert_eq!(got, (0..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ranked_measurement_reaches_a_later_pass_after_duplicate_seeds() {
+        use crate::search::independent_measured_events;
+
+        let sr = 4000u32;
+        let first = Detection {
+            id: 0,
+            t0r: 180.0,
+            f0: 118.0,
+            v: 120.0,
+            d: 1000.0,
+            score: 12.0,
+            score_approach: 12.0,
+            score_recede: 12.0,
+            half_s: 60.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+        };
+        let duplicate = Detection {
+            id: 1,
+            t0r: first.t0r + 0.5,
+            f0: first.f0 + 0.1,
+            v: first.v + 1.0,
+            d: first.d + 100.0,
+            score: 11.0,
+            ..first.clone()
+        };
+        let second = Detection {
+            id: 2,
+            d: 7000.0,
+            score: 10.0,
+            ..first.clone()
+        };
+        // Reuse the real PCM scene from the overlapping-pass recovery regressions. The
+        // first two seeds measure its close pass; only the later-ranked third seed can
+        // supply the distant pass, despite sharing the emitted tone and received CPA.
+        let x = simultaneous_same_tone_audio([0.10, 0.08]);
+        let detections = [&first, &duplicate, &second];
+        let mut batches = Vec::new();
+        let events = measure_ranked_counted(
+            detections.len(),
+            2,
+            |ranks| {
+                batches.push(ranks.clone());
+                ranks
+                    .map(|k| {
+                        measure(
+                            &x,
+                            sr,
+                            detections[k],
+                            &format!("e{}", k + 1),
+                            &MeasureParams::default(),
+                        )
+                    })
+                    .collect()
+            },
+            |events| independent_measured_events(events, 0.0).len(),
+        );
+        assert_eq!(batches, [0..2, 2..3]);
+        assert_eq!(events.len(), 3);
+        assert!(
+            events.iter().all(|e| e.quality.ok),
+            "{:?}",
+            events
+                .iter()
+                .map(|e| &e.quality.reasons)
+                .collect::<Vec<_>>()
+        );
+        let old_prefix = measure_ranked(
+            detections.len(),
+            2,
+            |ranks| ranks.map(|k| events[k].clone()).collect(),
+            |e| e.quality.ok,
+        );
+        assert_eq!(old_prefix.len(), 2);
+        assert_eq!(independent_measured_events(&old_prefix, 0.0).len(), 1);
+        let selected = independent_measured_events(&events, 0.0);
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|e| e.id == "e3"));
+        for d in [&first, &second] {
+            let fit = events
+                .iter()
+                .filter_map(|e| e.fit.as_ref())
+                .min_by(|a, b| (a.best.d - d.d).abs().total_cmp(&(b.best.d - d.d).abs()))
+                .unwrap();
+            assert!(
+                (fit.best.t0r - d.t0r).abs() < 0.5,
+                "CPA: {:?} against {d:?}",
+                fit.best
+            );
+            assert!((fit.best.f0 - d.f0).abs() < 0.5, "{:?}", fit.best);
+            assert!((fit.best.v - d.v).abs() < 5.0, "{:?}", fit.best);
+            assert!((fit.best.d / d.d - 1.0).abs() < 0.1, "{:?}", fit.best);
+        }
+        let windy = independent_measured_events(&events, 10.0);
+        assert_eq!(
+            selected.iter().map(|e| &e.id).collect::<Vec<_>>(),
+            windy.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        // Eligibility uses exactly the pre-existing aircraft bounds and quality gate.
+        // Mutate only those fields of an actual fit to check each boundary independently.
+        for (speed, distance, quality, expected) in [
+            (27.99, 1800.0, true, 0),
+            (90.0, 199.99, true, 0),
+            (90.0, 1800.0, false, 0),
+            (28.0, 200.0, true, 1),
+        ] {
+            let mut event = events[0].clone();
+            let fit = event.fit.as_mut().unwrap();
+            fit.best.v = speed;
+            fit.best.d = distance;
+            event.quality.ok = quality;
+            assert_eq!(independent_measured_events(&[event], 10.0).len(), expected);
+        }
+        let mut missing_fit = events[0].clone();
+        missing_fit.fit = None;
+        assert!(independent_measured_events(&[missing_fit], 0.0).is_empty());
     }
 
     /// (f0, v, d, emission time of the CPA) of the weak pass in `weak_scene`.

@@ -573,10 +573,12 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 
 ### `fdop detect <MEDIA>`: flyovers only, no ADS-B
 
-Detects flyovers and measures them strongest first, from the silence line up, until 24 pass the quality gates,
-with a warning on stderr when the detection or measurement cap cuts
-some or the audio looks high-passed, and writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv`
-for every fitted event. The default output directory is `fdop_runs/detect`.
+Detects flyovers and measures them strongest first, from the silence line up, until 24 independent aircraft
+events survive the same eligibility and harmonic checks used by `locate`. Refused fits, non-aircraft fits and
+duplicate traces of one pass do not consume that allowance. Every measured result remains in `events.json`,
+including duplicates and refusals. A warning on stderr says when either cap omits candidates or the audio
+looks high-passed. The command writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv` for
+every fitted event. The default output directory is `fdop_runs/detect`.
 
 `--audio-stream N` and `--audio-channel N` select the same source as in `locate`. For example,
 `fdop detect clip.mov --audio-stream 1 --audio-channel 0` measures the first channel of the second audio track.
@@ -804,7 +806,14 @@ Design notes:
   between them, at an excellent RMS. `drop_traversed` in `events.json` is the share of the central 10–90 % of the
   fitted drop that the trace travels: each continuous stretch adds its net fall, and a stretch ends at a time gap
   or where the trace steps more than 2 Hz off the model's own step. Under 15 % the event is refused. It still
-  counts as heard, and it still uses one of the 24 measurement slots.
+  counts as heard, but it does not use an independent-event slot.
+- **Measurement slots belong to independent aircraft events.** The same measured-curve comparison used by
+  the search groups duplicate seeds and harmonics before deciding whether the 24-event allowance is full.
+  Fits below the existing aircraft limits (28 m/s or 200 m closest distance) do not fill it either. Later
+  detections can therefore supply missing flyovers. Distinct overlapping Doppler shapes still count separately.
+  `locate` keeps at most 24 independent events after final grouping, with a warning if a better representative
+  changes the grouping enough to exceed that limit. Original detection ranks still determine the measurement-line
+  gate; grouping does not give a newly reached weak event the status of an earlier one.
 - **Hypotheses are compact.** Each is 20 bytes (a `u32` track index and four `f32`). The budgets are sized from
   physical memory: a tenth of RAM, capped at what a 32 GiB machine gets, 172 M hypotheses (3.4 GB). More would
   overflow the comparison budgets below and lower the grade, so every machine from 32 GiB up runs the same search.
@@ -1288,7 +1297,7 @@ audio or video recorded somewhere sensitive:
 | `ambiguous location: 'Springfield' matches places in K states` | Bare place name | Add the state: `"Springfield, IL"` |
 | `date range ... spans more than 15 days; narrow it` | Range too long | Split it into several runs |
 | `unrecognised date '09/08/2026': put the four-digit year first` | The year is not first. `09/08/2026` is 8 September in the US and 9 August in most other countries | Write it year first: `2026-09-08` |
-| Warning `detection kept the 60 strongest of N candidate curves` or `measured the K strongest of N flyover detections, stopping once 24 passed the quality gates` | A long or busy recording hit a fixed cap (see [Known issues](#known-issues)) | Nothing to change: the weaker flyovers are not used |
+| Warning `detection kept the 60 strongest of N candidate curves` or `measured the K strongest of N flyover detections, reaching the limit of 24 independent aircraft events` | A long or busy recording hit a fixed cap (see [Known issues](#known-issues)) | Nothing to change: the remaining flyovers are not used |
 | Warning `the audio has little energy below 100 Hz (45-95 Hz is N dB below 150-600 Hz)` | A high-pass filter does this, removing the fundamentals of slower propellers and weakening those near the cut. Speech-heavy audio can also read low | Use the unfiltered recording if you have one. Otherwise expect fewer usable flyovers, and do not read a failed search as evidence about the place |
 | Warning `the answer lies in CT, outside the searched state NY` (or `appears to lie in`, when the state is a gazetteer estimate) | A state search covers the state's bounding box, which takes in parts of its neighbours | If you know the recording was made in the searched state, distrust the answer whatever its grade, unless its radius reaches back across the border. A narrower `--near`, such as a county, takes in less of the neighbours |
 | `needs network or a cached file: Census gazetteer ...` | `--offline` before the gazetteer was cached | Run once online, or use a state, point or box region |
@@ -1344,7 +1353,7 @@ audio or video recorded somewhere sensitive:
   same lap twice, since it counts passes, not aircraft. The rule does not catch that case. The tied-place radius
   catches it only where the other places along the track fall inside the clock window and among the kept modes.
 - Detection and measurement are capped: at most 60 candidate curves; flyovers measured strongest first, from the
-  silence line (detection score 3.5) up, until 24 pass the quality gates; and 12 of those driving the pair join
+  silence line (detection score 3.5) up, until 24 independent aircraft events survive; and 12 of those driving the pair join
   (`--max-events`). Before this change only primaries scoring 4.5 or more were measured, and only the strongest 24
   of them, so a refused detection used up a place. The reference recording hits the detection cap (82 curves;
   before this change also the measurement cap, 32 strong flyovers), and a 3 h recording loses most of its
@@ -1367,10 +1376,9 @@ audio or video recorded somewhere sensitive:
   comparisons now fail the margin gate whether a rival was found or not; that correction does not calibrate
   the larger event search. Events omitted from pair seeding by driver or hypothesis limits can still leave
   unexplored explanations, even when no pair/fine/confirmation cut was recorded.
-  Before this change, events the ridge check refused kept their slots too: 19 of the 24 on that recording.
-  Multiple seeds of one physical pass can also consume measurement slots before measured-curve filtering
-  groups them. The residual detector's distant-only synthetic control uses two slots while correctly
-  contributing one independent event; its preceding single-bank baseline used one slot.
+  Earlier builds also spent slots on events the ridge check refused: 19 of the 24 on that recording.
+  Refusals, duplicate measured curves and fits outside the aircraft limits now leave room for later detections;
+  the independent-event limit and the measurement-line gate remain in force.
 - **A complete comparison can take hours.** The fine stage costs 50–70 ms of CPU per cell, and real searches run
   from tens of cells to about 900,000. A busy 3 h recording searched across a state took 9,602 s and 45,474
   CPU-seconds on an Apple M4 with 32 GiB while another replay ran, against 584 s when the fine stage stopped at

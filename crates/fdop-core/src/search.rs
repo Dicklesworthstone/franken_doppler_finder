@@ -173,6 +173,8 @@ pub struct SearchParams {
     pub max_confirm: usize,
 }
 
+const DEFAULT_CAP_SIGMA: f64 = 5.0;
+
 impl SearchParams {
     pub fn new(start_lo: f64, start_hi: f64, duration: f64, region: BBox) -> Self {
         Self {
@@ -190,7 +192,7 @@ impl SearchParams {
             fine_half_m: 500.0,
             quick_chi: 60.0,
             kappa: 12.0,
-            cap_sigma: 5.0,
+            cap_sigma: DEFAULT_CAP_SIGMA,
             max_quick: 20_000_000,
             max_fine: 2_000_000,
             refine_step_m: 25.0,
@@ -1861,6 +1863,42 @@ fn harmonic_events(a: &SearchEvent, b: &SearchEvent, cap_sigma: f64) -> bool {
     chi <= CORE_CHI
 }
 
+/// Quality-passing, aircraft-like measured events under the standard search's independent-pass
+/// policy. Use the same selection when counting measurement slots and supplying the final search:
+/// multiple seeds or harmonics of one pass must not hide a later independent flyover.
+///
+/// Wind widens the speed gates but does not change eligibility, ordering or harmonic grouping.
+/// This returns every selected event; a caller with a measurement cap must apply it afterwards.
+pub fn independent_measured_events(events: &[MeasuredEvent], wind_mps: f64) -> Vec<SearchEvent> {
+    let eligible = events
+        .iter()
+        .filter(|e| {
+            e.fit
+                .as_ref()
+                .is_some_and(|f| f.best.v >= 28.0 && f.best.d >= 200.0)
+        })
+        .filter_map(|e| SearchEvent::from_measured(e, wind_mps))
+        .collect();
+    independent_events(eligible, DEFAULT_CAP_SIGMA)
+}
+
+fn independent_events(mut evs: Vec<SearchEvent>, cap_sigma: f64) -> Vec<SearchEvent> {
+    // events: clean fits first, then best quality; drop harmonics of a stronger event
+    evs.sort_by(|a, b| {
+        a.misfit
+            .cmp(&b.misfit)
+            .then(b.quality.total_cmp(&a.quality))
+    });
+    let mut keep: Vec<SearchEvent> = Vec::new();
+    for e in evs {
+        if keep.iter().any(|k| harmonic_events(k, &e, cap_sigma)) {
+            continue;
+        }
+        keep.push(e);
+    }
+    keep
+}
+
 pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync)) -> SearchResult {
     let c = p.c;
     let frame = Frame::new(&p.region);
@@ -1871,21 +1909,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     let mut warnings = Vec::new();
     let tracks = inp.tracks;
     let atmo = inp.atmo;
-    // events: clean fits first, then best quality; drop harmonics of a stronger event
-    let mut evs: Vec<SearchEvent> = inp.events.clone();
-    evs.sort_by(|a, b| {
-        a.misfit
-            .cmp(&b.misfit)
-            .then(b.quality.total_cmp(&a.quality))
-    });
-    let mut keep: Vec<SearchEvent> = Vec::new();
-    for e in evs {
-        if keep.iter().any(|k| harmonic_events(k, &e, p.cap_sigma)) {
-            continue;
-        }
-        keep.push(e);
-    }
-    let evs = keep;
+    let evs = independent_events(inp.events.clone(), p.cap_sigma);
     funnel.events_used = evs.len();
     if evs.len() < 2 {
         warnings.push(format!(

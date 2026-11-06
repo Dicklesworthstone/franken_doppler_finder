@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Let later flyovers fill slots lost to duplicate or non-aircraft fits
+
+- **The fault.** Ranked measurement stopped after 24 fits passed its quality gates. Only afterward did the
+  pipeline exclude non-aircraft fits and the search group duplicate seeds and harmonics of one pass. Those
+  discarded fits could exhaust the allowance before a later, independent flyover was measured.
+- **The change.** Both `locate` and `detect` count independent aircraft events using the search's existing
+  eligibility, quality ordering and measured-curve comparison. All measured results remain in detection-rank
+  order until reporting, and original ranks still determine the measurement-line gate. No detection, quality,
+  harmonic or confidence threshold changes. The search still receives at most 24 independent events; a final
+  cap and warning cover changes in greedy grouping caused by a new, better representative.
+- **Evidence.** Regressions exercise ranked batches and real measured synthetic flyovers, including duplicate
+  first-pass seeds that previously hid a later pass. Validation outcomes are recorded in the commit. No new
+  reference-recording or field accuracy claim is made.
+
 ### Preserve alternative recording clocks for repeating flight pairs
 
 - **The fault.** The pair join retained 20 s clock cells, but the quick-to-fine merge then keyed survivors
