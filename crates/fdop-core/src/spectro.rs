@@ -235,6 +235,11 @@ pub fn hann(n: usize) -> Vec<f64> {
         .collect()
 }
 
+// Bound extra column-major storage independently of recording duration. Very wide bands
+// still need one column; FFT scratch remains separate and private to each Rayon worker.
+const STFT_BLOCK_FRAMES: usize = 256;
+const STFT_BLOCK_VALUES: usize = (4 * 1024 * 1024) / std::mem::size_of::<f32>();
+
 /// Hann STFT of `x` (sample rate `sr`), zero-padded so bins are <= `df_max` Hz, restricted to
 /// `[fmin, fmax]`. Frame centres are `t_offset + (i*hop + nwin/2)/sr`. Returns raw dB
 /// (power / (sum w)^2); call [`Spec::normalize_rows`] afterwards.
@@ -271,13 +276,21 @@ pub fn stft_band_db(
     let wsum: f64 = w.iter().sum();
     let norm = wsum * wsum;
     let opts = FftOptions::default().with_workers(WorkerPolicy::Exact(1));
-    // Column-major work buffer [t][f], transposed to row-major at the end.
-    let cols: Vec<Vec<f32>> = (0..nfr)
-        .into_par_iter()
-        .map_init(
+    // Transform a bounded set of frames, then copy them into the final row-major
+    // output. Keeping every column until the end would double the spectrogram's
+    // storage and allocate a separate vector for every frame in a long recording.
+    let block_frames = (STFT_BLOCK_VALUES / nb)
+        .clamp(1, STFT_BLOCK_FRAMES)
+        .min(nfr);
+    let mut cols = vec![0f32; nb * block_frames];
+    let mut db = vec![0f32; nb * nfr];
+    for first in (0..nfr).step_by(block_frames) {
+        let frames = block_frames.min(nfr - first);
+        let block = &mut cols[..nb * frames];
+        block.par_chunks_mut(nb).enumerate().for_each_init(
             || vec![0.0f64; nfft],
-            |buf, i| {
-                let s = i * hop;
+            |buf, (i, col)| {
+                let s = (first + i) * hop;
                 for (k, b) in buf.iter_mut().enumerate() {
                     *b = if k < nwin {
                         x[s + k] as f64 * w[k]
@@ -286,22 +299,19 @@ pub fn stft_band_db(
                     };
                 }
                 let spec = fsci_fft::rfft(buf, &opts).unwrap_or_default();
-                (b0..=b1)
-                    .map(|k| {
-                        let (re, im) = spec.get(k).copied().unwrap_or((0.0, 0.0));
-                        (10.0 * ((re * re + im * im) / norm + 1e-20).log10()) as f32
-                    })
-                    .collect()
+                for (fi, v) in col.iter_mut().enumerate() {
+                    let (re, im) = spec.get(b0 + fi).copied().unwrap_or((0.0, 0.0));
+                    *v = (10.0 * ((re * re + im * im) / norm + 1e-20).log10()) as f32;
+                }
             },
-        )
-        .collect();
-    drain_fft_traces();
-    let mut db = vec![0f32; nb * nfr];
-    db.par_chunks_mut(nfr).enumerate().for_each(|(fi, row)| {
-        for (ti, v) in row.iter_mut().enumerate() {
-            *v = cols[ti][fi];
-        }
-    });
+        );
+        drain_fft_traces();
+        db.par_chunks_mut(nfr).enumerate().for_each(|(fi, row)| {
+            for (ti, v) in row[first..first + frames].iter_mut().enumerate() {
+                *v = block[ti * nb + fi];
+            }
+        });
+    }
     let t = (0..nfr)
         .map(|i| t_offset + (i * hop) as f64 / srf + nwin as f64 / (2.0 * srf))
         .collect();
@@ -642,6 +652,73 @@ pub fn write_png_rgb(path: &Path, w: usize, h: usize, rgb: &[u8]) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_stft_matches_direct_frames_bit_for_bit() {
+        let sr = 512u32;
+        let nwin = 128usize;
+        let hop = 16usize;
+        // A single frame, multiple full blocks with a tail, nonzero frequency
+        // origins, zero padding, and a wide band that hits the byte budget first.
+        for (nfr, fmin, fmax, df_max, offset) in [
+            (1usize, 40.0, 160.0, 1.0, -4.25),
+            (513, 0.0, 256.0, 1.0, 23.125),
+            (257, 37.0, 181.0, 0.5, 0.0),
+            (259, 0.0, 256.0, 0.0625, 2000.0),
+        ] {
+            let mut rng = 0x1234_5678u32;
+            let x: Vec<f32> = (0..nwin + (nfr - 1) * hop)
+                .map(|i| {
+                    rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let noise = rng as f64 / u32::MAX as f64 - 0.5;
+                    let t = i as f64 / sr as f64;
+                    ((2.0 * std::f64::consts::PI * (41.0 * t + 3.0 * t * t)).sin()
+                        + 0.2 * (2.0 * std::f64::consts::PI * 147.0 * t).sin()
+                        + 0.1 * noise) as f32
+                })
+                .collect();
+            let actual =
+                stft_band_db(&x, sr, 0.25, 0.03125, fmin, fmax, df_max, offset).unwrap();
+            let nfft = nwin.max((sr as f64 / df_max).ceil() as usize).next_power_of_two();
+            let df = sr as f64 / nfft as f64;
+            let b0 = (fmin / df).ceil() as usize;
+            let b1 = ((fmax / df).floor() as usize).min(nfft / 2);
+            assert_eq!(actual.nt(), nfr);
+            assert_eq!(actual.nf(), b1 - b0 + 1);
+            assert_eq!(actual.meta.nfft, nfft);
+            assert_eq!(actual.f, (b0..=b1).map(|k| k as f64 * df).collect::<Vec<_>>());
+            let w = hann(nwin);
+            let wsum: f64 = w.iter().sum();
+            let norm = wsum * wsum;
+            let opts = FftOptions::default().with_workers(WorkerPolicy::Exact(1));
+            for ti in 0..nfr {
+                let mut buf = vec![0.0f64; nfft];
+                for k in 0..nwin {
+                    buf[k] = x[ti * hop + k] as f64 * w[k];
+                }
+                let fft = fsci_fft::rfft(&buf, &opts).unwrap();
+                for (fi, k) in (b0..=b1).enumerate() {
+                    let (re, im) = fft[k];
+                    let expected =
+                        (10.0 * ((re * re + im * im) / norm + 1e-20).log10()) as f32;
+                    assert_eq!(
+                        actual.at(fi, ti).to_bits(),
+                        expected.to_bits(),
+                        "frame {ti}, bin {k}, {nfr} frames, df_max {df_max}"
+                    );
+                }
+                assert_eq!(
+                    actual.t[ti],
+                    offset + (ti * hop) as f64 / sr as f64
+                        + nwin as f64 / (2.0 * sr as f64)
+                );
+                if ti % STFT_BLOCK_FRAMES == 0 {
+                    drain_fft_traces();
+                }
+            }
+            drain_fft_traces();
+        }
+    }
 
     #[test]
     fn tone_lands_in_right_bin_and_normalises() {

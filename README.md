@@ -835,6 +835,11 @@ Design notes:
   recording is under the floor, so no null run tests them, and an answer resting on one counts as measured
   past the old line. On swells of noise alone the stage adds nothing up to 30 dB. From 35 dB it adds strong
   curves of its own, and the measurement gates refuse them.
+- **STFT working storage stays bounded as recordings grow.** Frames transform into a reusable block of
+  at most 256 columns and 4 MiB of frequency values, then copy into the final row-major spectrogram.
+  A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
+  The final spectrogram still scales with recording length, but a second complete spectrogram and a
+  separate allocation for every frame are no longer retained. Frequency bins and frame centres are unchanged.
 - **Guided measurement follows the predicted ridge.** It selects the nearest qualified local spectral
   peak within the existing model band, using the existing SNR and robust-z requirements. A brighter
   neighbouring aircraft no longer automatically takes over the trace when both tones enter that band.

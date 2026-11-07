@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Bound STFT working storage for long recordings
+
+- Replace the complete column-major spectrogram and its per-frame allocations with a reusable block
+  of at most 256 frames and 4 MiB of frequency values, followed by a copy into the final row-major
+  output. An exceptionally wide band still requires one full column; FFT worker scratch and the
+  final output remain separate allocations.
+- Drain FFT trace records between blocks. Preserve the FFT, Hann normalization, frequency bins,
+  frame centres, return type and public parameters. This is a storage change; no speedup is claimed.
+- Add a direct-frame comparison covering a single frame, multiple blocks and a tail, cropped bands,
+  zero padding, nonzero time offsets and the byte-budget boundary. It checks every output value
+  bit for bit and checks both axes.
+- **Validation.** The new regression and workspace checks did not complete before the execution
+  environment became unavailable. The patch was recovered through GitHub after the outage; its
+  final source has not been compiled or rerun. No reference-recording improvement is claimed.
+
 ### Publish complete track caches under concurrent searches
 
 - `TrackStore::save` now creates an exclusive staging file for each writer in the destination's
