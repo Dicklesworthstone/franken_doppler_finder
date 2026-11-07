@@ -14,6 +14,13 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 const RIDGE_HALF_ROWS: i64 = 3;
+const PRIMARY_SPEED_GRID: [f64; 11] = [
+    40.0, 52.0, 64.0, 76.0, 88.0, 100.0, 113.0, 127.0, 142.0, 158.0, 175.0,
+];
+
+/// Upper speed of the original survey bank (m/s). Faster coarse seeds come from the
+/// supplemental bank and count as measurements past the old line in the locate pipeline.
+pub const PRIMARY_MAX_SPEED_MPS: f64 = PRIMARY_SPEED_GRID[PRIMARY_SPEED_GRID.len() - 1];
 
 #[derive(Clone, Debug)]
 pub struct DetectParams {
@@ -23,6 +30,10 @@ pub struct DetectParams {
     pub hop_s: f64,
     pub bins_per_octave: usize,
     pub v_grid: Vec<f64>,
+    /// After the existing banks, search their residual with faster subsonic templates. Their
+    /// spacing continues the primary bank's last ratio, up to the measurement bound, 0.8 c.
+    /// They only fill unused detection slots and must clear the strong detection line.
+    pub fast_templates: bool,
     pub d_grid: Vec<f64>,
     /// Spacing (s) of the path samples.
     pub path_dt: f64,
@@ -72,9 +83,8 @@ impl Default for DetectParams {
             win_s: 1.0,
             hop_s: 1.0,
             bins_per_octave: 48,
-            v_grid: vec![
-                40.0, 52.0, 64.0, 76.0, 88.0, 100.0, 113.0, 127.0, 142.0, 158.0, 175.0,
-            ],
+            v_grid: PRIMARY_SPEED_GRID.to_vec(),
+            fast_templates: true,
             d_grid,
             path_dt: 2.0,
             k_tau: vec![1.25, 2.0, 3.0],
@@ -106,7 +116,7 @@ pub struct LogSpec {
     /// z), raised to the same floor. A loud pass that raises every row together inflates each
     /// row's MAD before the frame contrast can remove the swell, which shrinks its own ridge;
     /// taking the frame contrast first keeps the swell out of the row statistics.
-    /// [`detect_counted`] scores it after everything else, on what `data` left unexplained.
+    /// [`detect_counted`] scores it after the primary and edge banks, on what `data` left unexplained.
     pub contrast: Option<Vec<f32>>,
 }
 
@@ -457,6 +467,28 @@ fn build_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
     out
 }
 
+/// Continue the established speed spacing without changing any primary template. Only the
+/// existing subsonic measurement domain is added; no detection or measurement line is relaxed.
+fn build_fast_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
+    if !p.fast_templates || !p.c.is_finite() || 0.8 * p.c <= PRIMARY_MAX_SPEED_MPS {
+        return Vec::new();
+    }
+    let ratio = PRIMARY_MAX_SPEED_MPS / PRIMARY_SPEED_GRID[PRIMARY_SPEED_GRID.len() - 2];
+    let mut speeds = Vec::new();
+    let mut speed = PRIMARY_MAX_SPEED_MPS * ratio;
+    while speed <= 0.8 * p.c {
+        speeds.push(speed);
+        speed *= ratio;
+    }
+    build_templates(
+        &DetectParams {
+            v_grid: speeds,
+            ..p.clone()
+        },
+        hop,
+    )
+}
+
 /// The edge bank: for each (v, d) whose shortest half is the `min_half_s` floor, that template
 /// as a [`EdgeRole::Base`] followed by its `edge_half_s` edge template. Empty when
 /// `edge_half_s` is not in (0, `min_half_s`).
@@ -510,9 +542,9 @@ pub struct Detection {
     pub from_contrast: bool,
 }
 
-/// Run the template bank. Returns detections with score >= `thr_silence_db`, strongest first (the
-/// contrast stage's, `from_contrast`, follow all the rest, strongest first among themselves); the
-/// primaries among them are the event candidates.
+/// Run the template banks. Primary/edge detections come first, then the contrast stage's, then
+/// the fast stage's; each group is strongest first. All clear `thr_silence_db`, and the two
+/// supplemental groups also clear `thr_db`. Family primaries are the measurement candidates.
 pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
     detect_counted(ls, p).0
 }
@@ -638,6 +670,7 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
                 .collect();
             cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
             cand.truncate(remaining_candidates);
+            remaining_candidates -= cand.len();
             let before = out.len();
             accept_candidates(
                 &view,
@@ -653,6 +686,38 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
             for d in added.iter_mut() {
                 d.from_contrast = true;
             }
+            added.sort_by(|a, b| b.score.total_cmp(&a.score));
+            cut += added.len().saturating_sub(room);
+            added.truncate(room);
+            out.extend(added);
+        }
+    }
+    // Faster passes were outside the original bank. Search only evidence its detections and
+    // the contrast stage left unexplained, and append rather than displacing their candidates.
+    let room = p.max_detections - out.len();
+    if p.fast_templates && room > 0 && remaining_candidates > 0 {
+        let fast = build_fast_templates(p, ls.hop_s);
+        if !fast.is_empty() {
+            zero_known(&mut lp, &known);
+            let (bs, bi) = score_bank(ls, &fast, &lp, &[(0, nt)]);
+            let threshold = p.thr_db.max(p.thr_silence_db);
+            let mut cand: Vec<usize> = (0..nr * nt)
+                .filter(|&k| bs[k] as f64 >= threshold)
+                .collect();
+            cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
+            cand.truncate(remaining_candidates);
+            let before = out.len();
+            accept_candidates(
+                ls,
+                p,
+                &fast,
+                (&bs, &bi),
+                &cand,
+                threshold,
+                &mut known,
+                &mut out,
+            );
+            let mut added = out.split_off(before);
             added.sort_by(|a, b| b.score.total_cmp(&a.score));
             cut += added.len().saturating_sub(room);
             added.truncate(room);
@@ -863,6 +928,13 @@ pub fn path_score(
 /// CPA lies too near the recording's start or end for a 24 s path) keeps its own half.
 pub fn refine(spec: &Spec, det: &Detection, c: f64) -> Detection {
     let mut best = det.clone();
+    // Keep the original refinement path for every primary-bank seed. A faster seed must
+    // be allowed to refine inside the same 0.8 c domain that measurement already accepts.
+    let v_max = if det.v > PRIMARY_MAX_SPEED_MPS {
+        0.8 * c
+    } else {
+        0.6 * c
+    };
     let step = spec.dt().max(0.25);
     let fixed_half = (det.half_s < 24.0).then_some(det.half_s);
     let score = |t0r: f64, f0: f64, v: f64, d: f64| {
@@ -894,7 +966,7 @@ pub fn refine(spec: &Spec, det: &Detection, c: f64) -> Detection {
             }
         }
         for k in -8..=8 {
-            let v = (best.v + 2.0 * k as f64 * scale).clamp(20.0, 0.6 * c);
+            let v = (best.v + 2.0 * k as f64 * scale).clamp(20.0, v_max);
             let r = score(best.t0r, best.f0, v, best.d);
             if r.0 > s {
                 (s, sa, sr) = r;
@@ -979,10 +1051,138 @@ pub(crate) fn edge_clip(
         .collect()
 }
 
+/// A subsonic source's exact retarded phase and inverse-range amplitude in stationary noise,
+/// with a separate steady 250 Hz tone. The clock phases and speeds are not on the survey grid.
+#[cfg(test)]
+pub(crate) fn fast_pass_scene((f0, v, d, t0r): (f64, f64, f64, f64), amp: f64) -> Vec<f32> {
+    let (sr, c) = (4000.0, 343.0);
+    let t0e = t0r - d / c;
+    let mut seed = 4242u64;
+    (0..(180.0 * sr) as usize)
+        .map(|i| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let t = i as f64 / sr;
+            let tau = crate::physics::retarded_tau(t, t0e, v, d, c);
+            let range = crate::physics::cv_radial(tau, v, d).0;
+            let source = amp * d / range * (std::f64::consts::TAU * f0 * tau).sin();
+            let noise = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+            (source + noise + 0.03 * (std::f64::consts::TAU * 250.0 * t).sin()) as f32
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) const FAST_PASSES: [(f64, f64, f64, f64); 3] = [
+    (95.0, 190.0, 4500.0, 75.13),
+    (118.0, 215.0, 5000.0, 80.37),
+    (83.0, 245.0, 3600.0, 85.61),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::physics::cv_curve;
+
+    #[test]
+    fn fast_templates_respect_the_existing_subsonic_measurement_bound() {
+        let off = DetectParams {
+            fast_templates: false,
+            ..Default::default()
+        };
+        assert!(build_fast_templates(&off, 1.0).is_empty());
+        for (c, empty) in [
+            (200.0, true),
+            (300.0, false),
+            (343.0, false),
+            (370.0, false),
+        ] {
+            let p = DetectParams {
+                c,
+                ..Default::default()
+            };
+            let fast = build_fast_templates(&p, 1.0);
+            assert_eq!(p.v_grid, PRIMARY_SPEED_GRID);
+            assert!(
+                fast.iter()
+                    .all(|t| t.v > PRIMARY_MAX_SPEED_MPS && t.v <= 0.8 * c)
+            );
+            assert_eq!(fast.is_empty(), empty);
+        }
+    }
+
+    #[test]
+    fn fast_stage_preserves_the_existing_stages_and_detection_cap() {
+        let p = DetectParams::default();
+        let off = DetectParams {
+            fast_templates: false,
+            ..p.clone()
+        };
+        let scenes = [
+            (
+                "ordinary",
+                fast_pass_scene((118.0, 120.0, 2400.0, 90.0), 0.16),
+            ),
+            ("fast", fast_pass_scene(FAST_PASSES[2], 0.16)),
+            ("edge", edge_clip(30.0, EDGE_PASS, 0.3, (0.0, 0.0, 0.0))),
+            ("contrast", swell_scene(0.08, 25.0)),
+        ];
+        let key = |d: &Detection| {
+            (
+                d.id,
+                [
+                    d.t0r,
+                    d.f0,
+                    d.v,
+                    d.d,
+                    d.score,
+                    d.score_approach,
+                    d.score_recede,
+                    d.half_s,
+                ]
+                .map(f64::to_bits),
+                d.harmonic_of,
+                d.from_contrast,
+            )
+        };
+        for (name, x) in scenes {
+            let (ls, _) = survey(&x, 4000, &p).unwrap();
+            let (without, old_cut) = detect_counted(&ls, &off);
+            let (with, cut) = detect_counted(&ls, &p);
+            assert!(with.len() >= without.len(), "{name}");
+            assert!(with.len() <= p.max_detections, "{name}");
+            assert!(cut >= old_cut, "{name}");
+            for (a, b) in without.iter().zip(&with) {
+                assert_eq!(key(a), key(b), "{name}");
+                assert!(b.harmonics.starts_with(&a.harmonics), "{name}");
+            }
+            let added = &with[without.len()..];
+            for d in added {
+                assert!(
+                    d.v > PRIMARY_MAX_SPEED_MPS && d.v <= 0.8 * p.c,
+                    "{name}: {d:?}"
+                );
+                assert!(d.score >= p.thr_db && !d.from_contrast, "{name}: {d:?}");
+            }
+            assert!(added.windows(2).all(|w| w[0].score >= w[1].score), "{name}");
+            if !without.is_empty() {
+                let capped = DetectParams {
+                    max_detections: 1,
+                    ..p.clone()
+                };
+                let capped_off = DetectParams {
+                    fast_templates: false,
+                    ..capped.clone()
+                };
+                assert_eq!(
+                    serde_json::to_value(detect_counted(&ls, &capped).0).unwrap(),
+                    serde_json::to_value(detect_counted(&ls, &capped_off).0).unwrap(),
+                    "{name}: the fast stage displaced a kept detection"
+                );
+            }
+        }
+    }
 
     #[test]
     fn image_scale_floor_leaves_a_spread_image_alone_and_raises_a_compressed_one_exactly() {

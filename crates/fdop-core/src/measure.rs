@@ -854,7 +854,10 @@ mod tests {
     /// Two aircraft in real PCM, the first with a strong second harmonic and a weaker
     /// fundamental. The supplied survey seeds identify their already-grouped family; the
     /// tests exercise actual refinement, ridge measurement, fitting and search selection.
-    fn harmonic_family_scene(broken_primary: bool, fundamental: bool) -> (Vec<f32>, Vec<Detection>) {
+    fn harmonic_family_scene(
+        broken_primary: bool,
+        fundamental: bool,
+    ) -> (Vec<f32>, Vec<Detection>) {
         let (sr, c) = (4000u32, 343.0);
         let primary = Detection {
             id: 41,
@@ -1461,6 +1464,157 @@ mod tests {
         assert!((fr.best.f0 - f0).abs() < 0.3, "f0 {}", fr.best.f0);
         assert!((fr.best.v - v).abs() < 4.0, "v {}", fr.best.v);
         assert!((fr.best.d / d - 1.0).abs() < 0.08, "d {}", fr.best.d);
+    }
+
+    /// The locate path, including family fallback and its independent-event counting, with
+    /// the original coarse detection retained beside each measurement for stage provenance.
+    fn survey_measure_families(
+        x: &[f32],
+        dp: &DetectParams,
+    ) -> (Vec<Detection>, Vec<MeasuredEvent>) {
+        let (ls, lin) = survey(x, 4000, dp).unwrap();
+        let detections = detect(&ls, dp);
+        let primary: Vec<_> = detections
+            .iter()
+            .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+            .collect();
+        let p = MeasureParams::default();
+        let events = measure_ranked_counted(
+            primary.len(),
+            MAX_MEASURED,
+            |ranks| {
+                ranks
+                    .map(|k| {
+                        measure_family(x, 4000, &lin, primary[k], &detections, &format!("e{k}"), &p)
+                    })
+                    .collect()
+            },
+            |events| crate::search::independent_measured_events(events, 0.0).len(),
+        );
+        (
+            primary.into_iter().take(events.len()).cloned().collect(),
+            events,
+        )
+    }
+
+    #[test]
+    fn fast_passes_survive_detection_refinement_and_measurement() {
+        use crate::detect::{FAST_PASSES, PRIMARY_MAX_SPEED_MPS, fast_pass_scene};
+        let dp = DetectParams::default();
+        let mut supplemental_recoveries = 0;
+        let check = |(f0, v, d, t0r): (f64, f64, f64, f64),
+                     seeds: &[Detection],
+                     events: &[MeasuredEvent]| {
+            let diagnostic: Vec<_> = seeds
+                .iter()
+                .zip(events)
+                .map(|(seed, event)| {
+                    (
+                        seed.v,
+                        seed.f0,
+                        seed.score,
+                        event.quality.ok,
+                        event.fit.as_ref().map(|f| f.best),
+                    )
+                })
+                .collect();
+            let independent = crate::search::independent_measured_events(events, 0.0);
+            eprintln!("fast {v} m/s: {diagnostic:?}");
+            assert_eq!(independent.len(), 1, "{v} m/s: {diagnostic:?}");
+            let rank = events
+                .iter()
+                .position(|event| event.id == independent[0].id)
+                .unwrap();
+            let event = &events[rank];
+            let b = event.fit.as_ref().unwrap().best;
+            assert!((b.f0 - f0).abs() < 0.3, "{v} m/s: {b:?}");
+            assert!((b.t0r - t0r).abs() < 0.3, "{v} m/s: {b:?}");
+            assert!((b.v - v).abs() < 4.0, "{v} m/s: {b:?}");
+            assert!((b.d / d - 1.0).abs() < 0.08, "{v} m/s: {b:?}");
+            let seed = &seeds[rank];
+            if seed.v > PRIMARY_MAX_SPEED_MPS {
+                assert!(seed.score >= dp.thr_db);
+                true
+            } else {
+                false
+            }
+        };
+        for pass in FAST_PASSES {
+            let x = fast_pass_scene(pass, 0.16);
+            let (seeds, events) = survey_measure_families(&x, &dp);
+            supplemental_recoveries += usize::from(check(pass, &seeds, &events));
+        }
+
+        // Sweep a fixed, complete 3 dB attenuation ladder for both faster scenes. Loud
+        // passes can already be fitted from a poorly matching old seed; a new template
+        // earns a recovery only if it supplies an accurate event where the old bank
+        // supplies none. Every newly detected case is measured; none is selected by fit.
+        let off = DetectParams {
+            fast_templates: false,
+            ..dp.clone()
+        };
+        for pass in [FAST_PASSES[1], FAST_PASSES[2]] {
+            for quieter_db in (0..=18).step_by(3) {
+                let amplitude = 0.16 * 10.0f64.powf(-(quieter_db as f64) / 20.0);
+                let x = fast_pass_scene(pass, amplitude);
+                let (ls, _) = survey(&x, 4000, &dp).unwrap();
+                let old = detect(&ls, &off);
+                let new = detect(&ls, &dp);
+                let added: Vec<_> = new
+                    .iter()
+                    .filter(|d| d.v > PRIMARY_MAX_SPEED_MPS && d.harmonic_of.is_none())
+                    .collect();
+                eprintln!(
+                    "fast ladder v={} attenuation={quieter_db}dB: {} original seeds, added {added:?}",
+                    pass.1,
+                    old.len()
+                );
+                if added.is_empty() {
+                    continue;
+                }
+                let (_, baseline) = survey_measure_families(&x, &off);
+                assert!(
+                    crate::search::independent_measured_events(&baseline, 0.0).is_empty(),
+                    "{} m/s, {quieter_db} dB: the original bank already supplied an event",
+                    pass.1
+                );
+                let (seeds, events) = survey_measure_families(&x, &dp);
+                assert!(
+                    check(pass, &seeds, &events),
+                    "{} m/s, {quieter_db} dB: no supplemental event",
+                    pass.1
+                );
+                supplemental_recoveries += 1;
+            }
+        }
+        assert!(
+            supplemental_recoveries >= 1,
+            "no supplemental detection supplied an aircraft event"
+        );
+    }
+
+    #[test]
+    fn fast_bank_noise_hum_and_reversed_passes_supply_no_aircraft_event() {
+        use crate::detect::{FAST_PASSES, fast_pass_scene};
+        let mut cases = vec![("noise and hum", fast_pass_scene(FAST_PASSES[0], 0.0))];
+        for (label, pass) in [
+            ("reversed 215 m/s", FAST_PASSES[1]),
+            ("reversed 245 m/s", FAST_PASSES[2]),
+        ] {
+            let mut reversed = fast_pass_scene(pass, 0.16);
+            reversed.reverse();
+            cases.push((label, reversed));
+        }
+        for (label, x) in cases {
+            let (seeds, events) = survey_measure_families(&x, &DetectParams::default());
+            let accepted: Vec<_> = seeds
+                .iter()
+                .zip(&events)
+                .filter(|(_, event)| event.is_aircraft_like())
+                .map(|(seed, event)| (seed, event.fit.as_ref().unwrap().best))
+                .collect();
+            assert!(accepted.is_empty(), "{label}: {accepted:?}");
+        }
     }
 
     fn simultaneous_same_tone_audio(amplitudes: [f64; 2]) -> Vec<f32> {

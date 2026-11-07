@@ -386,7 +386,7 @@ fn curve_call(
 
 /// Whether the measurement at rank `k`, of detection `d`, is one the old measurement line would not
 /// have made: past the strongest `max_measured`, a primary whose detection scored under `thr_db`,
-/// one found only on the contrast image, or a harmonic that rescued an unusable primary.
+/// one found only on the contrast image, a faster supplemental seed, or a harmonic recovery.
 fn past_the_old_line(
     k: usize,
     primary: &Detection,
@@ -397,6 +397,7 @@ fn past_the_old_line(
     k >= max_measured
         || primary.score < thr_db
         || primary.from_contrast
+        || primary.v > detect::PRIMARY_MAX_SPEED_MPS
         || measured.harmonic_of.is_some()
 }
 
@@ -943,7 +944,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         e.id = id;
     }
     log.say(&format!(
-        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, found only on the contrast image, or recovered from a harmonic)",
+        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, found only on the contrast image, from the fast bank, or recovered from a harmonic)",
         added.len(),
         dp.thr_db
     ));
@@ -2388,6 +2389,12 @@ mod tests {
         assert!(primary_only(24, det(9.0, false)));
         assert!(primary_only(0, det(4.4, false)));
         assert!(primary_only(0, det(9.0, true)));
+        let mut fast = det(9.0, false);
+        fast.v = detect::PRIMARY_MAX_SPEED_MPS;
+        assert!(!primary_only(0, fast.clone()));
+        fast.v += 1.0;
+        // Provenance belongs to the coarse seed even if refinement later lowers its speed.
+        assert!(past_the_old_line(0, &fast, &det(9.0, false), 24, 4.5));
 
         let primary = det(9.0, false);
         let mut measured = primary.clone();

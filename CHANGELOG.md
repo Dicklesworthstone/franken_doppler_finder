@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Detect faint aircraft beyond the original speed bank
+
+- Append faster subsonic templates after the existing primary, edge and contrast stages. Continue
+  the original grid's last speed ratio above 175 m/s, up to the existing 0.8 c measurement bound:
+  approximately 194, 215, 238 and 263 m/s at the default sound speed. Keep earlier detections and
+  their order, residual masking, the shared candidate budget and detection cap. Added seeds must
+  clear the existing strong line; no detector or measurement acceptance threshold is lowered.
+- Permit supplemental seeds to refine within the existing measurement domain while preserving the
+  original refinement path for legacy seeds. Count an event's faster coarse seed as measured past
+  the old line, even if refinement lowers its speed, so added evidence retains the existing grading
+  safeguard. This does not change aircraft-type filtering or independent-event caps.
+- **Validation.** All four focused fast-bank tests passed through real RCH. Three loud PCM scenes
+  at 190, 215 and 245 m/s retain the original accuracy assertions. A complete 14-scene attenuation
+  ladder additionally establishes one new recovery: a 215 m/s, 5 km pass attenuated by 18 dB yields
+  no baseline event, but the supplemental bank fits 118.01067 Hz (truth 118), 214.97648 m/s,
+  4999.652 m and 80.36653 s (truth 80.37). Noise/hum and reversed passes yield no aircraft event;
+  stage-prefix, detection-cap and speed-bound regressions pass.
+- Legacy detections can still mask some faster curves before this final bank runs. The synthetic
+  recovery does not establish that the previously reported field miss is fixed. Full application
+  compilation was killed in upstream `asupersync` before pipeline tests ran; the provenance test,
+  workspace gates and reference-recording replay remain pending.
+
 ### Recover unbiased frequencies after a long tonal asymptote
 
 - A pass that dwells near its asymptotic frequency can contaminate the row background enough to

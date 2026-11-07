@@ -257,7 +257,7 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
 | no unheard close pass | no tonal aircraft passed much closer than the heard ones without leaving a detection |
 | radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
 | curve match | listed when the [curve match](#the-curve-match) stands: the answer is within 3 km of where it stands. Also listed, failed, on a medium answer when the curve match ran with enough decoy clocks to judge (40) and stands nowhere |
-| measurement line | listed, failed, only on a medium answer that rests on a core match measured past the old line (a detection score under 4.5, past the strongest 24, found only on the contrast image, or recovered from a harmonic after its primary failed) when no curve match ran with enough decoy clocks to judge it |
+| measurement line | listed, failed, only on a medium answer that rests on a core match measured past the old line (a detection score under 4.5, past the strongest 24, found only on the contrast image, from a faster supplemental seed, or recovered from a harmonic after its primary failed) when no curve match ran with enough decoy clocks to judge it |
 
 Refinement uses the grid to find a basin, then improves the observer position with a bounded continuous
 search that evaluates the same physical trace model at every proposed point. The grid spacing controls
@@ -582,7 +582,7 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 
 ### `fdop detect <MEDIA>`: flyovers only, no ADS-B
 
-Detects flyovers and measures them strongest first, from the silence line up, until 24 independent aircraft
+Detects flyovers and measures them in detector order, strongest first within each stage, until 24 independent aircraft
 events survive the same eligibility and harmonic checks used by `locate`. If a family's primary fails,
 its detected harmonic siblings are tried strongest first until one passes the existing quality and aircraft
 gates. The family supplies at most one result. Refused fits, non-aircraft fits and duplicate traces of one
@@ -835,12 +835,20 @@ Design notes:
   before the frame contrast can take the swell out. On Livermore's N1387U_R44, a 157 Hz tone 33 dB over its
   neighbours at the CPA had a row z of 1 to 1.5, and nothing in its image scored over 2.88. An image under the 0.5
   floor therefore gets a second one from the same levels, with the frame contrast taken first and each row's
-  robust z after it (`LogSpec::contrast`). After everything else, the full bank scores it on what the accepted
+  robust z after it (`LogSpec::contrast`). After the primary and edge stages, the full bank scores it on what the accepted
   curves left, at the strong line, 4.5, since the lines were not set on this image. Its detections follow all
   the others, which keep their order, harmonic grouping and measurement, and carry `from_contrast`. No null
   recording is under the floor, so no null run tests them, and an answer resting on one counts as measured
   past the old line. On swells of noise alone the stage adds nothing up to 30 dB. From 35 dB it adds strong
   curves of its own, and the measurement gates refuse them.
+- **A final bank covers faster subsonic passes.** After the primary, edge and contrast stages, templates
+  continue the original speed spacing above 175 m/s, up to the existing measurement bound of 0.8 times
+  sound speed (about 194, 215, 238 and 263 m/s at 343 m/s). They use residual evidence, the remaining
+  candidate budget and detection slots, and must clear the existing strong line. Earlier detections keep
+  their order. Refinement permits these faster seeds inside the same measurement bound; legacy seeds
+  keep their original refinement path. A faster coarse seed counts as measured past the old line even
+  if refinement lowers its speed. A fixed 14-scene synthetic signal-strength sweep establishes one new
+  faint 215 m/s recovery with no baseline event; it does not establish recovery of a real field miss.
 - **STFT working storage stays bounded as recordings grow.** Frames transform into a reusable block of
   at most 256 columns and 4 MiB of frequency values, then copy into the final row-major spectrogram.
   A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
@@ -1458,8 +1466,9 @@ audio or video recorded somewhere sensitive:
     and nulls use, and 62 of 92 on set D.
   - The search follows each aircraft's real ADS-B path. For misfit events it also allows one change of tone,
     such as an RPM or power change.
-- **Detection envelope:** 35–1100 Hz, about 40–175 m/s and 250 m–12 km at detection, with the decode at
-  4 kHz.
+- **Detection envelope:** 35–1100 Hz and 250 m–12 km, with the decode at 4 kHz. The primary speed bank
+  spans 40–175 m/s; a final strong-only bank adds faster subsonic templates, about 194–263 m/s at the
+  default sound speed. Earlier detections can still mask a faster curve before that final bank runs.
 - **Atmosphere:** a straight-ray, height-averaged speed of sound with horizontal wind only. No refraction.
 - **Data volume:** each new UTC day costs about 4 GB of download, and adsb.lol archives cannot be fetched
   partially. adsb.lol has gaps on some days.
