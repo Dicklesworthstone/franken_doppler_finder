@@ -1027,7 +1027,7 @@ fn stamp_track(
                         dx * dx + dy * dy + dz * dz
                     };
                     let d2 = dist2(*q) as f32;
-                    if !d2.is_finite() || d2 > (reach * reach) as f32 {
+                    if !d2.is_finite() {
                         continue;
                     }
                     let before = if sample == 0 {
@@ -1081,10 +1081,23 @@ fn stamp_track(
                             }
                         }
                     }
-                    let (pos, vel) = tr.pv(bt);
+                    let (mut pos, mut vel) = tr.pv(bt);
+                    // Squared range is not quadratic along a turning Hermite path. Keep
+                    // the sampled point unless the actual proposed point is strictly closer.
+                    let proposed_d2 = dist2(g.enu.from_ecef(pos));
+                    if !proposed_d2.is_finite() || proposed_d2 >= dist2(*q) {
+                        bt = times[i];
+                        (pos, vel) = tr.pv(bt);
+                    }
                     let d = dist2(g.enu.from_ecef(pos)).sqrt();
                     let v = norm(vel);
-                    if v < 15.0 || v > p.v_grid.last().copied().unwrap_or(200.0) * 1.15 {
+                    // The closest sample can be outside reach while the interpolated pass
+                    // enters it. Apply the range gate to that pass, after finding its CPA.
+                    if !d.is_finite()
+                        || d > reach
+                        || v < 15.0
+                        || v > p.v_grid.last().copied().unwrap_or(200.0) * 1.15
+                    {
                         continue;
                     }
                     let c = c_at(bt);
@@ -1198,7 +1211,9 @@ fn score_exact(
         for i in 0..=n {
             let left = i == 0 || ds[i] <= ds[i - 1];
             let right = i == n || ds[i] < ds[i + 1];
-            if !(left && right) || ds[i] > p.reach_m {
+            // A grazing pass can lie inside reach between two samples that both lie outside.
+            // Refine the local minimum before applying the existing physical range gate.
+            if !(left && right) || !ds[i].is_finite() {
                 continue;
             }
             let te = ta + (tb - ta) * i as f64 / n as f64;
@@ -2874,6 +2889,179 @@ mod tests {
             ]);
         }
         tr
+    }
+
+    /// A pass just inside/outside the reach, straight or turning at 3 degrees per second.
+    fn grazing_track(distance: f64, turning: bool) -> TrackModel {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let height = 800.0;
+        let offset = (distance * distance - (height - MIC_HEIGHT_M).powi(2)).sqrt();
+        let mut tr = scene_track(
+            [offset, 0.0, height],
+            [0.0, 100.0, 0.0],
+            100.0,
+            -200.0,
+            1400.0,
+        );
+        if turning {
+            let omega = std::f64::consts::TAU / 120.0;
+            for (i, &t) in tr.t.iter().enumerate() {
+                let (sin, cos) = (omega * (t - clock - 100.0)).sin_cos();
+                tr.pos[i] = enu.to_ecef([offset + 1200.0 * (1.0 - cos), 1200.0 * sin, height]);
+                tr.vel[i] = enu.vec_to_ecef([1200.0 * omega * sin, 1200.0 * omega * cos, 0.0]);
+            }
+        }
+        tr.key = "grazing".into();
+        tr.icao = tr.key.clone();
+        tr
+    }
+
+    #[test]
+    fn grazing_pass_keeps_an_eligible_sample_when_the_quadratic_step_is_worse() {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let p = MatchParams::default();
+        let mut tr = scene_track(
+            [0.0, 7999.8, 600.0 + MIC_HEIGHT_M],
+            [100.0, 0.0, 0.0],
+            4.0,
+            0.0,
+            8.0,
+        );
+        assert_eq!(tr.t.len(), 3);
+        let ranges = [p.reach_m + 0.8, p.reach_m - 0.2, p.reach_m];
+        for (i, (east, radial_v)) in [(-400.0f64, 0.0), (0.0, 1.0), (400.0, -5.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let north = (ranges[i].powi(2) - east.powi(2) - 600.0f64.powi(2)).sqrt();
+            tr.pos[i] = enu.to_ecef([east, north, 600.0 + MIC_HEIGHT_M]);
+            tr.vel[i] = enu.vec_to_ecef([100.0, radial_v, 0.0]);
+        }
+        // The sampled squared ranges suggest a later CPA, but the actual cubic path there
+        // is farther away. The valid middle sample must survive the final physical gate.
+        let da = ranges[0].powi(2) - ranges[1].powi(2);
+        let db = ranges[2].powi(2) - ranges[1].powi(2);
+        let shift = 2.0 * (da - db) / (da + db);
+        let observer = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        assert!(norm(sub(tr.pos_at(clock + 4.0 + shift), observer)) > p.reach_m);
+        assert!(norm(sub(tr.pos_at(clock + 4.0), observer)) < p.reach_m);
+        let mut stamped = Vec::new();
+        stamp_track(
+            &tr,
+            &observer_cell(&p),
+            &p,
+            &|_| BASE_C,
+            clock,
+            (clock, clock + 8.0),
+            &mut stamped,
+        );
+        assert_eq!(stamped.len(), 1);
+        let expected = 4.0 + ranges[1] / BASE_C;
+        assert!((stamped[0].1.arrive as f64 - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn grazing_passes_reach_coarse_votes_between_range_samples() {
+        let (_, _, clock) = SCENE_AT;
+        let p = MatchParams::default();
+        let g = observer_cell(&p);
+        for turning in [false, true] {
+            for distance in [p.reach_m - 0.5, p.reach_m + 0.5] {
+                let tr = grazing_track(distance, turning);
+                for phase in [0.0, 2.0] {
+                    let mut stamped = Vec::new();
+                    stamp_track(
+                        &tr,
+                        &g,
+                        &p,
+                        &|_| BASE_C,
+                        clock,
+                        (clock + phase, clock + 360.0 + phase),
+                        &mut stamped,
+                    );
+                    if distance < p.reach_m {
+                        let arrival = 100.0 + distance / BASE_C;
+                        assert!(
+                            stamped.iter().any(|(_, pass)| {
+                                (pass.arrive as f64 - arrival).abs() < 0.1
+                            }),
+                            "eligible grazing pass lost: turning={turning}, phase={phase}"
+                        );
+                    } else {
+                        assert!(stamped.is_empty(), "a refined pass outside reach voted");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grazing_passes_are_heard_across_exact_clock_seeds() {
+        let p = MatchParams::default();
+        let mut crossing = scene_track(
+            [0.0, 800.0, 600.0 + MIC_HEIGHT_M],
+            [100.0, 0.0, 0.0],
+            300.0,
+            -200.0,
+            800.0,
+        );
+        crossing.key = "crossing".into();
+        crossing.icao = crossing.key.clone();
+        // Keep enough off-pass audio for the empirical null of this broad, distant curve.
+        let mut c = scene_for(
+            vec![grazing_track(p.reach_m - 0.5, false), crossing],
+            200.0,
+            900.0,
+        );
+        // Its sampled range at CPA +/- 2 s exceeds reach, although the actual pass is eligible.
+        let observer = geodetic_to_ecef(c.lat, c.lon, MIC_HEIGHT_M);
+        assert!(norm(sub(c.tracks[0].pos_at(c.clock + 98.0), observer)) > p.reach_m);
+        assert!(norm(sub(c.tracks[0].pos_at(c.clock + 102.0), observer)) > p.reach_m);
+        assert!(norm(sub(c.tracks[0].pos_at(c.clock + 100.0), observer)) < p.reach_m);
+        // An almost identical unrecorded path still must fail the unchanged final range gate.
+        let mut outside = grazing_track(p.reach_m + 0.5, false);
+        outside.key = "outside-reach".into();
+        outside.icao = outside.key.clone();
+        c.tracks.push(outside);
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let bank = build_bank(&im, &p);
+        let idx: Vec<_> = (0..c.tracks.len()).collect();
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &c.tracks,
+            region: c.region,
+            start_lo: c.clock,
+            start_hi: c.clock + 2.0,
+            duration_s: c.x.len() as f64 / 2800.0,
+            catalog: (f64::NEG_INFINITY, f64::INFINITY),
+            dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        // The aligned seed establishes audibility before the original failing sampling phases.
+        for phase in [2.0, 0.0, 0.5, 1.0, 1.5] {
+            let e = score_exact(&inp, &p, &bank, &idx, c.lat, c.lon, c.clock + phase)
+                .expect("the crossing flight supplies an exact score");
+            println!(
+                "grazing seed {phase}: heard {}, passes {:?}",
+                e.n_heard, e.passes
+            );
+            assert!((inp.start_lo..=inp.start_hi).contains(&e.clock));
+            for key in ["grazing", "crossing"] {
+                assert!(
+                    e.passes.iter().any(|pass| {
+                        pass.key == key && counts_as_heard(pass.value, pass.nats, pass.shared)
+                    }),
+                    "{key} was not independently heard at seed {phase}: {:?}",
+                    e.passes
+                );
+            }
+            assert!(e.passes.iter().all(|pass| pass.key != "outside-reach"));
+        }
     }
 
     #[test]

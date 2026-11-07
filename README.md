@@ -375,6 +375,10 @@ in `crates/fdop-core/src/curvematch.rs`:
   within one six-minute chunk. A shared sampling lattice and chunk ownership give each visit one vote per
   place. Interior approach times use the curvature of squared range and the interpolated trajectory;
   real track endpoints remain eligible, while an artificial catalogue boundary cannot create a pass.
+  Coarse and exact scoring refine a sampled local minimum before applying the physical reach limit,
+  so a pass just inside the limit can survive when its nearby samples are outside. Coarse refinement
+  keeps the original sampled point if its proposed time is no closer on the actual trajectory.
+  An actual closest approach outside the reach remains excluded.
   Exact trajectories between bank shapes use interpolated fitted null quantiles on the existing
   log-speed/log-distance grid. This removes evidence jumps caused solely by selecting a neighbouring
   calibration template. Bank nodes remain exact, exterior values clamp to the endpoints, and real
@@ -1167,6 +1171,15 @@ The clock coverage guard tracks timestamps, not equivalence of physical pass rec
 different seeds. More clock peaks can add work; progress logs expose candidate counts and initial
 exact starts separately from refinement and diagnostic probes. Full workspace checks, formatting,
 the CLI release selftest, field replays and runtime effects of the new changes remain unverified.
+
+The grazing-range repair adds straight/turning sampled-track cases, an actual Hermite-path
+fallback case, and a PCM test spanning several exact-clock seeds. The old coarse regression
+executed and lost a valid 7,999.5 m pass at sampling phase 2, as predicted. The first 400-second
+PCM fixture failed its aligned-seed audibility prerequisite at 3.055 nats, before checking the
+other seeds. Its revised 900-second recording supplies more off-pass background for the empirical
+null, with the same geometry, amplitude and physical assertions. That revision, the production
+fix and the Hermite regression remain unrun; source review and independent geometry checks
+passed. The final reach and heard thresholds are unchanged.
 
 The historical-radiosonde repair adds lifetime-boundary checks and an offline cached-profile
 regression, including a closed station with usable historical winds and a station opening at

@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep valid closest approaches between range samples
+
+- Refine finite local range minima before applying the physical reach gate in coarse curve
+  stamping and exact scoring. A valid 7,999.5 m pass at 100 m/s was discarded because its samples
+  two seconds either side were about 8,002 m away. The final 8 km limit is unchanged.
+- Evaluate a coarse quadratic timing proposal on the actual interpolated track. Keep the
+  original sample whenever the proposal is nonfinite or no closer, so a non-quadratic Hermite
+  path cannot lose an already eligible sample merely because its timing estimate is worse.
+  This is a bounded comparison of existing candidates, with no new search grid or range slack.
+- Add straight/turning track regressions across sampling phases and both sides of the reach,
+  a real Hermite interpolation regression, and actual PCM exact-scoring coverage with a separate
+  crossing flight and an unrecorded outside-reach control.
+- **Validation:** the old coarse regression executed through real RCH and failed at the predicted
+  straight-track sampling phase. The original 400-second PCM case failed its aligned-seed
+  audibility prerequisite at 3.055 nats, before it could check other seeds. Its revised
+  900-second PCM and longer grazing tracks provide more off-pass null background while keeping
+  geometry, amplitude and all physical gates. Independent source review and geometric
+  arithmetic checks passed, but the revised PCM, production fix, Hermite test, formatting,
+  workspace gates and recording replays remain unrun after executor loss. No successful new
+  PCM recovery is claimed.
+
 ### Remove exact-score evidence jumps between calibration templates
 
 - Replace nearest-template null selection for an exact trajectory with bilinear interpolation
