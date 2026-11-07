@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover supported track segments hidden by rejected reports
+
+- Preserve the original longest consistent position chain and recover additional supported
+  chains entirely outside its time coverage. Sparse corrupt reports can hide a real coverage
+  gap in the raw timestamps; previously the single winning chain discarded the other valid
+  section, removing a possible flight match from both searches.
+- Keep the existing predecessor time limit, physical predicates and tie order. Extra intervals
+  must be more than `max_gap_s` apart and reachable under the same speed/vertical bounds. Each
+  interval remains a separate interpolation model; overlapping alternatives stay rejected.
+- Preserve the original model's key, geometry, velocities and quality fractions. Extra models
+  append `#recoveredN` without renumbering later original models. All returned points contribute
+  to the existing cleaning counts. A denser ambiguous winning component is deliberately unchanged.
+- Reuse the existing predecessor paths: at most one linear root pass, an O(n log n) endpoint
+  ranking/ordered-neighbour scan and linear total traceback. Complete clean tracks avoid that
+  recovery allocation/sort when no temporally disjoint part could fit.
+- Add six regressions for sparse-gap recovery in both directions, ambiguous/overlapping/unreachable
+  alternatives, stable keys and minimum support. An independent planar model completed ten checks;
+  removing the old time limit instead admitted a mixed path containing all 800 false reports in
+  its overlapping-track control. This is arithmetic evidence, not native Rust execution.
+- **Validation:** independent source review found no blocker. New tests, formatting, Clippy,
+  release selftest and recording/reference replays remain unrun while the executor is unavailable.
+  No change in field accuracy or confidence is claimed.
+
 ### Release completed archive-day tracks while other downloads continue
 
 - Once a newly downloaded day is atomically cached, release its built point arrays immediately.

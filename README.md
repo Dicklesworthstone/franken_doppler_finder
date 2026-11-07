@@ -863,6 +863,13 @@ Design notes:
   moment of the flight is a candidate CPA: the recorder then sits on the perpendicular to the path through that
   point, at a distance that fits the measured CPA distance, and the moment fixes the recording start. A hash join
   on (east, north, recording start) finds the places two events share in O(N) time.
+- **Rejected reports cannot hide a separate supported flight segment.** Track cleaning keeps the
+  original longest physically consistent chain, then can recover another supported chain wholly
+  before or after it. Every retained interval must be separated by more than the existing 180 s
+  gap limit and physically reachable from its neighbours under the same speed/vertical limits.
+  Each interval becomes a separate model; interpolation never crosses the hole. The original
+  model and existing split keys stay intact; additional models use deterministic `#recoveredN`
+  suffixes. Overlapping alternatives and a denser ambiguous winning component remain unresolved.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
@@ -1118,6 +1125,14 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ## Testing
 
 ### Recovery changes (2026-11-07): validation incomplete
+
+**Separated track-segment recovery.** Six new regressions preserve the original model bit for bit
+while recovering either side of a coverage gap hidden by sparse false reports. Controls retain an
+ambiguous denser winner, reject overlapping and unreachable alternatives, keep later split IDs stable,
+and enforce the existing two-report minimum. An independent planar arithmetic model checked ten
+cases and exposed why unlimited predecessor lookback would admit a mixed false path; the implemented
+recovery keeps the original bounded predecessor search. Independent source review completed, but
+native tests, formatting, release selftest and recording replays remain unrun during the outage.
 
 **Fresh-day publication handoff.** Completed days now release their built point arrays after atomic
 publication and retain the same opened cache inode for later selective loading. New regressions cover

@@ -2,11 +2,12 @@
 //! vectors (velocity-Hermite). Reported ground speed / track / vertical rate are used when
 //! present and consistent with the positions; otherwise velocity comes from second-order
 //! finite differences. Tracks are split at gaps longer than `max_gap_s` so interpolation never
-//! invents geometry across a coverage hole. Within each piece only the longest physically
-//! consistent chain of positions is kept: archived legs can interleave junk positions (MLAT
-//! mis-solutions, another aircraft's position under the same address) that the interpolation
-//! would otherwise fly through. Points without GNSS height that GNSS-height points bracket closely
-//! are dropped first (`drop_bracketed_non_gnss`).
+//! invents geometry across a coverage hole. The longest physically consistent chain anchors each
+//! raw piece: archived legs can interleave junk positions (MLAT mis-solutions, another aircraft's
+//! position under the same address) that interpolation would otherwise fly through. Supported
+//! chains outside the winner's time coverage can survive as separate models when the same
+//! physical limits connect their endpoints. Overlapping alternatives stay rejected. Points without
+//! GNSS height that GNSS-height points bracket closely are dropped first (`drop_bracketed_non_gnss`).
 
 use fdop_types::engine::EngineClass;
 use fdop_types::geo::{Enu, V3, add, dot, ecef_to_geodetic, geodetic_to_ecef, norm, scale, sub};
@@ -14,7 +15,7 @@ use fdop_types::store::{FlightLeg, alt_src, pt_flags};
 
 #[derive(Clone, Debug)]
 pub struct TrackModel {
-    /// Leg key, plus `#k` when the leg was split at a gap.
+    /// Original leg/split key; extra parts recovered during cleaning append `#recoveredN`.
     pub key: String,
     pub icao: String,
     pub reg: String,
@@ -87,15 +88,14 @@ fn drop_bracketed_non_gnss(pts: &mut Vec<fdop_types::store::TrackPoint>, max_spa
     });
 }
 
-/// Indices of the longest chain of points (time-sorted) in which every consecutive pair is
-/// physically consistent: horizontal distance <= v_lim * dt + slack and height change <=
-/// `max_vz_mps` * dt + slack, with v_lim from the leg's median reported ground speed. Junk
-/// interleaved with a real track (even several junk points in a row) cannot form the longer
-/// chain, so it drops out; a clean leg keeps every point.
-fn consistent_chain(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) -> Vec<usize> {
+/// Keep the original longest physically consistent chain, then recover well-separated parts
+/// before or after it. Added parts must have at least two points, be more than `max_gap_s` from
+/// every kept part, and be physically reachable from their kept neighbours. An alternative
+/// overlapping the winning chain stays rejected, even if a portion extends beyond it.
+fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) -> Vec<Vec<usize>> {
     let n = pts.len();
     if n < 3 {
-        return (0..n).collect();
+        return vec![(0..n).collect()];
     }
     let mut gs: Vec<f64> = pts
         .iter()
@@ -143,14 +143,60 @@ fn consistent_chain(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) -> 
         }
         prefix_best[j] = prefix_best[j - 1].max(best[j]);
     }
-    let mut k = (0..n).max_by_key(|&k| (best[k], k)).unwrap_or(0);
-    let mut chain = vec![k];
-    while prev[k] != usize::MAX {
-        k = prev[k];
-        chain.push(k);
+    let winner = (0..n).max_by_key(|&k| (best[k], k)).unwrap_or(0);
+    let trace = |mut k: usize| {
+        let mut chain = vec![k];
+        while prev[k] != usize::MAX {
+            k = prev[k];
+            chain.push(k);
+        }
+        chain.reverse();
+        chain
+    };
+    let primary = trace(winner);
+    let first = primary[0];
+    // Clean tracks, and rejected reports confined to the winner's time support, retain the
+    // old result without allocating/sorting other paths. No disjoint part can fit here.
+    if primary.len() < 2
+        || (pts[first].t - pts[0].t <= bp.max_gap_s
+            && pts[n - 1].t - pts[winner].t <= bp.max_gap_s)
+    {
+        return vec![primary];
     }
-    chain.reverse();
-    chain
+
+    let mut roots: Vec<usize> = (0..n).collect();
+    for k in 0..n {
+        if prev[k] != usize::MAX {
+            roots[k] = roots[prev[k]];
+        }
+    }
+    let mut ends: Vec<usize> = (0..n).filter(|&k| best[k] >= 2).collect();
+    ends.sort_unstable_by(|&a, &b| best[b].cmp(&best[a]).then(b.cmp(&a)));
+    let mut kept = std::collections::BTreeMap::from([(first, winner)]);
+    for end in ends {
+        let start = roots[end];
+        let before = kept.range(..start).next_back().map(|(_, &k)| k);
+        let after = kept.range(start..).next().map(|(&k, _)| k);
+        if before.is_some_and(|k| {
+            k >= start || pts[start].t - pts[k].t <= bp.max_gap_s || !ok(k, start)
+        }) || after.is_some_and(|k| {
+            end >= k || pts[k].t - pts[end].t <= bp.max_gap_s || !ok(end, k)
+        }) {
+            continue;
+        }
+        // A long interval is used only to check physical reachability; no model interpolates
+        // across it. The predecessor paths themselves still obey the original time-gap limit.
+        kept.insert(start, end);
+    }
+    // Keep the legacy winner first so its model and key remain unchanged. Recovered parts
+    // follow in chronological order. Their disjoint spans bound total traceback work by n.
+    let mut chains = vec![primary];
+    for (_, end) in kept {
+        if end != winner {
+            chains.push(trace(end));
+        }
+    }
+    chains
 }
 
 fn fd_velocity(t: &[f64], p: &[V3]) -> Vec<V3> {
@@ -252,61 +298,71 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
     let mut part = 0;
     for i in 1..=pts.len() {
         if i == pts.len() || pts[i].t - pts[i - 1].t > bp.max_gap_s {
-            let keep = consistent_chain(&pts[start..i], bp);
-            let seg_owned: Vec<_> = keep.iter().map(|&k| pts[start + k]).collect();
-            let seg = &seg_owned[..];
-            if seg.len() >= 2 {
-                let t: Vec<f64> = seg.iter().map(|p| p.t).collect();
-                let pos: Vec<V3> = seg
-                    .iter()
-                    .map(|p| geodetic_to_ecef(p.lat, p.lon, p.alt_m as f64))
-                    .collect();
-                let fd = fd_velocity(&t, &pos);
-                let mut vel = fd.clone();
-                let mut n_rep = 0usize;
-                for (k, p) in seg.iter().enumerate() {
-                    if p.gs_mps.is_finite() && p.track_deg.is_finite() {
-                        let (gs, trk) = (p.gs_mps as f64, (p.track_deg as f64).to_radians());
-                        let enu = Enu::new(p.lat, p.lon, 0.0);
-                        // vertical: reported rate, else finite difference
-                        let fd_enu = enu.vec_from_ecef(fd[k]);
-                        let vu = if p.vrate_mps.is_finite() {
-                            p.vrate_mps as f64
-                        } else {
-                            fd_enu[2]
-                        };
-                        let rep = enu.vec_to_ecef([gs * trk.sin(), gs * trk.cos(), vu]);
-                        // consistency (only meaningful when neighbours are close in time)
-                        let near = (k > 0 && t[k] - t[k - 1] < 30.0)
-                            || (k + 1 < t.len() && t[k + 1] - t[k] < 30.0);
-                        if !near
-                            || norm(sub(rep, fd[k])) <= bp.vel_consistency_mps
-                            || turn_consistent(seg, &pos, k, &enu, vu, bp.vel_consistency_mps)
-                        {
-                            vel[k] = rep;
-                            n_rep += 1;
+            let chains = consistent_chains(&pts[start..i], bp);
+            let primary_kept = chains.first().is_some_and(|chain| chain.len() >= 2);
+            let base_key = if part == 0 && i == pts.len() && start == 0 {
+                leg.key.clone()
+            } else {
+                format!("{}#{}", leg.key, part)
+            };
+            for (recovered, keep) in chains.into_iter().enumerate() {
+                let seg_owned: Vec<_> = keep.iter().map(|&k| pts[start + k]).collect();
+                let seg = &seg_owned[..];
+                if seg.len() >= 2 {
+                    let t: Vec<f64> = seg.iter().map(|p| p.t).collect();
+                    let pos: Vec<V3> = seg
+                        .iter()
+                        .map(|p| geodetic_to_ecef(p.lat, p.lon, p.alt_m as f64))
+                        .collect();
+                    let fd = fd_velocity(&t, &pos);
+                    let mut vel = fd.clone();
+                    let mut n_rep = 0usize;
+                    for (k, p) in seg.iter().enumerate() {
+                        if p.gs_mps.is_finite() && p.track_deg.is_finite() {
+                            let (gs, trk) = (p.gs_mps as f64, (p.track_deg as f64).to_radians());
+                            let enu = Enu::new(p.lat, p.lon, 0.0);
+                            // vertical: reported rate, else finite difference
+                            let fd_enu = enu.vec_from_ecef(fd[k]);
+                            let vu = if p.vrate_mps.is_finite() {
+                                p.vrate_mps as f64
+                            } else {
+                                fd_enu[2]
+                            };
+                            let rep = enu.vec_to_ecef([gs * trk.sin(), gs * trk.cos(), vu]);
+                            // consistency (only meaningful when neighbours are close in time)
+                            let near = (k > 0 && t[k] - t[k - 1] < 30.0)
+                                || (k + 1 < t.len() && t[k + 1] - t[k] < 30.0);
+                            if !near
+                                || norm(sub(rep, fd[k])) <= bp.vel_consistency_mps
+                                || turn_consistent(seg, &pos, k, &enu, vu, bp.vel_consistency_mps)
+                            {
+                                vel[k] = rep;
+                                n_rep += 1;
+                            }
                         }
                     }
+                    let key = if recovered == 0 {
+                        base_key.clone()
+                    } else {
+                        format!("{base_key}#recovered{}", recovered - 1)
+                    };
+                    let mlat = seg.iter().filter(|p| p.flags & pt_flags::MLAT != 0).count();
+                    out.push(TrackModel {
+                        key,
+                        icao: leg.icao.clone(),
+                        reg: leg.reg.clone(),
+                        typ: leg.typ.clone(),
+                        engine: leg.engine,
+                        source: leg.source.clone(),
+                        reported_vel_frac: n_rep as f64 / seg.len() as f64,
+                        mlat_frac: mlat as f64 / seg.len() as f64,
+                        t,
+                        pos,
+                        vel,
+                    });
                 }
-                let key = if part == 0 && i == pts.len() && start == 0 {
-                    leg.key.clone()
-                } else {
-                    format!("{}#{}", leg.key, part)
-                };
-                let mlat = seg.iter().filter(|p| p.flags & pt_flags::MLAT != 0).count();
-                out.push(TrackModel {
-                    key,
-                    icao: leg.icao.clone(),
-                    reg: leg.reg.clone(),
-                    typ: leg.typ.clone(),
-                    engine: leg.engine,
-                    source: leg.source.clone(),
-                    reported_vel_frac: n_rep as f64 / seg.len() as f64,
-                    mlat_frac: mlat as f64 / seg.len() as f64,
-                    t,
-                    pos,
-                    vel,
-                });
+            }
+            if primary_kept {
                 part += 1;
             }
             start = i;
@@ -1337,6 +1393,206 @@ mod tests {
             (closest - true_d).abs() < 20.0,
             "closest {closest:.0} m vs {true_d:.0} m"
         );
+    }
+
+
+    fn gap_fixture_point(t: f64, north: f64) -> fdop_types::store::TrackPoint {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let bad = north != 0.0;
+        let p = enu.to_ecef([
+            100.0 * (t - 1000.0),
+            north,
+            if bad { 12_000.0 } else { 1200.0 },
+        ]);
+        let (lat, lon, alt) = ecef_to_geodetic(p);
+        fdop_types::store::TrackPoint {
+            t,
+            lat,
+            lon,
+            alt_m: alt as f32,
+            gs_mps: 100.0,
+            track_deg: 90.0,
+            vrate_mps: 0.0,
+            // Position corruption need not imply a missing geometric height. Keep these
+            // reports through the separate GNSS bridge filter to exercise chain selection.
+            alt_src: alt_src::GEOM,
+            flags: if bad { pt_flags::MLAT } else { 0 },
+        }
+    }
+
+    fn gap_fixture_leg(points: Vec<fdop_types::store::TrackPoint>) -> FlightLeg {
+        FlightLeg {
+            key: "synthetic-coverage-gap".into(),
+            icao: "000000".into(),
+            reg: String::new(),
+            typ: "PC12".into(),
+            source: "synthetic".into(),
+            engine: EngineClass::Turboprop,
+            points,
+        }
+    }
+
+    fn gap_fixture_bridge(n: usize) -> Vec<fdop_types::store::TrackPoint> {
+        (0..n)
+            .map(|i| gap_fixture_point(1081.0 + 318.0 * i as f64 / (n - 1) as f64, 100_000.0))
+            .collect()
+    }
+
+    fn assert_same_gap_model(actual: &TrackModel, expected: &TrackModel) {
+        assert_eq!(
+            (&actual.key, &actual.icao, &actual.reg, &actual.typ, &actual.source, actual.engine),
+            (&expected.key, &expected.icao, &expected.reg, &expected.typ, &expected.source, expected.engine)
+        );
+        assert_eq!(
+            (actual.t.len(), actual.pos.len(), actual.vel.len()),
+            (expected.t.len(), expected.pos.len(), expected.vel.len())
+        );
+        let bits = |m: &TrackModel| {
+            m.t.iter()
+                .chain(m.pos.iter().flatten())
+                .chain(m.vel.iter().flatten())
+                .map(|v| v.to_bits())
+                .chain([m.reported_vel_frac.to_bits(), m.mlat_frac.to_bits()])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(actual), bits(expected));
+    }
+
+    #[test]
+    fn rejected_reports_cannot_erase_either_side_of_a_real_coverage_gap() {
+        let p = BuildParams::default();
+        for (left, right) in [(80usize, 81usize), (81, 80)] {
+            let points: Vec<_> = (0..left)
+                .chain(400..400 + right)
+                .map(|i| gap_fixture_point(1000.0 + i as f64, 0.0))
+                .collect();
+            let leg = gap_fixture_leg(points);
+            let clean = build(&leg, &p);
+            assert_eq!(clean.len(), 2);
+            assert!(clean[1].t0() - clean[0].t1() > p.max_gap_s);
+            let winner = usize::from(right > left);
+            for bad_count in [3, 49] {
+                let mut dirty_leg = leg.clone();
+                dirty_leg.points.extend(gap_fixture_bridge(bad_count));
+                let dirty = build(&dirty_leg, &p);
+                let spans: Vec<_> = dirty.iter().map(|m| (m.t0(), m.t1(), m.t.len())).collect();
+                assert_eq!(dirty.len(), 2, "{left}/{right}, {bad_count} false reports: {spans:?}");
+                // The old winner remains first, with the old unsplit key and identical
+                // positions, velocities and quality fractions. The restored part is separate.
+                let mut primary = clean[winner].clone();
+                primary.key = leg.key.clone();
+                assert_same_gap_model(&dirty[0], &primary);
+                let mut recovered = clean[1 - winner].clone();
+                recovered.key = format!("{}#recovered0", leg.key);
+                assert_same_gap_model(&dirty[1], &recovered);
+                assert_eq!(dirty.iter().map(|m| m.t.len()).sum::<usize>(), left + right);
+                assert!(
+                    dirty.iter().all(|m| m.t.windows(2).all(|w| w[1] - w[0] <= p.max_gap_s)),
+                    "the cleaned coverage hole must never be interpolated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_denser_ambiguous_component_keeps_the_original_winner() {
+        let bad = gap_fixture_bridge(97);
+        let expected = build(&gap_fixture_leg(bad.clone()), &BuildParams::default());
+        let mut points: Vec<_> = (0..80)
+            .chain(400..480)
+            .map(|i| gap_fixture_point(1000.0 + i as f64, 0.0))
+            .collect();
+        points.extend(bad);
+        let actual = build(&gap_fixture_leg(points), &BuildParams::default());
+        // Neither 80-point component defeats the 97-point winner. Its identity is ambiguous;
+        // recovery must not replace it by joining the two shorter components over a long gap.
+        assert_eq!(actual.len(), 1);
+        assert_same_gap_model(&actual[0], &expected[0]);
+    }
+
+    #[test]
+    fn overlapping_coherent_reports_do_not_replace_a_complete_track() {
+        let mut leg = gap_fixture_leg(
+            (0..=1000).map(|i| gap_fixture_point(1000.0 + i as f64, 0.0)).collect(),
+        );
+        let expected = build(&leg, &BuildParams::default());
+        // Unlimited predecessor lookback could jump from the early genuine track to these
+        // dense late reports and outvote the genuine middle. The existing winning path is
+        // complete; an overlapping alternative must remain rejected in its entirety.
+        leg.points.extend((0..800).map(|i| {
+            gap_fixture_point(1900.0 + (i / 8) as f64 + 0.1 * (i % 8 + 1) as f64, 100_000.0)
+        }));
+        let actual = build(&leg, &BuildParams::default());
+        assert_eq!(actual.len(), 1);
+        assert_same_gap_model(&actual[0], &expected[0]);
+    }
+
+    #[test]
+    fn unreachable_disjoint_tracks_are_not_recovered() {
+        let leg = gap_fixture_leg(
+            (0..=80).map(|i| gap_fixture_point(1000.0 + i as f64, 0.0)).collect(),
+        );
+        let expected = build(&leg, &BuildParams::default());
+        for direction in [-1.0, 1.0] {
+            let mut dirty = leg.clone();
+            let time = |t: f64| 1040.0 + direction * (t - 1040.0);
+            // A coherent 40-point tail is separated by more than max_gap_s, but cannot
+            // physically reach the winner. Isolated outliers fill the raw timestamp gap.
+            dirty.points.extend(
+                (0..40).map(|i| gap_fixture_point(time(1500.0 + i as f64), 100_000.0)),
+            );
+            for (t, north) in [
+                (1180.0, 300_000.0),
+                (1280.0, -300_000.0),
+                (1380.0, 500_000.0),
+                (1480.0, -500_000.0),
+            ] {
+                dirty.points.push(gap_fixture_point(time(t), north));
+            }
+            let actual = build(&dirty, &BuildParams::default());
+            assert_eq!(actual.len(), 1, "direction {direction}: {actual:?}");
+            assert_same_gap_model(&actual[0], &expected[0]);
+        }
+    }
+
+    #[test]
+    fn recovered_parts_do_not_rename_later_original_models() {
+        let later = (2000..2080).map(|i| gap_fixture_point(1000.0 + i as f64, 0.0));
+        let original: Vec<_> = (400..481)
+            .map(|i| gap_fixture_point(1000.0 + i as f64, 0.0))
+            .chain(later)
+            .collect();
+        let mut leg = gap_fixture_leg(original);
+        let expected = build(&leg, &BuildParams::default());
+        assert_eq!(expected.len(), 2);
+        leg.points.extend((0..80).map(|i| gap_fixture_point(1000.0 + i as f64, 0.0)));
+        leg.points.extend(gap_fixture_bridge(3));
+        let actual = build(&leg, &BuildParams::default());
+        assert_eq!(actual.len(), 3);
+        assert_same_gap_model(&actual[0], &expected[0]);
+        assert_same_gap_model(&actual[2], &expected[1]);
+        assert_eq!(actual[1].key, format!("{}#recovered0", expected[0].key));
+        assert_eq!(actual.iter().map(|m| m.t.len()).sum::<usize>(), 241);
+    }
+
+    #[test]
+    fn a_recovered_part_still_needs_two_consistent_reports() {
+        for count in [1, 2] {
+            let mut leg = gap_fixture_leg(
+                (400..481).map(|i| gap_fixture_point(1000.0 + i as f64, 0.0)).collect(),
+            );
+            leg.points.extend((0..count).map(|i| gap_fixture_point(1000.0 + i as f64, 0.0)));
+            // All raw intervals stay under max_gap_s, including the sparse genuine prefix.
+            for t in [1100.0, 1250.0, 1399.0] {
+                leg.points.push(gap_fixture_point(t, 100_000.0));
+            }
+            let actual = build(&leg, &BuildParams::default());
+            assert_eq!(actual.len(), count, "{count} earlier report(s): {actual:?}");
+            assert_eq!(actual[0].t.len(), 81);
+            if count == 2 {
+                assert_eq!(actual[1].t, vec![1000.0, 1001.0]);
+            }
+        }
     }
 
     #[test]
