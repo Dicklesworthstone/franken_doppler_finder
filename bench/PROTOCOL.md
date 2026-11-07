@@ -1638,3 +1638,98 @@ Stage 5, `dpdem`'s R1 rows alone, started at 13:53:42Z. Three of its development
 - From 14:20:59Z to 14:39:52Z the operator built two development builds of `fdop`, from `main` `0abfbe9` with and without a
   change to `trace.rs`, in `fdop_replay` (`cargo build` and `cargo test`, 4 jobs, `nice` 5). They ran beside stage 5's
   `dpdem` R1 rows, which `dpwin` meant to run alone. Neither build is registered, and neither ran a benchmark row.
+
+## Addendum 25, 2026-11-07, set F's R1 read for `dp` and `dpdem`; set E's R1 read for the pinned build and `dpdem`; every run read
+
+### `libm` could not run its first step
+
+`libm` (Addendum 23) reached its first step at 14:44:45Z, when `dpwin` was done. `jobs/f_r1_dp.sh` exited at once with
+"national DEM is in the scored cache": it refuses while `cache/dp/dem/5070/conus_1000m.u16` exists, so that `dp` never runs
+with the ground model. `dpdem`'s set F rows (`dpwin` stage 3) had put that file there at 03:43Z, before `libm` was written at
+04:27Z, so its first step could never run and it waited for a `CHAIN_DONE` that could not come. That was the operator's
+mistake.
+
+- At 16:33Z `libm` was stopped by PID (its shell and its watchdog).
+- Regime `libm3` (`tools/fix18.py`; copy at `tools/start_chains.sh.pre18`) started at 16:33:28Z (`runs/libm3.out`).
+  1. It renamed `cache/dp/dem` to `cache/dp/dem_aside_libm3`. That directory was created at 03:43Z and holds only the
+     national DEM, so `dp`'s rows saw the cache that its other rows used.
+  2. It ran `jobs/f_r1_dp.sh`.
+  3. It renamed the DEM back at 16:34:28Z.
+  4. It ran `jobs/f_r1_dpdem.sh`.
+- Both scripts ran only the rows set aside as `*_fault_libmalloc`, with their original commands. Nothing was deleted.
+
+All three rows crashed again in the assertion of Addendum 23, alone on the machine (load 2.5, no other `fdop` or
+`dopplerprint` process):
+
+| Row | rc 133 at | Crash report (bench local time, UTC−5) |
+|---|---|---|
+| `runs_f/r1_dp/f_porthuron` | 16:33:44Z | `python3.12-2026-11-07-113345.ips` |
+| `runs_f/r1_dp/f_charlevoix` | 16:33:56Z | `python3.12-2026-11-07-113356.000.ips` |
+| `runs_f/r1_dpdem/f_porthuron` | 16:34:42Z | `python3.12-2026-11-07-113442.000.ips` |
+
+By the rule fixed in Addendum 23, before they ran again, each second crash is an error of `dopplerprint`'s run, and they are
+not run a third time.
+
+`libm2` (Addendum 24) started its reruns at 16:35:04Z, once those `CHAIN_DONE` files existed and no `dopplerprint` process ran.
+`libm3` had no rows left to run, and wrote "libm3 done" at 16:35:28Z. All three of `dpdem`'s development rows crashed a
+second time, in the same assertion, so they too count as errors:
+
+| Row | rc 133 at | Crash report |
+|---|---|---|
+| `runs/r1_dpdem/b3_sapsucker` | 16:35:25Z | `python3.12-2026-11-07-113525.000.ips` |
+| `runs/r1_dpdem/c_ref_0909` | 16:35:36Z | `python3.12-2026-11-07-113536.000.ips` |
+| `runs/r1_dpdem/b1_osprey_1101` | 16:38:11Z | `python3.12-2026-11-07-113812.ips` |
+
+### Set F's R1
+
+`tools/match/guardfix/inventory_f.sh` showed only the three rows above. Set F's R1 was then read once, at 16:36:18Z, with
+`score.py data/set_f/cases.json runs_f r1`. The output is kept as `runs_f/SCORE_r1_setF_libm3_20261107.txt` (sha256
+`07805ba512ec09690054a10d32e2d10b856e91c6fbb95c763347f8298de64576`). Every `fdop` cell is the same as in
+`SCORE_r1_setF_20261106.txt` (Addendum 20), checked cell by cell.
+
+| Tool, set F's ten cases | Correct asserted | Wrong asserted | Not asserted | Error |
+|---|---|---|---|---|
+| `dopplerprint` (`dp`) | 0 | 0 | 8 declined: 6 "needs_input", 2 "inconclusive" | 2 |
+| `dpdem` | 0 | 0 | 9 declined: 7 "needs_input", 2 "inconclusive" | 1 |
+| every `fdop` build, as Addendum 20 gave them | 0 | 0 | 10 | 0 |
+
+No build meets the rule against `dp` or `dpdem` on set F's R1: all tie at no correct and no wrong answer. Falsifier 3 does
+not fire.
+
+### Set E's R1
+
+`runs/r1_fdop` and `e2_r1_fdop` (the pinned build) and `r1_dpdem` and `e2_r1_dpdem` had `CHAIN_DONE`. `inventory.sh` showed no
+fault. No set E row of these two tools had an abnormal ending in its `.err`, and each `fdop` row that ended rc 1 has a
+`result.json`. Set E's R1 was then read once, at 16:42:03Z, with `score.py jobs/cases.json runs r1`. The output is kept as
+`runs/SCORE_r1_stage5_20261107.txt` (sha256 `636b6ea8c9e0cc02d91823423d3ac3f6f40118655a2dc4e2cf3f6969d07476a0`).
+
+| Tool, set E's eight counted cases | Correct asserted | Wrong asserted | Not asserted | Error |
+|---|---|---|---|---|
+| `fdop` `7e66501` (pinned) | 0 | 0 | 8: 2 low, 6 no location | 0 |
+| `dpdem` | 0 | 0 | 8 declined: 7 "needs_input", 1 "inconclusive" | 0 |
+| `fdop-6914ab7`, `fdop-9087ec4`, `dp`, as Addendum 22 gave them | 0 | 0 | 8 each | 0 |
+
+- **The claim.** No build meets the rule on set E's R1: every tool ties at no correct and no wrong answer. Falsifier 3 does
+  not fire.
+- **The two located cases.** The pinned build put `e_olympia` 46 km off and `e_tehachapi` 151 km off, both low.
+- **Development cases.** On A+B+C the pinned build gave 2 correct and 0 wrong (`a_ref` 271 m, medium; `b1_osprey_1101` 223
+  m, high), so falsifier 1 fires for it in R1 too. `dpdem` gave none correct and 1 wrong: the wrong-date run `c_osprey_1031`,
+  3,482 km off at high. It had 4 errors: the three rows above, and `b2_eagle`. Its other 7 were declines, one of which,
+  `b1_osprey_1102b`, printed a place 3,447 km off with "medium, inconclusive". Every `fdop` run at a wrong date was low.
+- **Seen before the reads.** While checking `libm2` and `libm3`, the operator listed the exit code of every `r1_dpdem` and
+  `e2_r1_dpdem` row. `dpdem`'s rc 2 and 3 are its declines, so its set E R1 answers were known before the read. The pre-read
+  check also showed which `fdop` rows located a place (rc 0) and which did not (rc 1). These are a rival's rows and the
+  usual inventory. No `fdop` build or setting changed after.
+
+### Where the sealed sets stand
+
+With these two reads, every run registered for sets E and F has been read.
+
+- **Set E.** The best `fdop` result is still `fdop-9087ec4`'s in R2 (Addendum 14): one correct answer and no wrong one, the
+  same count as `dp` and `dp48`. With no area (R3) and with only the date and the state (R1), no `fdop` build asserted an
+  answer on set E.
+- **Set F.** No tool was right on set F in any regime.
+- **The claim.** No `fdop` build has been shown more accurate than `dopplerprint` on a sealed set. Falsifier 3 fired on set
+  E's R2 for the pinned build and `fdop-6914ab7` (Addendum 14). It has not fired for `fdop-9087ec4` in any regime.
+- **Earlier falsifiers.** Falsifier 2 fired for both later builds on a development null (Addenda 8 and 11), and falsifier 1
+  fires for the pinned build in R1, R2 and R3.
