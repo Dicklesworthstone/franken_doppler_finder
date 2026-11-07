@@ -35,6 +35,7 @@ use fdop_types::geo::{
 use fdop_types::{BBox, Elevation, MIC_HEIGHT_M};
 use rayon::prelude::*;
 use serde::Serialize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BASE_C: f64 = 343.0;
 
@@ -1588,6 +1589,114 @@ struct Top {
     bin: u32,
 }
 
+/// One cell's votes, shared by spatial shortlisting and the later clock search. The caller
+/// clears the touched bins before reusing scratch, so neither pass changes the vote arithmetic.
+fn accumulate_votes(
+    passes: &[Pass],
+    bank: &Bank,
+    im: &CombImage,
+    t_base: f64,
+    clock_lo: f64,
+    acc: &mut [f32],
+    touched: &mut Vec<u32>,
+) {
+    for ps in passes {
+        let base = t_base + ps.arrive as f64 - im.t0 - clock_lo;
+        for &(tau, val) in &bank.surfaces[ps.tpl as usize].peaks {
+            let b = ((base - tau as f64 * im.dt) / im.dt).round();
+            if b >= 0.0 && (b as usize) < acc.len() {
+                let b = b as usize;
+                if acc[b] == 0.0 {
+                    touched.push(b as u32);
+                }
+                acc[b] += val;
+            }
+        }
+    }
+}
+
+/// Coarse clock peaks, retaining every bin of a tied plateau. Try plateau pivots a full
+/// sweep apart, plus its last bin, before the remaining bins so full-sweep coverage can
+/// coalesce their work. Keep the original best seed first and stronger peaks before weaker.
+fn clock_peak_candidates(votes: &[f32], span: (usize, usize), first: Top, half: i64) -> Vec<Top> {
+    let mut peaks = vec![first];
+    let sweep_bins = (half.max(0) as usize).saturating_mul(2).saturating_add(1);
+    let mut a = span.0;
+    while a <= span.1 {
+        let value = votes[a];
+        let mut b = a;
+        while b < span.1 && votes[b + 1] == value {
+            b += 1;
+        }
+        let left = if a == span.0 {
+            f32::NEG_INFINITY
+        } else {
+            votes[a - 1]
+        };
+        let right = if b == span.1 {
+            f32::NEG_INFINITY
+        } else {
+            votes[b + 1]
+        };
+        if value > 0.0 && value > left && value > right {
+            let mut push = |bin: usize| {
+                if bin as u32 != first.bin {
+                    peaks.push(Top {
+                        coarse: value,
+                        cell: first.cell,
+                        bin: bin as u32,
+                    });
+                }
+            };
+            for bin in (a..=b).step_by(sweep_bins) {
+                push(bin);
+            }
+            if !(b - a).is_multiple_of(sweep_bins) {
+                push(b);
+            }
+            for bin in a..b {
+                if !(bin - a).is_multiple_of(sweep_bins) {
+                    push(bin);
+                }
+            }
+        }
+        a = b + 1;
+    }
+    // Stable sorting preserves the plateau pivots before its remaining bins.
+    peaks[1..].sort_by(|a, b| b.coarse.total_cmp(&a.coarse));
+    peaks
+}
+
+/// A fractional window endpoint can put a clamped seed on another clock lattice. Being
+/// inside the old sweep's interval is not enough: this exact timestamp must have been tried.
+fn clock_was_swept(clock: f64, swept: &[f64], dt: f64, half: i64) -> bool {
+    let reach = half as f64 * dt;
+    let lo = swept.partition_point(|&seed| seed < clock - reach);
+    swept[lo..]
+        .iter()
+        .take_while(|&&seed| seed <= clock + reach)
+        .any(|&seed| {
+            let k = ((seed - clock) / dt).round();
+            k.abs() <= half as f64 && seed - k * dt == clock
+        })
+}
+
+/// Every in-window timestamp of this clamped seed's exact sweep must already have been
+/// evaluated. This tracks clock coverage only: physical pass selection and curve construction
+/// still belong to each evaluated seed. Merely visiting the centre does not cover its tails.
+fn clock_sweep_was_covered(
+    clock: f64,
+    swept: &[f64],
+    dt: f64,
+    half: i64,
+    window: (f64, f64),
+) -> bool {
+    (-half..=half).all(|k| {
+        let at = clock - k as f64 * dt;
+        at < window.0 || at > window.1 || clock_was_swept(at, swept, dt, half)
+    })
+}
+
 /// Decoy windows before and after the real one. The count stays the same near a day's edge, or at
 /// the end of the archive, by taking what one side cannot hold from the other.
 fn decoy_counts(
@@ -1833,6 +1942,17 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         .map(|b| window_of(bin_clock(b)).map_or(i32::MIN, |w| w as i32))
         .collect();
     let n_win = (n_lo + n_hi + 1) as usize;
+    let mut window_bins: Vec<Option<(usize, usize)>> = vec![None; n_win];
+    for (bin, &w) in bin_window.iter().enumerate() {
+        if w == i32::MIN {
+            continue;
+        }
+        let wi = (w as i64 + n_lo) as usize;
+        match &mut window_bins[wi] {
+            Some((_, hi)) => *hi = bin,
+            span @ None => *span = Some((bin, bin)),
+        }
+    }
     // Each window keeps its own list of cells with their best clock, so the real window and the
     // decoys go through one code path: a margin over decoys searched less hard would mean nothing.
     let per_window: Vec<Vec<Top>> = (0..ncells)
@@ -1850,19 +1970,9 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                 if rng.is_empty() {
                     return (acc, touched, lists);
                 }
-                for ps in &passes[rng] {
-                    let base = t_base + ps.arrive as f64 - im.t0 - clock_lo;
-                    for &(tau, val) in &bank.surfaces[ps.tpl as usize].peaks {
-                        let b = ((base - tau as f64 * dt) / dt).round();
-                        if b >= 0.0 && (b as usize) < nbins {
-                            let b = b as usize;
-                            if acc[b] == 0.0 {
-                                touched.push(b as u32);
-                            }
-                            acc[b] += val;
-                        }
-                    }
-                }
+                accumulate_votes(
+                    &passes[rng], &bank, im, t_base, clock_lo, &mut acc, &mut touched,
+                );
                 let mut per_win: Vec<(f32, u32)> = vec![(0.0, 0); n_win];
                 for &b in &touched {
                     let v = acc[b as usize];
@@ -1908,8 +2018,14 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         .into_par_iter()
         .filter(|&i| track_near_region(&inp.tracks[i], &pad, span, p.sample_s))
         .collect();
+    let clock_candidates = AtomicUsize::new(0);
+    let clock_scores = AtomicUsize::new(0);
     // The whole search inside one clock window. Run once for the real window and once per decoy.
-    let search_window = |list: &[Top], shift_s: f64| -> Vec<MatchMode> {
+    let search_window = |list: &[Top], wi: usize| -> Vec<MatchMode> {
+        let Some(bins) = window_bins[wi] else {
+            return Vec::new();
+        };
+        let shift_s = (wi as i64 - n_lo) as f64 * stride;
         let window = MatchInputs {
             start_lo: inp.start_lo + shift_s,
             start_hi: inp.start_hi + shift_s,
@@ -1930,27 +2046,58 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                 }
             }
         }
-        let mut scored: Vec<(usize, Exact)> = chosen
+        // A spatial start represents its whole disc, but its strongest coarse clock can
+        // be an alias. Revisit clock peaks only at these selected cells. Scratch is one
+        // existing vote array per worker plus at most one candidate per bin in this window;
+        // there is no new clock cap, and the spatial shortlist and refinement budgets stay.
+        let mut scored: Vec<(usize, Top, Exact)> = chosen
             .par_iter()
             .enumerate()
-            .filter_map(|(i, m)| {
-                score_exact(
-                    &window,
-                    p,
-                    &bank,
-                    &keep,
-                    m.1,
-                    m.2,
-                    bin_clock(m.0.bin as usize),
-                )
-                .map(|e| (i, e))
-            })
+            .map_init(
+                || (vec![0f32; nbins], Vec::<u32>::new()),
+                |(acc, touched), (i, m)| {
+                    let cell = m.0.cell as usize;
+                    let rng = offs[cell] as usize..offs[cell + 1] as usize;
+                    accumulate_votes(&passes[rng], &bank, im, t_base, clock_lo, acc, touched);
+                    let seeds = clock_peak_candidates(acc, bins, m.0, p.clock_sweep_frames);
+                    clock_candidates.fetch_add(seeds.len(), Ordering::Relaxed);
+                    for bin in touched.drain(..) {
+                        acc[bin as usize] = 0.0;
+                    }
+                    let mut swept = Vec::new();
+                    let mut best: Option<(Top, Exact)> = None;
+                    for seed in seeds {
+                        let clock = bin_clock(seed.bin as usize)
+                            .clamp(window.start_lo, window.start_hi);
+                        if clock_sweep_was_covered(
+                            clock,
+                            &swept,
+                            im.dt,
+                            p.clock_sweep_frames,
+                            (window.start_lo, window.start_hi),
+                        ) {
+                            continue;
+                        }
+                        clock_scores.fetch_add(1, Ordering::Relaxed);
+                        let Some(e) = score_exact(&window, p, &bank, &keep, m.1, m.2, clock) else {
+                            continue;
+                        };
+                        let at = swept.partition_point(|&old| old < clock);
+                        swept.insert(at, clock);
+                        if best.as_ref().is_none_or(|b| e.evidence > b.1.evidence) {
+                            best = Some((seed, e));
+                        }
+                    }
+                    best.map(|(seed, e)| (i, seed, e))
+                },
+            )
+            .flatten()
             .collect();
-        scored.sort_by(|a, b| b.1.evidence.total_cmp(&a.1.evidence).then(a.0.cmp(&b.0)));
+        scored.sort_by(|a, b| b.2.evidence.total_cmp(&a.2.evidence).then(a.0.cmp(&b.0)));
         let mut modes: Vec<MatchMode> = scored
             .into_par_iter()
             .enumerate()
-            .filter_map(|(rank, (i, e))| {
+            .filter_map(|(rank, (i, seed, e))| {
                 let m = &chosen[i];
                 let (la, lo, e) = if rank < p.refine_modes {
                     refine_point(
@@ -1960,7 +2107,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                         &keep,
                         m.1,
                         m.2,
-                        bin_clock(m.0.bin as usize),
+                        bin_clock(seed.bin as usize),
                     )?
                 } else {
                     (m.1, m.2, e)
@@ -1969,7 +2116,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                     lat: la,
                     lon: lo,
                     clock_unix: e.clock,
-                    coarse: m.0.coarse as f64,
+                    coarse: seed.coarse as f64,
                     evidence: e.evidence,
                     r50_m: e.r50_m,
                     n_heard: e.n_heard,
@@ -1991,7 +2138,12 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         }
         distinct
     };
-    let modes = search_window(&per_window[n_lo as usize], 0.0);
+    let modes = search_window(&per_window[n_lo as usize], n_lo as usize);
+    let real_clock_candidates = clock_candidates.load(Ordering::Relaxed);
+    let real_clock_scores = clock_scores.load(Ordering::Relaxed);
+    say(&format!(
+        "curve match: real window, {real_clock_candidates} coarse clock candidates, {real_clock_scores} initial exact clock starts"
+    ));
     timings.push(("exact".to_string(), t.elapsed().as_secs_f64()));
     let t = std::time::Instant::now();
     let aliases = modes.first().map_or_else(Vec::new, |top| {
@@ -2056,7 +2208,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         .filter(|&wi| wi as i64 != n_lo)
         .map(|wi| {
             let shift_s = (wi as i64 - n_lo) as f64 * stride;
-            match search_window(&per_window[wi], shift_s).first() {
+            match search_window(&per_window[wi], wi).first() {
                 Some(m) => DecoyWindow {
                     shift_s,
                     best_coarse: m.coarse,
@@ -2079,6 +2231,12 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         })
         .collect();
     timings.push(("decoys".to_string(), t.elapsed().as_secs_f64()));
+    say(&format!(
+        "curve match: {} decoy windows, {} coarse clock candidates, {} initial exact clock starts",
+        decoys.len(),
+        clock_candidates.load(Ordering::Relaxed) - real_clock_candidates,
+        clock_scores.load(Ordering::Relaxed) - real_clock_scores,
+    ));
     let top = modes.first().map(|m| m.evidence);
     let decoy_best = decoys
         .iter()
@@ -2373,6 +2531,17 @@ mod tests {
         hi: f64,
         catalog: (f64, f64),
     ) -> MatchResult {
+        run_case_logged(c, p, lo, hi, catalog, &|_| {})
+    }
+
+    fn run_case_logged(
+        c: &Case,
+        p: &MatchParams,
+        lo: f64,
+        hi: f64,
+        catalog: (f64, f64),
+        say: &(dyn Fn(&str) + Sync),
+    ) -> MatchResult {
         let dem = FlatElevation(0.0);
         let atmo = UniformAtmosphere(Medium::still(BASE_C));
         let im = build_image(&c.x, 2800, p).unwrap();
@@ -2388,7 +2557,101 @@ mod tests {
             fine_dem: &dem,
             atmo: &atmo,
         };
-        run(&inp, p, &|_| {})
+        run(&inp, p, say)
+    }
+
+    #[test]
+    fn alternative_clock_sweeps_keep_unvisited_tails_and_fractional_phases() {
+        let wide = (-10.0, 10.0);
+        // The centre at 2 was visited from 0, but its far edge at 4 was not.
+        assert!(!clock_sweep_was_covered(2.0, &[0.0], 1.0, 2, wide));
+        assert!(clock_sweep_was_covered(1.0, &[0.0, 2.0], 1.0, 2, wide));
+
+        let wide = (90.0, 110.0);
+        assert!(!clock_sweep_was_covered(102.0, &[100.0], 0.5, 4, wide));
+        // Coverage can come from multiple sweeps, but covered endpoints do not fill a gap.
+        assert!(clock_sweep_was_covered(100.0, &[98.0, 102.0], 0.5, 4, wide));
+        assert!(!clock_sweep_was_covered(100.0, &[96.0, 104.0], 0.5, 4, wide));
+
+        let clipped = (100.0, 100.75);
+        assert!(clock_sweep_was_covered(100.5, &[100.0], 0.5, 4, clipped));
+        assert!(!clock_sweep_was_covered(100.25, &[100.0], 0.5, 4, clipped));
+        assert!(clock_sweep_was_covered(100.25, &[100.25], 0.5, 4, clipped));
+
+        let fixed = (100.25, 100.25);
+        assert!(!clock_sweep_was_covered(100.25, &[100.0], 0.5, 4, fixed));
+        assert!(clock_sweep_was_covered(100.25, &[100.25], 0.5, 4, fixed));
+    }
+
+    #[test]
+    fn alternative_clock_peaks_keep_boundaries_plateaus_and_coarse_priority() {
+        let votes = [6.0, 6.0, 0.0, 4.0, 4.0, 4.0, 0.0, 3.0, 1.0, 5.0, 5.0];
+        let first = Top {
+            coarse: votes[1],
+            cell: 7,
+            bin: 1,
+        };
+        let peaks = clock_peak_candidates(&votes, (0, votes.len() - 1), first, 1);
+        let bins: Vec<_> = peaks.iter().map(|p| p.bin).collect();
+        // The original tie winner stays first; plateau pivots/endpoints precede its interior.
+        assert_eq!(bins, [1, 0, 9, 10, 3, 5, 4, 7]);
+        assert!(peaks.iter().all(|p| p.cell == first.cell));
+        assert!(peaks.windows(2).all(|p| p[0].coarse >= p[1].coarse));
+    }
+
+    #[test]
+    fn alternative_clock_peaks_cover_long_plateaus_with_bounded_exact_starts() {
+        const N: usize = 2001;
+        const HALF: i64 = 4;
+        const DT: f64 = 0.5;
+        let origin = 1000.0;
+        let votes = vec![5.0; N];
+        let first = Top {
+            coarse: 5.0,
+            cell: 0,
+            bin: 1001,
+        };
+        let peaks = clock_peak_candidates(&votes, (0, N - 1), first, HALF);
+        assert_eq!(peaks.len(), N);
+        assert_eq!(peaks[0].bin, first.bin);
+        let window = (
+            origin - HALF as f64 * DT,
+            origin + (N - 1 + HALF as usize) as f64 * DT,
+        );
+        let mut swept = Vec::new();
+        for peak in peaks {
+            let clock = origin + peak.bin as f64 * DT;
+            if !clock_sweep_was_covered(clock, &swept, DT, HALF, window) {
+                let at = swept.partition_point(|&old| old < clock);
+                swept.insert(at, clock);
+            }
+        }
+        // Check actual timestamps independently of the coverage predicate.
+        let mut visited: Vec<_> = swept
+            .iter()
+            .flat_map(|&clock| (-HALF..=HALF).map(move |k| clock - k as f64 * DT))
+            .collect();
+        visited.sort_by(f64::total_cmp);
+        visited.dedup();
+        for bin in 0..N {
+            for k in -HALF..=HALF {
+                let clock = origin + bin as f64 * DT - k as f64 * DT;
+                assert!(
+                    visited.binary_search_by(|old| old.total_cmp(&clock)).is_ok(),
+                    "bin {bin}, step {k} was never swept"
+                );
+            }
+        }
+        let lower_bound = (N + 2 * HALF as usize).div_ceil((2 * HALF + 1) as usize);
+        assert!(
+            swept.len() >= lower_bound && swept.len() <= lower_bound + 2,
+            "{} starts for {N} candidates; interval-cover lower bound {lower_bound}",
+            swept.len()
+        );
+        println!(
+            "clock plateau: {N} candidates, {} exact starts, interval-cover lower bound {lower_bound}",
+            swept.len()
+        );
     }
 
     fn observer_cell(p: &MatchParams) -> Grid {
@@ -2612,6 +2875,96 @@ mod tests {
                 >= 2,
             "the returning aircraft must supply distinct heard visits: {top:?}"
         );
+    }
+
+    #[test]
+    fn alternative_clock_peaks_recover_the_three_flight_recording() {
+        let mut heard: Vec<_> = [
+            ([0.0, 800.0, 600.0 + MIC_HEIGHT_M], [80.0, 0.0, 0.0], 70.0),
+            ([750.0, 0.0, 650.0], [0.0, 95.0, 0.0], 190.0),
+            ([600.0, -600.0, 550.0], [-70.0, -70.0, 0.0], 310.0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (pos, vel, cpa))| {
+            let mut tr = scene_track(pos, vel, cpa, -120.0, 960.0);
+            tr.key = format!("heard-{i}");
+            tr.icao = tr.key.clone();
+            tr
+        })
+        .collect();
+        let mut c = scene_for(heard.clone(), 200.0, 400.0);
+        // The earlier sky repeats two paths. Extra parallel flights at the same slant range
+        // vote for the first sound, but exact pixel ownership can credit that sound only once.
+        // Only the true clock contains the third independent heard pass.
+        for tr in heard.iter_mut().take(2) {
+            for t in &mut tr.t {
+                *t -= 600.0;
+            }
+            tr.key = format!("earlier-{}", tr.key);
+            tr.icao = tr.key.clone();
+            c.tracks.push(tr.clone());
+        }
+        for (i, (north, height)) in [(-800.0, 600.0), (600.0, 800.0), (-600.0, 800.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut tr = scene_track(
+                [0.0, north, height + MIC_HEIGHT_M],
+                [80.0, 0.0, 0.0],
+                -530.0,
+                -720.0,
+                360.0,
+            );
+            tr.key = format!("earlier-parallel-{i}");
+            tr.icao = tr.key.clone();
+            c.tracks.push(tr);
+        }
+        let p = MatchParams {
+            decoy_span_s: 900.0,
+            probe: Some((c.lat, c.lon, c.clock)),
+            ..MatchParams::default()
+        };
+        // This small region fits in any selected spatial start's existing refinement disc.
+        // The regression isolates lost clocks rather than changing the spatial shortlist.
+        assert!(
+            haversine_m(c.region.south, c.region.west, c.region.north, c.region.east) < p.nms_m
+        );
+        let started = std::time::Instant::now();
+        let r = run_case_logged(
+            &c,
+            &p,
+            c.clock - 610.0,
+            c.clock + 10.0,
+            (f64::NEG_INFINITY, f64::INFINITY),
+            &|message| println!("{message}"),
+        );
+        let truth = r.probe.first().expect("the known observer scores");
+        assert!(truth.n_heard >= 3, "{truth:?}");
+        let top = r.modes.first().expect("the recording seeds an exact match");
+        println!(
+            "clock alternatives: {:.3} s total; stages {:?}; true evidence {:.3}, found {:.3}, clock error {:+.3} s",
+            started.elapsed().as_secs_f64(),
+            r.timings_s,
+            truth.evidence,
+            top.evidence,
+            top.clock_unix - c.clock
+        );
+        assert!(
+            (top.clock_unix - c.clock).abs() < 3.0,
+            "a coarse clock alias hid the recording: {top:?}; truth {truth:?}; refined truth {:?}",
+            r.probe.get(1)
+        );
+        assert!(haversine_m(top.lat, top.lon, c.lat, c.lon) < 200.0, "{top:?}");
+        for i in 0..3 {
+            assert!(
+                top.passes.iter().any(|pass| {
+                    pass.key == format!("heard-{i}")
+                        && counts_as_heard(pass.value, pass.nats, pass.shared)
+                }),
+                "the recovered clock must retain heard-{i}: {top:?}"
+            );
+        }
     }
 
     /// Both knots are outside the spatial and time filters, but their interpolated pass produces

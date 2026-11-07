@@ -359,10 +359,15 @@ in `crates/fdop-core/src/curvematch.rs`:
   Weighing against a flat spread instead credited every flight at every clock on rumbling audio, because the
   rumble sits where the propeller tones are. The decoy clocks are weighted the same way.
 - **Search.** Flights vote for (place, clock) cells 200 m apart. The best 16 places are rescored with the exact
-  curve (the real trajectory, emission-time solve, modelled wind and sound speed). Each of the best 4 stands for
-  every place within 1 km of it, so every point of that disc is scored on a 100 m grid before it is climbed to
-  25 m. A close pass with no energy costs evidence, as in the trace search, and one audio event can credit only
-  one flight.
+  curve (the real trajectory, emission-time solve, modelled wind and sound speed). At each selected place,
+  positive local peaks in the clock votes, including tied plateaus, supply alternative recording times.
+  Exact evidence chooses the clock that reaches spatial refinement; a stronger coarse alias is no longer
+  the only timing seed. The original seed is tried first. A later sweep is skipped only when every
+  in-window timestamp it would score was already covered on the same clock lattice by successful sweeps.
+  Each of the best 4 places stands for every place within 1 km of it, so every point of that disc is scored
+  on a 100 m grid before it is climbed to 25 m. A close pass with no energy costs evidence, as in the trace
+  search, and one audio event can credit only one flight. This recovers clock alternatives at selected
+  places; the existing spatial shortlist still limits which places reach exact scoring.
   Flights are screened for exact scoring using their interpolated paths over the catalogue span, at the
   closest-approach sampling interval. This retains sparse passes that enter the search area between logged
   ADS-B positions.
@@ -1114,6 +1119,19 @@ and workspace Clippy were killed by SIGKILL in upstream `asupersync`, including 
 frontend and backend job. The metadata/offline pipeline tests, full workspace gates, CLI release
 selftest and reference-recording replay therefore remain unconfirmed; the external selftest does
 not replace them.
+
+The clock-alternative repair adds three selector regressions and a 400-second synthetic PCM case.
+Two earlier matching paths and extra parallel flights create a competing coarse explanation; the
+new case requires the true recording clock within 3 s, the observer within 200 m and all three
+independently heard flight identities. Neither the old-code failure nor the new Rust recovery has
+executed. Independent source review and JavaScript selector checks passed: 16,200 plateau cases
+retained every candidate and required sweep timestamp, and 2,000 fractional/large-epoch cases
+had no unsafe timestamp suppression. A 2,001-bin plateau needed 225 initial exact starts to cover
+2,009 timestamps in that model. These are component-model results, not Rust or PCM timings.
+The coverage guard tracks timestamps, not equivalence of physical pass reconstruction from
+different seeds. Formatting, compilation, the new Rust tests, production runtime and recording
+replays remain unverified. More clock peaks can add substantial work; progress logs expose
+candidate counts and initial exact starts separately from refinement and diagnostic probes.
 
 The historical-radiosonde repair adds lifetime-boundary checks and an offline cached-profile
 regression, including a closed station with usable historical winds and a station opening at

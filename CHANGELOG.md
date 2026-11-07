@@ -19,6 +19,31 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Let exact flight evidence choose alternative recording clocks
+
+- At each already selected spatial cell, revisit positive local peaks in the coarse clock votes,
+  retaining every bin of tied plateaus. A stronger coarse alias no longer supplies the only clock
+  seed; keep the best exact evidence and carry that winning clock into spatial refinement.
+- Share unchanged vote accumulation between shortlisting and selected-cell rescans, with reusable
+  per-worker scratch and at most one candidate per window bin. Try the original seed first and
+  plateau pivots/endpoints before their interior bins. Coalesce a sweep only when all of its
+  in-window timestamps were covered by successful sweeps on the same lattice, retaining unseen
+  tails and fractional phases. This is timestamp coverage, not proof that physical pass
+  reconstruction is seed-invariant.
+- Real and decoy windows use the same search. Preserve the spatial shortlist, refinement budgets,
+  bank, acoustic gates and confidence rules. Progress logs report coarse candidates and initial
+  exact clock starts; refinement and diagnostic probes are outside those counters.
+- Add three selector regressions and a 400-second three-flight PCM regression against a competing
+  earlier clock with repeated paths and parallel acoustic explanations. Require the correct
+  clock within 3 s, observer within 200 m and all three independent true flight identities.
+- **Validation limit:** two independent source reviews found no concrete blocker. JavaScript
+  component checks passed 16,200 plateau configurations and 2,000 fractional/large-epoch coverage
+  cases; the 2,001-bin plateau used 225 starts for 2,009 timestamps. These are not Rust tests or
+  production timings. The old-code PCM build was killed before test execution, then the executor
+  became unavailable. New Rust compilation, formatting, regressions, workspace gates and field
+  replays remain unrun. No measured recovery or performance gain is claimed; additional clock
+  peaks can increase runtime, and places excluded by the existing spatial shortlist remain so.
+
 ### Recover historical winds from stations that have since closed
 
 - Select radiosonde stations by their archive lifetimes for the requested soundings, rather
