@@ -25,7 +25,7 @@ at that commit, not per-change commits.
   image takes each row's robust z before the frame contrast removes the swell, so the swell inflates every row's
   MAD and compresses the pass's own ridges. The spread floor (`min_image_scale`) raises the whole image, but it
   cannot restore a ridge's contrast against its row. On set D's N1387U_R44 (33 m/s at 421 m), a 157 Hz tone
-  33 dB over its neighbours at the CPA had a row z of 1 to 1.5, and nothing on it scored over 2.88.
+  33 dB over its neighbours at the CPA had a row z of 1 to 1.5, and nothing in its image scored over 2.88.
 - **The change.** When the floor raises an image, `survey` also builds a second one from the same pooled and
   clamped levels: each frame's contrast over +-1/3 octave first, then each row's robust z, raised to the floor
   (`LogSpec::contrast`). After the passes and the edge stage, the full bank scores it on the residual of every
@@ -41,8 +41,8 @@ at that commit, not per-change commits.
   answers as the strong line with 101 added events on set D instead of 54. Taking it from the levels without
   the 20 dB ceiling made weaker curves of its own in a probe on swelled scenes (strongest 4.07 at 35 dB and 4.82
   at 40 dB from the silence line, against 5.26 and 9.58 with the ceiling). At the strong line, though, it put
-  N814SR_R07's first event at 91 m/s and 565 m, right only at 30/60 % (right from 15/30 % on `3f408f4`), and set
-  D was right at 22 / 28 / 30 / 33 / 37. The strong line and the ceiling were chosen on this development set.
+  N814SR_R07's first event at 91 m/s and 565 m, right only at 30/60 % (right from 15/30 % on `3f408f4`), and was
+  right on set D at 22 / 28 / 30 / 33 / 37. The strong line and the ceiling were chosen on this development set.
 - **Evidence.**
   - Metamorphic, on 11 scenes: an image at or above the floor has no contrast image and detects exactly as
     before. Under it, every detection without the stage is in the result with it, first and in order, field for

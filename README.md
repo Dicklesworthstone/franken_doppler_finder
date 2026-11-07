@@ -817,7 +817,7 @@ Design notes:
 - **A compressed image is scored once more, contrast first.** The swell that compresses an image also
   shrinks the ridges of the pass that made it. It raises every row together, which inflates each row's MAD
   before the frame contrast can take the swell out. On Livermore's N1387U_R44, a 157 Hz tone 33 dB over its
-  neighbours at the CPA had a row z of 1 to 1.5, and nothing on it scored over 2.88. An image under the 0.5
+  neighbours at the CPA had a row z of 1 to 1.5, and nothing in its image scored over 2.88. An image under the 0.5
   floor therefore gets a second one from the same levels, with the frame contrast taken first and each row's
   robust z after it (`LogSpec::contrast`). After everything else, the full bank scores it on what the accepted
   curves left, at the strong line, 4.5, since the lines were not set on this image. Its detections follow all
