@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover unbiased frequencies after a long tonal asymptote
+
+- A pass that dwells near its asymptotic frequency can contaminate the row background enough to
+  displace the normalized peak by several FFT bins. Restoring only the selected three bins then
+  misses the raw peak and biases the fitted tone, closest distance and arrival time.
+- After the unchanged normalized qualification, climb the restored peak only inside that peak's
+  strictly descending spectral basin. Stop at a valley or flat noise floor; accept a concave local
+  interpolation only inside the original guide band. Keep the original frequency if restoration
+  would leave that basin or band. SNR, robust-z and all measurement acceptance gates are unchanged.
+- Add analytic sub-bin vertex checks across positive/negative backgrounds and slopes, and controls
+  preventing a hidden hum or an out-of-band vertex from relocating the qualified ridge.
+- **Validation.** All six trace tests and the real-PCM harmonic-family recovery regression passed
+  together through real RCH with the pinned toolchain. The recovered 118 Hz, 120 m/s, 1500 m pass
+  fits at 118.00009 Hz, 119.99997 m/s, 1500.071 m and a 110.00011 s arrival (truth: 110 s),
+  preserving its original accuracy assertions and independent crossing-aircraft check. Before this
+  fix it fitted 119.09793 Hz and 109.54688 s. Full workspace and reference-recording checks remain
+  pending; the synthetic correction does not establish field accuracy or confidence calibration.
+
 ### Hear every returning pass in the whole-recording curve search
 
 - Coarse curve matching now keeps every sampled local closest approach, rather than only the closest

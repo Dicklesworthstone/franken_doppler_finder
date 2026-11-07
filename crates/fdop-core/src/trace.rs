@@ -254,9 +254,11 @@ fn profile_peak(
         && k > 0
         && k + 1 < n_off
     {
-        // Normalisation is essential for selecting a real ridge above persistent hum,
-        // but its frequency-dependent subtraction tilts the local peak. Restore only
-        // the three bins used for metrology, after every normalised qualification gate.
+        // Normalisation selects the ridge above persistent hum, but a pass that dwells
+        // near an asymptote can put enough tone into its row background to move the
+        // normalised maximum by several FFT bins. Climb the restored local peak only
+        // inside this normalised peak's basin: crossing a valley could change ridges.
+        // Qualification and its SNR/z stay entirely on the normalised profile.
         let raw = |o: usize| {
             let (mut sum, mut count) = (0.0, 0usize);
             for &(tk, shift) in &path {
@@ -273,14 +275,33 @@ fn profile_peak(
             }
             (count >= need).then_some(sum / count as f64)
         };
-        if let (Some(a), Some(b), Some(c)) = (raw(k - 1), raw(k), raw(k + 1)) {
-            let curvature = a - 2.0 * b + c;
-            let offset = 0.5 * (a - c) / curvature;
-            // A concave vertex inside this same three-bin neighbourhood is a local
-            // correction. Never use background restoration to jump to another ridge.
-            if curvature < 0.0 && offset.is_finite() && offset.abs() <= 1.0 {
-                fhat = f_pred + offs[k] + offset * df;
+        let (mut left, mut right) = (k - 1, k + 1);
+        while left > 0 && prof[left - 1].is_finite() && prof[left - 1] < prof[left] {
+            left -= 1;
+        }
+        while right + 1 < n_off && prof[right + 1].is_finite() && prof[right + 1] < prof[right] {
+            right += 1;
+        }
+        let mut peak = k;
+        while peak > left && peak < right {
+            let (Some(a), Some(b), Some(c)) = (raw(peak - 1), raw(peak), raw(peak + 1)) else {
+                break;
+            };
+            if b >= a && b >= c {
+                let curvature = a - 2.0 * b + c;
+                let offset = 0.5 * (a - c) / curvature;
+                if curvature < 0.0
+                    && offset.is_finite()
+                    && offset.abs() <= 1.0
+                    && (offs[peak] + offset * df).abs() <= band
+                {
+                    fhat = f_pred + offs[peak] + offset * df;
+                }
+                break;
             }
+            // Each step must rise in raw level and remain in the same normalised basin.
+            // If the raw maximum is outside it, retain the qualified frequency instead.
+            peak = if a > c { peak - 1 } else { peak + 1 };
         }
     }
     Some((fhat, snr, snr / mad))
@@ -567,6 +588,47 @@ mod tests {
     }
 
     #[test]
+    fn background_restoration_recovers_a_vertex_shifted_by_several_fft_bins() {
+        for center in [100.04, 100.13, 100.22] {
+            for slope in [-12.0, 12.0] {
+                for baseline in [-65.0, 35.0] {
+                    let height = |f: f64| (40.0 - 4.0 * (f - center).powi(2)).max(0.0);
+                    let mut spec = spec_from_profile(height);
+                    // A background concentrated around the tone models the part of a
+                    // long asymptote that contributes to a row median. Its subtraction
+                    // moves the selected peak by about 1 Hz, still in the same lobe.
+                    let background: Vec<f32> = spec
+                        .f
+                        .iter()
+                        .map(|&f| (baseline + slope * (f - center) * height(f) / 40.0) as f32)
+                        .collect();
+                    let nt = spec.nt();
+                    for (row, offset) in spec.db.chunks_mut(nt).zip(&background) {
+                        for value in row {
+                            *value -= offset;
+                        }
+                    }
+                    let peak = |offsets| {
+                        guided_ridge_peak(&spec, 1, 100.0, |_| 0.0, 5.0, 12.0, 1, 3.0, 4.0, offsets)
+                            .unwrap()
+                    };
+                    let normalized = peak(None);
+                    let restored = peak(Some(background.as_slice()));
+                    assert!(
+                        (normalized.0 - center).abs() > 2.0 * spec.df(),
+                        "{normalized:?}"
+                    );
+                    assert!(
+                        (restored.0 - center).abs() < 2e-5,
+                        "center={center}, slope={slope}, baseline={baseline}: {restored:?}"
+                    );
+                    assert_eq!((restored.1, restored.2), (normalized.1, normalized.2));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn background_restoration_follows_the_curve_at_fractional_frequencies() {
         let center = 100.13;
         let along = |t: f64| 0.37 * (t - 1.0) + 0.19 * (t - 1.0).powi(2);
@@ -654,5 +716,27 @@ mod tests {
         ] {
             assert_eq!(peak(&spec, Some(background.as_slice())), Some(normalized));
         }
+
+        // A flattened noise floor also ends the selected lobe. A persistent tone that
+        // normalisation removed beyond it must not become the calibrated frequency.
+        let isolated = spec_from_profile(|f| (40.0 - 4.0 * (f - 100.0).powi(2)).max(0.0));
+        let normalized = peak(&isolated, None).unwrap();
+        let hum: Vec<_> = isolated
+            .f
+            .iter()
+            .map(|f| (1000.0 * (-0.5 * ((f - 106.0) / 3.0).powi(2)).exp()) as f32)
+            .collect();
+        assert_eq!(peak(&isolated, Some(hum.as_slice())), Some(normalized));
+
+        // Even inside a broad selected lobe, the raw vertex must stay inside the
+        // existing position band. Its 6 Hz shift here exceeds the 5 Hz guide band.
+        let broad = spec_from_profile(|f| (120.0 - 2.0 * (f - 100.0).powi(2)).max(0.0));
+        let normalized = peak(&broad, None).unwrap();
+        let tilted: Vec<_> = broad
+            .f
+            .iter()
+            .map(|f| (24.0 * (f - 100.0)) as f32)
+            .collect();
+        assert_eq!(peak(&broad, Some(tilted.as_slice())), Some(normalized));
     }
 }

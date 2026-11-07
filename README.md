@@ -856,9 +856,11 @@ Design notes:
   along the full Doppler curve. Noise exclusion accounts for the Hann main lobe and chirp smear, so
   narrowing the frequency tolerance does not count the signal as its own noise. Normalized spectra
   still select and qualify peaks. Only after qualification, local frequency interpolation restores
-  the removed row background; its slope must not shift the measured tone. The restored parabola
-  must be concave and remain inside the same three-bin neighborhood, and the original frequency
-  tolerance and SNR/z thresholds stay in force. No extra full spectrogram is retained.
+  the removed row background; its slope must not shift the measured tone. If normalization moved
+  that peak by several FFT bins, restoration climbs only within its original spectral lobe, stopping
+  at a valley or flat noise floor. A concave local parabola gives the frequency, inside the original
+  frequency tolerance. Restoration cannot cross to another ridge or a removed hum, and the original
+  SNR/z thresholds stay in force. No extra full spectrogram is retained.
 - **Steep passes get a matched window.** A 0.5 s main window stops holding a chirp at 1/win² = 4 Hz/s. Frames
   steeper than that read a second spectrogram, with the window that matches the latest fit's chirp. There the
   peak integrates along the model's curve, the band is at least 0.25 s of chirp to allow for detection's error,
@@ -1023,6 +1025,16 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ### Recovery changes (2026-11-07): validation incomplete
 
+**Latest focused checks.** The executor recovered, and real RCH with the pinned nightly now runs
+the core tests. Six guided-ridge/background-restoration tests and the harmonic-family recovery PCM
+case pass together on the final frequency-restoration code. All three harmonic-family cases, the
+five local-approach/search regressions, the three coarse curve-stamping regressions and the STFT
+bitwise-reference test have also passed. These use one build job, two Rayon workers, optimization
+level 1 for workspace crates, unoptimized dependencies and no debug information. Full workspace
+tests, Clippy, release selftest and reference-recording replay are still pending.
+
+**Earlier recovery checks.**
+
 The integrated `fdop-types` crate passed all 22 library tests on the pinned nightly, including all seven
 store tests for footer validation, trailing members, staging collisions and concurrent writers.
 `cargo clippy -p fdop-types --all-targets --locked --offline -- -D warnings` also passed. These ran directly
@@ -1038,10 +1050,9 @@ channel-controlled source completion, and retains the existing final-source sele
 code and tests were recovered through GitHub after another executor outage and reviewed, but have not yet
 been compiled, formatted or executed. No weather accuracy improvement is claimed from those unrun tests.
 
-The harmonic-family, nearby-return and bounded-STFT regressions are present but have not completed
-compilation or execution. The final patches were recovered through GitHub after the outage; full
-workspace tests, Clippy, selftest and reference-recording replay remain unconfirmed. These changes
-make no claim of improved real-recording accuracy or calibrated confidence. See [CHANGELOG.md](CHANGELOG.md)
+The harmonic-family, nearby-return and bounded-STFT patches were recovered through GitHub after
+the outage; their focused regressions have now run as described above. These changes make no claim
+of improved real-recording accuracy or calibrated confidence. See [CHANGELOG.md](CHANGELOG.md)
 for the exact scope and validation record; results below belong to the earlier builds identified there.
 
 ### Previous checks (2026-11-06)
