@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Publish complete track caches under concurrent searches
+
+- `TrackStore::save` now creates an exclusive staging file for each writer in the destination's
+  directory. Two searches of the same day and region no longer truncate or modify the same staging
+  inode while one of them publishes it. A reused process ID or a leftover staging file is skipped;
+  compression, flush and sync still finish before rename.
+- `TrackStore::load` extends the footer validation in `6c48541`: it also rejects bytes after the
+  first compressed member, including a second store, an empty member and raw garbage. The existing
+  fallback to another covering cache or a fresh download handles these invalid stores.
+- Regressions exercise four concurrent writers with an active reader, staging-name collisions,
+  and trailing compressed data; the upstream footer and undeclared-payload regressions remain.
+- **Validation.** Before integration with `6c48541`, all five store tests passed on the pinned
+  nightly through RCH with one build job and temporary unoptimized development-profile settings
+  (`cargo test -p fdop-types --locked --config 'profile.dev.opt-level=0' --config 'profile.dev.debug=0'
+  --config 'profile.dev.package."*".opt-level=0' store::tests`). The integrated source passed rustfmt
+  and `git diff --check`. The executor then became unavailable during the core build, before the
+  seven-test rerun, workspace checks, Clippy or selftest could finish. Those remain unconfirmed.
+
 ### Validate cached track stores through the gzip footer
 
 - **The fault.** The store reader returned after the declared legs and points. The gzip decoder can

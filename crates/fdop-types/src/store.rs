@@ -7,14 +7,16 @@
 use crate::BBox;
 use crate::engine::EngineClass;
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 8] = b"FDOPTRK1";
 const POINT_BYTES: usize = 8 * 3 + 4 * 4 + 2;
+static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Altitude provenance of a point.
 pub mod alt_src {
@@ -121,19 +123,36 @@ fn r_str<R: Read>(r: &mut R) -> io::Result<String> {
     String::from_utf8(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Reserve a private file beside the destination, so concurrent saves never share an inode
+/// and publication stays a same-filesystem rename. A leftover from a reused PID is skipped.
+fn create_staging_file(path: &Path, next_id: &AtomicU64) -> io::Result<(PathBuf, std::fs::File)> {
+    loop {
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("fdtrk.part.{}.{id}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl TrackStore {
     pub fn n_points(&self) -> usize {
         self.legs.iter().map(|l| l.points.len()).sum()
     }
 
-    /// Write atomically (temp file + rename).
+    /// Write atomically (exclusive staging file + sync + rename), including concurrent saves.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }
-        let tmp = path.with_extension("fdtrk.part");
+        let (tmp, f) = create_staging_file(path, &NEXT_STAGING_ID)?;
         {
-            let f = std::fs::File::create(&tmp)?;
             let mut w = GzEncoder::new(BufWriter::with_capacity(1 << 20, f), Compression::fast());
             w.write_all(MAGIC)?;
             let meta = serde_json::to_vec(&self.meta).map_err(io::Error::other)?;
@@ -167,6 +186,7 @@ impl TrackStore {
         std::fs::rename(&tmp, path)
     }
 
+    /// Read one complete gzip member, checking its checksum and rejecting trailing data.
     pub fn load(path: &Path) -> io::Result<Self> {
         let f = std::fs::File::open(path)?;
         let mut r = BufReader::with_capacity(1 << 20, GzDecoder::new(BufReader::new(f)));
@@ -224,8 +244,10 @@ impl TrackStore {
         // Reaching the declared record count does not make the gzip member complete:
         // the decoder checks CRC32 and ISIZE only when a read reaches its footer.
         // Also reject undeclared decoded data instead of accepting a partial payload.
+        // The bufread decoder preserves compressed bytes after the member, so a second
+        // member or appended garbage must be rejected too.
         let mut trailing = [0u8; 1];
-        if r.read(&mut trailing)? != 0 {
+        if r.read(&mut trailing)? != 0 || r.into_inner().into_inner().read(&mut trailing)? != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{} has trailing track-store data", path.display()),
@@ -492,5 +514,124 @@ mod tests {
         assert_eq!(back.legs[0].points[3].t, 30.0);
         let f = back.filtered(&BBox::new(39.0, -74.0, 41.0, -72.0), 35.0, 45.0);
         assert_eq!(f.legs[0].points.len(), 5); // t=40 plus two neighbours each side
+    }
+
+    #[test]
+    fn concurrent_saves_publish_only_complete_stores() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let path = test_path("concurrent");
+        let stores: Vec<_> = (0..5)
+            .map(|generation| {
+                let mut store = sample_store();
+                store.meta.stats = serde_json::json!({"generation": generation});
+                let p = store.legs[0].points[0];
+                store.legs[0].points = (0..8192 + 512 * generation)
+                    .map(|i| TrackPoint {
+                        t: i as f64,
+                        alt_m: generation as f32,
+                        ..p
+                    })
+                    .collect();
+                store
+            })
+            .collect();
+        stores[0].save(&path).unwrap();
+        let barrier = Barrier::new(stores.len());
+        let running = AtomicUsize::new(stores.len() - 1);
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = stores[1..]
+                .iter()
+                .map(|store| {
+                    let (path, barrier, running) = (&path, &barrier, &running);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let result = store.save(path);
+                        running.fetch_sub(1, Ordering::Release);
+                        result
+                    })
+                })
+                .collect();
+            barrier.wait();
+            loop {
+                let finished = running.load(Ordering::Acquire) == 0;
+                let published = TrackStore::load(&path).unwrap();
+                let generation = published.meta.stats["generation"].as_u64().unwrap() as usize;
+                assert!(generation < stores.len());
+                assert_eq!(published.legs.len(), 1);
+                assert_eq!(published.n_points(), 8192 + 512 * generation);
+                for (i, p) in published.legs[0].points.iter().enumerate() {
+                    assert_eq!(p.t, i as f64);
+                    assert_eq!(p.alt_m, generation as f32);
+                }
+                if finished {
+                    break;
+                }
+            }
+            for writer in writers {
+                writer.join().unwrap().unwrap();
+            }
+        });
+        // Every successful writer renamed its private staging file away.
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn staging_collisions_preserve_the_existing_writer() {
+        let path = test_path("collision");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (first, mut writer) = create_staging_file(&path, &AtomicU64::new(0)).unwrap();
+        writer.write_all(b"first incomplete store").unwrap();
+        // A new process can reuse this PID and restart its counter, leaving the same names.
+        let (second, mut other) = create_staging_file(&path, &AtomicU64::new(0)).unwrap();
+        other.write_all(b"second incomplete store").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"first incomplete store");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second incomplete store");
+        assert!(
+            !path.exists(),
+            "a staging file was published before completion"
+        );
+    }
+
+    #[test]
+    fn load_rejects_bytes_after_the_gzip_member() {
+        let path = test_path("trailing-compressed");
+        for empty in [false, true] {
+            let mut store = sample_store();
+            if empty {
+                store.legs.clear();
+            }
+            store.save(&path).unwrap();
+            let valid = std::fs::read(&path).unwrap();
+            let empty_member = GzEncoder::new(Vec::new(), Compression::fast())
+                .finish()
+                .unwrap();
+            for (name, suffix) in [
+                ("second-store", valid.clone()),
+                ("empty-member", empty_member),
+                ("trailing-garbage", vec![0]),
+            ] {
+                let mut bad = valid.clone();
+                bad.extend_from_slice(&suffix);
+                std::fs::write(&path, &bad).unwrap();
+                let error = TrackStore::load(&path).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData,
+                    "{name}, empty={empty}"
+                );
+                assert!(error.to_string().contains("trailing track-store data"));
+            }
+            std::fs::write(&path, &valid).unwrap();
+            assert_eq!(
+                TrackStore::load(&path).unwrap().n_points(),
+                store.n_points()
+            );
+        }
     }
 }

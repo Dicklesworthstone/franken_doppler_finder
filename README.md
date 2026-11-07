@@ -728,6 +728,10 @@ or incomplete cache is identified in the progress output, and other eligible cac
 downloading again or failing in `--offline` mode. Partial feeds retain their missing-feed warnings. A larger
 region on the same day downloads that day again if no usable cache covers it.
 
+Concurrent searches publish track stores through separate, exclusively created staging files, so one
+writer cannot truncate another writer's cache. A load also rejects bytes after its compressed member,
+including additional gzip members; a damaged cache goes through the recovery path above.
+
 An incomplete release listing captured before the publication window closes is rechecked online until
 both prod and MLAT are present or a successful post-window lookup confirms the missing feed. An early
 prod-only listing therefore cannot become permanent merely because the day has aged. Offline runs
