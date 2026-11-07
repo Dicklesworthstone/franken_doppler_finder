@@ -583,6 +583,14 @@ inside one UTC day can use just that day's archive; its rounded day limit does n
 unrelated following day. If the recording's padded window reaches or crosses UTC midnight, the
 next day is still required.
 
+Archive and weather coverage use the actual decoded length of the selected audio stream. A longer
+video track therefore does not force the audio search to wait for an unrelated unpublished day.
+Decoding happens before publication clipping; weather still overlaps detection and measurement.
+For a creation-time hint, a finite container duration is also retained when it is longer, because
+the tag may identify the end of the container. Missing or understated duration tags cannot shorten
+the decoded timeline. In `result.json`, `extra.media.duration_s` retains the probed container value;
+the additive `extra.media.decoded_duration_s` records the audio duration used by the search.
+
 With `--start`, its clock window is intersected with the local dates before checking archive availability or
 fetching weather and tracks. Only the UTC days needed by that window, the recording duration and track padding
 are fetched; unrelated days in a broader `--dates` range are not required, including in `--offline` mode. A
@@ -947,7 +955,8 @@ Design notes:
   hypothesis after the regular grid and its distance fallback, clip the cross-track ray to the
   requested box and probe that interval. Every added point still passes the terrain, distance,
   region and clock checks. This recovers an in-box strip without changing the regular grid;
-  it is not an exhaustive search of disconnected terrain pockets.
+  inclusive interval endpoints remain eligible when the interior probes fail. This is not an
+  exhaustive search of disconnected terrain pockets.
 - **Terrain is checked across the full cross-track reach.** A hillside can bring a later observer point back
   inside the slant-distance gate after a valley falls outside it. One failed point no longer cuts off that side.
 - **A location still needs two events after clock checks.** A candidate pruned to one flyover is removed.
@@ -1105,6 +1114,13 @@ and workspace Clippy were killed by SIGKILL in upstream `asupersync`, including 
 frontend and backend job. The metadata/offline pipeline tests, full workspace gates, CLI release
 selftest and reference-recording replay therefore remain unconfirmed; the external selftest does
 not replace them.
+
+The selected-audio coverage repair adds an offline known-location case with 1,300 seconds of
+audio inside a longer video. A fixed publication clock makes the container request reach an
+unpublished day while the audio fits its cached day. It also checks missing/nonfinite duration
+metadata and the container-end tag convention. These Rust/FFmpeg regressions remain unrun.
+The region-clipping follow-up adds eight boundary cases covering both interval endpoints in four
+directions; independent arithmetic checks support them, with Rust execution still unconfirmed.
 
 The cross-track region-clipping repair adds two geometry regressions and a two-flight full-search
 case where the observer's box lies between the 350 m samples. Independent source review and

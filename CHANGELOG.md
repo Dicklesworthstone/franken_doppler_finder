@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Base archive and weather coverage on the selected audio timeline
+
+- Decode the selected audio before publication-window selection. Use its actual sample count
+  for the initial archive requirement and weather request, matching the existing track load,
+  retry, curve catalogue and search. A short audio recording inside a longer video can now be
+  searched without requiring that video's unrelated unpublished UTC day.
+- Preserve the larger valid container duration only for the creation-time start/end ambiguity.
+  Missing, understated and nonfinite duration tags cannot exclude the decoded timeline or
+  expand a hint to infinity. Keep the existing `extra.media.duration_s` meaning and add
+  `extra.media.decoded_duration_s` to report the audio duration used.
+- Reuse the existing positive offline location fixture for an additional long-video case:
+  losslessly copied 1,300-second audio, an eight-hour sparse video, only one cached UTC day,
+  and a fixed publication clock. The old container-length request must fail; the real pipeline
+  must recover both intended flights, the observer and clock under the existing assertions.
+  A private clock callback makes publication checks deterministic in that test; public
+  `locate` still reads the current clock separately at every publication check.
+- Also retain eligible endpoints in the new region-clipped cross-track fallback after its
+  existing interior probes fail. Eight dyadic boundary cases cover both ends and all four
+  directions, preserving the earlier interior probe order and all final acceptance gates.
+- **Validation limit:** independent source reviews and boundary arithmetic checks passed;
+  these are not Rust execution. The new pipeline/FFmpeg tests and formatting remain unrun
+  after executor loss. The attempted current-core command was
+  `cargo --config 'profile.dev.package."*".opt-level=0' --config 'profile.test.package."*".opt-level=0' test -p fdop-core --lib --locked --offline narrow_region_does_not_skip_close_fast_flyovers -- --nocapture --test-threads=1`
+  on the pinned nightly, one compiler job, two Rayon workers, opt-level 1 for workspace crates,
+  and no debug/incremental output. It exited 101 after upstream `fsci-linalg` rustc received
+  SIGKILL, before core compilation. A diagnostic rerun of the archived `51d9bb0` one-sided
+  measurement test printed only its start before disconnection; no assertion or final outcome
+  was captured. The concurrent measurement follow-up records its separate diagnosis and
+  unrun revised accuracy assertions.
+
 ### Check the newly recovered pass against its physical truth
 
 - Diagnose the previously reported one-sided-recovery test failure on `697eb4a`: all three original

@@ -171,6 +171,23 @@ fn metadata_start_window(
     (window.0 <= window.1).then_some(window)
 }
 
+/// The creation tag may mark the container's end even when its selected audio ends earlier.
+/// Missing or invalid duration tags cannot shorten the decoded timeline or widen it to infinity.
+fn media_metadata_start_window(
+    full: (f64, f64),
+    info: &audio::MediaInfo,
+    decoded_duration: f64,
+    tolerance: f64,
+) -> Option<(f64, f64)> {
+    let creation = info.creation_unix?;
+    let duration = if info.duration_s.is_finite() && info.duration_s > 0.0 {
+        info.duration_s.max(decoded_duration)
+    } else {
+        decoded_duration
+    };
+    metadata_start_window(full, creation, duration, tolerance)
+}
+
 struct PublishedWindow {
     clock: (f64, f64),
     adsb_end: f64,
@@ -819,6 +836,14 @@ pub(crate) fn event_png(
 
 /// Run the whole pipeline.
 pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
+    locate_with_clock(a, log, &unix_now)
+}
+
+fn locate_with_clock(
+    a: &LocateArgs,
+    log: &Arc<Log>,
+    now: &dyn Fn() -> f64,
+) -> Result<LocateOutcome, String> {
     let t_all = Instant::now();
     let mut timings = serde_json::Map::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -869,11 +894,17 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         given_start,
         a.clock_tol_s,
     )?;
-    let metadata_window = if given_start.is_none()
-        && !a.ignore_metadata_time
-        && let Some(ct) = info.creation_unix
-    {
-        metadata_start_window(full_window, ct, info.duration_s, a.clock_tol_s)
+    // Archive and weather coverage follow the selected audio, not a longer video or a
+    // missing/incorrect duration tag. Decode before publication clipping; weather still
+    // overlaps detection and measurement. Metadata retains both start/end conventions.
+    let t = Instant::now();
+    let x = audio::decode_with_selection(&a.media, 0.0, None, a.sr, a.audio_selection)?;
+    let dur = x.len() as f64 / a.sr as f64;
+    log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
+    warnings.extend(low_band_warning(&x, a.sr));
+    timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
+    let metadata_window = if given_start.is_none() && !a.ignore_metadata_time {
+        media_metadata_start_window(full_window, &info, dur, a.clock_tol_s)
     } else {
         None
     };
@@ -881,8 +912,8 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         a,
         full_window,
         metadata_window,
-        info.duration_s,
-        unix_now(),
+        dur,
+        now(),
         &mut warnings,
     )?;
     let mut metadata_fallback = metadata_window.is_some() && !meta_window;
@@ -931,16 +962,9 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     };
     log.say(&describe_window(&archive, meta_window, metadata_fallback));
     let curve_params = curvematch::MatchParams::default();
-    let mut weather_rx = start_weather(a, region.bbox, &archive, info.duration_s, &curve_params);
+    let mut weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
     let run_dir = a.out.clone().unwrap_or_else(|| default_run_dir(&a.media));
     std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
-    // ---- audio --------------------------------------------------------------------------
-    let t = Instant::now();
-    let x = audio::decode_with_selection(&a.media, 0.0, None, a.sr, a.audio_selection)?;
-    let dur = x.len() as f64 / a.sr as f64;
-    log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
-    warnings.extend(low_band_warning(&x, a.sr));
-    timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
     let mut curve_clock = archive.clock;
     let curve_skip = curve_match_skip_reason(&curve_params, region.bbox, curve_clock);
     if a.curve_match
@@ -1189,7 +1213,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                 warnings.push(why);
                 meta_window = false;
                 metadata_fallback = true;
-                archive = published_start_window(a, full_window, dur, unix_now(), &mut warnings)?;
+                archive = published_start_window(a, full_window, dur, now(), &mut warnings)?;
                 weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
                 log.say(&describe_window(&archive, false, true));
                 continue;
@@ -1298,7 +1322,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             );
             meta_window = false;
             metadata_fallback = true;
-            archive = published_start_window(a, full_window, dur, unix_now(), &mut warnings)?;
+            archive = published_start_window(a, full_window, dur, now(), &mut warnings)?;
             weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
             log.say(&describe_window(&archive, false, true));
             continue;
@@ -1992,7 +2016,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     report.timings = serde_json::Value::Object(timings);
     report.extra = json!({
         "window": window_note,
-        "media": {"duration_s": info.duration_s, "codec": info.audio_codec, "sample_rate": info.sample_rate, "creation_time": info.creation_time, "audio_stream": info.audio_stream, "audio_channel": info.audio_channel},
+        "media": {"duration_s": info.duration_s, "decoded_duration_s": dur, "codec": info.audio_codec, "sample_rate": info.sample_rate, "creation_time": info.creation_time, "audio_stream": info.audio_stream, "audio_channel": info.audio_channel},
         "region_bbox": region.bbox.as_array(),
         "atmosphere": {"source": atmo.describe(), "c_0_1500m": m1.c, "c_0_5000m": m5.c, "wind_0_5000m": [m5.wind_e, m5.wind_n]},
         "search_events": sevs,
@@ -2231,19 +2255,53 @@ mod tests {
 
     #[test]
     fn offline_metadata_locates_with_only_its_archive_day() {
+        offline_location_with_selected_audio(false);
+    }
+
+    #[test]
+    fn selected_audio_does_not_require_the_longer_videos_unpublished_day() {
+        offline_location_with_selected_audio(true);
+    }
+
+    fn offline_location_with_selected_audio(long_video: bool) {
         use fdop_types::geo::{Enu, ecef_to_geodetic, haversine_m};
         use fdop_types::store::{FlightLeg, TrackPoint, alt_src};
-        let a = offline_test_args("metadata-locate");
+        let mut a = offline_test_args(if long_video {
+            "selected-audio"
+        } else {
+            "metadata-locate"
+        });
         // Generate in exactly the atmosphere an uncached offline run will use. The selftest
         // itself keeps its warm/windy atmosphere and otherwise uses this same synthesis.
         let atmo = fdop_types::atmo::StandardAtmosphere::new(15.0, 0.0, 0.5);
         let fixture =
             crate::selftest::synthesize(a.media.parent().unwrap(), &atmo, &|_| {}).unwrap();
-        let mux = std::process::Command::new("ffmpeg")
-            .args(["-nostdin", "-v", "error", "-i"])
-            .arg(&fixture.wav)
+        let mut mux = std::process::Command::new("ffmpeg");
+        mux.args(["-nostdin", "-v", "error", "-i"]).arg(&fixture.wav);
+        let creation = if long_video {
+            a.media.set_extension("mkv");
+            a.start = Some(iso_utc(fixture.start));
+            // Eight sparse black video frames extend into the next UTC day. The actual
+            // audio remains the same 1300-second known-answer recording, copied losslessly.
+            mux.args([
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:r=1/3600:d=28800",
+                "-map",
+                "0:a:0",
+                "-map",
+                "1:v:0",
+                "-c:v",
+                "ffv1",
+            ]);
+            fixture.start + 28_800.0
+        } else {
+            fixture.start
+        };
+        let mux = mux
             .args(["-c:a", "copy", "-metadata"])
-            .arg(format!("creation_time={}", iso_utc(fixture.start)))
+            .arg(format!("creation_time={}", iso_utc(creation)))
             .arg(&a.media)
             .output()
             .expect("ffmpeg is required by locate and the selftest");
@@ -2252,10 +2310,12 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&mux.stderr)
         );
-        assert_eq!(
-            audio::probe(&a.media).unwrap().creation_unix,
-            Some(fixture.start)
-        );
+        let info = audio::probe(&a.media).unwrap();
+        assert_eq!(info.creation_unix, Some(creation));
+        if long_video {
+            let midnight = unix_from_utc(2026, 9, 9, 0, 0, 0.0);
+            assert!(fixture.start + info.duration_s > midnight, "{info:?}");
+        }
         let legs = fixture
             .tracks
             .iter()
@@ -2313,7 +2373,28 @@ mod tests {
                 .to_string()
                 .contains("2026-09-07 (offline, not cached)")
         );
-        let outcome = locate(&a, &Log::new(true)).unwrap();
+        let outcome = if long_video {
+            let now = parse_iso_utc("2026-09-09T01:00:00Z").unwrap();
+            let clock = (fixture.start - a.clock_tol_s, fixture.start + a.clock_tol_s);
+            // At this fixed clock the cached day has finished, but the next UTC day has
+            // not. The former container-duration request really would reject the input.
+            let error =
+                published_start_window(&a, clock, info.duration_s, now, &mut Vec::new())
+                    .err()
+                    .expect("the longer container reaches an unpublished day");
+            assert!(error.contains("no published day covers"), "{error}");
+            locate_with_clock(&a, &Log::new(true), &|| now).unwrap()
+        } else {
+            locate(&a, &Log::new(true)).unwrap()
+        };
+        assert_eq!(
+            outcome.report.extra["media"]["decoded_duration_s"],
+            json!(fixture.duration)
+        );
+        assert_eq!(
+            outcome.report.extra["media"]["duration_s"],
+            json!(info.duration_s)
+        );
         assert!(outcome.found, "{}", outcome.report.answer.verdict);
         let answer = &outcome.report.answer;
         let error = haversine_m(
@@ -2344,7 +2425,7 @@ mod tests {
             outcome.report.extra["window"]
                 .as_str()
                 .unwrap()
-                .contains("creation_time")
+                .contains(if long_video { "--start" } else { "creation_time" })
         );
         assert!(
             !outcome
@@ -2592,6 +2673,32 @@ mod tests {
             assert!(requested_start_window(dates, None, bad).is_err());
         }
         assert!(requested_start_window(dates, None, -1.0).is_err());
+    }
+
+    #[test]
+    fn metadata_uses_decoded_duration_and_keeps_container_end_tags() {
+        let full = (0.0, 20_000.0);
+        let mut info = audio::MediaInfo {
+            creation_unix: Some(10_000.0),
+            duration_s: 7200.0,
+            ..Default::default()
+        };
+        // A container-end tag must still include the real start when audio is shorter.
+        assert_eq!(
+            media_metadata_start_window(full, &info, 1300.0, 60.0),
+            Some((2740.0, 10_060.0))
+        );
+        // Missing, understated and nonfinite probe values cannot omit the decoded start.
+        for duration in [0.0, 12.0, -1.0, f64::NAN, f64::INFINITY] {
+            info.duration_s = duration;
+            assert_eq!(
+                media_metadata_start_window(full, &info, 1300.0, 60.0),
+                Some((8640.0, 10_060.0)),
+                "container duration {duration}"
+            );
+        }
+        info.creation_unix = None;
+        assert!(media_metadata_start_window(full, &info, 1300.0, 60.0).is_none());
     }
 
     #[test]

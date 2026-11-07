@@ -462,10 +462,16 @@ fn region_cross_track_offset(
     if (d_lo..=d_hi).contains(&dm) {
         return Some(middle);
     }
+    let mut endpoint = None;
     for edge in [lo, hi] {
         let de = distance(edge);
         if !de.is_finite() {
             continue;
+        }
+        // Preserve the existing interior probes first: an endpoint can pass distance
+        // yet fail the caller's terrain-clearance or clock check.
+        if endpoint.is_none() && (d_lo..=d_hi).contains(&de) {
+            endpoint = Some(edge);
         }
         let lower = dm.min(de).max(d_lo);
         let upper = dm.max(de).min(d_hi);
@@ -490,7 +496,7 @@ fn region_cross_track_offset(
             }
         }
     }
-    None
+    endpoint
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6307,6 +6313,34 @@ mod tests {
             assert!(b > 200.0 && b < 300.0);
             assert!(region.contains(0.002 - b * 0.00001, 0.0));
             assert!((d_lo..=d_hi).contains(&distance(b)));
+        }
+    }
+
+    #[test]
+    fn region_cross_track_offsets_keep_inclusive_endpoints() {
+        let unit = 1.0 / 1024.0;
+        let step = unit / 128.0;
+        let region = BBox::new(0.0, 0.0, 2.0 * unit, 2.0 * unit);
+        let distance = |b: f64| b.hypot(1024.0);
+        for (origin, direction) in [
+            ((-unit, unit), (step, 0.0)),
+            ((3.0 * unit, unit), (-step, 0.0)),
+            ((unit, -unit), (0.0, step)),
+            ((unit, 3.0 * unit), (0.0, -step)),
+        ] {
+            // Only the endpoint is eligible; every interior probe misses the gate.
+            // Dyadic coordinates make the clipping boundaries exactly representable.
+            for (expected, d_lo, d_hi) in [
+                (128.0, 1024.0, distance(128.0)),
+                (384.0, distance(384.0), 2048.0),
+            ] {
+                let b =
+                    region_cross_track_offset(d_lo, d_hi, &region, origin, direction, distance)
+                        .expect("the clipped endpoint satisfies both inclusive gates");
+                assert_eq!(b, expected);
+                assert!(region.contains(origin.0 + b * direction.0, origin.1 + b * direction.1));
+                assert!((d_lo..=d_hi).contains(&distance(b)));
+            }
         }
     }
 
