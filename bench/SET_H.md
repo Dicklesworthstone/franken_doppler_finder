@@ -116,7 +116,7 @@ with the screen files.
 | 5, description | 44 | radio or scanner feeds (10), a nest site not given (9), music or recorded sound (6), a second stream at a site (6), bans or terms (4), private (3), outside the US or the store (3), a site that cannot be fixed (3) |
 | 6, truth | 0 | |
 | 7, traffic | 14 | fewer than 6 passes within 3 km |
-| 8, hearing | 7 | 5 heard by neither method; 2 pilots not taken under the outage rule (Boulder County Fairgrounds, clock held 420 s; San Jose City Hall, 1505 s) |
+| 8, hearing | 7 | 4 heard by neither method; 1 with no close pass in the part of its pilot kept (Nashville); 2 pilots not taken under the outage rule (Boulder County Fairgrounds, clock held 420 s; San Jose City Hall, 1505 s) |
 | 9, case | 1 | Deerfield Beach |
 
 The new pilots heard (n close passes, k above the chance lines' 90th percentile, m their mean percentile; band power,
@@ -129,25 +129,31 @@ Nashville kept the first 3695 s of its pilot (one 16 s outage), and no aircraft 
 - **Retries.** A fetch fault (HTTP 400 or 404, a yt-dlp or ffmpeg error) was retried once. A stream whose fragments
   carry no wall clock, or that has no from-start format, was not taken without a retry: that is the stream, not the
   fetch. One HTTP 400 (row 716) was missed in the first retry round, retried alone afterwards, and failed again.
-- **Description.** An underwater camera passes (rows 314 and 732). A rescue's indoor room passes where the rescue
-  publishes its address (627), and is out where the sanctuary is private and its address unpublished (644).
-- **Truth.** The query's first match is taken, even where a park's polygon reaches past the limit from its point
-  (Silver Springs State Park, 5.3 km; it stopped at traffic).
+- **Description.** An underwater camera passes (rows 314 and 732). A rescue's camera passes where the rescue publishes
+  its address (627). A private room at a sanctuary that is private, with no published address, is out (644). A stream
+  whose site cannot be fixed within its limit stops here, so no stream stopped at the truth.
+- **Truth.** The first match is taken when it is the place named, even where a park's polygon reaches past the limit
+  from its point (Silver Springs State Park, 5.3 km; it stopped at traffic).
 - **Outage rule on a pilot.** The capture is cut at its first outage and kept if the clock holds 30 minutes, as for a
   test capture.
+- **Caches.** Each build kept one cache root: new and empty for its first case, and reused by its second. The rule asks
+  for no more, and every run declined on its audio alone, before any downloaded data could matter.
 
 ### Found after the runs, and not used by set H
 
 With every outcome read, fdop's tonal oracle was run on the two test captures, with pass lists from the test window's
 ADS-B. It hears St. Augustine at 7 of 18 close passes (m 0.78) and Deerfield at 6 of 10 (m 0.91; band power 5 of 10,
-0.74), so the aimed filter finds the aircraft on the test hours too. But each pass is faint. The true passes' best matched-filter
-scores are 1.48 to 2.01 and 2.05 to 2.49, while the detector keeps nothing under 3.5. In both captures the best of the
-chance lines (2.21 and 2.79) beats every true pass, and a blind search has to beat the best window of the whole
-recording. The detector's candidate list was empty on both, even with a cap of 400. On each of the 10 pilots in sets G
-and H that had a close pass and were heard, the best chance line scores at least as high as the best true pass. At St.
-Augustine, South Ponte Vedra and Deerfield the true passes stay under 3. At PortMiami and the Irvin Plant they reach 3.5
-and 4.1, with chance lines up to 6.6. At Bryant Park, Fremont Street, Treasure Island and Venice they pass 5, and chance
-lines reach 8.8 to 10.6. At a busy site a shifted window can hold another aircraft. Pier 39 scored 0 everywhere.
+0.74), so the aimed filter finds the aircraft on the test hours too. But each pass is faint. The true passes' best
+matched-filter scores are 1.48 to 2.01 and 2.05 to 2.49, and no registered build keeps a candidate under 3.5 (`7e66501`
+none under 4.5). The oracle and `deeplist` are built on `446a2bf`, whose survey and score are those of all four builds:
+its `detect.rs` is `981fad1`'s and `37a156b`'s, `6914ab7`'s but for comments, and `7e66501`'s scoring refactored. In
+both captures the best of the chance lines (2.21 and 2.79) beats every true pass, and a blind search has to beat the
+best window of the whole recording. The detector's candidate list was empty on both, even with a cap of 400. On each of
+the 10 pilots in sets G and H that had a close pass and were heard, the best chance line scores at least as high as the
+best true pass. At St. Augustine, South Ponte Vedra and Deerfield the true passes stay under 3. At PortMiami and the
+Irvin Plant they reach 3.5 and 4.1, with chance lines up to 6.6. At Bryant Park, Fremont Street, Treasure Island and
+Venice they pass 5, and chance lines reach 8.8 to 10.6. At a busy site a shifted window can hold another aircraft.
+Pier 39 scored 0 everywhere.
 
 So set H's cases are solvable in the sense its rule fixed: aircraft passed, and fdop's own filter, aimed with the true
 passes, finds them above chance. They are not solvable by a method that must first find single flyovers blind, and
