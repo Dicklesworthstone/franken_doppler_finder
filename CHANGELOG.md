@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep duplicate hypothesis pairs out of the search's working set
+
+- Deduplicate flight/place/clock seeds inside ordered worker chunks as each pair is generated,
+  then merge bounded batches in the original input order. A dense hash bucket no longer allocates
+  every raw match before selecting its representatives. Earlier batches' duplicates allocate no
+  candidate entry. The hash index and distinct surviving seeds remain proportional to the search.
+- Preserve every comparison, the original first representative, f32 midpoint arithmetic, spatial
+  and clock-cell keys, same-flight separation, budgets and confidence thresholds. No early cut is
+  introduced to obtain the memory reduction.
+- Add an exhaustive ordered-pair oracle covering duplicate-heavy and unique cells, negative
+  coordinates and clock boundaries, same-flight separation, multiple batches, empty inputs and
+  one/four Rayon workers. Add an opt-in 16-million-pair resource regression with one true seed.
+- **Validation:** the exact original and updated join source both passed the ordered oracle
+  natively on the pinned nightly with real Rayon 1.12.0 in a focused component build. The updated
+  file passes rustfmt and the diff passes whitespace checks. Full core/workspace checks and
+  recording replays are not established by this component result; no field speedup or grade
+  change is claimed.
+
 ### Let the curve match judge a run with `--start` and the default clock tolerance
 
 - `--clock-tol` now defaults to 120 s (it was 180 s). The curve match ranks its answer against decoy clock

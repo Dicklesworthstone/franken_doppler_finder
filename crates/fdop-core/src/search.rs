@@ -674,7 +674,7 @@ fn clock_cell(t_s: f64) -> Option<i64> {
     (cell.is_finite() && cell >= i64::MIN as f64 && cell < i64::MAX as f64).then_some(cell as i64)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Joined {
     ei: usize,
     ej: usize,
@@ -687,6 +687,11 @@ struct Joined {
     t_s: f64,
 }
 
+// Bound duplicate-bearing scratch without capping the distinct seeds that reach scoring.
+// Indexed chunks keep the original input/bucket order, including the first representative.
+const JOIN_BATCH_HYPOTHESES: usize = 4096;
+const JOIN_CHUNK_HYPOTHESES: usize = 64;
+
 #[allow(clippy::too_many_arguments)]
 fn join(
     hi: &[Hyp],
@@ -698,6 +703,9 @@ fn join(
     same_flight_min_dt: f64,
     t_base: f64,
 ) -> Vec<Joined> {
+    if hi.is_empty() || hj.is_empty() {
+        return Vec::new();
+    }
     let key = |e: f32, n: f32, ts: f32| {
         (
             (e as f64 / r).floor() as i32,
@@ -709,63 +717,86 @@ fn join(
     for (k, h) in hi.iter().enumerate() {
         map.entry(key(h.e, h.n, h.t_s)).or_default().push(k as u32);
     }
+    // One representative per (flights, 600 m cell, 20 s), as in the original join.
+    let cell = |j: &Joined| {
+        Some((
+            j.ti,
+            j.tj,
+            (j.e / 600.0).floor() as i32,
+            (j.n / 600.0).floor() as i32,
+            clock_cell(j.t_s)?,
+        ))
+    };
     let r2 = r * r;
-    let out: Vec<Joined> = hj
-        .par_iter()
-        .flat_map_iter(|b| {
-            let (kx, ky, kt) = key(b.e, b.n, b.t_s);
-            let mut v = Vec::new();
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    for dtk in -1..=1 {
-                        if let Some(list) = map.get(&(kx + dx, ky + dy, kt + dtk)) {
-                            for &ia in list {
-                                let a = &hi[ia as usize];
-                                let (de, dn) = ((a.e - b.e) as f64, (a.n - b.n) as f64);
-                                if de * de + dn * dn > r2 || ((a.t_s - b.t_s) as f64).abs() > tt {
-                                    continue;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for batch in hj.chunks(JOIN_BATCH_HYPOTHESES) {
+        let parts: Vec<Vec<Joined>> = batch
+            .par_chunks(JOIN_CHUNK_HYPOTHESES)
+            .map(|chunk| {
+                let mut local_seen = std::collections::HashSet::new();
+                let mut kept = Vec::new();
+                for b in chunk {
+                    let (kx, ky, kt) = key(b.e, b.n, b.t_s);
+                    for dx in -1..=1 {
+                        for dy in -1..=1 {
+                            for dtk in -1..=1 {
+                                if let Some(list) = map.get(&(kx + dx, ky + dy, kt + dtk)) {
+                                    for &ia in list {
+                                        let a = &hi[ia as usize];
+                                        let (de, dn) = ((a.e - b.e) as f64, (a.n - b.n) as f64);
+                                        if de * de + dn * dn > r2
+                                            || ((a.t_s - b.t_s) as f64).abs() > tt
+                                        {
+                                            continue;
+                                        }
+                                        if a.trk == b.trk
+                                            && ((a.t_e - b.t_e) as f64).abs() < same_flight_min_dt
+                                        {
+                                            continue;
+                                        }
+                                        let j = Joined {
+                                            ei,
+                                            ej,
+                                            ti: a.trk,
+                                            tj: b.trk,
+                                            te_i: a.t_e as f64 + t_base,
+                                            te_j: b.t_e as f64 + t_base,
+                                            e: 0.5 * (a.e + b.e) as f64,
+                                            n: 0.5 * (a.n + b.n) as f64,
+                                            t_s: 0.5 * (a.t_s + b.t_s) as f64 + t_base,
+                                        };
+                                        // Deduplicate at production, not after collecting even
+                                        // one bucket: a dense bucket alone can make millions
+                                        // of raw pairs. Earlier batches need no scratch entry.
+                                        if let Some(k) = cell(&j)
+                                            && !seen.contains(&k)
+                                            && local_seen.insert(k)
+                                        {
+                                            kept.push(j);
+                                        }
+                                    }
                                 }
-                                if a.trk == b.trk
-                                    && ((a.t_e - b.t_e) as f64).abs() < same_flight_min_dt
-                                {
-                                    continue;
-                                }
-                                v.push(Joined {
-                                    ei,
-                                    ej,
-                                    ti: a.trk,
-                                    tj: b.trk,
-                                    te_i: a.t_e as f64 + t_base,
-                                    te_j: b.t_e as f64 + t_base,
-                                    e: 0.5 * (a.e + b.e) as f64,
-                                    n: 0.5 * (a.n + b.n) as f64,
-                                    t_s: 0.5 * (a.t_s + b.t_s) as f64 + t_base,
-                                });
                             }
                         }
                     }
                 }
+                kept
+            })
+            .collect();
+        // Rayon collects indexed chunks in input order. Never iterate a hash set to
+        // emit candidates: later fitting depends on the original first representative.
+        for part in parts {
+            for j in part {
+                if let Some(k) = cell(&j)
+                    && seen.insert(k)
+                {
+                    out.push(j);
+                }
             }
-            v
-        })
-        .collect();
-    // one representative per (flights, 600 m cell, 20 s)
-    let mut seen: std::collections::HashSet<(u32, u32, i32, i32, i64)> =
-        std::collections::HashSet::new();
-    out.into_iter()
-        .filter(|j| {
-            let Some(clock) = clock_cell(j.t_s) else {
-                return false;
-            };
-            seen.insert((
-                j.ti,
-                j.tj,
-                (j.e / 600.0).floor() as i32,
-                (j.n / 600.0).floor() as i32,
-                clock,
-            ))
-        })
-        .collect()
+        }
+    }
+    out
 }
 
 /// Merge duplicate place/clock seeds and rank every flight pair's best cell before its next.
@@ -3301,6 +3332,128 @@ mod tests {
     use crate::track::straight_track;
     use fdop_types::FlatElevation;
 
+    // Exhaustive reference: visit every input pair in the original bucket/insertion order.
+    // No hash join, parallel chunks or intermediate candidate collection is used here.
+    fn exhaustive_join(hi: &[Hyp], hj: &[Hyp], r: f64, tt: f64, t_base: f64) -> Vec<Joined> {
+        let cell = |h: &Hyp| {
+            (
+                (h.e as f64 / r).floor() as i32,
+                (h.n as f64 / r).floor() as i32,
+                (h.t_s as f64 / tt).floor() as i64,
+            )
+        };
+        let mut ordered: Vec<usize> = (0..hi.len()).collect();
+        ordered.sort_by_key(|&i| (cell(&hi[i]), i));
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for b in hj {
+            let kb = cell(b);
+            for &ia in &ordered {
+                let a = &hi[ia];
+                let ka = cell(a);
+                if (ka.0 - kb.0).abs() > 1
+                    || (ka.1 - kb.1).abs() > 1
+                    || (ka.2 - kb.2).abs() > 1
+                    || ((a.e - b.e) as f64).powi(2) + ((a.n - b.n) as f64).powi(2) > r * r
+                    || ((a.t_s - b.t_s) as f64).abs() > tt
+                    || (a.trk == b.trk && ((a.t_e - b.t_e) as f64).abs() < SAME_FLIGHT_MIN_DT_S)
+                {
+                    continue;
+                }
+                let j = Joined {
+                    ei: 2,
+                    ej: 5,
+                    ti: a.trk,
+                    tj: b.trk,
+                    te_i: a.t_e as f64 + t_base,
+                    te_j: b.t_e as f64 + t_base,
+                    e: 0.5 * (a.e + b.e) as f64,
+                    n: 0.5 * (a.n + b.n) as f64,
+                    t_s: 0.5 * (a.t_s + b.t_s) as f64 + t_base,
+                };
+                let Some(clock) = clock_cell(j.t_s) else {
+                    continue;
+                };
+                if seen.insert((
+                    j.ti,
+                    j.tj,
+                    (j.e / 600.0).floor() as i32,
+                    (j.n / 600.0).floor() as i32,
+                    clock,
+                )) {
+                    out.push(j);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pair_join_preserves_every_ordered_representative_across_batches() {
+        let coordinates = [-1200.0, -600.25, -600.0, -0.25, 0.0, 299.75, 600.0, 1200.0];
+        let hypothesis = |i: usize| Hyp {
+            trk: (i % 7) as u32,
+            t_e: 100.0 + (i % 13) as f32 * 15.0,
+            e: coordinates[i % coordinates.len()],
+            n: coordinates[(i / coordinates.len()) % coordinates.len()],
+            t_s: (i % 9) as f32 * 10.0 - 40.0,
+        };
+        let hi: Vec<_> = (0..80).map(hypothesis).collect();
+        // Repeated cells with different representatives straddle several worker chunks and
+        // multiple bounded batches. A different representative would move the next trace fit.
+        let hj: Vec<_> = (0..8205).map(|i| hypothesis((i * 17) % 97)).collect();
+        let unique_hi: Vec<_> = (0..40)
+            .map(|i| Hyp {
+                trk: i,
+                ..hypothesis(0)
+            })
+            .collect();
+        let unique_hj: Vec<_> = (40..120)
+            .map(|i| Hyp {
+                trk: i,
+                ..hypothesis(0)
+            })
+            .collect();
+        let same: Vec<_> = [0.0, 29.75, 30.0, 30.25, 60.0]
+            .into_iter()
+            .map(|t_e| Hyp {
+                t_e,
+                ..hypothesis(0)
+            })
+            .collect();
+        for (a, b) in [(&hi, &hj), (&unique_hi, &unique_hj), (&same, &same)] {
+            for (r, tt, base) in [(600.0, 20.0, 0.0), (625.0, 30.0, 1_700_000_019.875)] {
+                let expected = exhaustive_join(a, b, r, tt, base);
+                assert!(!expected.is_empty());
+                for workers in [1, 4] {
+                    let actual = rayon::ThreadPoolBuilder::new()
+                        .num_threads(workers)
+                        .build()
+                        .unwrap()
+                        .install(|| join(a, b, 2, 5, r, tt, SAME_FLIGHT_MIN_DT_S, base));
+                    assert_eq!(actual, expected, "workers={workers}, r={r}, tt={tt}");
+                }
+            }
+        }
+        assert!(join(&[], &hj, 2, 5, 600.0, 20.0, 30.0, 0.0).is_empty());
+        assert!(join(&hi, &[], 2, 5, 600.0, 20.0, 30.0, 0.0).is_empty());
+    }
+
+    #[test]
+    #[ignore = "resource measurement: 16 million compatible hypothesis pairs"]
+    fn dense_pair_join_keeps_one_seed_without_raw_pair_storage() {
+        let a = Hyp {
+            trk: 1,
+            t_e: 100.0,
+            e: 100.0,
+            n: 100.0,
+            t_s: 200.0,
+        };
+        let b = Hyp { trk: 2, ..a };
+        let actual = join(&vec![a; 4096], &vec![b; 4096], 2, 5, 600.0, 20.0, 30.0, 0.0);
+        assert_eq!(actual, exhaustive_join(&[a], &[b], 600.0, 20.0, 0.0));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn synth_event(
         id: &str,
@@ -5320,11 +5473,17 @@ mod tests {
             atmo: &atmo,
         };
         let result = run(&inputs, &p, &|_| {});
-        let winner = result.candidates.first().unwrap_or_else(|| {
-            panic!("in-region flyovers were lost: {:?}", result.funnel)
-        });
+        let winner = result
+            .candidates
+            .first()
+            .unwrap_or_else(|| panic!("in-region flyovers were lost: {:?}", result.funnel));
         for key in ["A", "B"] {
-            assert!(winner.events.iter().any(|m| m.event == key && m.flight == key));
+            assert!(
+                winner
+                    .events
+                    .iter()
+                    .any(|m| m.event == key && m.flight == key)
+            );
         }
         assert!(haversine_m(lat, lon, winner.lat, winner.lon) < 75.0);
         assert!((winner.t_start_utc - t_s).abs() < 0.2);
@@ -5413,8 +5572,18 @@ mod tests {
                 result.funnel
             )
         });
-        assert!(winner.events.iter().any(|m| m.event == "A" && m.flight == "A"));
-        assert!(winner.events.iter().any(|m| m.event == "B" && m.flight == "B"));
+        assert!(
+            winner
+                .events
+                .iter()
+                .any(|m| m.event == "A" && m.flight == "A")
+        );
+        assert!(
+            winner
+                .events
+                .iter()
+                .any(|m| m.event == "B" && m.flight == "B")
+        );
         assert!(haversine_m(lat, lon, winner.lat, winner.lon) < 75.0);
         assert!((winner.t_start_utc - t_s).abs() < 0.2);
         assert!(result.funnel.truncated.is_empty());
@@ -6334,9 +6503,8 @@ mod tests {
                 (128.0, 1024.0, distance(128.0)),
                 (384.0, distance(384.0), 2048.0),
             ] {
-                let b =
-                    region_cross_track_offset(d_lo, d_hi, &region, origin, direction, distance)
-                        .expect("the clipped endpoint satisfies both inclusive gates");
+                let b = region_cross_track_offset(d_lo, d_hi, &region, origin, direction, distance)
+                    .expect("the clipped endpoint satisfies both inclusive gates");
                 assert_eq!(b, expected);
                 assert!(region.contains(origin.0 + b * direction.0, origin.1 + b * direction.1));
                 assert!((d_lo..=d_hi).contains(&distance(b)));
@@ -6357,20 +6525,11 @@ mod tests {
             );
         }
         let probe = |d_lo, d_hi, distance: fn(f64) -> f64| {
-            region_cross_track_offset(
-                d_lo,
-                d_hi,
-                &region,
-                (0.002, 0.0),
-                (-0.00001, 0.0),
-                distance,
-            )
+            region_cross_track_offset(d_lo, d_hi, &region, (0.002, 0.0), (-0.00001, 0.0), distance)
         };
         assert!(probe(10.0, 50.0, |b| b).is_none(), "region is beyond reach");
         assert!(probe(800.0, 1500.0, |b| b.hypot(2000.0)).is_none());
-        assert!(
-            probe(1200.0, 1500.0, |b| if b < 260.0 { 1000.0 } else { 2000.0 }).is_none()
-        );
+        assert!(probe(1200.0, 1500.0, |b| if b < 260.0 { 1000.0 } else { 2000.0 }).is_none());
         assert!(probe(800.0, 1500.0, |_| f64::NAN).is_none());
     }
 

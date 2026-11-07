@@ -1095,6 +1095,13 @@ Search clock scans also reuse trace-fit and result buffers, preserving the origi
 candidate comparisons. Before/after synthetic comparisons check complete point scores and chosen clocks
 bit-for-bit; the size of the end-to-end speedup has not yet been measured on a real recording.
 
+Pair joining now discards duplicate flight/place/clock seeds as they are generated, using bounded
+batches of 4,096 input hypotheses and ordered worker chunks. Previously it held every compatible
+raw pair before deduplicating: a dense bucket could exhaust memory before the quick-check budget
+was considered. The hash index and distinct surviving seeds still consume memory; this is not a
+fixed total-memory bound. The same first representative, candidate order, spatial and clock cells,
+and complete comparison are retained. No detection cap, search budget or confidence line changes.
+
 **Component measurements, 2026-11-04.** Optimized Rust builds on a shared AMD EPYC 9V74 host, with
 alternating old/new execution order. The detector uses four Rayon workers; other probes are serial.
 These medians compare the actual old and new functions, with unchanged supporting physics for the
