@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Release rejected pair seeds and completed search stages promptly
+
+- Run the unchanged quick trace check immediately after each event-pair join. Only survivors
+  carry into the following pair; candidate order, scores, cumulative joined counts and the
+  stop-after-complete-pair budget remain unchanged. Rejected seeds still consume the existing
+  comparison budget, so streaming cannot silently search further or erase a truncation.
+- Release hypothesis clouds after the join phase and fine-grid seed storage after fine scoring,
+  before confirmation/refinement. These arrays previously lived until the whole search returned.
+- Add a real three-flight regression that rejects every quick seed and requires the first
+  completed pair to exhaust a zero quick budget, recording `pairs: 3 -> 1` with no candidates.
+- Record native old/new join measurements in README: three alternating 1,048,576-pair runs
+  preserved the answer, with median peak RSS 70,360 -> 9,472 KiB (86.5% lower). The updated
+  16,777,216-pair case passed at 9,344 KiB. Both use actual production join source, the pinned
+  nightly, real Rayon and per-child kernel resource accounting. They do not measure this
+  follow-up's end-to-end effect or a recording's runtime.
+- **Validation:** independent source review and focused formatting/whitespace checks pass.
+  The new full-search budget regression is pending the native core build; the join component
+  results above do not establish this follow-up's integration result or recording accuracy.
+
 ### Require complete flight archives before publishing a day's tracks
 
 - Require both tar end blocks and drain the complete underlying stream before ingestion succeeds.

@@ -1118,6 +1118,31 @@ was considered. The hash index and distinct surviving seeds still consume memory
 fixed total-memory bound. The same first representative, candidate order, spatial and clock cells,
 and complete comparison are retained. No detection cap, search budget or confidence line changes.
 
+Each event pair now reaches the quick trace check before the next pair is joined, so rejected
+seeds do not accumulate across the entire search. The joined-seed budget still counts rejected
+seeds and stops at the same complete-pair boundary. Hypothesis clouds are released before fine
+scoring, and fine-grid input seeds before confirmation and refinement. These later stages retain
+their surviving candidates; the changes do not impose an additional search cut.
+
+**Pair-join component measurement, 2026-11-07.** The
+`dense_pair_join_with_one_million_raw_matches` workload has 1,024 hypotheses on each side,
+1,048,576 compatible raw pairs and one retained seed. Exact original and updated join source
+ran with the pinned nightly, Rayon 1.12.0, four workers and an optimized test build (level 2,
+no debug information) on a shared AMD EPYC 9V74 Linux host. All three alternating before/after
+pairs passed the same assertion; per-child kernel peak RSS and monotonic elapsed time gave:
+
+| Median over three runs | Original join | Bounded join |
+|---|---:|---:|
+| Peak process RSS | 70,360 KiB | 9,472 KiB |
+| Elapsed time | 0.680 s | 0.148 s |
+
+That is 86.5% lower measured peak RSS on this duplicate-heavy component fixture. Scheduling
+was shared, and these are not whole-recording timings or total `fdop` memory measurements.
+The updated `dense_pair_join_keeps_one_seed_without_raw_pair_storage` regression also passed
+with 16,777,216 compatible pairs and 9,344 KiB peak RSS; its original-version counterpart was
+not run under the shared 8 GiB memory limit. No end-to-end memory reduction is claimed from
+the additional per-pair quick-scoring and early-release changes.
+
 The exact-curve scorer now builds one conservative ECEF box per shortlisted trajectory and reuses it
 across candidate locations, clock alternatives, refinement and decoy windows. The box encloses the full
 Hermite curves, including turns outside the reported points. A trajectory proven farther away than the

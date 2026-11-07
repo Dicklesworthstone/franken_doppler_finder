@@ -2101,7 +2101,8 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     let rho = 0.5 * p.along_step_m.hypot(p.cross_step_m);
     let r_join = 2.0 * rho + 120.0;
     let slop = p.along_dt_max + p.cross_step_m / c + 2.0;
-    let mut joined: Vec<Joined> = Vec::new();
+    let mut quick: Vec<(Joined, f64)> = Vec::new();
+    let done = AtomicUsize::new(0);
     let mut pairs = Vec::new();
     for (x, &i) in pairable.iter().enumerate() {
         for &j in &pairable[x + 1..] {
@@ -2124,47 +2125,57 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             (j, i, hj, hi)
         };
         let tt = evs[i].t_tol + evs[j].t_tol + slop;
-        let mut jv = join(ha, hb, a, b, r_join, tt, SAME_FLIGHT_MIN_DT_S, t_base);
-        progress(&format!("join {}x{}: {}", evs[a].id, evs[b].id, jv.len()));
-        joined.append(&mut jv);
+        let joined = join(ha, hb, a, b, r_join, tt, SAME_FLIGHT_MIN_DT_S, t_base);
+        progress(&format!(
+            "join {}x{}: {}",
+            evs[a].id,
+            evs[b].id,
+            joined.len()
+        ));
+        funnel.joined += joined.len();
+        // Quick-score this pair before joining the next. Rejected seeds then leave the
+        // working set immediately; surviving seeds retain the same pair/input order.
+        let checked: Vec<(Joined, f64)> = joined
+            .par_iter()
+            .filter_map(|j| {
+                let k = done.fetch_add(1, Ordering::Relaxed);
+                if k.is_multiple_of(500_000) && k > 0 {
+                    progress(&format!("quick check {k}/{} joined so far", funnel.joined));
+                }
+                let (la, lo) = frame.latlon(j.e, j.n);
+                if !p.region.contains(la, lo) {
+                    return None;
+                }
+                let o = observer(la, lo, inp.coarse_dem);
+                let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
+                let pe = eval_point(&o, &assign, &evs, tracks, p, atmo, true, true, true)?;
+                let worst = pe.chis.iter().map(|c| c.chi).fold(0.0, f64::max);
+                let qs: f64 = pe
+                    .chis
+                    .iter()
+                    .zip(&assign)
+                    .map(|(c, a)| ev_weight(&evs[a.0]) * (1.0 - c.chi / p.quick_chi).max(0.0))
+                    .sum();
+                (worst <= p.quick_chi).then_some((*j, qs))
+            })
+            .collect();
+        quick.extend(checked);
         pairs_done += 1;
-        if joined.len() > p.max_quick {
+        // The budget counts every joined seed, including rejected ones, and still stops
+        // only after a complete event pair. Streaming must not grant extra comparisons.
+        if funnel.joined > p.max_quick {
             break;
         }
     }
+    // The join is the last user of these potentially multi-gigabyte clouds. They must
+    // not remain live while the fine search, confirmation and refinement allocate.
+    drop(hyps);
     if pairs_done < pairs.len() {
         warnings.push(format!("joined {pairs_done} of {} event pairs before the quick-check budget ({}); narrow the region or dates", pairs.len(), p.max_quick));
         funnel
             .truncated
             .push(format!("pairs: {} -> {pairs_done}", pairs.len()));
     }
-    funnel.joined = joined.len();
-    // quick check at the joined point
-    let done = AtomicUsize::new(0);
-    let quick: Vec<(Joined, f64)> = joined
-        .par_iter()
-        .filter_map(|j| {
-            let k = done.fetch_add(1, Ordering::Relaxed);
-            if k.is_multiple_of(500_000) && k > 0 {
-                progress(&format!("quick check {k}/{}", joined.len()));
-            }
-            let (la, lo) = frame.latlon(j.e, j.n);
-            if !p.region.contains(la, lo) {
-                return None;
-            }
-            let o = observer(la, lo, inp.coarse_dem);
-            let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
-            let pe = eval_point(&o, &assign, &evs, tracks, p, atmo, true, true, true)?;
-            let worst = pe.chis.iter().map(|c| c.chi).fold(0.0, f64::max);
-            let qs: f64 = pe
-                .chis
-                .iter()
-                .zip(&assign)
-                .map(|(c, a)| ev_weight(&evs[a.0]) * (1.0 - c.chi / p.quick_chi).max(0.0))
-                .sum();
-            (worst <= p.quick_chi).then_some((*j, qs))
-        })
-        .collect();
     funnel.quick_passed = quick.len();
     progress(&format!("quick check passed: {}", quick.len()));
     let mut fine_in = ranked_fine_seeds(quick);
@@ -2251,6 +2262,8 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             })
         })
         .collect();
+    // Only the fine survivors are needed from here on.
+    drop(fine_in);
     funnel.fine_passed = fine.len();
     progress(&format!("fine survivors: {}", fine.len()));
     let mut fine = fine;
@@ -3439,9 +3452,7 @@ mod tests {
         assert!(join(&hi, &[], 2, 5, 600.0, 20.0, 30.0, 0.0).is_empty());
     }
 
-    #[test]
-    #[ignore = "resource measurement: 16 million compatible hypothesis pairs"]
-    fn dense_pair_join_keeps_one_seed_without_raw_pair_storage() {
+    fn check_dense_pair_join(size: usize) {
         let a = Hyp {
             trk: 1,
             t_e: 100.0,
@@ -3450,8 +3461,20 @@ mod tests {
             t_s: 200.0,
         };
         let b = Hyp { trk: 2, ..a };
-        let actual = join(&vec![a; 4096], &vec![b; 4096], 2, 5, 600.0, 20.0, 30.0, 0.0);
+        let actual = join(&vec![a; size], &vec![b; size], 2, 5, 600.0, 20.0, 30.0, 0.0);
         assert_eq!(actual, exhaustive_join(&[a], &[b], 600.0, 20.0, 0.0));
+    }
+
+    #[test]
+    #[ignore = "resource measurement: 16 million compatible hypothesis pairs"]
+    fn dense_pair_join_keeps_one_seed_without_raw_pair_storage() {
+        check_dense_pair_join(4096);
+    }
+
+    #[test]
+    #[ignore = "resource measurement: 1 million compatible hypothesis pairs"]
+    fn dense_pair_join_with_one_million_raw_matches() {
+        check_dense_pair_join(1024);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6148,6 +6171,51 @@ mod tests {
                 res.warnings
             );
         }
+    }
+
+    #[test]
+    fn quick_pair_budget_counts_rejected_seeds_before_starting_another_pair() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let prop = Prop::from_medium(&med, &enu);
+        let mut third = synth_event(
+            "e3",
+            &case.tracks[2],
+            x,
+            case.t_s,
+            90.0,
+            343.0,
+            case.t_s + 1500.0,
+            &prop,
+        );
+        // Keep the known A/B pair first; the third actual pass still supplies two
+        // more pairable combinations that the zero budget must leave unchecked.
+        third.misfit = true;
+        case.events.push(third);
+        case.p.region = BBox::new(
+            case.obs.0 - 0.01,
+            case.obs.1 - 0.01,
+            case.obs.0 + 0.01,
+            case.obs.1 + 0.01,
+        );
+        case.p.start_lo = case.t_s - 30.0;
+        case.p.start_hi = case.t_s + 30.0;
+        case.p.max_quick = 0;
+        case.p.max_fine = 0;
+        // Force all quick checks to fail. Counting survivors instead of joined seeds
+        // would now join every pair, changing the budget's meaning and hiding its cut.
+        case.p.quick_chi = -1.0;
+        let result = run_case(&case, med);
+        assert_eq!(result.funnel.events_used, 3);
+        assert_eq!(result.funnel.event_pairs, 3);
+        assert!(result.funnel.joined > 0, "{:?}", result.funnel);
+        assert_eq!(result.funnel.quick_passed, 0);
+        assert_eq!(result.funnel.fine_scored, 0);
+        assert_eq!(result.funnel.truncated, ["pairs: 3 -> 1"]);
+        assert!(result.candidates.is_empty());
+        assert!(!result.margin_passes(3.0));
     }
 
     /// The confirmer cap is a cut like the pair and fine budgets: `run` must record it in the
