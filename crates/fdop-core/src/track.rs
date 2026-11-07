@@ -30,6 +30,36 @@ pub struct TrackModel {
     pub mlat_frac: f64,
 }
 
+/// Conservative ECEF box of a complete interpolated track, including excursions between knots.
+/// Construct once with [`TrackModel::bounds`], then reuse it to rule out distant observers before
+/// solving closest approaches. A box hit only permits the exact geometry check; it proves no pass.
+#[derive(Clone, Copy, Debug)]
+pub struct TrackBounds {
+    lo: V3,
+    hi: V3,
+}
+
+impl TrackBounds {
+    /// Whether any part of the track could be within `distance_m` of ECEF position `x`.
+    /// Unknown inputs fail open. Round the lower distance down and the radius up so a grazing
+    /// pass cannot be lost to subtraction, squaring, accumulation or the final distance's sqrt.
+    pub fn may_reach(&self, x: V3, distance_m: f64) -> bool {
+        if !distance_m.is_finite() || distance_m < 0.0 || x.iter().any(|v| !v.is_finite()) {
+            return true;
+        }
+        let mut distance2 = 0.0;
+        for (k, &v) in x.iter().enumerate() {
+            let gap = (self.lo[k] - v).max(v - self.hi[k]).max(0.0);
+            let lower = gap.next_down().max(0.0);
+            distance2 = (distance2 + (lower * lower).next_down().max(0.0))
+                .next_down()
+                .max(0.0);
+        }
+        let radius = distance_m.next_up();
+        distance2 <= (radius * radius).next_up()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BuildParams {
     pub max_gap_s: f64,
@@ -377,6 +407,52 @@ impl TrackModel {
     }
     pub fn t1(&self) -> f64 {
         self.t[self.t.len() - 1]
+    }
+
+    /// Bound every cubic Hermite segment by its Bezier control hull. Bounding only the reported
+    /// positions would miss a turn whose curve reaches beyond both knots. Invalid/overflowing
+    /// inputs yield no bound and must retain the track for the normal geometry checks.
+    pub fn bounds(&self) -> Option<TrackBounds> {
+        let n = self.t.len();
+        if n < 2 || self.pos.len() != n || self.vel.len() != n {
+            return None;
+        }
+        let mut bounds = TrackBounds {
+            lo: [f64::INFINITY; 3],
+            hi: [f64::NEG_INFINITY; 3],
+        };
+        for i in 0..n - 1 {
+            let (ta, tb) = (self.t[i], self.t[i + 1]);
+            let h = tb - ta;
+            if !ta.is_finite() || !tb.is_finite() || h <= 0.0 || !h.is_finite() {
+                return None;
+            }
+            for k in 0..3 {
+                let (pa, pb) = (self.pos[i][k], self.pos[i + 1][k]);
+                let (va, vb) = (h * self.vel[i][k], h * self.vel[i + 1][k]);
+                let control = [pa, pa + va / 3.0, pb - vb / 3.0, pb];
+                if [pa, pb, va, vb].iter().any(|v| !v.is_finite())
+                    || control.iter().any(|v| !v.is_finite())
+                {
+                    return None;
+                }
+                // `pv_in` evaluates the Hermite basis in ECEF, where large signed positions
+                // can cancel. This allowance bounds its basis/products/sums, plus construction
+                // of the control points, in units of the largest input term on this axis.
+                let scale = pa.abs().max(pb.abs()).max(va.abs()).max(vb.abs()).max(1.0);
+                let pad = 128.0 * f64::EPSILON * scale;
+                let lo =
+                    (control.iter().copied().fold(f64::INFINITY, f64::min) - pad).next_down();
+                let hi =
+                    (control.iter().copied().fold(f64::NEG_INFINITY, f64::max) + pad).next_up();
+                if !lo.is_finite() || !hi.is_finite() {
+                    return None;
+                }
+                bounds.lo[k] = bounds.lo[k].min(lo);
+                bounds.hi[k] = bounds.hi[k].max(hi);
+            }
+        }
+        Some(bounds)
     }
 
     #[inline]
@@ -1298,6 +1374,151 @@ mod tests {
             assert_eq!(nearest.t_e, global.t_e);
             assert_eq!(nearest.d, global.d);
             assert_eq!(nearest.speed, global.speed);
+        }
+    }
+
+    #[test]
+    fn bounds_enclose_hermite_excursions_in_every_ecef_octant() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let base = straight_track(
+            &enu,
+            [0.0; 3],
+            [50.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+        );
+        for magnitude in [0.0, 6_000_000.0, 6_000_000_000_000.0] {
+            for octant in 0..8 {
+                let offset: V3 = std::array::from_fn(|k| {
+                    if octant & (1 << k) == 0 {
+                        magnitude
+                    } else {
+                        -magnitude
+                    }
+                });
+                let mut tr = base.clone();
+                tr.t = vec![10.0, 30.0, 55.0];
+                tr.pos = [
+                    [-500.0, 0.0, -300.0],
+                    [500.0, 0.0, 100.0],
+                    [900.0, 700.0, 900.0],
+                ]
+                .map(|p| add(offset, p))
+                .to_vec();
+                tr.vel = vec![
+                    [50.0, 300.0, 100.0],
+                    [50.0, -300.0, -100.0],
+                    [30.0, 40.0, 50.0],
+                ];
+                let bounds = tr.bounds().unwrap();
+                // Both knots are south of the bowed first segment: a point-only box loses it.
+                let middle = tr.pos_at(20.0);
+                assert!(
+                    middle[1]
+                        > tr.pos
+                            .iter()
+                            .map(|p| p[1])
+                            .fold(f64::NEG_INFINITY, f64::max)
+                );
+                assert!(bounds.may_reach(middle, 0.0));
+                for i in 0..=400 {
+                    let p = tr.pos_at(10.0 + 45.0 * i as f64 / 400.0);
+                    for d in [0.0, 0.0001, 1.0, 7999.5] {
+                        let x = add(p, [0.6 * d, -0.8 * d, 0.0]);
+                        let actual = norm(sub(p, x));
+                        assert!(
+                            bounds.may_reach(x, actual),
+                            "{octant}, {magnitude}, {i}, {d}"
+                        );
+                    }
+                }
+                let far = [bounds.hi[0] + 8001.0, bounds.hi[1], bounds.hi[2]];
+                assert!(!bounds.may_reach(far, 8000.0));
+            }
+        }
+    }
+
+    #[test]
+    fn bounds_distance_keeps_grazing_faces_edges_and_corners() {
+        for offset in [-6_000_000.0, 0.0, 6_000_000.0] {
+            let bounds = TrackBounds {
+                lo: [offset; 3],
+                hi: [offset + 100.0; 3],
+            };
+            for x in [bounds.lo, bounds.hi, [offset + 50.0; 3]] {
+                assert!(bounds.may_reach(x, 0.0));
+            }
+            for direction in [-1.0, 1.0] {
+                let corner = if direction < 0.0 {
+                    bounds.lo
+                } else {
+                    bounds.hi
+                };
+                for delta in [[5.0, 0.0, 0.0], [3.0, 4.0, 0.0], [1.0, 2.0, 2.0]] {
+                    let x = add(corner, scale(delta, direction));
+                    let radius = norm(sub(x, corner));
+                    assert!(
+                        bounds.may_reach(x, radius),
+                        "{offset}, {direction}, {delta:?}"
+                    );
+                    assert!(!bounds.may_reach(x, radius - 0.001));
+                }
+            }
+            for radius in [-1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+                assert!(bounds.may_reach([offset + 1e100; 3], radius));
+            }
+            for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(bounds.may_reach([v, 0.0, 0.0], 1.0));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_track_geometry_has_no_pruning_bound() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let base = straight_track(
+            &enu,
+            [0.0; 3],
+            [50.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+        );
+        assert!(base.bounds().is_some());
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut tr = base.clone();
+            tr.t[0] = bad;
+            assert!(tr.bounds().is_none());
+            for k in 0..3 {
+                let mut tr = base.clone();
+                tr.pos[1][k] = bad;
+                assert!(tr.bounds().is_none());
+                let mut tr = base.clone();
+                tr.vel[0][k] = bad;
+                assert!(tr.bounds().is_none());
+            }
+        }
+        for end in [-1.0, 0.0] {
+            let mut tr = base.clone();
+            tr.t[1] = end;
+            assert!(tr.bounds().is_none());
+        }
+        let mut tr = base.clone();
+        tr.vel[0][0] = f64::MAX; // finite input whose control-point construction overflows
+        assert!(tr.bounds().is_none());
+        for n in 0..2 {
+            let mut tr = base.clone();
+            tr.pos.truncate(n);
+            assert!(tr.bounds().is_none());
+            let mut tr = base.clone();
+            tr.vel.truncate(n);
+            assert!(tr.bounds().is_none());
+            let mut tr = base.clone();
+            tr.t.truncate(n);
+            assert!(tr.bounds().is_none());
         }
     }
 

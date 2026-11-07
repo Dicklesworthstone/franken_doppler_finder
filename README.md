@@ -1109,6 +1109,14 @@ was considered. The hash index and distinct surviving seeds still consume memory
 fixed total-memory bound. The same first representative, candidate order, spatial and clock cells,
 and complete comparison are retained. No detection cap, search budget or confidence line changes.
 
+The exact-curve scorer now builds one conservative ECEF box per shortlisted trajectory and reuses it
+across candidate locations, clock alternatives, refinement and decoy windows. The box encloses the full
+Hermite curves, including turns outside the reported points. A trajectory proven farther away than the
+existing reach limit skips the repeated closest-approach scan; uncertain geometry keeps the original
+path. This does not change the reach limit, score formulas, candidate order or confidence thresholds.
+The new shortcut has source review and regression coverage, but native equivalence and runtime
+measurements remain pending; no end-to-end speedup is claimed.
+
 **Component measurements, 2026-11-04.** Optimized Rust builds on a shared AMD EPYC 9V74 host, with
 alternating old/new execution order. The detector uses four Rayon workers; other probes are serial.
 These medians compare the actual old and new functions, with unchanged supporting physics for the
@@ -1158,6 +1166,19 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Conservative trajectory bounds (2026-11-07): native validation pending
+
+Added geometry regressions for between-knot Hermite excursions, signed ECEF coordinates, grazing
+faces/edges/corners and malformed input. The exact-score regression adds 1,024 distant tracks to the
+existing synthetic three-flight PCM fixture and compares all returned float bits, counts and serialized
+pass metadata against the original unpruned path at three observer/clock combinations. It includes
+unchanged silence and chance-calibration handling; it does not assert a speedup.
+
+Independent JavaScript double-precision arithmetic checks covered 38,514 translated/grazing cases and
+confirmed the fixture's distant tracks lie outside every tested observer's reach. These are auxiliary
+geometry checks, not execution of the Rust tests. Native scoring equivalence, formatting, Clippy,
+selftest and real-recording replays remain unrun because the executor became unavailable.
 
 ### Shared cache recovery (2026-11-07): native validation pending
 

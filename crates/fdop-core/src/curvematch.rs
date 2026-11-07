@@ -27,7 +27,7 @@
 
 use crate::physics::cv_ratio_rel_t0r;
 use crate::spectro::{median_f32, stft_band_db};
-use crate::track::{Prop, TrackModel};
+use crate::track::{Prop, TrackBounds, TrackModel};
 use fdop_types::atmo::Atmosphere;
 use fdop_types::geo::{
     Enu, V3, ecef_to_geodetic, geodetic_to_ecef, haversine_m, m_per_deg, norm, sub,
@@ -1213,6 +1213,22 @@ struct Exact {
     n_close: usize,
 }
 
+/// The existing regional shortlist, with geometry bounds built once for every real/decoy window,
+/// clock alternative, refinement and alias. Unknown bounds retain the original exact checks.
+struct ExactTrack {
+    index: usize,
+    bounds: Option<TrackBounds>,
+}
+
+impl ExactTrack {
+    fn new(index: usize, tr: &TrackModel) -> Self {
+        Self {
+            index,
+            bounds: tr.bounds(),
+        }
+    }
+}
+
 /// Evidence at a point with exact curves (real trajectory, emission-time solve, modelled wind and
 /// sound speed), over a small clock sweep shared by all passes, inside this window's start bounds.
 /// `None` if no pass is in reach.
@@ -1220,7 +1236,7 @@ fn score_exact(
     inp: &MatchInputs<'_>,
     p: &MatchParams,
     bank: &Bank,
-    idx: &[usize],
+    idx: &[ExactTrack],
     lat: f64,
     lon: f64,
     clock0: f64,
@@ -1255,7 +1271,14 @@ fn score_exact(
     let v_cap = p.v_grid.last().copied().unwrap_or(200.0) * 1.15;
     let mut ones: Vec<One> = Vec::new();
     let mut scratch = SweepBuffers::new(bank.nf0);
-    for &ti in idx {
+    for candidate in idx {
+        if candidate
+            .bounds
+            .is_some_and(|b| !b.may_reach(x, p.reach_m))
+        {
+            continue;
+        }
+        let ti = candidate.index;
         let tr = &inp.tracks[ti];
         let (ta, tb) = (tr.t0().max(lo), tr.t1().min(hi));
         if tb - ta < 2.0 * p.sample_s {
@@ -1533,7 +1556,7 @@ fn along_track_aliases(
     inp: &MatchInputs<'_>,
     p: &MatchParams,
     bank: &Bank,
-    idx: &[usize],
+    idx: &[ExactTrack],
     top: &MatchMode,
 ) -> Vec<MatchMode> {
     let z = inp.fine_dem.elev_m(top.lat, top.lon);
@@ -1552,7 +1575,7 @@ fn along_track_aliases(
         let t_guess = top.clock_unix + ps.t_audio - ps.slant_m / BASE_C;
         let Some(cpa) = idx
             .iter()
-            .map(|&i| &inp.tracks[i])
+            .map(|t| &inp.tracks[t.index])
             .filter(|t| t.key == ps.key)
             .find_map(|t| t.cpa_near(x, t_guess, 30.0))
         else {
@@ -1606,7 +1629,7 @@ fn refine_point(
     inp: &MatchInputs<'_>,
     p: &MatchParams,
     bank: &Bank,
-    idx: &[usize],
+    idx: &[ExactTrack],
     lat: f64,
     lon: f64,
     clock: f64,
@@ -2138,9 +2161,10 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
     // tracks worth solving exactly
     let t = std::time::Instant::now();
     let pad = inp.region.padded_km(p.reach_m / 1000.0 + 2.0);
-    let keep: Vec<usize> = (0..inp.tracks.len())
+    let keep: Vec<ExactTrack> = (0..inp.tracks.len())
         .into_par_iter()
         .filter(|&i| track_near_region(&inp.tracks[i], &pad, span, p.sample_s))
+        .map(|i| ExactTrack::new(i, &inp.tracks[i]))
         .collect();
     let clock_candidates = AtomicUsize::new(0);
     let clock_scores = AtomicUsize::new(0);
@@ -3094,7 +3118,12 @@ mod tests {
         let atmo = UniformAtmosphere(Medium::still(BASE_C));
         let im = build_image(&c.x, 2800, &p).unwrap();
         let bank = build_bank(&im, &p);
-        let idx: Vec<_> = (0..c.tracks.len()).collect();
+        let idx: Vec<_> = c
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
         let inp = MatchInputs {
             image: &im,
             tracks: &c.tracks,
@@ -3448,6 +3477,119 @@ mod tests {
         assert!(!track_near_region(&far, &pad, span, p.sample_s));
     }
 
+    /// A conservative geometry shortcut must leave all exact evidence and pass metadata unchanged.
+    #[test]
+    fn spatial_bounds_preserve_exact_scores_with_many_distant_tracks() {
+        let mut c = case(0.5, false);
+        let p = params();
+        let enu = Enu::new(c.lat, c.lon, 0.0);
+        let nearby = c.tracks.len();
+        for i in 0..1024 {
+            let side = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let mut tr = straight_track(
+                &enu,
+                [
+                    side * (28_000.0 + 60.0 * (i % 64) as f64),
+                    100.0 * (i / 64) as f64,
+                    1000.0,
+                ],
+                [0.0, 70.0, 0.0],
+                c.clock + 450.0,
+                c.clock - 150.0,
+                c.clock + 1050.0,
+                1200.0,
+            );
+            tr.key = format!("distant-{i}");
+            c.tracks.push(tr);
+        }
+        let idx: Vec<_> = c
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
+        // None is the production fallback for unknown geometry and also the original unpruned
+        // scorer. Both paths see the same full catalogue, pass order, PCM image and calibration.
+        let unbounded: Vec<_> = (0..c.tracks.len())
+            .map(|index| ExactTrack {
+                index,
+                bounds: None,
+            })
+            .collect();
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let bank = build_bank(&im, &p);
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &c.tracks,
+            region: c.region,
+            start_lo: c.clock - 30.0,
+            start_hi: c.clock + 30.0,
+            duration_s: c.x.len() as f64 / 2800.0,
+            catalog: (f64::NEG_INFINITY, f64::INFINITY),
+            dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let signature = |e: Exact| {
+            let bits: Vec<_> = [e.evidence, e.r50_m, e.clock]
+                .into_iter()
+                .chain(e.passes.iter().flat_map(|p| {
+                    [
+                        p.t_audio,
+                        p.slant_m,
+                        p.speed_mps,
+                        p.f0_hz,
+                        p.score,
+                        p.nats,
+                        p.value,
+                        p.clock_offset_s,
+                    ]
+                }))
+                .map(f64::to_bits)
+                .collect();
+            (
+                bits,
+                e.n_heard,
+                e.n_close,
+                serde_json::to_value(e.passes).unwrap(),
+            )
+        };
+        let (mut old_time, mut bounded_time) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        for (east, north, dt) in [
+            (0.0, 0.0, 0.0),
+            (1000.0, -800.0, 1.25),
+            (-2500.0, 2000.0, -1.25),
+        ] {
+            let (lat, lon, _) = enu.to_geodetic([east, north, 0.0]);
+            let x = geodetic_to_ecef(lat, lon, MIC_HEIGHT_M);
+            assert!(
+                idx[nearby..]
+                    .iter()
+                    .all(|t| t.bounds.is_some_and(|b| !b.may_reach(x, p.reach_m)))
+            );
+            let now = std::time::Instant::now();
+            let original =
+                score_exact(&inp, &p, &bank, &unbounded, lat, lon, c.clock + dt).unwrap();
+            old_time += now.elapsed();
+            let now = std::time::Instant::now();
+            let bounded = score_exact(&inp, &p, &bank, &idx, lat, lon, c.clock + dt).unwrap();
+            bounded_time += now.elapsed();
+            if east == 0.0 {
+                assert!(
+                    original.n_heard >= 2,
+                    "the unchanged PCM must contain independent heard passes"
+                );
+            }
+            assert_eq!(signature(bounded), signature(original));
+        }
+        println!(
+            "three exact scores, {nearby} nearby and 1024 distant tracks: original {old_time:?}, bounded {bounded_time:?}"
+        );
+    }
+
     /// Frame-quantized seeds may lie outside a sub-frame prior, but the physical prediction and
     /// every shared-clock trial must obey the supplied interval. The quarter-second boundaries
     /// make an unconstrained half-second sweep unable to pass by coincidence.
@@ -3459,7 +3601,12 @@ mod tests {
         let atmo = UniformAtmosphere(Medium::still(BASE_C));
         let im = build_image(&c.x, 2800, &p).unwrap();
         let bank = build_bank(&im, &p);
-        let idx: Vec<usize> = (0..c.tracks.len()).collect();
+        let idx: Vec<_> = c
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
         for (a, b) in [(1.25, 1.25), (-1.25, -1.25), (0.25, 0.4), (-0.4, -0.25)] {
             let inp = MatchInputs {
                 image: &im,
@@ -3722,7 +3869,12 @@ mod tests {
             atmo: &atmo,
         };
         let bank = build_bank(&im, &p);
-        let idx: Vec<usize> = (0..c.tracks.len()).collect();
+        let idx: Vec<_> = c
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
         let (mlat, mlon) = m_per_deg(c.lat);
         let (la0, lo0) = (c.lat + 420.0 / mlat, c.lon - 430.0 / mlon);
         let start = haversine_m(la0, lo0, c.lat, c.lon);
@@ -3856,7 +4008,11 @@ mod tests {
                 atmo: &atmo,
             };
             let bank = build_bank(&im, &p);
-            let idx: Vec<usize> = (0..tracks.len()).collect();
+            let idx: Vec<_> = tracks
+                .iter()
+                .enumerate()
+                .map(|(i, tr)| ExactTrack::new(i, tr))
+                .collect();
             let at = score_exact(&inp, &p, &bank, &idx, lat, lon, clock).expect("observer scores");
             let moved = score_exact(&inp, &p, &bank, &idx, moved_lat, lon, clock + dt)
                 .expect("moved place scores");

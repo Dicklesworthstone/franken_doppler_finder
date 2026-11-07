@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Skip unreachable trajectories before repeated exact-curve scoring
+
+- Build conservative trajectory bounds once per regional shortlist and reuse them across real and
+  decoy windows, clock alternatives, spatial refinement and along-track alias checks. Reject only
+  tracks whose bounds prove they cannot meet the existing observer-distance gate.
+- Enclose each cubic Hermite segment using its Bezier control hull, including excursions beyond
+  reported positions. Pad outward for floating-point evaluation and use conservative distance
+  rounding; malformed or nonfinite geometry falls back to the existing scorer.
+- Preserve scoring arithmetic, pass order, hearing/silence evidence, reach limits, detection caps
+  and confidence thresholds. Add grazing/invalid-input regressions and an exact-output comparison
+  using the original three-flight PCM plus 1,024 distant tracks at three observers/clocks.
+- **Validation limit:** independent source review and auxiliary JavaScript geometry checks only
+  (38,514 translated/grazing cases). Native Rust equivalence, workspace checks, selftest and
+  recording replays remain unrun after the executor outage. No measured speedup is claimed.
+
 ### Recover damaged auxiliary caches without colliding with concurrent runs
 
 - Give downloaded files, weather JSON/failure notes, terrain PNGs and geoid heights separate,
