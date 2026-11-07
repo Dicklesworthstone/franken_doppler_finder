@@ -1518,3 +1518,57 @@ tool with an R1 directory. No set E row of the pinned build had started, so the 
 `dpwin` is at stage 2 (Addendum 21): at 23:38:26Z the release page of 2026-11-06's archive did not exist yet. Stages 3 to 5
 follow it. The pinned build's set E R3 and R1, `fdop-9087ec4`'s set E R3, and every `dpdem` row are read as their chains
 finish, each once, into a new file.
+
+## Addendum 23, 2026-11-07, set F's R3 read for `dpdem`; three `dopplerprint` R1 rows stopped by the macOS allocator
+
+### Set F's R3 with `dpdem`
+
+At 04:27:55Z every set F R3 job had `CHAIN_DONE` (`r3_dp`, `r3_dpdem` and the eight `fdop` builds, 10 rows each), and
+`tools/match/guardfix/inventory_f.sh` showed no infrastructure fault in them. They were read once with
+`score.py data/set_f/cases.json runs_f r3`. The output is kept as `runs_f/SCORE_r3_setF_dpdem_20261107.txt` (sha256
+`6928578be7b6164a867985fc58c74d2c521ecdb59942b2c5c0961772cac13474`). Every column but `dpdem`'s is the same, line for line,
+as in `SCORE_r3_setF_20261106.txt` (Addendum 19).
+
+| Tool | Correct asserted | Wrong asserted | Not asserted | Error |
+|---|---|---|---|---|
+| `dopplerprint` with the ground model (`dpdem`) | 0 | 0 | 10 declined: 8 "needs_input", 2 "inconclusive" | 0 |
+
+No `fdop` build meets the rule against `dpdem` on set F's R3: each ties it at no correct and no wrong answer. Falsifier 3
+does not fire.
+
+- **Seen before the read.** At about 04:24Z, while finding out why three R1 rows had crashed (below), the operator listed
+  every set F row of `r1_dp`, `r1_dpdem` and `r3_dpdem`: exit code, peak memory and the JSON `status` field. Every row that
+  ended said "needs_input" or "inconclusive", and no location was printed. So `dpdem`'s R3 answers, and `dp`'s and `dpdem`'s
+  R1 answers, were known before their reads. They are rivals' rows, and no `fdop` build or setting changed after the listing.
+  `inventory_f.sh` reports these faults without printing results, and it should have been run first.
+
+### Three R1 rows crashed in the allocator
+
+| Row | Start | End | Peak resident | Crash report (bench local time, UTC−5) |
+|---|---|---|---|---|
+| `runs_f/r1_dp/f_porthuron` | 03:42:04Z | rc 133, 03:42:17Z | 14.9 GB | `python3.12-2026-11-06-224218.ips` |
+| `runs_f/r1_dp/f_charlevoix` | 03:42:23Z | rc 133, 03:42:35Z | 16.6 GB | `python3.12-2026-11-06-224236.ips` |
+| `runs_f/r1_dpdem/f_porthuron` | 03:48:36Z | rc 133, 03:48:49Z | 14.3 GB | `python3.12-2026-11-06-224850.ips` |
+
+- Each `.err` ends "time: command terminated abnormally", and each `.out` is empty.
+- Each crash report reads `BUG IN LIBMALLOC: malloc assertion "err == VM_RECLAIM_SUCCESS" failed` (EXC_BREAKPOINT, SIGTRAP).
+  The failing call is a `realloc` that shrinks a buffer in `dopplerprint`'s Rust extension `_core.abi3.so`.
+- This is the same fault as `r1_dp/c_ref_0909` (Addendum 16). It came from the macOS allocator, not from a decision of the
+  tool.
+- Each row ran alone. `dpwin` stages 2 and 3 run one row at a time, and `runs/mem_log.txt` shows one `dopplerprint` row, no
+  `fdop` row, and swap flat at 1.6 GB on this 32 GB machine.
+- At 04:27:04Z the three rows were renamed `<case>_fault_libmalloc.{err,out,status}`. The `CHAIN_DONE` files of
+  `runs_f/r1_dp` and `runs_f/r1_dpdem` were renamed `CHAIN_DONE_before_libmalloc`, so no read can start before the rows run
+  again. Nothing was deleted.
+- Regime `libm` (`tools/fix16.py`; copy at `tools/start_chains.sh.pre16`) was started at 04:27:41Z (`runs/libm.out`).
+  - It waits until `dpwin` is done (`runs/e2_r1_dpdem/CHAIN_DONE`) and no `fdop` or `dopplerprint` process runs.
+  - It then runs `jobs/f_r1_dp.sh`, followed by `jobs/f_r1_dpdem.sh`. Both scripts skip every row that has an rc, so only
+    these three rows run, with their original commands.
+- **Fixed before the rows run again.** If a row ends rc 133 in the same assertion a second time, it counts as an error of
+  `dopplerprint`'s run on this machine and is not run a third time. Addendum 22 already counted `c_ref_0909` that way: its
+  rerun at 19:44:20Z on 11-06 crashed the same way (`python3.12-2026-11-06-144448.ips`).
+  `f_porthuron` has now crashed on both of its inputs, the AAC file and the 48 kHz WAV, so another crash would not be a
+  surprise.
+- No documented workaround was found. One Apple Developer Forums report of a different xzone assertion says
+  `MallocNanoZone=0` did not help. The commands are not changed.
+- `dopplerprint`'s and `dpdem`'s set F R1 are read once, into a new file, when `libm` is done.
