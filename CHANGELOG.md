@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Use Alaska and Hawaii radiosonde archives
+
+- Select valid four-character US station identifiers using the provider's country metadata,
+  admitting Alaska and Hawaii stations excluded by the former K-only filter. Keep legacy
+  cached listings without country metadata compatible with continental K identifiers, and
+  exclude explicit foreign entries and aggregate identifiers.
+- Preserve non-K station prefixes in sounding requests. IEM prefixes three-character requests
+  with K, so stripping an Alaska or Hawaii identifier queried another station. Keep the existing
+  three-character continental URLs and cache keys; station lifetimes, sounding brackets,
+  geographic limits and atmospheric interpolation retain their existing rules.
+- Add an actual offline cached-profile regression for Alaska-style, Hawaii-style, continental
+  and legacy identifiers. Independently spelled cache URLs, both 00Z/12Z profiles and the public
+  weather fetch must yield the expected sound speed and interpolated 30-knot eastward wind.
+- **Validation limit:** source review and the primary
+  [IEM sounding endpoint](https://github.com/akrherz/iem/blob/main/pylib/iemweb/json/raob.py) and
+  [network endpoint](https://github.com/akrherz/iem/blob/main/pylib/iemweb/geojson/network.py)
+  confirm the provider contract. The new Rust tests and formatting did not run before the
+  executor disconnected. No live-weather accuracy or runtime claim is made.
+
 ### Let exact flight evidence choose alternative recording clocks
 
 - At each already selected spatial cell, revisit positive local peaks in the coarse clock votes,

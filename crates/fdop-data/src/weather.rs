@@ -395,7 +395,19 @@ fn raob_stations(
     for f in feats {
         let id = f.get("id").and_then(|x| x.as_str()).unwrap_or("");
         let pr = &f["properties"];
-        if !(id.len() == 4 && id.starts_with('K')) || !raob_station_overlaps(pr, window) {
+        // Alaska and Hawaii use non-K identifiers. The provider's country metadata
+        // identifies US stations; old cached listings without it retain their K stations.
+        let us_station = pr
+            .get("country")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| id.starts_with('K'), |country| country == "US");
+        if !(id.len() == 4
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            && us_station)
+            || !raob_station_overlaps(pr, window)
+        {
             continue;
         }
         let c = &f["geometry"]["coordinates"];
@@ -489,10 +501,10 @@ fn parse_raob(profile: &serde_json::Value) -> Vec<Level> {
 fn raob_url(t: f64, station: &str) -> String {
     let (y, m, d) = utc_date(t);
     let hh = ((t.rem_euclid(86400.0)) / 3600.0).round() as u32;
-    format!(
-        "{IEM_RAOB}?ts={y:04}{m:02}{d:02}{hh:02}00&station={}",
-        &station[1..]
-    )
+    // IEM prefixes three-character inputs with K. Keep that spelling for existing
+    // continental cache keys, but pass other US station identifiers intact.
+    let station = station.strip_prefix('K').unwrap_or(station);
+    format!("{IEM_RAOB}?ts={y:04}{m:02}{d:02}{hh:02}00&station={station}")
 }
 
 fn raob_atmosphere(
@@ -1119,6 +1131,118 @@ mod tests {
             lv.iter().all(|l| (l.wind_e - 20.0 * KT).abs() < 0.01),
             "{lv:?}"
         );
+    }
+
+    #[test]
+    fn radiosonde_request_ids_preserve_us_prefixes_and_continental_cache_keys() {
+        let t = fdop_types::time::unix_from_utc(2024, 9, 8, 12, 0, 0.0);
+        for (id, requested) in [("KAAA", "AAA"), ("PAAA", "PAAA"), ("PHAA", "PHAA")] {
+            assert_eq!(
+                raob_url(t, id),
+                format!("{IEM_RAOB}?ts=202409081200&station={requested}")
+            );
+        }
+    }
+
+    #[test]
+    fn us_radiosonde_prefixes_recover_cached_winds() {
+        use fdop_types::atmo::sound_speed;
+        use fdop_types::time::unix_from_utc;
+        let (lat, lon) = (40.876466, -73.524951);
+        let day = unix_from_utc(2024, 9, 8, 0, 0, 0.0);
+        let bbox = BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01);
+        // Synthetic station identities and profiles at the permitted reference coordinate.
+        // State labels exercise provider conventions, not real station observations.
+        let feature = |id: &str, properties: serde_json::Value| {
+            serde_json::json!({
+                "id": id,
+                "properties": properties,
+                "geometry": {"coordinates": [lon, lat]},
+            })
+        };
+        for (label, id, requested, properties) in [
+            (
+                "alaska",
+                "PAAA",
+                "PAAA",
+                serde_json::json!({"country": "US", "state": "AK"}),
+            ),
+            (
+                "hawaii",
+                "PHAA",
+                "PHAA",
+                serde_json::json!({"country": "US", "state": "HI"}),
+            ),
+            (
+                "continental",
+                "KAAA",
+                "AAA",
+                serde_json::json!({"country": "US", "state": "NY"}),
+            ),
+            ("legacy", "KAAA", "AAA", serde_json::json!({})),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "fdop-raob-prefix-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("weather")).unwrap();
+            let put = |url: &str, value: serde_json::Value| {
+                let path = dir.join("weather").join(format!("{:016x}.json", fnv(url)));
+                std::fs::write(path, value.to_string()).unwrap();
+            };
+            put(
+                IEM_RAOB_NETWORK,
+                serde_json::json!({"features": [
+                    feature("CNEA", serde_json::json!({"country": "CA"})),
+                    feature("PNEA", serde_json::json!({"country": "JP"})),
+                    feature("KNEA", serde_json::json!({"country": "CA"})),
+                    feature("_ALL", serde_json::json!({"country": "US"})),
+                    feature("PNON", serde_json::json!({})),
+                    feature(id, properties),
+                ]}),
+            );
+            for (hour, wind) in [("00", 20.0), ("12", 40.0)] {
+                let profile: Vec<_> = (0..6)
+                    .map(|i| {
+                        serde_json::json!({
+                            "hght": 100.0 + 1200.0 * f64::from(i),
+                            "tmpc": 10.0,
+                            "dwpc": 10.0,
+                            "drct": 270.0,
+                            "sknt": wind,
+                        })
+                    })
+                    .collect();
+                // Spell the expected provider URL independently of raob_url: truncating a
+                // non-K identifier must miss the cache, rather than create its own oracle.
+                let url = format!("{IEM_RAOB}?ts=20240908{hour}00&station={requested}");
+                put(&url, serde_json::json!({"profiles": [{"profile": profile}]}));
+            }
+            let chosen = raob_stations(&dir, true, (day, day + 43_200.0)).unwrap();
+            assert_eq!(chosen.len(), 1, "{label}: {chosen:?}");
+            assert_eq!(chosen[0].0, id);
+            let weather = fetch_atmosphere(&bbox, day + 3600.0, day + 39_600.0, &dir, true);
+            let source = weather.atmo.describe();
+            assert!(weather.winds_aloft, "{label}: {source}; {:?}", weather.warnings);
+            assert!(
+                source.contains(id) && source.contains("2 of 2 soundings usable"),
+                "{source}"
+            );
+            let medium = weather.atmo.medium(lat, lon, day + 21_600.0, 100.0, 5000.0);
+            assert!((medium.c - sound_speed(10.0, 1.0)).abs() < 1e-8, "{medium:?}");
+            assert!((medium.wind_e - 30.0 * KT).abs() < 1e-8, "{medium:?}");
+            assert!(medium.wind_n.abs() < 1e-8, "{medium:?}");
+            assert!(
+                weather
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("hourly surface temperatures unavailable"))
+            );
+        }
     }
 
     #[test]
