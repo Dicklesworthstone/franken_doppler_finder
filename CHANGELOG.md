@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Validate cached track stores through the gzip footer
+
+- **The fault.** The store reader returned after the declared legs and points. The gzip decoder can
+  supply those bytes before reading the footer, so a missing footer or an invalid CRC32/ISIZE could
+  evade validation and make an incomplete or damaged cache look usable.
+- **The change.** Loading now reads through the end of the gzip member after the last declared record.
+  A decoder error rejects the store; an extra decoded byte rejects undeclared payload. This lets the
+  existing covering-cache recovery try another store or download again. Offline runs can try another
+  valid covering cache, and otherwise report the missing usable data.
+- **Regression coverage added.** Nonempty and empty stores with each of the last eight footer bytes
+  truncated or changed must fail loading; restoring the valid bytes must work. A separate test adds
+  undeclared data inside a valid gzip member and expects an invalid-data error. The existing roundtrip
+  shares the same synthetic fixture.
+- **Validation limit.** The complete repair passed the pinned rustfmt check after the executor briefly
+  recovered. A single-job fdop-types test build then lost the executor before completion, so tests,
+  Clippy and selftest remain unconfirmed. The patch was also reviewed against the reader and decoder
+  behavior. No real-recording or runtime validation is claimed.
+
 ### Refresh early partial ADS-B listings after publication
 
 - **The fault.** A cached release listing was accepted as final once the archived day was more than
@@ -30,10 +48,10 @@ at that commit, not per-change commits.
 - **Regression coverage added.** Two deterministic on-disk tests cover a provisional listing on an old
   day, a settled partial listing, exact publication boundaries, complete early listings, staging plus
   MLAT still missing prod, unavailable timestamp evidence, and the public offline cache-reading path.
-- **Validation.** The initial repair passed the pinned rustfmt check; a subsequent test-only slice cleanup was
-  reviewed without an executor. Workspace test compilation was
-  killed with exit 137; a focused fdop-data test build then lost its executor before completion. Test,
-  Clippy and selftest results are unconfirmed. No real-recording accuracy improvement is claimed.
+- **Validation.** The complete repair passed the pinned rustfmt check when the executor briefly
+  recovered. Workspace test compilation was killed with exit 137; focused fdop-data builds lost the
+  executor before completion. Test, Clippy and selftest results remain unconfirmed.
+  No real-recording accuracy improvement is claimed.
 
 ### Score a compressed survey image once more, contrast first
 

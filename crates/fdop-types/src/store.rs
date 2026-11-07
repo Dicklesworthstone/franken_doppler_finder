@@ -221,6 +221,16 @@ impl TrackStore {
                 points,
             });
         }
+        // Reaching the declared record count does not make the gzip member complete:
+        // the decoder checks CRC32 and ISIZE only when a read reaches its footer.
+        // Also reject undeclared decoded data instead of accepting a partial payload.
+        let mut trailing = [0u8; 1];
+        if r.read(&mut trailing)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} has trailing track-store data", path.display()),
+            ));
+        }
         Ok(Self { meta, legs })
     }
 
@@ -370,8 +380,7 @@ mod tests {
         assert!(split.filtered(&bbox, 145.0, 155.0).legs.is_empty());
     }
 
-    #[test]
-    fn roundtrip() {
+    fn sample_store() -> TrackStore {
         let p = |t: f64| TrackPoint {
             t,
             lat: 40.0 + t * 1e-5,
@@ -383,7 +392,7 @@ mod tests {
             alt_src: alt_src::GEOM,
             flags: pt_flags::MLAT,
         };
-        let store = TrackStore {
+        TrackStore {
             meta: StoreMeta {
                 version: 1,
                 bbox: BBox::new(39.0, -74.0, 41.0, -72.0),
@@ -403,9 +412,77 @@ mod tests {
                 engine: EngineClass::Turboprop,
                 points: (0..10).map(|i| p(i as f64 * 10.0)).collect(),
             }],
-        };
-        let dir = std::env::temp_dir().join(format!("fdop-store-test-{}", std::process::id()));
-        let path = dir.join("t.fdtrk");
+        }
+    }
+
+    fn test_path(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("fdop-store-{label}-{}-{nonce}", std::process::id());
+        std::env::temp_dir().join(name).join("t.fdtrk")
+    }
+
+    #[test]
+    fn load_verifies_gzip_footer_after_declared_records() {
+        let path = test_path("footer");
+        for empty in [false, true] {
+            let mut store = sample_store();
+            if empty {
+                store.legs.clear();
+            }
+            store.save(&path).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(TrackStore::load(&path).is_ok());
+            // All declared records still decompress, but the final CRC32/ISIZE
+            // bytes are incomplete or wrong. Both must invalidate the cache.
+            for missing in 1..=8 {
+                std::fs::write(&path, &bytes[..bytes.len() - missing]).unwrap();
+                assert!(
+                    TrackStore::load(&path).is_err(),
+                    "accepted {missing} missing footer bytes (empty={empty})"
+                );
+            }
+            for offset in 1..=8 {
+                let mut corrupt = bytes.clone();
+                let i = corrupt.len() - offset;
+                corrupt[i] ^= 1;
+                std::fs::write(&path, &corrupt).unwrap();
+                assert!(
+                    TrackStore::load(&path).is_err(),
+                    "accepted changed footer byte {offset} (empty={empty})"
+                );
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            let restored = TrackStore::load(&path).unwrap();
+            assert_eq!(restored.n_points(), store.n_points());
+            assert_eq!(restored.legs.len(), store.legs.len());
+        }
+    }
+
+    #[test]
+    fn load_rejects_undeclared_data_inside_gzip() {
+        let path = test_path("trailing");
+        sample_store().save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut payload = Vec::new();
+        GzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut payload)
+            .unwrap();
+        payload.push(0xa5);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&payload).unwrap();
+        std::fs::write(&path, encoder.finish().unwrap()).unwrap();
+        let error = TrackStore::load(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("trailing track-store data"));
+    }
+
+    #[test]
+    fn roundtrip() {
+        let store = sample_store();
+        let path = test_path("roundtrip");
         store.save(&path).unwrap();
         let back = TrackStore::load(&path).unwrap();
         assert_eq!(back.legs.len(), 1);

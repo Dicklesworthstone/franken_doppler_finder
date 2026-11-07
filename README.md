@@ -722,7 +722,8 @@ Cache layout:
 ```
 
 Cached day stores are tried from the smallest covering box to the largest. A store is reused only when it
-can be read and its stored box and time interval cover the requested slice of that UTC day. An unreadable
+can be read and its stored box and time interval cover the requested slice of that UTC day. Loading also
+verifies the gzip checksum and complete footer and rejects undeclared decompressed data. An unreadable
 or incomplete cache is identified in the progress output, and other eligible caches are tried before
 downloading again or failing in `--offline` mode. Partial feeds retain their missing-feed warnings. A larger
 region on the same day downloads that day again if no usable cache covers it.
