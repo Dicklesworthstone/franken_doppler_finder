@@ -33,8 +33,10 @@ at that commit, not per-change commits.
   using unchanged source modules, the real `fdop-types`, the pinned nightly and exact locked
   dependencies. This includes recognized-type precedence and the archive-completion tests.
   Independent source review and focused formatting/whitespace checks also pass. The full
-  data-crate build and its new offline-fetch regression remain pending; the component excludes
-  `fetch.rs` and is not an HTTP, workspace or recording-accuracy result.
+  data-crate build and a serial retry were blocked when their `asupersync 0.6.2` compiler ended
+  with SIGKILL, before the new offline-fetch regression could run. The shared environment reached
+  its 8 GiB cap during validation. The component excludes `fetch.rs` and is not an HTTP,
+  workspace or recording-accuracy result.
 
 ### Release rejected pair seeds and completed search stages promptly
 
@@ -51,9 +53,13 @@ at that commit, not per-change commits.
   16,777,216-pair case passed at 9,344 KiB. Both use actual production join source, the pinned
   nightly, real Rayon and per-child kernel resource accounting. They do not measure this
   follow-up's end-to-end effect or a recording's runtime.
-- **Validation:** independent source review and focused formatting/whitespace checks pass.
-  The new full-search budget regression is pending the native core build; the join component
-  results above do not establish this follow-up's integration result or recording accuracy.
+- **Validation:** the pinned-nightly full-core binary passes the new budget regression, complete
+  ordered-join equivalence, and the unchanged two-flyover localization test (correct flights,
+  less than 60 m position error, less than 1 s clock error and successful refinement). Independent
+  review and focused formatting/whitespace checks pass. The broader core run exposed two existing
+  curve-match tests that fail: short-circuit localization is 340 m off and 2.5 s early; the grazing
+  fixture recovers its trajectory but supplies 6.334 nats, below the unchanged 6.9-nat hearing line.
+  See README Testing for the incomplete workspace checks and exact scope of the native evidence.
 
 ### Require complete flight archives before publishing a day's tracks
 
@@ -68,8 +74,10 @@ at that commit, not per-change commits.
   the last part exists, even after the publication window. Complete day-cache hits bypass API
   lookup, while offline mode still uses valid cached metadata. A newly empty lookup no longer
   silently restores an older listing.
-- Add termination, transport, split-boundary, sidecar and listing-refresh regressions. These native
-  tests remain unrun after the executor outage; this change has independent source review.
+- Add termination, transport, split-boundary, sidecar and listing-refresh regressions. The archive
+  reader tests now pass within the 20-test production build/ingest component; release-discovery
+  tests remain unrun after the full data-crate dependency compiler was killed. This change also
+  has independent source review.
 - Existing day stores do not retain proof of their source tar's completeness. This prevents new
   incomplete ingestion; it cannot reconstruct tracks absent from an older cache.
 

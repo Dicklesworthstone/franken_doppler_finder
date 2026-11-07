@@ -1209,6 +1209,37 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Search working set (2026-11-07): focused native integration passes
+
+The pinned `nightly-2026-08-31` full-core test binary passes these three checks through the actual
+search code, in addition to the pair-join component measurements in Performance:
+
+- `pair_join_preserves_every_ordered_representative_across_batches`: complete ordered seed equality,
+  including multiple batches, worker counts, clock/spatial boundaries and repeated-flight exclusions.
+- `quick_pair_budget_counts_rejected_seeds_before_starting_another_pair`: rejected quick seeds still
+  consume the joined budget and record the same complete-pair truncation.
+- `two_synthetic_flyovers_locate_the_observer`: correct A/B identities, less than 60 m position error,
+  less than 1 s clock error, successful refinement and coherent candidate/margin reporting.
+
+The broader core run was stopped after 32 passes, two failures and four declared audio-test ignores
+to reproduce the failures individually. Both exact reruns fail without changing their assertions:
+
+- `coarse_stamps_feed_a_short_circuit_and_crossing_flight_into_the_match` hears the crossing flight
+  and all three circuit visits, but its selected location is 340.027 m off and its clock is 2.5 s
+  early, outside the test's 150 m and 2 s requirements.
+- `grazing_passes_are_heard_across_exact_clock_seeds` recovers the within-range trajectory at
+  7,999.5 m. Its aligned-seed audibility prerequisite fails at 6.334 nats against the unchanged
+  6.9-nat hearing line, before the remaining clock phases run. This does not show geometric loss.
+
+The full data-crate test build, a serial retry and workspace Clippy ended with dependency-compiler
+SIGKILLs (`asupersync 0.6.2` for the data tests and `0.5.0` for Clippy). The shared environment
+reached its 8 GiB cap during validation; these builds used one job and reduced compiler memory
+settings. Thus the new full offline-fetch regression has not run. `cargo fmt --all -- --check`
+still fails on files outside these search/data
+changes; the three edited Rust files pass focused formatting and whitespace checks. Full workspace
+tests, release CLI selftest and reference/field replays were not completed. No full-core, workspace,
+release or new recording-accuracy pass is claimed.
+
 ### Complete archive ingestion (2026-11-07): native reader component verified
 
 New regressions require both tar end blocks, surface errors reported after the marker, accept zero
@@ -1217,7 +1248,7 @@ regressions pass as part of 20 production build/ingest tests in a native compone
 modules, real `fdop-types`, pinned nightly and exact locked dependencies. The component also verifies
 recognized-type precedence across joined days. It does not include the fetch or release-discovery
 modules: their offline-cache, sidecar, contiguous-part, unfinished-upload and listing-refresh tests
-still await the full data-crate build. This is not an end-to-end archive replay or workspace pass.
+remain blocked by the full data-crate build. This is not an end-to-end archive replay or workspace pass.
 
 ### Conservative trajectory bounds (2026-11-07): native validation pending
 
