@@ -14,7 +14,7 @@ use asupersync::runtime::{Runtime, RuntimeBuilder};
 use std::fmt;
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,6 +25,44 @@ use std::time::Duration;
 /// Generic client identity (no personal contact data is ever sent).
 pub const USER_AGENT: &str =
     "franken_doppler_finder/0.1 (aircraft-doppler geolocation research tool)";
+
+static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Reserve a private sibling of the destination. Exclusive creation also skips files
+/// left by an interrupted process whose PID has since been reused.
+fn staging_file(path: &Path) -> io::Result<(PathBuf, std::fs::File)> {
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cache path has no filename"))?;
+    loop {
+        let id = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+        let mut temporary = name.to_os_string();
+        temporary.push(format!(".part.{}.{id}", std::process::id()));
+        let tmp = path.with_file_name(temporary);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Publish a complete cache response with a same-filesystem rename. Concurrent
+/// writers own separate staging files; readers see one complete response at a time.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let (tmp, mut file) = staging_file(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(tmp, path)
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpError {
@@ -311,19 +349,22 @@ impl Net {
         Err(last.unwrap_or_else(|| HttpError::new(url, None, "no attempt made")))
     }
 
-    /// GET into `path` atomically (temp file + rename). Returns bytes written.
+    /// GET into `path` atomically (private temp file + rename). Returns bytes written.
     pub fn download_to(&self, url: &str, path: &Path) -> Result<u64, HttpError> {
-        let tmp = path.with_extension(format!(
-            "{}part",
-            path.extension()
-                .map(|e| format!("{}.", e.to_string_lossy()))
-                .unwrap_or_default()
-        ));
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| HttpError::new(url, None, format!("mkdir: {e}")))?;
-        }
-        let mut f = std::fs::File::create(&tmp)
+        self.download_to_validated(url, path, |_| Ok(()))
+            .map(|(n, ())| n)
+    }
+
+    /// Validate the completed private download before replacing a published cache.
+    /// Return the parsed value from that same file, even if another writer publishes
+    /// a newer response immediately afterward. Validation failures preserve the cache.
+    pub fn download_to_validated<T>(
+        &self,
+        url: &str,
+        path: &Path,
+        validate: impl FnOnce(&Path) -> Result<T, String>,
+    ) -> Result<(u64, T), HttpError> {
+        let (tmp, mut f) = staging_file(path)
             .map_err(|e| HttpError::new(url, None, format!("create: {e}")))?;
         let n = self.stream(url, &[], &AtomicBool::new(false), &mut |chunk| {
             f.write_all(chunk).map_err(|e| format!("write: {e}"))
@@ -331,9 +372,11 @@ impl Net {
         f.sync_all()
             .map_err(|e| HttpError::new(url, None, format!("sync: {e}")))?;
         drop(f);
+        let value = validate(&tmp)
+            .map_err(|e| HttpError::new(url, None, format!("download validation: {e}")))?;
         std::fs::rename(&tmp, path)
             .map_err(|e| HttpError::new(url, None, format!("rename: {e}")))?;
-        Ok(n)
+        Ok((n, value))
     }
 
     /// Stream a GET body into `sink`, resuming with `Range` after transport errors.
@@ -696,6 +739,130 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&head).to_ascii_lowercase()
+    }
+
+    fn test_cache_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fdop-http-{label}-{}-{}",
+            std::process::id(),
+            NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn concurrent_downloads_publish_and_validate_their_own_complete_response() {
+        let path = test_cache_path("concurrent").join("table.zip");
+        write_atomic(&path, b"previous valid cache").unwrap();
+        let old_part = path.with_extension("zip.part");
+        std::fs::write(&old_part, b"an interrupted older download").unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let bodies = [vec![b'a'; 128 * 1024], vec![b'b'; 96 * 1024]];
+        let mut workers = Vec::new();
+        for body in bodies.clone() {
+            let barrier = barrier.clone();
+            let path = path.clone();
+            workers.push(std::thread::spawn(move || {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let served = body.clone();
+                let server = std::thread::spawn(move || {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    read_head(&mut sock);
+                    write!(
+                        sock,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        served.len()
+                    )
+                    .unwrap();
+                    let middle = served.len() / 2;
+                    sock.write_all(&served[..middle]).unwrap();
+                    sock.flush().unwrap();
+                    // Both downloads have opened their output and received part of the
+                    // response before either can publish it.
+                    barrier.wait();
+                    sock.write_all(&served[middle..]).unwrap();
+                });
+                let got = Net::new()
+                    .unwrap()
+                    .download_to_validated(&format!("http://{addr}/table"), &path, |tmp| {
+                        std::fs::read(tmp).map_err(|e| e.to_string())
+                    });
+                server.join().unwrap();
+                let (size, parsed) = got.unwrap();
+                assert_eq!(size, body.len() as u64);
+                assert_eq!(parsed, body);
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let published = std::fs::read(&path).unwrap();
+        assert!(bodies.contains(&published));
+        assert_eq!(
+            std::fs::read(old_part).unwrap(),
+            b"an interrupted older download"
+        );
+    }
+
+    #[test]
+    fn failed_download_or_validation_preserves_the_published_cache() {
+        for truncated in [false, true] {
+            let path = test_cache_path("failed").join("table.zip");
+            write_atomic(&path, b"previous valid cache").unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                read_head(&mut sock);
+                write!(
+                    sock,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\ninvalid",
+                    if truncated { 70 } else { 7 }
+                )
+                .unwrap();
+            });
+            let mut validated = false;
+            let error = Net::new()
+                .unwrap()
+                .with_retries(0)
+                .download_to_validated(&format!("http://{addr}/table"), &path, |_| {
+                    validated = true;
+                    Err::<(), _>("not a valid table".to_string())
+                })
+                .unwrap_err();
+            server.join().unwrap();
+            assert_eq!(validated, !truncated);
+            if !truncated {
+                assert!(error.message.contains("not a valid table"), "{error}");
+            }
+            assert_eq!(std::fs::read(path).unwrap(), b"previous valid cache");
+        }
+    }
+
+    #[test]
+    fn concurrent_cache_writes_never_expose_partial_payloads() {
+        let path = test_cache_path("atomic").join("weather.json");
+        write_atomic(&path, &vec![0; 64 * 1024]).unwrap();
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for byte in 1..=4 {
+                let path = &path;
+                workers.push(scope.spawn(move || {
+                    for _ in 0..8 {
+                        write_atomic(path, &vec![byte; 64 * 1024]).unwrap();
+                    }
+                }));
+            }
+            while workers.iter().any(|worker| !worker.is_finished()) {
+                let bytes = std::fs::read(&path).unwrap();
+                assert_eq!(bytes.len(), 64 * 1024);
+                assert!(bytes[0] <= 4 && bytes.iter().all(|&b| b == bytes[0]));
+                std::thread::yield_now();
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
     }
 
     /// Serve 10 of 100 bytes and drop, then answer the resume (`Range: bytes=10-`) with

@@ -121,16 +121,12 @@ fn get_cached(
     let (v, body) = match res {
         Ok(x) => x,
         Err(e) => {
-            let _ = std::fs::create_dir_all(&dir);
             let msg: String = e.to_string().chars().take(200).collect();
-            let _ = std::fs::write(&fail, msg);
+            let _ = fdop_http::write_atomic(&fail, msg.as_bytes());
             return Err(e);
         }
     };
-    std::fs::create_dir_all(&dir)?;
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, &body)?;
-    std::fs::rename(&tmp, &path)?;
+    fdop_http::write_atomic(&path, &body)?;
     Ok(v)
 }
 

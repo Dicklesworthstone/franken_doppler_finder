@@ -170,13 +170,7 @@ impl TerrariumDem {
         match decode_terrarium_png(&resp.body) {
             Ok(g) => {
                 self.fetched.fetch_add(1, Ordering::Relaxed);
-                if let Some(d) = path.parent() {
-                    let _ = std::fs::create_dir_all(d);
-                }
-                let tmp = path.with_extension("png.part");
-                if std::fs::write(&tmp, &resp.body).is_ok() {
-                    let _ = std::fs::rename(&tmp, &path);
-                }
+                let _ = fdop_http::write_atomic(&path, &resp.body);
                 Some(Arc::new(g))
             }
             Err(_) => {

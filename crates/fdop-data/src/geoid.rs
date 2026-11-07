@@ -77,11 +77,7 @@ fn read_cached(path: &Path) -> Option<f64> {
 /// Keep a height, renamed into place so a simultaneous run never reads half a file. A failure only
 /// costs the next run its reads again.
 fn write_cached(path: &Path, n: f64) {
-    let Some(dir) = path.parent() else { return };
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    let _ = std::fs::create_dir_all(dir)
-        .and_then(|()| std::fs::write(&tmp, format!("{n}\n")))
-        .and_then(|()| std::fs::rename(&tmp, path));
+    let _ = fdop_http::write_atomic(path, format!("{n}\n").as_bytes());
 }
 
 /// Geoid height and its source: ("ngs") from the cache or from two NGS reads that agree, else

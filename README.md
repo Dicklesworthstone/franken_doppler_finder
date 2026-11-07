@@ -792,6 +792,13 @@ Concurrent searches publish track stores through separate, exclusively created s
 writer cannot truncate another writer's cache. A load also rejects bytes after its compressed member,
 including additional gzip members; a damaged cache goes through the recovery path above.
 
+Weather responses, terrain tiles, geoid heights and file downloads also use private, exclusively
+created staging files. Concurrent runs cannot share or truncate one another's in-progress response.
+Census gazetteer ZIPs are parsed before reuse; online searches replace an unreadable, malformed or
+empty table only after downloading and parsing a valid replacement. A failed download or validation
+leaves the published cache intact. Offline searches report the unusable cache path and how to repair
+it; a valid cache is reused without any request.
+
 For uncached multi-day searches, each UTC day is built and atomically cached as soon as all of its
 requested feeds finish, while the remaining days continue downloading. Completed raw feeds pass through
 a bounded queue instead of accumulating until the last download. A failed feed prevents publication
@@ -1151,6 +1158,19 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Shared cache recovery (2026-11-07): native validation pending
+
+New regression tests cover simultaneous downloads to one cache path, validating each writer's own
+response, preserving the published file after transport or validation failures, concurrent byte-cache
+writers, and repairing damaged Census ZIP/table contents before offline reuse. Network cases use
+loopback HTTP servers and generated payloads; no live Census request is used.
+
+The pinned-toolchain workspace build through RCH ended with exit 137 during dependency compilation.
+A single-job retry was interrupted to prioritize focused checks, then the execution environment
+became unavailable before any new test result could be observed. Untouched-head formatting already
+reported 66 differences. These changes have source review, but no new native test, Clippy, formatting,
+selftest or real-recording pass is claimed.
 
 ### Default clock tolerance (2026-11-07)
 
@@ -1736,7 +1756,7 @@ audio or video recorded somewhere sensitive:
 | Warning `detection kept the 60 strongest of N candidate curves` or `measured the K strongest of N flyover detections, reaching the limit of 24 independent aircraft events` | A long or busy recording hit a fixed cap (see [Known issues](#known-issues)) | Nothing to change: the remaining flyovers are not used |
 | Warning `the audio has little energy below 100 Hz (45-95 Hz is N dB below 150-600 Hz)` | A high-pass filter does this, removing the fundamentals of slower propellers and weakening those near the cut. Speech-heavy audio can also read low | Use the unfiltered recording if you have one. Otherwise expect fewer usable flyovers, and do not read a failed search as evidence about the place |
 | Warning `the answer lies in CT, outside the searched state NY` (or `appears to lie in`, when the state is a gazetteer estimate) | A state search covers the state's bounding box, which takes in parts of its neighbours | If you know the recording was made in the searched state, distrust the answer whatever its grade, unless its radius reaches back across the border. A narrower `--near`, such as a county, takes in less of the neighbours |
-| `needs network or a cached file: Census gazetteer ...` | `--offline` before the gazetteer was cached | Run once online, or use a state, point or box region |
+| `needs network or a cached file: Census gazetteer ...` | No usable cached table: it is absent, unreadable, malformed or empty | Run once without `--offline` to fetch and validate a replacement, or use a state, point or box region |
 | `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days are cached. A day missing from adsb.lol cannot be searched |
 | A download pauses for a minute, then carries on | The server stopped sending with the connection still open. After 60 s with no data, `fdop` reconnects and resumes with an HTTP `Range` request | Nothing. Resumed `206` responses are checked for their byte offset, range boundary and total length before new bytes are accepted. Capped ranges continue until the full object is proved complete; a range's body length is never treated as the archive length. After repeated failures with no new bytes it stops |
 | Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears some hours after it ends | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |

@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover damaged auxiliary caches without colliding with concurrent runs
+
+- Give downloaded files, weather JSON/failure notes, terrain PNGs and geoid heights separate,
+  exclusively created sibling staging files. Sync complete contents before atomic publication;
+  simultaneous writers cannot truncate or rename one another's in-progress response.
+- Add a validated-download path that parses the writer's own completed file before publication
+  and returns that parsed value. A transport or validation failure preserves the published cache.
+- Read and parse existing Census ZIPs before reuse. Online place/county/ZIP lookups recover from
+  unreadable archives, malformed tables and header-only tables; offline errors identify the path
+  and request an online refresh. Valid cached tables remain entirely offline.
+- Add local HTTP/concurrency regressions for complete independent responses and failed replacement,
+  a simultaneous byte-cache writer/reader regression, and generated-ZIP recovery/preservation tests.
+- **Validation limit:** source review only. The pinned-nightly RCH workspace build was killed
+  during dependency compilation (exit 137); a serial retry was interrupted for focused checks and
+  the executor then disconnected before any new test result was observed. Formatting already
+  failed on the untouched checkout. Native tests, Clippy, final formatting and selftest remain
+  unrun; this change makes no localization-accuracy or measured-performance claim.
+
 ### Keep duplicate hypothesis pairs out of the search's working set
 
 - Deduplicate flight/place/clock seeds inside ordered worker chunks as each pair is generated,

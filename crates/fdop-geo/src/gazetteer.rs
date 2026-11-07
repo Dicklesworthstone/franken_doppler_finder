@@ -269,20 +269,30 @@ impl Gazetteer {
     }
 
     fn load(&self, kind: GazKind) -> Result<Vec<GazRecord>, GeoError> {
+        self.load_from_url(kind, &kind.url())
+    }
+
+    fn load_from_url(&self, kind: GazKind, url: &str) -> Result<Vec<GazRecord>, GeoError> {
         let path = self.zip_path(kind);
-        if !path.exists() {
-            if !self.allow_network {
-                return Err(GeoError::Offline(format!(
-                    "Census gazetteer {} is not cached at {}",
-                    kind.file_stem(),
-                    path.display()
-                )));
-            }
-            let net = fdop_http::Net::new()?;
-            net.download_to(&kind.url(), &path)?;
+        let cache_error = match read_table(kind, &path) {
+            Ok(records) => return Ok(records),
+            Err(e) => e,
+        };
+        if !self.allow_network {
+            return Err(GeoError::Offline(format!(
+                "Census gazetteer {} has no usable cache at {} ({cache_error}); rerun without --offline to fetch it",
+                kind.file_stem(),
+                path.display()
+            )));
         }
-        let text = read_zip_text(&path)?;
-        parse_gazetteer(kind, &text)
+        // A stale partial download must not permanently disable place/ZIP regions.
+        // Parse our own completed response before publication, so neither a bad server
+        // response nor a concurrent writer can replace it with unvalidated contents.
+        let net = fdop_http::Net::new()?;
+        let (_, records) = net.download_to_validated(url, &path, |tmp| {
+            read_table(kind, tmp).map_err(|e| e.to_string())
+        })?;
+        Ok(records)
     }
 
     /// Find a place by name ("Oyster Bay", "Springfield city"), optionally within a state.
@@ -442,6 +452,18 @@ pub fn nearest_of(recs: &[GazRecord], lat: f64, lon: f64, k: usize) -> Vec<Nearb
         .collect()
 }
 
+fn read_table(kind: GazKind, path: &Path) -> Result<Vec<GazRecord>, GeoError> {
+    let records = parse_gazetteer(kind, &read_zip_text(path)?)?;
+    if records.is_empty() {
+        return Err(GeoError::Data(format!(
+            "{} contains no {} records",
+            path.display(),
+            kind.file_stem()
+        )));
+    }
+    Ok(records)
+}
+
 fn read_zip_text(path: &Path) -> Result<String, GeoError> {
     let f = std::fs::File::open(path)?;
     let mut za =
@@ -469,6 +491,7 @@ fn read_zip_text(path: &Path) -> Result<String, GeoError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::io::Write;
 
     pub const PLACES: &str = "USPS\tGEOID\tANSICODE\tNAME\tLSAD\tFUNCSTAT\tALAND\tAWATER\tALAND_SQMI\tAWATER_SQMI\tINTPTLAT\tINTPTLONG                                     \n\
 NY\t3655992\t02390185\tOyster Bay CDP\t57\tS\t4523214\t1234\t1.746\t0.0\t40.866940\t-73.531318\n\
@@ -564,5 +587,99 @@ VT\t5000710675\t01462073\tStowe town\tA\t187000000\t2000\t72.2\t0.1\t44.465000\t
     fn offline_without_cache_errors() {
         let g = Gazetteer::new("/nonexistent-fdop-cache", false);
         assert!(matches!(g.zcta("11771"), Err(GeoError::Offline(_))));
+    }
+
+    fn cache_for_test() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "fdop-gazetteer-recovery-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn zipped_table(text: &str) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("table.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(text.as_bytes()).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn serve_table(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                sock.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            sock.write_all(&body).unwrap();
+        });
+        (format!("http://{addr}/table.zip"), handle)
+    }
+
+    #[test]
+    fn corrupt_gazetteer_cache_is_recovered_and_reused_offline() {
+        let good = zipped_table(ZCTAS);
+        let header_only = ZCTAS.lines().next().unwrap();
+        for corrupt in [
+            b"interrupted ZIP".to_vec(),
+            zipped_table("not a Census table"),
+            zipped_table(header_only),
+        ] {
+            let cache = cache_for_test();
+            let offline = Gazetteer::new(&cache, false);
+            let path = offline.zip_path(GazKind::Zcta);
+            fdop_http::write_atomic(&path, &corrupt).unwrap();
+            let error = offline.records(GazKind::Zcta).unwrap_err();
+            assert!(matches!(error, GeoError::Offline(_)));
+            assert!(error.to_string().contains("no usable cache"));
+            assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+
+            let (url, server) = serve_table(good.clone());
+            let online = Gazetteer::new(&cache, true);
+            let recovered = online.load_from_url(GazKind::Zcta, &url);
+            server.join().unwrap();
+            assert_eq!(
+                recovered.unwrap(),
+                parse_gazetteer(GazKind::Zcta, ZCTAS).unwrap()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), good);
+            assert_eq!(
+                Gazetteer::new(&cache, false).zcta("11771").unwrap().lat,
+                40.874
+            );
+            // A valid cache does not attempt a second request, even online.
+            assert!(online.load_from_url(GazKind::Zcta, "not a URL").is_ok());
+        }
+    }
+
+    #[test]
+    fn invalid_gazetteer_download_does_not_replace_the_cache() {
+        for existing in [None, Some(b"old damaged cache".as_slice())] {
+            let gaz = Gazetteer::new(cache_for_test(), true);
+            let path = gaz.zip_path(GazKind::Zcta);
+            if let Some(bytes) = existing {
+                fdop_http::write_atomic(&path, bytes).unwrap();
+            }
+            let (url, server) = serve_table(zipped_table("server maintenance"));
+            let error = gaz.load_from_url(GazKind::Zcta, &url).unwrap_err();
+            server.join().unwrap();
+            assert!(error.to_string().contains("download validation"), "{error}");
+            match existing {
+                Some(bytes) => assert_eq!(std::fs::read(path).unwrap(), bytes),
+                None => assert!(!path.exists()),
+            }
+        }
     }
 }
