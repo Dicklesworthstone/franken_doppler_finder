@@ -751,6 +751,11 @@ both prod and MLAT are present or a successful post-window lookup confirms the m
 prod-only listing therefore cannot become permanent merely because the day has aged. Offline runs
 continue to use the cached listing and report missing feeds.
 
+When neighboring track stores overlap, reports within the existing 0.05 s duplicate interval
+prefer non-MLAT positions even if an MLAT report arrived slightly earlier. The merge preserves
+the previous flight-leg joins and same-quality choices, including interleaved overlaps from
+three or more files. Unjoined legs retain their original point allocation.
+
 Archive ingestion and cached-window slicing retain the original samples bracketing a sparse segment that
 crosses the requested region and time window, even when neither sample is inside. The segment must enter
 both at the same time. Ingestion does not infer a crossing across a ground report or restart marker;
@@ -1091,6 +1096,12 @@ at 250 and 263 m/s. Independent geometry checks confirm that every old ten-secon
 the padded reach boxes and that the normal cadence enters both. The actual Rust regression,
 formatting and real-recording replays remain unrun because the executor is unavailable; source
 review and arithmetic do not substitute for those checks.
+
+The overlapping-store merge repair adds regressions for MLAT timestamp offsets, duplicate
+boundaries, interleaved three-store reports, reintroduced timestamps and unchanged leg joins.
+Source review and independent JavaScript models check representative selection and legacy
+grouping; the Rust regressions, formatting, workspace gates and recording replays remain unrun
+while the executor is unavailable.
 
 **Earlier recovery checks.**
 

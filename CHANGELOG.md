@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep better flight positions when cached track stores overlap
+
+- Prefer a non-MLAT report over a duplicate MLAT report even when the MLAT timestamp is
+  slightly earlier. Previously time-first sorting discarded the later, better position,
+  which could introduce a false bend or altitude jump where daily stores overlap.
+- Preserve the original merge decisions, duplicate intervals and equal-quality report
+  identities with indices into the joined reports. Apply better-quality substitutions only
+  after grouping is complete and only within each surviving interval. A third overlapping
+  store cannot resurrect a discarded same-quality report, widen an interval or reorder
+  the resulting trajectory. Same-store legs remain separate.
+- Allocate this bookkeeping only for actual joins. Unjoined legs keep their existing
+  point vectors; retain existing metadata/source handling, key format and strict 0.05 s cutoff.
+- Add eight regressions covering earlier/equal/later MLAT duplicates at midnight, interval
+  boundaries, interleaved three-store chains, equal-quality ties, reintroduced timestamps,
+  join limits and separate same-store legs.
+- **Validation limit:** independent source review and JavaScript model comparisons support
+  the selection and grouping logic. The exact Rust regressions, formatting, full workspace
+  checks and reference replays could not run because the executor is unavailable. No
+  measured accuracy or runtime improvement is claimed.
+
 ### Retain close fast aircraft when sampling outside the search region
 
 - Use the existing distance/velocity timestep on both sides of the padded reach boundary.

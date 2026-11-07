@@ -359,6 +359,36 @@ pub fn build_store(
     TrackStore { meta, legs }
 }
 
+/// Prefer non-MLAT reports inside the surviving original duplicate intervals. Keep the exact
+/// legacy representative when quality ties: a report discarded during an earlier merge must
+/// not reappear merely because a later store shifts the interval anchors. The raw point array
+/// is append-only until these representative indices have been materialized.
+fn dedupe_store_points(mut points: Vec<TrackPoint>, anchors: Vec<usize>) -> Vec<TrackPoint> {
+    let mut kept: Vec<TrackPoint> = anchors.into_iter().map(|i| points[i]).collect();
+    points.sort_by(|a, b| {
+        a.t.total_cmp(&b.t)
+            .then((a.flags & pt_flags::MLAT).cmp(&(b.flags & pt_flags::MLAT)))
+    });
+    let mut reports = points.into_iter().peekable();
+    for preferred in &mut kept {
+        let group_start = preferred.t;
+        // Some reports were already discarded before a later store changed the anchors.
+        // They remain discarded unless they belong to a surviving original interval.
+        while reports
+            .peek()
+            .is_some_and(|p| p.t.total_cmp(&group_start).is_lt())
+        {
+            let _ = reports.next();
+        }
+        while let Some(p) = reports.next_if(|p| (p.t - group_start).abs() < DEDUPE_S) {
+            if (p.flags & pt_flags::MLAT) < (preferred.flags & pt_flags::MLAT) {
+                *preferred = p;
+            }
+        }
+    }
+    kept
+}
+
 /// Merge stores (e.g. consecutive UTC days). Legs of the same aircraft from DIFFERENT stores
 /// are joined when they overlap in time or the gap is <= `join_gap_s` (a flight crossing
 /// midnight UTC); legs from the same store are never joined. Duplicate instants (< 0.05 s)
@@ -404,30 +434,31 @@ pub fn merge_stores(stores: Vec<TrackStore>, join_gap_s: f64) -> TrackStore {
     let mut out: Vec<FlightLeg> = Vec::new();
     for (icao, mut legs) in by_icao {
         legs.sort_by(|a, b| a.1.t0().total_cmp(&b.1.t0()));
-        // groups: (set of store ids, merged leg)
-        let mut groups: Vec<(Vec<usize>, FlightLeg)> = Vec::new();
+        // groups: (set of store ids, leg, original representative indices). Allocate indices
+        // only for an actual join. They preserve the old join boundaries, duplicate groups
+        // and exact-timestamp payloads while raw points stay available for quality selection.
+        // An unjoined leg keeps its original allocation and never runs the duplicate pass.
+        let mut groups: Vec<(Vec<usize>, FlightLeg, Option<Vec<usize>>)> = Vec::new();
         for (si, l) in legs {
-            if let Some((ids, g)) = groups.last_mut() {
-                let overlap_or_close = l.t0() <= g.t1() + join_gap_s;
+            if let Some((ids, g, anchors)) = groups.last_mut() {
+                let last_t = anchors.as_ref().map_or_else(
+                    || g.t1(),
+                    |indices| indices.last().map_or(f64::NAN, |&i| g.points[i].t),
+                );
+                let overlap_or_close = l.t0() <= last_t + join_gap_s;
                 if overlap_or_close && !ids.contains(&si) {
                     joins += 1;
                     ids.push(si);
-                    let mut pts = std::mem::take(&mut g.points);
-                    pts.extend(l.points);
-                    pts.sort_by(|a, b| {
+                    let previous_len = g.points.len();
+                    let anchors = anchors.get_or_insert_with(|| (0..previous_len).collect());
+                    g.points.extend(l.points);
+                    anchors.extend(previous_len..g.points.len());
+                    anchors.sort_by(|&i, &j| {
+                        let (a, b) = (&g.points[i], &g.points[j]);
                         a.t.total_cmp(&b.t)
                             .then((a.flags & pt_flags::MLAT).cmp(&(b.flags & pt_flags::MLAT)))
                     });
-                    let mut dd: Vec<TrackPoint> = Vec::with_capacity(pts.len());
-                    for p in pts {
-                        if let Some(last) = dd.last()
-                            && (p.t - last.t).abs() < DEDUPE_S
-                        {
-                            continue;
-                        }
-                        dd.push(p);
-                    }
-                    g.points = dd;
+                    anchors.dedup_by(|b, a| (g.points[*b].t - g.points[*a].t).abs() < DEDUPE_S);
                     if g.typ.is_empty() {
                         g.typ = l.typ.clone();
                         g.engine = l.engine;
@@ -443,9 +474,12 @@ pub fn merge_stores(stores: Vec<TrackStore>, join_gap_s: f64) -> TrackStore {
                     continue;
                 }
             }
-            groups.push((vec![si], l));
+            groups.push((vec![si], l, None));
         }
-        for (n, (_, mut g)) in groups.into_iter().enumerate() {
+        for (n, (_, mut g, anchors)) in groups.into_iter().enumerate() {
+            if let Some(anchors) = anchors {
+                g.points = dedupe_store_points(std::mem::take(&mut g.points), anchors);
+            }
             let (y, m, d) = utc_date(g.t0());
             g.key = format!("{icao}_{y:04}{m:02}{d:02}_{n}");
             out.push(g);
@@ -627,5 +661,291 @@ mod tests {
             m.meta.sources,
             vec!["d1".to_string(), "d2".to_string(), "d2b".to_string()]
         );
+    }
+
+    fn merge_test_point(t: f64, flags: u8) -> TrackPoint {
+        TrackPoint {
+            t,
+            lat: 40.876466,
+            lon: -73.524951,
+            alt_m: 1000.0,
+            gs_mps: 90.0,
+            track_deg: 90.0,
+            vrate_mps: 0.0,
+            alt_src: alt_src::GEOM,
+            flags,
+        }
+    }
+
+    fn merge_test_store(points: Vec<TrackPoint>, label: &str) -> TrackStore {
+        TrackStore {
+            meta: StoreMeta {
+                version: STORE_VERSION,
+                bbox: fdop_types::BBox::new(40.0, -74.0, 41.0, -73.0),
+                t_start: points.first().unwrap().t,
+                t_end: points.last().unwrap().t,
+                geoid_n_m: -32.0,
+                sources: vec![label.into()],
+                stats: serde_json::json!({}),
+                created_unix: T0,
+            },
+            legs: vec![FlightLeg {
+                key: label.into(),
+                icao: "abc123".into(),
+                reg: "TEST".into(),
+                typ: "PC12".into(),
+                source: "prod+mlat".into(),
+                engine: EngineClass::Turboprop,
+                points,
+            }],
+        }
+    }
+
+    #[test]
+    fn cross_day_merge_keeps_non_mlat_geometry() {
+        let midnight = T0 + 86_400.0;
+        let point = |offset: f64, mlat: bool| {
+            let mut p = merge_test_point(midnight + offset, 0);
+            // A 90 m/s eastbound flight. The duplicate MLAT reports have an independent
+            // 1.1 km northward error and a 200 m height error; they must not bend its seam.
+            p.lon += (90.0 * offset / fdop_types::geo::EARTH_R).to_degrees()
+                / p.lat.to_radians().cos();
+            if mlat {
+                p.lat += 0.01;
+                p.alt_m -= 200.0;
+                p.alt_src = alt_src::BARO_RAW;
+                p.flags = pt_flags::MLAT;
+            }
+            p
+        };
+        for offset in [-0.03125, 0.0, 0.03125] {
+            for reverse_stores in [false, true] {
+                let a = merge_test_store(
+                    vec![
+                        point(-10.0, false),
+                        point(offset, true),
+                        point(10.0 + offset, true),
+                    ],
+                    "day1",
+                );
+                let b = merge_test_store(
+                    vec![point(0.0, false), point(10.0, false), point(20.0, false)],
+                    "day2",
+                );
+                let stores = if reverse_stores { vec![b, a] } else { vec![a, b] };
+                let merged = merge_stores(stores, 300.0);
+                assert_eq!(merged.legs.len(), 1);
+                let leg = &merged.legs[0];
+                let expected: Vec<_> = [-10.0, 0.0, 10.0, 20.0]
+                    .into_iter()
+                    .map(|t| point(t, false))
+                    .collect();
+                assert_eq!(
+                    leg.points, expected,
+                    "MLAT offset={offset}, reverse_stores={reverse_stores}"
+                );
+                assert_eq!(leg.key, "abc123_20260908_0");
+                assert_eq!(leg.icao, "abc123");
+                assert_eq!(leg.reg, "TEST");
+                assert_eq!(leg.typ, "PC12");
+                assert_eq!(merged.meta.stats["cross_store_joins"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn cross_store_duplicate_priority_keeps_cluster_boundaries() {
+        let p = merge_test_point;
+        let merged = merge_stores(
+            vec![
+                merge_test_store(vec![p(0.0, pt_flags::MLAT), p(0.0625, 0)], "a"),
+                merge_test_store(vec![p(0.03125, 0), p(10.0, 0)], "b"),
+                merge_test_store(vec![p(5.0, 0), p(20.0, 0)], "c"),
+            ],
+            300.0,
+        );
+        // A later, preferred representative does not extend the original 0..0.05 group,
+        // either immediately or when the already merged leg is joined to a third store.
+        assert_eq!(
+            merged.legs[0].points,
+            [p(0.03125, 0), p(0.0625, 0), p(5.0, 0), p(10.0, 0), p(20.0, 0)]
+        );
+        let at_boundary = merge_stores(
+            vec![
+                merge_test_store(vec![p(0.0, pt_flags::MLAT), p(10.0, 0)], "a"),
+                merge_test_store(vec![p(DEDUPE_S, 0), p(20.0, 0)], "b"),
+            ],
+            300.0,
+        );
+        assert_eq!(
+            at_boundary.legs[0].points,
+            [p(0.0, pt_flags::MLAT), p(DEDUPE_S, 0), p(10.0, 0), p(20.0, 0)]
+        );
+    }
+
+    #[test]
+    fn cross_store_priority_preserves_join_boundary() {
+        let p = merge_test_point;
+        let merged = merge_stores(
+            vec![
+                merge_test_store(vec![p(-10.0, 0), p(0.0, pt_flags::MLAT)], "a"),
+                merge_test_store(vec![p(-5.0, 0), p(0.03125, 0)], "b"),
+                merge_test_store(vec![p(300.015625, 0), p(320.0, 0)], "c"),
+            ],
+            300.0,
+        );
+        // The preferred point is later, but choosing it does not close a gap that the
+        // original duplicate group left beyond the join limit.
+        assert_eq!(merged.legs.len(), 2);
+        assert_eq!(merged.legs[0].points, [p(-10.0, 0), p(-5.0, 0), p(0.03125, 0)]);
+        assert_eq!(merged.legs[1].points, [p(300.015625, 0), p(320.0, 0)]);
+        assert_eq!(merged.meta.stats["cross_store_joins"], 1);
+    }
+
+    #[test]
+    fn cross_store_priority_handles_interleaved_reports() {
+        let p = merge_test_point;
+        let merged = merge_stores(
+            vec![
+                merge_test_store(
+                    vec![p(-10.0, 0), p(0.0, pt_flags::MLAT), p(0.0625, 0), p(10.0, 0)],
+                    "a",
+                ),
+                merge_test_store(vec![p(-5.0, 0), p(0.046875, 0), p(10.0, 0)], "b"),
+                merge_test_store(
+                    vec![
+                        p(-1.0, 0),
+                        p(-0.03125, pt_flags::MLAT),
+                        p(0.03125, 0),
+                        p(20.0, 0),
+                    ],
+                    "c",
+                ),
+            ],
+            300.0,
+        );
+        // The third store introduces a point before an earlier duplicate group. Preserve
+        // the surviving original intervals, rather than moving a preferred report into an
+        // older group and emitting it out of order or outside its 0.05 s interval.
+        assert_eq!(
+            merged.legs[0].points,
+            [
+                p(-10.0, 0),
+                p(-5.0, 0),
+                p(-1.0, 0),
+                p(-0.03125, pt_flags::MLAT),
+                p(0.03125, 0),
+                p(10.0, 0),
+                p(20.0, 0),
+            ]
+        );
+        assert!(merged.legs[0].points.windows(2).all(|p| p[0].t < p[1].t));
+    }
+
+    #[test]
+    fn cross_store_equal_priorities_keep_previous_tie_behavior() {
+        for flags in [0, pt_flags::MLAT] {
+            for offset in [0.0, 0.03125] {
+                for reverse_stores in [false, true] {
+                    let first = merge_test_point(0.0, flags);
+                    let mut second = merge_test_point(offset, flags);
+                    second.alt_m += 50.0;
+                    let a = merge_test_store(vec![first, merge_test_point(10.0, flags)], "a");
+                    let b = merge_test_store(vec![second, merge_test_point(20.0, flags)], "b");
+                    let stores = if reverse_stores { vec![b, a] } else { vec![a, b] };
+                    let merged = merge_stores(stores, 300.0);
+                    let expected = if offset == 0.0 && reverse_stores {
+                        second
+                    } else {
+                        first
+                    };
+                    assert_eq!(merged.legs[0].points[0], expected);
+                    assert_eq!(merged.legs[0].points.len(), 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cross_store_equal_priorities_preserve_three_store_clusters() {
+        for flags in [0, pt_flags::MLAT] {
+            let p = |t| merge_test_point(t, flags);
+            let merged = merge_stores(
+                vec![
+                    merge_test_store(vec![p(-10.0), p(0.0), p(0.09375), p(10.0)], "a"),
+                    merge_test_store(vec![p(-5.0), p(0.03125), p(10.0)], "b"),
+                    merge_test_store(vec![p(-1.0), p(-0.03125), p(20.0)], "c"),
+                ],
+                300.0,
+            );
+            // B's 0.03125 was discarded with A's 0.0 before C shifted the anchor.
+            // No quality improved, so final selection must not resurrect that sample.
+            assert_eq!(merged.legs.len(), 1);
+            assert_eq!(
+                merged.legs[0].points,
+                [
+                    p(-10.0),
+                    p(-5.0),
+                    p(-1.0),
+                    p(-0.03125),
+                    p(0.09375),
+                    p(10.0),
+                    p(20.0),
+                ]
+            );
+            assert_eq!(merged.meta.stats["cross_store_joins"], 2);
+        }
+    }
+
+    #[test]
+    fn cross_store_equal_priorities_preserve_reintroduced_payload() {
+        for flags in [0, pt_flags::MLAT] {
+            let p = |t| merge_test_point(t, flags);
+            let mut discarded = p(0.03125);
+            discarded.alt_m = 1100.0;
+            let mut retained = p(0.03125);
+            retained.alt_m = 1300.0;
+            let merged = merge_stores(
+                vec![
+                    merge_test_store(vec![p(-10.0), p(0.0), p(10.0)], "a"),
+                    merge_test_store(vec![p(-5.0), discarded, p(10.0)], "b"),
+                    merge_test_store(vec![p(-1.0), p(-0.03125), retained, p(20.0)], "c"),
+                ],
+                300.0,
+            );
+            // C reintroduces this timestamp after B's report was already discarded.
+            // A same-quality raw report cannot replace the original surviving payload.
+            assert_eq!(merged.legs.len(), 1);
+            assert_eq!(
+                merged.legs[0].points,
+                [
+                    p(-10.0),
+                    p(-5.0),
+                    p(-1.0),
+                    p(-0.03125),
+                    retained,
+                    p(10.0),
+                    p(20.0),
+                ]
+            );
+            assert_eq!(merged.meta.stats["cross_store_joins"], 2);
+        }
+    }
+
+    #[test]
+    fn cross_store_priority_does_not_join_same_store_legs() {
+        let p = merge_test_point;
+        let mut a = merge_test_store(vec![p(0.0, 0), p(10.0, pt_flags::MLAT)], "a");
+        let returning = merge_test_store(vec![p(30.0, 0), p(40.0, 0)], "return");
+        a.meta.t_end = returning.meta.t_end;
+        a.legs.extend(returning.legs);
+        let b = merge_test_store(vec![p(10.03125, 0), p(20.0, 0)], "b");
+        let merged = merge_stores(vec![a, b], 300.0);
+        assert_eq!(merged.legs.len(), 2);
+        assert_eq!(merged.legs[0].points, [p(0.0, 0), p(10.03125, 0), p(20.0, 0)]);
+        assert_eq!(merged.legs[1].points, [p(30.0, 0), p(40.0, 0)]);
+        assert_eq!(merged.legs[0].key, "abc123_19700101_0");
+        assert_eq!(merged.legs[1].key, "abc123_19700101_1");
+        assert_eq!(merged.meta.stats["cross_store_joins"], 1);
     }
 }
