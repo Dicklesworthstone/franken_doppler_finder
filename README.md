@@ -349,10 +349,19 @@ in `crates/fdop-core/src/curvematch.rs`:
 
 - **Image.** A 1 s STFT at 0.5 s hops on 48 rows per octave, each row standardised against its own running low
   quantile over 60 s and clipped, then a weighted comb over the first six harmonics.
+  The comb retains the full analysed received-frequency band. An approaching high-tone fast pass is
+  no longer cropped merely because its received frequency exceeds 2.2 times the maximum emitted tone.
 - **Bank of curves.** On a log-frequency axis a constant-speed pass is one fixed path for each (speed, distance),
   and the emitted tone is only a row shift, so one sweep per path scores every arrival time and tone. That
   path's scores at all times of the recording are its null: a lookup becomes a p-value, then an e-value. Both
   halves of a pass must light up.
+  The default speed bank keeps its original eleven rows and adds two 20% steps, about 208 and
+  250 m/s. The existing 15% trajectory allowance then includes the detector's 215–263 m/s fast
+  passes in both coarse voting and exact scoring. Each emitted-tone hypothesis independently
+  needs at least 25% of the full squared weight on each half within the time/frequency image;
+  an out-of-band neighbouring tone cannot discard its usable pixels. Reused range-difference
+  buffers accumulate clipped coverage, while fully covered paths keep scalar normalization.
+  Real windows, null calibration and decoy windows all use this same scorer.
 - **Tone by type.** For common propeller types a tone the propeller can make (blades × rpm / 60, from typical
   published figures) earns more and other tones less. The weights are divided by where this recording's best
   tones fall with no weighting, and scaled to average one over those tones, so they do not favour every flight.
@@ -1112,6 +1121,14 @@ at 100 m spacing (1,370 retained), and 3.885 s to 62.2 ms at 1 km spacing (16,00
 Both outputs matched exactly. These are single-trial deduplication measurements, not total search
 timings; real-recording runtime has not been remeasured.
 
+The independent curve match now has 221 default bank paths (13 speeds across 17 distances) and
+279 received-frequency rows at 4 kHz input. The previous counts were 187 paths and 238 rows.
+Supporting faster and higher received tones therefore adds bank work and retained image storage.
+Its per-tone boundary handling reuses scratch buffers, adds each clipped coverage interval in constant
+time, and keeps the original scalar normalization when every tone fits. Runtime and peak memory have
+not been remeasured. Additional bank rows also change the tone-prior histogram, so field grades need
+replay even though real and decoy searches share the scorer and the acceptance thresholds are unchanged.
+
 Weather retrieval overlaps audio analysis. After audio analysis, the pipeline waits up to 190 s for weather:
 the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. Usable hourly
 surface weather or radiosonde profiles are retained as they arrive; updates do not restart that deadline.
@@ -1125,6 +1142,18 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ## Testing
 
 ### Recovery changes (2026-11-07): validation incomplete
+
+**Fast passes in the independent curve matcher.** Five new regressions cover per-tone frequency
+clipping, a simple independent coverage/score oracle, production-speed coarse votes, two crossing
+215/263 m/s synthetic passes with 52 decoy windows and reversed/steady-tone controls, and a 300 Hz
+emitted tone received near 1.2 kHz beyond the former image crop. Only these new PCM fixtures suppress
+harmonics above the usable sample band; earlier fixtures remain unchanged.
+
+Independent f32 arithmetic checks matched all 624 deterministic oracle cases. Another 2,000 weighted
+cases matched coverage and winning tone, with a maximum score difference of about 3.8e-6. These are
+arithmetic models, not Rust or PCM execution. Source review completed; native regressions, formatting,
+workspace checks, release selftest and reference/field replays remain unrun while the executor is
+unavailable. No new recording recovery or confidence result is claimed.
 
 **Separated track-segment recovery.** Six new regressions preserve the original model bit for bit
 while recovering either side of a coverage gap hidden by sparse false reports. Controls retain an

@@ -19,6 +19,31 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Let the independent curve matcher score faster subsonic passes
+
+- Extend the default speed grid by two existing 20% steps, to about 250 m/s. Its unchanged 15%
+  trajectory allowance now includes the detector's 215–263 m/s fast passes; previously coarse
+  and exact scoring excluded everything above about 199 m/s despite those detector seeds.
+- Retain the full analysed received-frequency comb. A visible high-tone approach can exceed
+  the old `2.2 * f0_hi` crop even when its emitted fundamental and received spectrum are in range.
+- Clip each path sample to its valid emitted-tone interval instead of discarding the entire
+  sample when another tone would leave the image. Require the existing 25% squared-weight
+  coverage independently on both halves for each tone. Reuse scratch and O(1) range-difference
+  updates; fully covered paths keep the original scalar arithmetic. Bank/null and exact/decoy
+  scoring all share the same kernel.
+- Add five regressions: visible-tone edge coverage, an independent per-tone oracle, default-speed
+  coarse admission and its limit, real phase-integrated crossing-fast PCM with 52 decoys and
+  negative controls, and a high-tone PCM probe beyond the old received-frequency crop. New fast
+  fixtures alone suppress supra-band harmonics; all pre-existing PCM fixtures remain unchanged.
+- **Cost/calibration:** default bank paths rise from 187 to 221 and the 4 kHz comb from 238 to
+  279 received rows. Added templates also change the tone-prior histogram. Hearing, coverage,
+  margin, radius and decoy-count thresholds are unchanged; no runtime or field-grade claim is made.
+- **Validation:** independent source reviews found no blocker. A separate f32 arithmetic model
+  matched all 624 deterministic cases; 2,000 non-dyadic weighted cases kept the same coverage and
+  winning tone, with maximum score difference about 3.8e-6. Straight-path arithmetic validates
+  the high-tone fixture geometry. These checks are not native Rust/PCM passes: new regressions,
+  formatting, Clippy, release selftest and reference/field replays remain unrun during the outage.
+
 ### Recover supported track segments hidden by rejected reports
 
 - Preserve the original longest consistent position chain and recover additional supported

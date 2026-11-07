@@ -160,7 +160,9 @@ impl Default for MatchParams {
             floor_stride_s: 2.0,
             clip: (-3.0, 8.0),
             neighbour_cost: 1.0,
-            v_grid: geometric(28.0, 1.2, 11),
+            // Keep the original bank and add two 20% steps for faster subsonic passes.
+            // The existing 15% trajectory allowance then includes the detector's fast seeds.
+            v_grid: geometric(28.0, 1.2, 13),
             d_grid: geometric(120.0, 1.3, 17),
             r_ref_m: 1500.0,
             half_k: 3.5,
@@ -329,8 +331,10 @@ pub fn build_image(x: &[f32], sr: u32, p: &MatchParams) -> Result<CombImage, Str
         }
     });
     let rows = rows2;
-    let nu = ((p.f0_hi * 2.2 / p.band_lo).log2() * b).floor() as usize + 1;
-    let nu = nu.min(nr);
+    // These are received frequencies. Fast approach tones can exceed the old 2.2*f0_hi
+    // crop; all these rows were already whitened. Emitted-tone hypotheses stay bounded
+    // by f0_lo/f0_hi, and the sweep checks each tone's visible coverage independently.
+    let nu = nr;
     let shifts: Vec<(usize, f32)> = p
         .harmonics
         .iter()
@@ -604,10 +608,37 @@ fn stat_of(stat: Stat, a: f32, b: f32) -> f32 {
     }
 }
 
-/// Sum one path over every emitted-tone row at arrival frame `tau` of `im`. `acc` holds two rows of
-/// `nf0`. Returns the best statistic and its row (`None` if too little of either half is in the
-/// recording). `tone` is the type's `ln q` per row and the path's null scale: a row's statistic is
-/// raised by what its tone is worth in nats.
+/// Reused sums and range differences for visible weight at each emitted tone.
+/// Difference arrays add a sample's squared weight to a clipped row interval in O(1).
+struct SweepBuffers {
+    approach: Vec<f32>,
+    recede: Vec<f32>,
+    approach_w2_diff: Vec<f32>,
+    recede_w2_diff: Vec<f32>,
+}
+
+impl SweepBuffers {
+    fn new(nf0: usize) -> Self {
+        Self {
+            approach: vec![0.0; nf0],
+            recede: vec![0.0; nf0],
+            approach_w2_diff: vec![0.0; nf0 + 1],
+            recede_w2_diff: vec![0.0; nf0 + 1],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.approach.fill(0.0);
+        self.recede.fill(0.0);
+        self.approach_w2_diff.fill(0.0);
+        self.recede_w2_diff.fill(0.0);
+    }
+}
+
+/// Sum one path over every emitted-tone row at arrival frame tau of im.
+/// Each tone must retain 25% of the full squared weight on BOTH halves in the image.
+/// A neighbouring tone falling outside the frequency band cannot discard its pixels.
+/// The tone argument is the type's log prior per row and the path's null scale.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn sweep_tau(
@@ -617,52 +648,79 @@ fn sweep_tau(
     r0: usize,
     nf0: usize,
     stat: Stat,
-    acc_a: &mut [f32],
-    acc_b: &mut [f32],
+    scratch: &mut SweepBuffers,
     full: (f32, f32),
     tone: Option<(&[f32], f32)>,
 ) -> Option<(f32, usize)> {
-    acc_a.fill(0.0);
-    acc_b.fill(0.0);
+    scratch.clear();
     let (mut wa, mut wb) = (0f32, 0f32);
+    let mut clipped = false;
     for s in pth {
-        let frame = tau + s.dt as i64;
+        let frame = tau + i64::from(s.dt);
         if frame < 0 || frame >= im.nt as i64 {
             continue;
         }
-        let first = r0 as i64 + s.dr as i64;
-        if first < 0 || first as usize + nf0 > im.nu {
+        let first = r0 as i64 + i64::from(s.dr);
+        let lo = (-first).max(0) as usize;
+        let hi = ((im.nu as i64 - first).max(0) as usize).min(nf0);
+        if lo >= hi {
             continue;
         }
-        let off = frame as usize * im.nu + first as usize;
-        let src = &im.comb[off..off + nf0];
-        let acc = if s.approach {
-            wa += s.w * s.w;
-            &mut *acc_a
+        let (acc, diff, weight) = if s.approach {
+            (&mut scratch.approach, &mut scratch.approach_w2_diff, &mut wa)
         } else {
-            wb += s.w * s.w;
-            &mut *acc_b
+            (&mut scratch.recede, &mut scratch.recede_w2_diff, &mut wb)
         };
-        for (d, v) in acc.iter_mut().zip(src) {
+        let w2 = s.w * s.w;
+        if lo == 0 && hi == nf0 {
+            *weight += w2;
+        } else {
+            clipped = true;
+            diff[lo] += w2;
+            diff[hi] -= w2;
+        }
+        let off = frame as usize * im.nu + (first + lo as i64) as usize;
+        let src = &im.comb[off..off + hi - lo];
+        for (d, v) in acc[lo..hi].iter_mut().zip(src) {
             *d += s.w * v;
         }
     }
-    if wa < 0.25 * full.0 || wb < 0.25 * full.1 {
-        return None;
-    }
-    let (ra, rb) = (1.0 / wa.sqrt(), 1.0 / wb.sqrt());
-    let (mut best, mut at) = (f32::NEG_INFINITY, 0);
-    for (r, (a, b)) in acc_a.iter().zip(acc_b.iter()).enumerate() {
+    // Most bank paths fit the whole tone range. Keep their original scalar arithmetic
+    // and two square roots instead of normalizing every emitted row independently.
+    let common = if clipped {
+        None
+    } else {
+        if wa < 0.25 * full.0 || wb < 0.25 * full.1 {
+            return None;
+        }
+        Some((1.0 / wa.sqrt(), 1.0 / wb.sqrt()))
+    };
+    let (mut extra_a, mut extra_b) = (0f32, 0f32);
+    let (mut best, mut at, mut any) = (f32::NEG_INFINITY, 0, false);
+    for (row, (a, b)) in scratch.approach.iter().zip(&scratch.recede).enumerate() {
+        let (ra, rb) = if let Some(gains) = common {
+            gains
+        } else {
+            extra_a += scratch.approach_w2_diff[row];
+            extra_b += scratch.recede_w2_diff[row];
+            let row_wa = (wa + extra_a).max(0.0);
+            let row_wb = (wb + extra_b).max(0.0);
+            if row_wa < 0.25 * full.0 || row_wb < 0.25 * full.1 {
+                continue;
+            }
+            (1.0 / row_wa.sqrt(), 1.0 / row_wb.sqrt())
+        };
+        any = true;
         let mut s = stat_of(stat, a * ra, b * rb);
         if let Some((q, beta)) = tone {
-            s += beta * q[r];
+            s += beta * q[row];
         }
         if s > best {
             best = s;
-            at = r;
+            at = row;
         }
     }
-    Some((best, at))
+    any.then_some((best, at))
 }
 
 /// ln of the Vovk-Wang e-value kappa p^(kappa - 1) of a lookup worth `nats` = -ln p. Kept in logs:
@@ -711,12 +769,12 @@ fn build_bank(im: &CombImage, p: &MatchParams) -> Bank {
                     (acc.0, acc.1 + s.w * s.w)
                 }
             });
-            let (mut a, mut b) = (vec![0f32; nf0], vec![0f32; nf0]);
+            let mut scratch = SweepBuffers::new(nf0);
             let mut score = vec![f32::NEG_INFINITY; im.nt];
             let mut rows = vec![0u64; nf0];
             for (tau, sc) in score.iter_mut().enumerate() {
                 if let Some((s, r)) = sweep_tau(
-                    im, &pth, tau as i64, r0, nf0, p.stat, &mut a, &mut b, full, None,
+                    im, &pth, tau as i64, r0, nf0, p.stat, &mut scratch, full, None,
                 ) {
                     *sc = s;
                     rows[r] += 1;
@@ -1196,7 +1254,7 @@ fn score_exact(
     }
     let v_cap = p.v_grid.last().copied().unwrap_or(200.0) * 1.15;
     let mut ones: Vec<One> = Vec::new();
-    let (mut a, mut b) = (vec![0f32; bank.nf0], vec![0f32; bank.nf0]);
+    let mut scratch = SweepBuffers::new(bank.nf0);
     for &ti in idx {
         let tr = &inp.tracks[ti];
         let (ta, tb) = (tr.t0().max(lo), tr.t1().min(hi));
@@ -1275,8 +1333,7 @@ fn score_exact(
                         bank.r0,
                         bank.nf0,
                         p.stat,
-                        &mut a,
-                        &mut b,
+                        &mut scratch,
                         full,
                         tone,
                     )
@@ -4415,5 +4472,345 @@ mod tests {
         let at_reach = p_heard(&p, longest, p.reach_m);
         assert!(at_reach <= 0.13, "{at_reach}");
         assert!(p.r50_m.windows(2).all(|w| (w[1] / w[0] - 2.0).abs() < 1e-9));
+    }
+
+    /// Deliberately simple per-tone oracle: clip each predicted pixel independently.
+    #[allow(clippy::too_many_arguments)]
+    fn direct_visible_tone_sweep(
+        im: &CombImage,
+        pth: &[Sample],
+        tau: i64,
+        r0: usize,
+        nf0: usize,
+        stat: Stat,
+        full: (f32, f32),
+        tone: Option<(&[f32], f32)>,
+    ) -> Option<(f32, usize)> {
+        let (mut best, mut at, mut any) = (f32::NEG_INFINITY, 0, false);
+        for row in 0..nf0 {
+            let (mut a, mut b, mut wa, mut wb) = (0f32, 0f32, 0f32, 0f32);
+            for s in pth {
+                let frame = tau + i64::from(s.dt);
+                let received = r0 as i64 + row as i64 + i64::from(s.dr);
+                if !(0..im.nt as i64).contains(&frame)
+                    || !(0..im.nu as i64).contains(&received)
+                {
+                    continue;
+                }
+                let value = im.comb[frame as usize * im.nu + received as usize];
+                if s.approach {
+                    a += s.w * value;
+                    wa += s.w * s.w;
+                } else {
+                    b += s.w * value;
+                    wb += s.w * s.w;
+                }
+            }
+            if wa < 0.25 * full.0 || wb < 0.25 * full.1 {
+                continue;
+            }
+            any = true;
+            let mut value = stat_of(stat, a * (1.0 / wa.sqrt()), b * (1.0 / wb.sqrt()));
+            if let Some((q, beta)) = tone {
+                value += beta * q[row];
+            }
+            if value > best {
+                best = value;
+                at = row;
+            }
+        }
+        any.then_some((best, at))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn actual_visible_tone_sweep(
+        im: &CombImage,
+        pth: &[Sample],
+        tau: i64,
+        r0: usize,
+        nf0: usize,
+        stat: Stat,
+        full: (f32, f32),
+        tone: Option<(&[f32], f32)>,
+    ) -> Option<(f32, usize)> {
+        let mut scratch = SweepBuffers::new(nf0);
+        sweep_tau(im, pth, tau, r0, nf0, stat, &mut scratch, full, tone)
+    }
+
+    #[test]
+    fn visible_tone_survives_other_tones_crossing_frequency_edges() {
+        let mut im = CombImage {
+            t0: 0.0,
+            dt: 1.0,
+            f_lo: 25.0,
+            bpo: 48.0,
+            nt: 3,
+            nu: 12,
+            comb: vec![0.0; 36],
+        };
+        let pth = [
+            Sample { dt: -1, dr: 5, w: 1.0, approach: true },
+            Sample { dt: 1, dr: -4, w: 1.0, approach: false },
+        ];
+        // Emitted row 2 has visible pixels at received rows 10 and 1.
+        // Rows 0 and 4 have louder pixels, but lack the opposite half entirely.
+        im.comb[10] = 4.0;
+        im.comb[2 * im.nu + 1] = 6.0;
+        im.comb[8] = 100.0;
+        im.comb[2 * im.nu + 3] = 100.0;
+        for stat in [Stat::Min, Stat::Sum] {
+            let got = actual_visible_tone_sweep(&im, &pth, 1, 3, 5, stat, (1.0, 1.0), None)
+                .expect("one emitted tone has complete approach and recede coverage");
+            assert_eq!(got.1, 2);
+            assert!((got.0 - stat_of(stat, 4.0, 6.0)).abs() < 1e-6);
+        }
+        // One visible half cannot borrow coverage from another emitted tone.
+        im.comb[10] = 0.0;
+        im.comb[2 * im.nu + 1] = 0.0;
+        let got = actual_visible_tone_sweep(
+            &im, &pth, 1, 3, 5, Stat::Min, (1.0, 1.0), None,
+        ).unwrap();
+        assert_eq!(got.0, 0.0);
+    }
+
+    #[test]
+    fn clipped_sweeps_match_independent_per_tone_coverage_and_scores() {
+        let im = CombImage {
+            t0: 0.0,
+            dt: 1.0,
+            f_lo: 25.0,
+            bpo: 48.0,
+            nt: 13,
+            nu: 19,
+            comb: (0..13 * 19).map(|i| ((i * 13 % 37) as f32 - 18.0) * 0.25).collect(),
+        };
+        let pth = [
+            Sample { dt: -4, dr: 8, w: 0.25, approach: true },
+            Sample { dt: -2, dr: 3, w: 1.0, approach: true },
+            Sample { dt: -1, dr: 1, w: 0.5, approach: true },
+            Sample { dt: 0, dr: 0, w: 1.0, approach: false },
+            Sample { dt: 1, dr: -2, w: 0.5, approach: false },
+            Sample { dt: 4, dr: -9, w: 0.25, approach: false },
+        ];
+        let full = (1.3125, 1.3125);
+        for nf0 in [1, 5, 9] {
+            let q: Vec<_> = (0..nf0).map(|r| (r as f32 - 3.0) * 0.125).collect();
+            for r0 in [0, 3, 9, 17] {
+                for tau in 0..im.nt as i64 {
+                    for stat in [Stat::Min, Stat::Sum] {
+                        for tone in [None, Some((q.as_slice(), 0.5))] {
+                            let expected = direct_visible_tone_sweep(
+                                &im, &pth, tau, r0, nf0, stat, full, tone,
+                            );
+                            let got = actual_visible_tone_sweep(
+                                &im, &pth, tau, r0, nf0, stat, full, tone,
+                            );
+                            match (got, expected) {
+                                (None, None) => {}
+                                (Some((got, row)), Some((want, want_row))) => {
+                                    assert_eq!(row, want_row, "r0={r0} nf0={nf0} tau={tau}");
+                                    assert!((got - want).abs() < 2e-6, "{got} != {want}");
+                                }
+                                pair => panic!("coverage differs: {pair:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_curve_bank_stamps_fast_passes_and_keeps_its_speed_limit() {
+        let (_, _, clock) = SCENE_AT;
+        let p = MatchParams::default();
+        let g = observer_cell(&p);
+        let old_limit = geometric(28.0, 1.2, 11).last().unwrap() * 1.15;
+        for speed in [215.0, 249.0, 263.0] {
+            assert!(speed > old_limit);
+            let tr = scene_track(
+                [0.0, 900.0, 600.0 + MIC_HEIGHT_M],
+                [speed, 0.0, 0.0],
+                120.0,
+                -200.0,
+                500.0,
+            );
+            let mut stamped = Vec::new();
+            stamp_track(
+                &tr, &g, &p, &|_| BASE_C, clock,
+                (clock - 200.0, clock + 500.0), &mut stamped,
+            );
+            assert_eq!(stamped.len(), 1, "lost {speed} m/s pass");
+            let arrival = 120.0 + 900.0f64.hypot(600.0) / BASE_C;
+            assert!((stamped[0].1.arrive as f64 - arrival).abs() < 0.01);
+        }
+        let speed = p.v_grid.last().unwrap() * 1.15 + 10.0;
+        let tr = scene_track(
+            [0.0, 900.0, 600.0 + MIC_HEIGHT_M],
+            [speed, 0.0, 0.0],
+            120.0,
+            -200.0,
+            500.0,
+        );
+        let mut stamped = Vec::new();
+        stamp_track(
+            &tr, &g, &p, &|_| BASE_C, clock,
+            (clock - 200.0, clock + 500.0), &mut stamped,
+        );
+        assert!(stamped.is_empty(), "the configured speed allowance still applies");
+    }
+
+    /// New fast fixtures alone suppress harmonics beyond the sample rate's usable band.
+    /// Their phase still integrates the real retarded-time ratio, independently of the bank.
+    fn scene_with_visible_harmonics(
+        tracks: Vec<TrackModel>,
+        tones: &[f64],
+        half_m: f64,
+        duration_s: f64,
+    ) -> Case {
+        assert_eq!(tracks.len(), tones.len());
+        let mut c = scene_for(Vec::new(), half_m, duration_s);
+        let enu = Enu::new(c.lat, c.lon, 0.0);
+        let observer = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let medium = Prop::still(BASE_C);
+        let sr = 2800.0;
+        let mut pcm: Vec<f64> = c.x.iter().map(|&v| f64::from(v)).collect();
+        for (tr, &f0) in tracks.iter().zip(tones) {
+            let (mut phase, mut hint, mut warm) = (0.0, 0usize, None);
+            let (mut range, mut ratio) = (f64::INFINITY, 0.0);
+            for (i, value) in pcm.iter_mut().enumerate() {
+                if i % 400 == 0 {
+                    match tr.solve_emission_sweep(
+                        c.clock + i as f64 / sr, observer, &medium, warm, &mut hint, 1e-5,
+                    ) {
+                        Some((te, r, q)) => {
+                            warm = Some(te);
+                            range = r;
+                            ratio = q;
+                        }
+                        None => {
+                            warm = None;
+                            ratio = 0.0;
+                        }
+                    }
+                }
+                if ratio <= 0.0 {
+                    continue;
+                }
+                phase += std::f64::consts::TAU * f0 * ratio / sr;
+                let amplitude = 0.5 * 1000.0 / range;
+                for harmonic in 1..=4 {
+                    let h = f64::from(harmonic);
+                    if h * f0 * ratio <= 0.45 * sr {
+                        *value += amplitude / h * (h * phase).sin();
+                    }
+                }
+            }
+        }
+        c.x = pcm.into_iter().map(|v| v as f32).collect();
+        c.tracks = tracks;
+        c
+    }
+
+    #[test]
+    fn fast_pcm_retains_visible_received_tones_above_the_old_image_crop() {
+        let mut tr = scene_track(
+            [0.0, 600.0, 700.0 + MIC_HEIGHT_M],
+            [263.0, 0.0, 0.0], 120.0, -200.0, 900.0,
+        );
+        tr.key = "fast-high-tone".into();
+        tr.icao = "000003".into();
+        let c = scene_with_visible_harmonics(vec![tr], &[300.0], 200.0, 300.0);
+        let p = MatchParams { hop_s: 1.0, ..Default::default() };
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let observer = geodetic_to_ecef(c.lat, c.lon, MIC_HEIGHT_M);
+        let medium = Prop::still(BASE_C);
+        let tr = &c.tracks[0];
+        let te = c.clock + 104.0;
+        let rv = sub(tr.pos_at(te), observer);
+        let received = te + medium.travel(rv, norm(rv));
+        let frame = ((received - c.clock - im.t0) / im.dt).round() as usize;
+        assert!(frame < im.nt);
+        let (_, _, ratio) = tr.solve_emission_p(
+            c.clock + im.t0 + frame as f64 * im.dt, observer, &medium, None,
+        ).unwrap();
+        let frequency = 300.0 * ratio;
+        let row = im.row_of(frequency).round() as usize;
+        let old_rows = ((p.f0_hi * 2.2 / p.band_lo).log2() * p.bins_per_octave)
+            .floor() as usize + 1;
+        assert!(row >= old_rows, "{frequency} Hz must exercise the old crop");
+        assert!(frequency < p.band_hi.min(0.45 * 2800.0));
+        assert!(row < im.nu, "visible received fundamental at {frequency} Hz was cropped");
+        let energy = (row.saturating_sub(1)..=(row + 1).min(im.nu - 1))
+            .map(|r| im.comb[frame * im.nu + r])
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(energy > 2.0, "the predicted received tone has no visible energy: {energy}");
+    }
+
+    #[test]
+    fn fast_crossing_pcm_reaches_the_curve_match_and_controls_are_refused() {
+        let mut a = scene_track(
+            [0.0, 600.0, 700.0 + MIC_HEIGHT_M],
+            [215.0, 0.0, 0.0], 120.0, -200.0, 900.0,
+        );
+        a.key = "fast-east".into();
+        a.icao = "000001".into();
+        let mut b = scene_track(
+            [700.0, 0.0, 600.0 + MIC_HEIGHT_M],
+            [0.0, 263.0, 0.0], 360.0, -200.0, 900.0,
+        );
+        b.key = "fast-north".into();
+        b.icao = "000002".into();
+        let c = with_sky(
+            scene_with_visible_harmonics(vec![a, b], &[90.0, 115.0], 200.0, 600.0),
+            3,
+        );
+        // Preserve the production speed bank and all evidence/coverage/decoy gates.
+        // A smaller distance bank, one-second image hops and 52 complete decoy windows
+        // bound this PCM regression while exceeding the unchanged 40-decoy requirement.
+        let p = MatchParams {
+            hop_s: 1.0,
+            d_grid: vec![500.0, 1000.0, 2000.0],
+            decoy_span_s: 1680.0,
+            top_modes: 4,
+            refine_modes: 1,
+            ..Default::default()
+        };
+        let r = run_case(&c, &p, c.clock - 2.0, c.clock + 2.0);
+        let top = r.modes.first().expect("both fast passes reach the spatial search");
+        assert!(haversine_m(top.lat, top.lon, c.lat, c.lon) < 200.0);
+        assert!((top.clock_unix - c.clock).abs() < 2.0);
+        assert!(top.n_heard >= 2);
+        for key in ["fast-east", "fast-north"] {
+            assert!(top.passes.iter().any(|pass| {
+                pass.key == key && counts_as_heard(pass.value, pass.nats, pass.shared)
+            }), "missing independently heard {key}");
+        }
+        assert!(r.decoys.len() >= MIN_DECOYS);
+        assert!(verdict(&r).is_some_and(|v| v.stands));
+
+        for reversed in [false, true] {
+            let mut control = Case {
+                x: if reversed {
+                    c.x.iter().rev().copied().collect()
+                } else {
+                    noise(c.x.len(), 77, 0.05).iter().map(|&v| v as f32).collect()
+                },
+                tracks: c.tracks.clone(),
+                region: c.region,
+                lat: c.lat,
+                lon: c.lon,
+                clock: c.clock,
+            };
+            if !reversed {
+                for (i, value) in control.x.iter_mut().enumerate() {
+                    let t = i as f64 / 2800.0;
+                    *value += (0.2 * (std::f64::consts::TAU * 90.0 * t).sin()
+                        + 0.1 * (std::f64::consts::TAU * 180.0 * t).sin()) as f32;
+                }
+            }
+            let result = run_case(&control, &p, control.clock - 2.0, control.clock + 2.0);
+            assert_refused(&result);
+        }
     }
 }
