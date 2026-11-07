@@ -901,9 +901,11 @@ struct Pass {
     tpl: u16,
 }
 
-/// Closest approaches of `tr` to every cell in reach, per chunk of track, so a flight that comes
-/// back counts once per visit. A minimum on a chunk's edge belongs to the neighbouring chunk unless
-/// the track really ends there.
+/// Local closest approaches of `tr` to every cell in reach, so a flight that comes back counts
+/// once per visit even when several visits fit in one chunk. All chunks use the same sampling
+/// lattice and read one extra sample at either edge; a minimum belongs to the chunk that owns its
+/// central sample. This also keeps a shortened final chunk from moving a boundary pass between
+/// chunks. Scratch is bounded by the chunk's positions, not by its cells or number of visits.
 fn stamp_track(
     tr: &TrackModel,
     g: &Grid,
@@ -919,85 +921,51 @@ fn stamp_track(
     }
     let reach = p.reach_m;
     let rc = (reach / g.step).ceil() as i64;
-    let mut chunk_start = ta;
+    let last_sample = ((tb - ta) / p.sample_s).ceil() as usize;
+    let (ends_a, ends_b) = (ta <= tr.t0() + 1.0, tb >= tr.t1() - 1.0);
+    let trim = 0.5 * (p.chunk_s - p.chunk_step_s);
+    let mut chunk = 0usize;
     loop {
+        let chunk_start = ta + chunk as f64 * p.chunk_step_s;
         let chunk_end = (chunk_start + p.chunk_s).min(tb);
-        let n = (((chunk_end - chunk_start) / p.sample_s).ceil() as usize).max(2);
-        let times: Vec<f64> = (0..=n)
-            .map(|i| chunk_start + (chunk_end - chunk_start) * i as f64 / n as f64)
+        // The same global sample and its two neighbours must be compared in either chunk.
+        // Re-spacing the last chunk's samples could give a pass no owner, or two owners.
+        let first = (((chunk_start - ta) / p.sample_s).floor() as usize).saturating_sub(1);
+        let last = (((chunk_end - ta) / p.sample_s).ceil() as usize)
+            .saturating_add(1)
+            .min(last_sample);
+        let times: Vec<f64> = (first..=last)
+            .map(|i| (ta + i as f64 * p.sample_s).min(tb))
             .collect();
         let pts: Vec<V3> = times
             .iter()
             .map(|&t| g.enu.from_ecef(tr.pos_at(t)))
             .collect();
-        let (mut x0, mut x1, mut y0, mut y1) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
-        for q in &pts {
+        let own_lo = if chunk == 0 {
+            f64::NEG_INFINITY
+        } else {
+            ta + trim + chunk as f64 * p.chunk_step_s
+        };
+        let own_hi = if chunk_end >= tb {
+            f64::INFINITY
+        } else {
+            ta + trim + (chunk + 1) as f64 * p.chunk_step_s
+        };
+        for (i, q) in pts.iter().enumerate() {
+            let sample = first + i;
+            if times[i] < own_lo
+                || times[i] >= own_hi
+                || (sample == 0 && !ends_a)
+                || (sample == last_sample && !ends_b)
+            {
+                continue;
+            }
             let (ix, iy) = (
                 ((q[0] - g.e0) / g.step).round() as i64,
                 ((q[1] - g.n0) / g.step).round() as i64,
             );
-            x0 = x0.min(ix - rc);
-            x1 = x1.max(ix + rc);
-            y0 = y0.min(iy - rc);
-            y1 = y1.max(iy + rc);
-        }
-        let (x0, x1, y0, y1) = (
-            x0.max(0),
-            x1.min(g.ncols as i64 - 1),
-            y0.max(0),
-            y1.min(g.nrows as i64 - 1),
-        );
-        if x0 <= x1 && y0 <= y1 {
-            let (w, h) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
-            let mut best = vec![(f32::INFINITY, 0u32); w * h];
-            for (i, q) in pts.iter().enumerate() {
-                let (ix, iy) = (
-                    ((q[0] - g.e0) / g.step).round() as i64,
-                    ((q[1] - g.n0) / g.step).round() as i64,
-                );
-                for yy in (iy - rc).max(y0)..=(iy + rc).min(y1) {
-                    let dy = g.n0 + yy as f64 * g.step - q[1];
-                    let row = (yy - y0) as usize * w;
-                    let cell_row = yy as usize * g.ncols;
-                    for xx in (ix - rc).max(x0)..=(ix + rc).min(x1) {
-                        let dx = g.e0 + xx as f64 * g.step - q[0];
-                        let dz = g.up[cell_row + xx as usize] as f64 - q[2];
-                        let d2 = (dx * dx + dy * dy + dz * dz) as f32;
-                        let b = &mut best[row + (xx - x0) as usize];
-                        if d2 < b.0 {
-                            *b = (d2, i as u32);
-                        }
-                    }
-                }
-            }
-            let last = pts.len() - 1;
-            let (ends_a, ends_b) = (chunk_start <= tr.t0() + 1.0, chunk_end >= tr.t1() - 1.0);
-            // chunks overlap; a closest approach counts only in the chunk whose middle holds it
-            let trim = 0.5 * (p.chunk_s - p.chunk_step_s);
-            let own_lo = if chunk_start <= ta {
-                f64::NEG_INFINITY
-            } else {
-                chunk_start + trim
-            };
-            let own_hi = if chunk_end >= tb {
-                f64::INFINITY
-            } else {
-                chunk_start + trim + p.chunk_step_s
-            };
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    let (d2, i) = best[(yy - y0) as usize * w + (xx - x0) as usize];
-                    let i = i as usize;
-                    if !d2.is_finite()
-                        || d2 > (reach * reach) as f32
-                        || (i == 0 && !ends_a)
-                        || (i == last && !ends_b)
-                    {
-                        continue;
-                    }
-                    if times[i] < own_lo || times[i] >= own_hi {
-                        continue;
-                    }
+            for yy in (iy - rc).max(0)..=(iy + rc).min(g.nrows as i64 - 1) {
+                for xx in (ix - rc).max(0)..=(ix + rc).min(g.ncols as i64 - 1) {
                     let cell = yy as usize * g.ncols + xx as usize;
                     if !g.inside[cell] {
                         continue;
@@ -1007,34 +975,67 @@ fn stamp_track(
                         g.n0 + yy as f64 * g.step,
                         g.up[cell] as f64,
                     ];
-                    // the closest point on the two segments around the best sample
-                    let (mut bd2, mut bt) = (d2 as f64, times[i]);
-                    for (a, b) in [(i.saturating_sub(1), i), (i, (i + 1).min(last))] {
-                        if a == b {
-                            continue;
+                    let dist2 = |q: V3| {
+                        let (dx, dy, dz) = (x[0] - q[0], x[1] - q[1], x[2] - q[2]);
+                        dx * dx + dy * dy + dz * dz
+                    };
+                    let d2 = dist2(*q) as f32;
+                    if !d2.is_finite() || d2 > (reach * reach) as f32 {
+                        continue;
+                    }
+                    let before = if sample == 0 {
+                        f32::INFINITY
+                    } else {
+                        dist2(pts[i - 1]) as f32
+                    };
+                    // Equal minima belong to their first sample, as in the former global
+                    // minimum. Neighbours are read even outside the current reach square.
+                    if d2 >= before || before.is_nan() {
+                        continue;
+                    }
+                    let after = if sample == last_sample {
+                        f32::INFINITY
+                    } else {
+                        dist2(pts[i + 1]) as f32
+                    };
+                    if d2 > after || after.is_nan() {
+                        continue;
+                    }
+                    // Interpolate squared range, not the two straight chords: on a turn the
+                    // nearest point of a chord need not be near the actual CPA time. Its
+                    // quadratic vertex is exact for a straight steady pass and uses the same
+                    // three samples, including unequal spacing at a shortened final interval.
+                    let mut bt = times[i];
+                    if sample > 0 && sample < last_sample {
+                        let (ha, hb) = (times[i] - times[i - 1], times[i + 1] - times[i]);
+                        let centre = dist2(*q);
+                        let a = (dist2(pts[i - 1]) - centre) / ha;
+                        let b = (dist2(pts[i + 1]) - centre) / hb;
+                        let curve = (a + b) / (ha + hb);
+                        if curve > 0.0 && curve.is_finite() {
+                            let slope = b - curve * hb;
+                            let shift = -slope / (2.0 * curve);
+                            if shift.is_finite() {
+                                bt += shift.clamp(-ha, hb);
+                            }
                         }
-                        let s = sub(pts[b], pts[a]);
+                    } else {
+                        // At a real track boundary only one side exists; keep the former
+                        // segment projection so a CPA just inside that first/last sample
+                        // interval is not pinned to the endpoint.
+                        let j = if sample == 0 { i + 1 } else { i - 1 };
+                        let s = sub(pts[j], *q);
                         let ss: f64 = s.iter().map(|v| v * v).sum();
-                        if ss <= 0.0 {
-                            continue;
-                        }
-                        let r = sub(x, pts[a]);
-                        let u = (r[0] * s[0] + r[1] * s[1] + r[2] * s[2]) / ss;
-                        let u = u.clamp(0.0, 1.0);
-                        let q = [
-                            pts[a][0] + u * s[0],
-                            pts[a][1] + u * s[1],
-                            pts[a][2] + u * s[2],
-                        ];
-                        let e = sub(q, x);
-                        let dd: f64 = e.iter().map(|v| v * v).sum();
-                        if dd < bd2 {
-                            bd2 = dd;
-                            bt = times[a] + u * (times[b] - times[a]);
+                        if ss > 0.0 && ss.is_finite() {
+                            let r = sub(x, *q);
+                            let u = (r[0] * s[0] + r[1] * s[1] + r[2] * s[2]) / ss;
+                            if u.is_finite() {
+                                bt += u.clamp(0.0, 1.0) * (times[j] - times[i]);
+                            }
                         }
                     }
-                    let d = bd2.sqrt();
-                    let (_, vel) = tr.pv(bt);
+                    let (pos, vel) = tr.pv(bt);
+                    let d = dist2(g.enu.from_ecef(pos)).sqrt();
                     let v = norm(vel);
                     if v < 15.0 || v > p.v_grid.last().copied().unwrap_or(200.0) * 1.15 {
                         continue;
@@ -1056,7 +1057,7 @@ fn stamp_track(
         if chunk_end >= tb {
             break;
         }
-        chunk_start += p.chunk_step_s;
+        chunk += 1;
     }
 }
 
@@ -2268,10 +2269,14 @@ mod tests {
 
     /// `scene` with tracks of any shape, every one of them heard.
     fn scene_of(tracks: Vec<TrackModel>, half_m: f64) -> Case {
+        scene_for(tracks, half_m, 900.0)
+    }
+
+    fn scene_for(tracks: Vec<TrackModel>, half_m: f64, dur: f64) -> Case {
         let (lat, lon, clock) = SCENE_AT;
         let enu = Enu::new(lat, lon, 0.0);
         let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
-        let (sr, dur) = (2800.0, 900.0);
+        let sr = 2800.0;
         let m = Prop::still(BASE_C);
         let mut buf = noise((sr * dur) as usize, 42, 0.05);
         for (i, tr) in tracks.iter().enumerate() {
@@ -2384,6 +2389,229 @@ mod tests {
             atmo: &atmo,
         };
         run(&inp, p, &|_| {})
+    }
+
+    fn observer_cell(p: &MatchParams) -> Grid {
+        let (lat, lon, _) = SCENE_AT;
+        Grid {
+            enu: Enu::new(lat, lon, 0.0),
+            ncols: 1,
+            nrows: 1,
+            e0: 0.0,
+            n0: 0.0,
+            step: p.cell_m,
+            up: vec![MIC_HEIGHT_M as f32],
+            inside: vec![true],
+        }
+    }
+
+    /// A 120 s circuit at 63 m/s, with alternating 800/400 m heights on its near side.
+    /// Every shallower visit was hidden by a closer neighbour in the old 360 s chunks.
+    fn short_circuit(first_cpa: f64) -> TrackModel {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let omega = std::f64::consts::TAU / 120.0;
+        let mut tr = scene_track(
+            [300.0, 0.0, 800.0],
+            [0.0, 1200.0 * omega, 0.0],
+            first_cpa,
+            -120.0,
+            960.0,
+        );
+        tr.key = "short-circuit".into();
+        tr.icao = tr.key.clone();
+        for (i, &t) in tr.t.iter().enumerate() {
+            let theta = omega * (t - clock - first_cpa);
+            let (sin, cos) = theta.sin_cos();
+            let (zsin, zcos) = (0.5 * theta).sin_cos();
+            tr.pos[i] = enu.to_ecef([1500.0 - 1200.0 * cos, 1200.0 * sin, 600.0 + 200.0 * zcos]);
+            tr.vel[i] = enu.vec_to_ecef([
+                1200.0 * omega * sin,
+                1200.0 * omega * cos,
+                -100.0 * omega * zsin,
+            ]);
+        }
+        tr
+    }
+
+    #[test]
+    fn coarse_stamps_keep_every_short_circuit_visit_once() {
+        let (_, _, clock) = SCENE_AT;
+        // Both exact ownership boundaries (300 and 540 s in the default chunks) and passes
+        // between survey samples must survive a final chunk whose duration is not a multiple
+        // of the 4 s sample interval. Different chunk partitions must emit identical stamps.
+        for first_cpa in [60.0, 60.75] {
+            let tr = short_circuit(first_cpa);
+            let mut reference = None;
+            for (chunk_s, chunk_step_s) in [(360.0, 240.0), (240.0, 240.0), (80.0, 61.0)] {
+                let p = MatchParams {
+                    chunk_s,
+                    chunk_step_s,
+                    ..MatchParams::default()
+                };
+                let g = observer_cell(&p);
+                let mut stamped = Vec::new();
+                stamp_track(
+                    &tr,
+                    &g,
+                    &p,
+                    &|_| BASE_C,
+                    clock,
+                    (clock, clock + 719.0),
+                    &mut stamped,
+                );
+                stamped.sort_by(|a, b| a.1.arrive.total_cmp(&b.1.arrive));
+                assert_eq!(
+                    stamped.len(),
+                    6,
+                    "chunk {chunk_s}/{chunk_step_s}, CPA {first_cpa}"
+                );
+                let keys: Vec<_> = stamped
+                    .iter()
+                    .map(|&(cell, pass)| (cell, pass.arrive.to_bits(), pass.tpl))
+                    .collect();
+                if let Some(expected) = &reference {
+                    assert_eq!(&keys, expected, "chunk partition changed a pass");
+                } else {
+                    reference = Some(keys);
+                }
+                for (k, &(cell, pass)) in stamped.iter().enumerate() {
+                    let height: f64 = if k % 2 == 0 { 800.0 } else { 400.0 };
+                    let distance = 300.0f64.hypot(height - MIC_HEIGHT_M);
+                    let heard = first_cpa + 120.0 * k as f64 + distance / BASE_C;
+                    assert_eq!(cell, 0);
+                    assert!(
+                        (pass.arrive as f64 - heard).abs() < 0.1,
+                        "visit {k}: {} vs {heard}",
+                        pass.arrive
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coarse_stamps_preserve_a_straight_pass_and_track_boundary_rules() {
+        let (_, _, clock) = SCENE_AT;
+        let tr = scene_track(
+            [0.0, 800.0, 600.0 + MIC_HEIGHT_M],
+            [80.0, 0.0, 0.0],
+            300.0,
+            0.0,
+            720.0,
+        );
+        let p = MatchParams {
+            v_grid: vec![50.0, 80.0, 120.0],
+            d_grid: vec![500.0, 1000.0, 2000.0],
+            ..MatchParams::default()
+        };
+        let g = observer_cell(&p);
+        let mut stamped = Vec::new();
+        stamp_track(
+            &tr,
+            &g,
+            &p,
+            &|_| BASE_C,
+            clock,
+            (clock, clock + 720.0),
+            &mut stamped,
+        );
+        assert_eq!(stamped.len(), 1);
+        assert_eq!(stamped[0].0, 0);
+        assert_eq!(stamped[0].1.arrive, (300.0 + 1000.0 / BASE_C) as f32);
+        assert_eq!(stamped[0].1.tpl, 4);
+
+        // A clipped catalogue span is not evidence of a pass at its edge.
+        for span in [
+            (clock + 100.0, clock + 290.0),
+            (clock + 310.0, clock + 500.0),
+        ] {
+            stamped.clear();
+            stamp_track(&tr, &g, &p, &|_| BASE_C, clock, span, &mut stamped);
+            assert!(stamped.is_empty());
+        }
+        // A real track endpoint is still retained for the exact scorer's existing end rule.
+        let partial = scene_track(
+            [0.0, 800.0, 600.0 + MIC_HEIGHT_M],
+            [80.0, 0.0, 0.0],
+            300.0,
+            0.0,
+            292.0,
+        );
+        stamped.clear();
+        stamp_track(
+            &partial,
+            &g,
+            &p,
+            &|_| BASE_C,
+            clock,
+            (clock, clock + 720.0),
+            &mut stamped,
+        );
+        assert_eq!(stamped.len(), 1);
+        let expected = 292.0 + 1000.0f64.hypot(8.0 * 80.0) / BASE_C;
+        assert!((stamped[0].1.arrive as f64 - expected).abs() < 0.001);
+
+        // A genuine CPA inside the first or last sample interval still gets sub-sample timing.
+        for cpa in [1.0, 59.0] {
+            let boundary = scene_track(
+                [0.0, 800.0, 600.0 + MIC_HEIGHT_M],
+                [80.0, 0.0, 0.0],
+                cpa,
+                0.0,
+                60.0,
+            );
+            stamped.clear();
+            stamp_track(
+                &boundary,
+                &g,
+                &p,
+                &|_| BASE_C,
+                clock,
+                (clock, clock + 720.0),
+                &mut stamped,
+            );
+            assert_eq!(stamped.len(), 1);
+            assert!((stamped[0].1.arrive as f64 - cpa - 1000.0 / BASE_C).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn coarse_stamps_feed_a_short_circuit_and_crossing_flight_into_the_match() {
+        let circuit = short_circuit(60.0);
+        let mut crossing =
+            scene_track([0.0, -600.0, 500.0], [80.0, 0.0, 0.0], 240.0, -120.0, 960.0);
+        crossing.key = "crossing".into();
+        crossing.icao = crossing.key.clone();
+        // Actual harmonic PCM from the moving tracks, with independent fixed-seed noise.
+        let c = scene_for(vec![circuit, crossing], 400.0, 360.0);
+        let p = MatchParams {
+            decoy_span_s: 360.0,
+            ..MatchParams::default()
+        };
+        let r = run_case(&c, &p, c.clock - 10.0, c.clock + 10.0);
+        let top = r
+            .modes
+            .first()
+            .expect("the heard passes seed an exact match");
+        let error = haversine_m(top.lat, top.lon, c.lat, c.lon);
+        assert!(error < 150.0, "{error} m: {top:?}");
+        assert!((top.clock_unix - c.clock).abs() < 2.0, "{top:?}");
+        assert!(top.n_heard >= 3, "{top:?}");
+        assert!(top.passes.iter().any(|pass| {
+            pass.key == "crossing" && counts_as_heard(pass.value, pass.nats, pass.shared)
+        }));
+        assert!(
+            top.passes
+                .iter()
+                .filter(|pass| {
+                    pass.key == "short-circuit"
+                        && counts_as_heard(pass.value, pass.nats, pass.shared)
+                })
+                .count()
+                >= 2,
+            "the returning aircraft must supply distinct heard visits: {top:?}"
+        );
     }
 
     /// Both knots are outside the spatial and time filters, but their interpolated pass produces

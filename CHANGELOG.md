@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Hear every returning pass in the whole-recording curve search
+
+- Coarse curve matching now keeps every sampled local closest approach, rather than only the closest
+  visit within each six-minute chunk. A common sampling lattice and ownership interval prevent lost or
+  duplicate visits across overlapping chunks and shortened final chunks. Scratch storage stays bounded
+  by one chunk's sampled positions. Real and decoy windows use the same path and evidence gates.
+- Interpolate interior closest approaches from squared-range curvature, then evaluate the actual
+  Hermite trajectory. This removes the straight-chord timing bias exposed by a fractional circular
+  pass. Preserve the existing segment projection at real track endpoints and reject catalogue edges.
+- **Validation.** All three focused `coarse_stamps_` regressions passed through real RCH with the pinned
+  toolchain: six repeated circuit visits across different chunk partitions; straight, fractional and
+  boundary approaches; and synthesized PCM with a returning aircraft plus an independent crossing.
+  The PCM case uses the production template bank and locates within 150 m and 2 s while crediting at
+  least two circuit visits and the crossing. No acceptance tolerances or calibration were relaxed.
+  Workspace checks, release selftest and reference-recording replay remain pending; these synthetic
+  results do not establish field accuracy.
+
 ### Keep usable weather when another source stalls
 
 - **The fault.** After pressure-level weather failed, the surface and radiosonde requests ran concurrently,

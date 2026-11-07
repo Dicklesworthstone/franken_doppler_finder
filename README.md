@@ -366,6 +366,10 @@ in `crates/fdop-core/src/curvematch.rs`:
   Flights are screened for exact scoring using their interpolated paths over the catalogue span, at the
   closest-approach sampling interval. This retains sparse passes that enter the search area between logged
   ADS-B positions.
+  The coarse votes retain every sampled local approach, including several visits by a circling aircraft
+  within one six-minute chunk. A shared sampling lattice and chunk ownership give each visit one vote per
+  place. Interior approach times use the curvature of squared range and the interpolated trajectory;
+  real track endpoints remain eligible, while an artificial catalogue boundary cannot create a pass.
 - **How far it hears.** A pass is credited by how likely it was to be heard at its slant range: a logistic in dB
   around the range heard half the time. That range depends on the microphone, wind and noise, and is not known
   before the match: the osprey cam's 10-31 recording has 9- to 12-nat curves from passes 4 to 6 km out. So every
