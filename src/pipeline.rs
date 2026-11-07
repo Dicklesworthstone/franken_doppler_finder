@@ -484,15 +484,27 @@ fn metadata_needs_fallback(
     meta_window && !trace_has_candidate && !curve.is_some_and(|v| v.stands)
 }
 
+/// Where the clock window the curve match searched came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClockSource {
+    /// `--start` +- `--clock-tol`.
+    Start,
+    /// The file's `creation_time`, read as the start or the end, +- `--clock-tol`.
+    CreationTime,
+    /// The local dates, clipped by the published archive to under `CURVE_MAX_CLOCK_S`.
+    Dates,
+}
+
 /// Why a curve match that ran cannot judge, and what would let it. It gets fewer than `MIN_DECOYS`
 /// decoy windows either because its clock window is wider than `max_judged_window_s`, or, for a
-/// narrower one, because the fetched days end too close to it. Without `--start` the curve match
-/// runs only on a `creation_time` window: a full date window is wider than `CURVE_MAX_CLOCK_S`.
+/// narrower one, because its decoys must come from the UTC days the recording needs, before the
+/// published archive ends (`curve_catalog_span`), and those end too close to it. The limits are
+/// printed rounded down and the width rounded up, so the advice never names a window past the line.
 fn too_few_decoys_warning(
     p: &curvematch::MatchParams,
     clock: (f64, f64),
     n_decoys: usize,
-    from_start: bool,
+    source: ClockSource,
     duration: f64,
 ) -> Option<String> {
     let need = curvematch::MIN_DECOYS;
@@ -500,18 +512,22 @@ fn too_few_decoys_warning(
         return None;
     }
     let (width, max) = (clock.1 - clock.0, curvematch::max_judged_window_s(p));
+    let (shown_width, shown_max, shown_tol) = (width.ceil(), max.floor(), (0.5 * max).floor());
+    let span_h = p.decoy_span_s / 3600.0;
     let cause = if width <= max {
-        "the fetched ADS-B days leave no room for more around this clock".to_string()
-    } else if from_start {
-        format!(
-            "a {width:.0} s clock window gets no more within about +-{:.0} h, and one of {max:.0} s or less gets {need} (--clock-tol {:.0} or less with --start)",
-            p.decoy_span_s / 3600.0,
-            0.5 * max
-        )
+        "its decoys come only from the UTC days this recording needs, before the published ADS-B archive ends, and those leave no room for more around this clock".to_string()
     } else {
-        format!(
-            "the creation_time window is {width:.0} s wide, since it spans the recording's {duration:.0} s as well as the tolerance, and only one of {max:.0} s or less gets {need}"
-        )
+        match source {
+            ClockSource::Start => format!(
+                "a {shown_width:.0} s clock window gets no more within about +-{span_h:.0} h, and one of {shown_max:.0} s or less gets {need} (--clock-tol {shown_tol:.0} or less with --start)"
+            ),
+            ClockSource::CreationTime => format!(
+                "the creation_time window is {shown_width:.0} s wide, since it spans the recording's {duration:.0} s as well as the tolerance, and only one of {shown_max:.0} s or less gets {need}"
+            ),
+            ClockSource::Dates => format!(
+                "a {shown_width:.0} s clock window gets no more within about +-{span_h:.0} h, and only one of {shown_max:.0} s or less gets {need} (--start with --clock-tol {shown_tol:.0} or less)"
+            ),
+        }
     };
     Some(format!(
         "the curve match ran with {n_decoys} decoy clocks, under the {need} it needs to judge: {cause}. It can neither stand nor overrule the trace search's grade"
@@ -1000,6 +1016,9 @@ fn locate_with_clock(
     let run_dir = a.out.clone().unwrap_or_else(|| default_run_dir(&a.media));
     std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
     let mut curve_clock = archive.clock;
+    // whether `curve_clock` is the creation_time window; it stays so if a wider retry keeps the
+    // metadata attempt's curve match
+    let mut curve_from_metadata = meta_window;
     let curve_skip = curve_match_skip_reason(&curve_params, region.bbox, curve_clock);
     if a.curve_match
         && let Some(why) = &curve_skip
@@ -1325,6 +1344,7 @@ fn locate_with_clock(
         {
             let t = Instant::now();
             curve_clock = archive.clock;
+            curve_from_metadata = meta_window;
             curve = match run_curve_match(
                 a,
                 &curve_params,
@@ -1400,12 +1420,19 @@ fn locate_with_clock(
     let curve_judged = curve
         .as_ref()
         .is_some_and(|r| curve_judges_window(curve_clock, (s_lo, s_hi), r.decoys.len()));
+    let curve_source = if a.start.is_some() {
+        ClockSource::Start
+    } else if curve_from_metadata {
+        ClockSource::CreationTime
+    } else {
+        ClockSource::Dates
+    };
     if let Some(r) = &curve
         && let Some(w) = too_few_decoys_warning(
             &curve_params,
             curve_clock,
             r.decoys.len(),
-            a.start.is_some(),
+            curve_source,
             dur,
         )
     {
@@ -2829,19 +2856,36 @@ mod tests {
     fn a_curve_match_short_of_decoys_says_why_and_what_would_judge() {
         let p = curvematch::MatchParams::default();
         let need = curvematch::MIN_DECOYS;
-        assert!(too_few_decoys_warning(&p, (1000.0, 1240.0), need, true, 600.0).is_none());
+        let warn = |clock, n, source| too_few_decoys_warning(&p, clock, n, source, 600.0);
+        assert!(warn((1000.0, 1240.0), need, ClockSource::Start).is_none());
         // +-180 s around --start: the old default
-        let w = too_few_decoys_warning(&p, (1000.0, 1360.0), 34, true, 600.0).unwrap();
+        let w = warn((1000.0, 1360.0), 34, ClockSource::Start).unwrap();
         assert!(w.contains("34 decoy clocks"), "{w}");
         assert!(w.contains("360 s clock window"), "{w}");
-        assert!(w.contains("--clock-tol 150 or less"), "{w}");
+        assert!(w.contains("--clock-tol 150 or less with --start"), "{w}");
         // a creation_time window holds the recording's length too
-        let w = too_few_decoys_warning(&p, (1000.0, 1840.0), 16, false, 600.0).unwrap();
+        let w = warn((1000.0, 1840.0), 16, ClockSource::CreationTime).unwrap();
         assert!(w.contains("creation_time window is 840 s wide"), "{w}");
         assert!(!w.contains("--clock-tol"), "{w}");
-        // a window narrow enough, short only because the fetched days end
-        let w = too_few_decoys_warning(&p, (1000.0, 1240.0), 30, true, 600.0).unwrap();
+        // a date window clipped by the archive is neither of those
+        let w = warn((1000.0, 2500.0), 8, ClockSource::Dates).unwrap();
+        assert!(w.contains("1500 s clock window"), "{w}");
+        assert!(!w.contains("creation_time"), "{w}");
+        // a window narrow enough, short only because its UTC days or the archive end
+        let w = warn((1000.0, 1240.0), 30, ClockSource::Start).unwrap();
         assert!(w.contains("leave no room"), "{w}");
+        // limits that are not whole seconds are rounded down, and the width up, so the advice
+        // stays inside the line: 7230 / 20 - 60 = 301.5 s, a tolerance of 150.75 s
+        let odd = curvematch::MatchParams {
+            decoy_span_s: 7230.0,
+            ..Default::default()
+        };
+        assert_eq!(curvematch::max_judged_window_s(&odd), 301.5);
+        let w =
+            too_few_decoys_warning(&odd, (1000.0, 1301.75), 38, ClockSource::Start, 600.0).unwrap();
+        assert!(w.contains("302 s clock window"), "{w}");
+        assert!(w.contains("one of 301 s or less"), "{w}");
+        assert!(w.contains("--clock-tol 150 or less"), "{w}");
     }
 
     #[test]

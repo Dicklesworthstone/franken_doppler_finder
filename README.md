@@ -403,12 +403,13 @@ in `crates/fdop-core/src/curvematch.rs`:
   on all three of the osprey cam's days and 2 km at Duke Farms; most of the osprey cam's decoy windows took 1 km
   (31, 39 and 36 of 48).
 - **Decoy clocks.** The same search, step for step, runs at other clock windows of the same width, each the
-  width plus 60 s apart, out to about ±2 hours, on whichever side the fetched days cover. A clock that far off
-  cannot be right, so the best decoy is what this recording and this sky give by chance. A start known to
-  ±120 s (the default `--clock-tol`) gets 48 decoys and ±150 s gets 40, the fewest that can judge. A wider
-  window gets fewer (±180 s gets 34), and so does the `creation_time` window of any clip longer than a
-  minute, which also spans the recording's length. Up to 30 min such a window is still searched, but its
-  verdict can neither stand nor change a grade, and a warning says why.
+  width plus 60 s apart, out to about ±2 hours, on whichever side the UTC days this recording needs cover
+  before the published archive ends. A clock that far off cannot be right, so the best decoy is what this
+  recording and this sky give by chance. A start known to ±120 s (the default `--clock-tol`) gets 48 decoys
+  and ±150 s gets 40, the fewest that can judge. A wider window gets fewer (±180 s gets 34), and so does the
+  `creation_time` window of any clip longer than a minute, which also spans the recording's length. Up to
+  30 min such a window is still searched, but its verdict can neither stand nor change a grade, and a
+  warning says why.
   Exact scoring and every spatial refinement keep the recording start inside the supplied interval,
   including fixed and fractional-second starts. Each decoy enforces the same interval shifted to its own
   clock window.
@@ -575,7 +576,7 @@ or change their Doppler frequencies.
 | `--near <REGION>` | required | Coarse US region; see [Region syntax](#region-syntax) |
 | `-o, --out <DIR>` | `fdop_runs/<name>_<unix time>` | Output directory |
 | `--start <ISO>` | — | Exact recording start if known, e.g. `2026-09-08T19:17:30-04:00`. Without a zone it is read as **UTC**. Unix seconds also work |
-| `--clock-tol <S>` | `120` | Finite, nonnegative clock tolerance (s) around `--start` or the file's `creation_time`. The [curve match](#the-curve-match) can judge only a clock window of 300 s or less: with `--start`, 150 s or less. Before 2026-11-07 the default was 180 s, at which it never could |
+| `--clock-tol <S>` | `120` | Finite, nonnegative clock tolerance (s) around `--start` or the file's `creation_time`. The [curve match](#the-curve-match) can judge only a clock window of 300 s or less: with `--start`, 150 s or less. Before 2026-11-07 the default was 180 s, at which a run with `--start` never could |
 | `--ignore-metadata-time` | off | Ignore the container's `creation_time` |
 | `--max-events <N>` | `12` | Maximum events that drive the pair join; the others can still confirm |
 | `--no-curve-match` | off | Skip the [curve match](#the-curve-match); the answer then comes from the trace search alone |
@@ -1278,12 +1279,12 @@ selftest or real-recording pass is claimed.
 
 ### Default clock tolerance (2026-11-07)
 
-The `--clock-tol` default change (CHANGELOG) was checked through real RCH with the pinned nightly, on one
-worker with two build jobs. These are focused checks, not a suite pass.
+The `--clock-tol` default change and its follow-up (CHANGELOG) were checked through real RCH with the
+pinned nightly. These are focused checks, not a suite pass.
 
-- **On `c5545ca` with the change:** the application's `cli::tests::` and `pipeline::tests::` passed, 31 of
-  31, including `the_default_clock_tolerance_lets_the_curve_match_judge` and
-  `a_curve_match_short_of_decoys_says_why_and_what_would_judge`. In `fdop-core`,
+- **On `c5545ca` with the change, on one worker with two build jobs:** the application's `cli::tests::` and
+  `pipeline::tests::` passed, 31 of 31, including `the_default_clock_tolerance_lets_the_curve_match_judge`
+  and `a_curve_match_short_of_decoys_says_why_and_what_would_judge`. In `fdop-core`,
   `curvematch::tests::the_widest_judged_window_is_where_the_decoys_run_out` and
   `decoys_fill_from_the_side_the_catalogue_covers` passed. Workspace all-target Clippy passed with
   warnings denied. rustfmt reports nothing in the lines this change adds; it reports 10 differences elsewhere
@@ -1293,6 +1294,14 @@ worker with two build jobs. These are focused checks, not a suite pass.
   true clock (error +0.000 s) and all three heard flights, but placed the observer 213 m from the truth, over
   its 200 m bound. This change does not touch that search, and the test was not re-run on the curve-match
   changes that followed `e925900`.
+- **On `0abfbe9` with the follow-up** (the short-of-decoys warning names the window it ran on and rounds its
+  advice inside the line): the application's `cli::tests::` and `pipeline::tests::` passed, 31 of 31,
+  including `a_curve_match_short_of_decoys_says_why_and_what_would_judge` with its new cases, and the same
+  two `fdop-core` tests passed, on one worker with two build jobs. Workspace all-target Clippy passed with
+  warnings denied, on another worker with one. rustfmt reports the same 4 differences in `src/pipeline.rs`
+  as without the follow-up, none in its lines. The same three checks passed again on `80b8241` with the
+  follow-up, the tree it was committed on, which adds ten upstream commits that do not touch
+  `src/pipeline.rs`.
 - **Not run:** the full core and workspace suites, `fdop selftest`, and any recording. No recording was
   re-run with the new default, so no change in accuracy is claimed.
 
