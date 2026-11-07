@@ -351,8 +351,30 @@ fn om_grid(
     .map_err(DataError)
 }
 
-/// Active upper-air stations: (id, lat, lon, elevation).
-fn raob_stations(cache: &Path, offline: bool) -> Result<Vec<(String, f64, f64, f64)>, DataError> {
+/// IEM gives lifetime bounds as dates; keep the whole final UTC date eligible. Current
+/// online status says nothing about an older recording. Missing or malformed dates cannot rule
+/// out a station; neither can an internally inconsistent lifetime.
+fn raob_station_overlaps(properties: &serde_json::Value, window: (f64, f64)) -> bool {
+    let date = |key: &str| {
+        properties
+            .get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| fdop_types::time::parse_date(s).ok())
+            .map(|(y, m, d)| fdop_types::time::unix_from_utc(y, m, d, 0, 0, 0.0))
+    };
+    let (begin, end) = (date("archive_begin"), date("archive_end"));
+    if begin.zip(end).is_some_and(|(a, b)| a > b) {
+        return true;
+    }
+    begin.is_none_or(|t| t <= window.1) && end.is_none_or(|t| window.0 < t + 86_400.0)
+}
+
+/// Stations whose archives may cover the requested soundings: (id, lat, lon, elevation).
+fn raob_stations(
+    cache: &Path,
+    offline: bool,
+    window: (f64, f64),
+) -> Result<Vec<(String, f64, f64, f64)>, DataError> {
     let v = get_cached(
         IEM_RAOB_NETWORK,
         cache,
@@ -373,10 +395,7 @@ fn raob_stations(cache: &Path, offline: bool) -> Result<Vec<(String, f64, f64, f
     for f in feats {
         let id = f.get("id").and_then(|x| x.as_str()).unwrap_or("");
         let pr = &f["properties"];
-        if !(id.len() == 4 && id.starts_with('K'))
-            || pr.get("archive_end").is_some_and(|x| !x.is_null())
-            || pr.get("online").and_then(|x| x.as_bool()) == Some(false)
-        {
+        if !(id.len() == 4 && id.starts_with('K')) || !raob_station_overlaps(pr, window) {
             continue;
         }
         let c = &f["geometry"]["coordinates"];
@@ -483,8 +502,11 @@ fn raob_atmosphere(
     cache: &Path,
     offline: bool,
 ) -> Result<ScatteredAtmosphere, DataError> {
+    // Select stations for the 00Z/12Z brackets too, not just times inside the recording.
+    let t0 = (t_start / 43200.0).floor() * 43200.0;
+    let t1 = (t_end / 43200.0).ceil() * 43200.0;
     let (clat, clon) = b.center();
-    let mut st = raob_stations(cache, offline)?;
+    let mut st = raob_stations(cache, offline, (t0, t1))?;
     st.sort_by(|x, y| {
         fdop_types::geo::haversine_m(clat, clon, x.1, x.2)
             .total_cmp(&fdop_types::geo::haversine_m(clat, clon, y.1, y.2))
@@ -505,9 +527,6 @@ fn raob_atmosphere(
     if chosen.is_empty() {
         return Err(DataError::new("no upper-air station within 700 km"));
     }
-    // 00Z/12Z soundings bracketing the window
-    let t0 = (t_start / 43200.0).floor() * 43200.0;
-    let t1 = (t_end / 43200.0).ceil() * 43200.0;
     let mut stations = Vec::new();
     let (mut n_ok, mut n_tried) = (0, 0);
     for (id, la, lo, _) in &chosen {
@@ -1100,6 +1119,146 @@ mod tests {
             lv.iter().all(|l| (l.wind_e - 20.0 * KT).abs() < 0.01),
             "{lv:?}"
         );
+    }
+
+    #[test]
+    fn radiosonde_station_lifetimes_use_inclusive_utc_dates() {
+        use fdop_types::time::unix_from_utc;
+        let day = unix_from_utc(2024, 9, 8, 0, 0, 0.0);
+        let closed = serde_json::json!({
+            "archive_begin": "2024-09-08",
+            "archive_end": "2024-09-08",
+            "online": false,
+        });
+        assert!(raob_station_overlaps(&closed, (day, day)));
+        assert!(raob_station_overlaps(&closed, (day + 86_399.0, day + 86_399.0)));
+        assert!(!raob_station_overlaps(&closed, (day - 1.0, day - 1.0)));
+        assert!(!raob_station_overlaps(&closed, (day + 86_400.0, day + 86_400.0)));
+        assert!(raob_station_overlaps(&closed, (day - 43_200.0, day)));
+
+        for unknown in [
+            serde_json::json!({}),
+            serde_json::json!({"archive_begin": null, "archive_end": null, "online": false}),
+            serde_json::json!({"archive_begin": "bad", "archive_end": "2024-02-30"}),
+            serde_json::json!({"archive_begin": 2024, "archive_end": false}),
+            serde_json::json!({"archive_begin": "2025-01-01", "archive_end": "2024-01-01"}),
+        ] {
+            assert!(raob_station_overlaps(&unknown, (day, day)), "{unknown}");
+        }
+        assert!(!raob_station_overlaps(
+            &serde_json::json!({"archive_begin": "2024-09-09"}),
+            (day, day + 86_399.0)
+        ));
+        assert!(!raob_station_overlaps(
+            &serde_json::json!({"archive_end": "2024-09-07"}),
+            (day, day + 86_400.0)
+        ));
+    }
+
+    #[test]
+    fn historical_radiosondes_use_closed_stations_and_sounding_brackets() {
+        use fdop_types::atmo::sound_speed;
+        use fdop_types::time::unix_from_utc;
+        let (lat, lon) = (40.876466, -73.524951);
+        let day = unix_from_utc(2024, 9, 8, 0, 0, 0.0);
+        let feature = |id: &str, properties: serde_json::Value| {
+            serde_json::json!({
+                "id": id,
+                "properties": properties,
+                "geometry": {"coordinates": [lon, lat]},
+            })
+        };
+        // Four present-day stations would consume every slot before the closed station.
+        // All are synthetic and colocated so only the archive dates decide eligibility.
+        let mut historical = Vec::new();
+        for id in ["KNEA", "KNEB", "KNEC", "KNED"] {
+            historical.push(feature(
+                id,
+                serde_json::json!({"archive_begin": "2025-01-01", "online": true}),
+            ));
+        }
+        historical.push(feature(
+            "KOLD",
+            serde_json::json!({
+                "archive_begin": "2020-01-01",
+                "archive_end": "2024-09-08",
+                "online": false,
+            }),
+        ));
+        let bracket = vec![feature(
+            "KBEG",
+            serde_json::json!({"archive_begin": "2024-09-09", "online": true}),
+        )];
+        for (label, features, window, id, times, count) in [
+            (
+                "closed",
+                historical,
+                (day + 3_600.0, day + 46_800.0),
+                "KOLD",
+                vec![day, day + 43_200.0],
+                "2 of 3 soundings usable",
+            ),
+            (
+                "next-bracket",
+                bracket,
+                (day + 54_000.0, day + 57_600.0),
+                "KBEG",
+                vec![day + 86_400.0],
+                "1 of 2 soundings usable",
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "fdop-raob-lifetime-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("weather")).unwrap();
+            let put = |url: &str, v: serde_json::Value| {
+                let path = dir.join("weather").join(format!("{:016x}.json", fnv(url)));
+                std::fs::write(path, v.to_string()).unwrap();
+            };
+            put(IEM_RAOB_NETWORK, serde_json::json!({"features": features}));
+            let profile: Vec<_> = (0..6)
+                .map(|i| {
+                    serde_json::json!({
+                        "hght": 100.0 + 1200.0 * f64::from(i),
+                        "tmpc": 10.0,
+                        "dwpc": 10.0,
+                        "drct": 270.0,
+                        "sknt": 20.0,
+                    })
+                })
+                .collect();
+            for t in times {
+                put(
+                    &raob_url(t, id),
+                    serde_json::json!({"profiles": [{"profile": &profile}]}),
+                );
+            }
+            let chosen = raob_stations(
+                &dir,
+                true,
+                (
+                    (window.0 / 43_200.0).floor() * 43_200.0,
+                    (window.1 / 43_200.0).ceil() * 43_200.0,
+                ),
+            )
+            .unwrap();
+            assert_eq!(chosen.len(), 1, "{label}: {chosen:?}");
+            assert_eq!(chosen[0].0, id);
+            let bbox = BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01);
+            let atmo = raob_atmosphere(&bbox, window.0, window.1, &dir, true)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let source = atmo.describe();
+            assert!(source.contains(id) && source.contains(count), "{source}");
+            let medium = atmo.medium(lat, lon, window.0, 100.0, 5000.0);
+            assert!((medium.c - sound_speed(10.0, 1.0)).abs() < 1e-8);
+            assert!((medium.wind_e - 20.0 * KT).abs() < 1e-8);
+            assert!(medium.wind_n.abs() < 1e-8);
+        }
     }
 
     #[test]

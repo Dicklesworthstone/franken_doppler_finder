@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover historical winds from stations that have since closed
+
+- Select radiosonde stations by their archive lifetimes for the requested soundings, rather
+  than rejecting every station that is offline today or has an archive end date. Stations
+  that opened after the request no longer consume the nearest-station selection slots.
+- Include the existing 00Z/12Z brackets when checking lifetimes. IEM exposes archive dates at
+  day precision, so the final UTC date remains eligible. Missing or malformed date bounds
+  stay open; contradictory valid lifetimes do not exclude a possibly useful station.
+  Keep the existing distance ordering, 700 km reach, neighborhood and four-station limits.
+- Add date-boundary regressions and an actual offline cached-profile test: four newer stations
+  must not displace a closed station's historical temperature and wind profiles, and a station
+  opening at the next 00Z must remain available for that bracket. The fixture checks the
+  resulting constant-temperature sound speed and 20-knot eastward wind.
+- **Validation limit:** the [IEM network endpoint](https://github.com/akrherz/iem/blob/main/pylib/iemweb/geojson/network.py) confirms separate
+  `archive_begin`/`archive_end` dates and current `online` status. Two source reviews checked
+  date boundaries, selection, real parsers and atmosphere expectations. The new Rust tests,
+  formatting, workspace gates and recording replays remain unrun because the executor is
+  unavailable; no observed weather-accuracy improvement is claimed.
+
 ### Base archive and weather coverage on the selected audio timeline
 
 - Decode the selected audio before publication-window selection. Use its actual sample count

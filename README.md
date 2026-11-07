@@ -785,7 +785,7 @@ and warns when it does. Going offline therefore preserves the altitude reference
 |---|---|---|
 | ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing |
 | Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Jets are dropped; unknown types are kept |
-| Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. A slow service does not discard a usable profile from the other source. The 15 °C standard atmosphere is used only if no usable profile arrives, with a warning |
+| Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. A slow service does not discard a usable profile from the other source. Radiosonde stations are selected by archive dates covering the requested sounding brackets, so a station closed today can still serve historical recordings. The 15 °C standard atmosphere is used only if no usable profile arrives, with a warning |
 | Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search; a tile that cannot be fetched counts as 0 m, with a warning giving the number of such tiles. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
 | Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL. Taken once two reads agree, then kept in the cache; −30 m, with a warning, if the reads fail or never agree, or under `--offline` |
 | Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Offline fallback uses the gazetteer's internal points |
@@ -1114,6 +1114,11 @@ and workspace Clippy were killed by SIGKILL in upstream `asupersync`, including 
 frontend and backend job. The metadata/offline pipeline tests, full workspace gates, CLI release
 selftest and reference-recording replay therefore remain unconfirmed; the external selftest does
 not replace them.
+
+The historical-radiosonde repair adds lifetime-boundary checks and an offline cached-profile
+regression, including a closed station with usable historical winds and a station opening at
+the following sounding bracket. The provider date contract and production/parser paths were
+reviewed independently; the new Rust regressions and formatting remain unrun.
 
 The selected-audio coverage repair adds an offline known-location case with 1,300 seconds of
 audio inside a longer video. A fixed publication clock makes the container request reach an
