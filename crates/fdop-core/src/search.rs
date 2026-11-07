@@ -445,15 +445,17 @@ fn hypotheses(
             while t <= te_hi {
                 let (pos, vel) = tr.pv(t);
                 let (la, lo, h) = ecef_to_geodetic(pos);
-                if !reach.contains(la, lo) {
-                    t += 10.0;
-                    continue;
-                }
                 let local = Enu::new(la, lo, 0.0);
                 let ve = local.vec_from_ecef(vel);
-                let speed = norm(vel);
                 let vh = ve[0].hypot(ve[1]);
                 let dt = (p.along_step_m / vh.max(1.0)).clamp(0.2, p.along_dt_max);
+                if !reach.contains(la, lo) {
+                    // A close fast pass can enter and leave this entire box in ten seconds.
+                    // Keep the usual along-track sampling outside too, so entry is not skipped.
+                    t += dt;
+                    continue;
+                }
+                let speed = norm(vel);
                 let z0 = dem.elev_m(la, lo);
                 let med = atmo.medium(la, lo, t, z0 + MIC_HEIGHT_M, h);
                 let c = med.c;
@@ -5161,6 +5163,95 @@ mod tests {
             atmo: &atmo,
         };
         run(&inp, &case.p, &|_s| {})
+    }
+
+    #[test]
+    fn narrow_region_does_not_skip_close_fast_flyovers() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let t_s = 1_788_895_000.0;
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let prop = Prop::from_medium(&med, &enu);
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        for (key, position, velocity, t_cpa, f0) in [
+            (
+                "A",
+                [0.0, 60.0, 220.0 + MIC_HEIGHT_M],
+                [250.0, 0.0, 0.0],
+                120.0,
+                112.7,
+            ),
+            (
+                "B",
+                [100.0, 0.0, 220.0 + MIC_HEIGHT_M],
+                [0.0, 263.0, 0.0],
+                360.0,
+                149.3,
+            ),
+        ] {
+            let mut tr = straight_track(
+                &enu,
+                position,
+                velocity,
+                t_s + t_cpa,
+                t_s - 600.0,
+                t_s + 1200.0,
+                5.0,
+            );
+            tr.key = key.into();
+            let mut ev = synth_event(key, &tr, x, t_s, f0, 343.0, t_s + t_cpa, &prop);
+            // The existing generous timing/distance floors for a model-misfit event. A
+            // wider tolerance changes the scan's initial phase, not whether a pass exists.
+            ev.t_tol = 9.0;
+            ev.misfit = true;
+            ev.d_gate[1] *= 1.75 / 1.25;
+            let cpa = tr.cpa_nearest_time(x, t_s + t_cpa, 30.0).unwrap();
+            assert!(gates_ok(&ev, &cpa, &prop, 0.0));
+            tracks.push(tr);
+            events.push(ev);
+        }
+        let mut p = SearchParams::new(
+            t_s,
+            t_s,
+            600.0,
+            BBox::new(lat - 0.002, lon - 0.002, lat + 0.002, lon + 0.002),
+        );
+        p.refine_half_m = 200.0;
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let frame = Frame::new(&p.region);
+        let counts: Vec<_> = events
+            .iter()
+            .map(|ev| {
+                hypotheses(ev, &tracks, &p, &frame, &dem, &atmo, t_s - 86_400.0, 10_000).count
+            })
+            .collect();
+        assert!(
+            counts.iter().all(|&n| n > 0),
+            "both real passes need hypotheses: {counts:?}"
+        );
+        let inputs = SearchInputs {
+            heard_times: events.iter().map(|ev| ev.t_rec).collect(),
+            events,
+            tracks: &tracks,
+            coarse_dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let result = run(&inputs, &p, &|_| {});
+        let winner = result.candidates.first().unwrap_or_else(|| {
+            panic!(
+                "both real passes were skipped: counts={counts:?}, funnel={:?}",
+                result.funnel
+            )
+        });
+        assert!(winner.events.iter().any(|m| m.event == "A" && m.flight == "A"));
+        assert!(winner.events.iter().any(|m| m.event == "B" && m.flight == "B"));
+        assert!(haversine_m(lat, lon, winner.lat, winner.lon) < 75.0);
+        assert!((winner.t_start_utc - t_s).abs() < 0.2);
+        assert!(result.funnel.truncated.is_empty());
     }
 
     fn circuit_flyover_case(med: fdop_types::atmo::Medium) -> TwoCase {

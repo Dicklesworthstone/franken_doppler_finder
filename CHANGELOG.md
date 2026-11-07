@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain close fast aircraft when sampling outside the search region
+
+- Use the existing distance/velocity timestep on both sides of the padded reach boundary.
+  The previous ten-second jump outside the box could skip a whole close pass through a small
+  region, leaving an otherwise eligible event with no flight hypotheses. Speed, distance,
+  terrain, gap, budget and confidence checks retain their existing values.
+- Add a regression using real track interpolation, propagation and full search with two
+  orthogonal synthetic passes at 250 and 263 m/s, at the published reference coordinates.
+  It verifies the true CPAs pass the existing gates, requires hypotheses for both events,
+  both intended flight matches, less than 75 m position error, less than 0.2 s clock error
+  and no truncated comparison.
+- **Validation limit:** two independent source reviews and a numerical geometry check support
+  the failure mechanism: all old ten-second probes lie outside the padded boxes, while the
+  normal cadence puts seven and eight probes inside. The Rust regression, formatting check,
+  workspace gates and reference replays remain unrun after the executor became unavailable.
+  More sampling outside the box changes the scan phase and costs additional work; no
+  unchanged-output, runtime or real-recording accuracy claim is made.
+
 ### Preserve the original sub-bin correction at a spectral basin boundary
 
 - The multi-bin restoration walk could reach the neighbouring basin-boundary bin and discard a

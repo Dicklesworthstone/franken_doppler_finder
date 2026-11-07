@@ -931,6 +931,11 @@ Design notes:
   `funnel.hypotheses` shows;
   a budget demotion is also a warning. An event with no eligible flight hypotheses is reported with a zero
   count and does not consume a driver slot: later matchable flyovers can still seed the search.
+- **Fast tracks retain the normal sampling cadence outside the reach box.** The previous fixed
+  ten-second skip could jump across a small region and miss an entire close flyover. Both inside
+  and outside the box now use the existing distance/velocity timestep, before the same speed,
+  distance, terrain and gap checks. This adds samples on outside segments; its runtime and
+  real-recording effects have not been measured.
 - **Terrain is checked across the full cross-track reach.** A hillside can bring a later observer point back
   inside the slant-distance gate after a valley falls outside it. One failed point no longer cuts off that side.
 - **A location still needs two events after clock checks.** A candidate pruned to one flyover is removed.
@@ -1080,6 +1085,12 @@ and workspace Clippy were killed by SIGKILL in upstream `asupersync`, including 
 frontend and backend job. The metadata/offline pipeline tests, full workspace gates, CLI release
 selftest and reference-recording replay therefore remain unconfirmed; the external selftest does
 not replace them.
+
+The outside-region sampling repair adds a full-search regression with two close synthetic passes
+at 250 and 263 m/s. Independent geometry checks confirm that every old ten-second probe misses
+the padded reach boxes and that the normal cadence enters both. The actual Rust regression,
+formatting and real-recording replays remain unrun because the executor is unavailable; source
+review and arithmetic do not substitute for those checks.
 
 **Earlier recovery checks.**
 
