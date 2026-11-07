@@ -1572,3 +1572,69 @@ does not fire.
 - No documented workaround was found. One Apple Developer Forums report of a different xzone assertion says
   `MallocNanoZone=0` did not help. The commands are not changed.
 - `dopplerprint`'s and `dpdem`'s set F R1 are read once, into a new file, when `libm` is done.
+
+## Addendum 24, 2026-11-07, set E's R3 read for the pinned build, `fdop-9087ec4` and `dpdem`; three `dpdem` R1 rows stopped by the allocator
+
+### Set E's R3
+
+`dpwin` stage 4 (Addendum 21) ran from 03:50:33Z to 13:53:42Z. With it, `runs/r3_fdop` and `e2_r3_fdop` (the pinned build),
+`r3_fdop_9087ec4` and `e2_r3_fdop_9087ec4`, and `r3_dpdem` and `e2_r3_dpdem` had `CHAIN_DONE`, and every set E row of these
+three tools had an rc, none of them 133, 137 or 143. R3 was then read once, at 14:28:10Z, with
+`score.py jobs/cases.json runs r3`. The output is kept as `runs/SCORE_r3_stage4_20261107.txt` (sha256
+`8b22d0d729b99fe3ba850c37cdac495334c71f39342e775bbd6141e8ec5bc6f0`). Its `dp` and `fdop-6914ab7` columns on set E are as
+Addendum 21 gave them. `tools/match/guardfix/inventory.sh` and a search of the rows' `.err` files ran just after the read,
+not before it as Addendum 23 says they should: no fault, no "command terminated abnormally", and each `fdop` row that ended rc
+1 has a `result.json`, so each is `fdop`'s "no location". `dpdem`'s rows ended rc 2 or 3, its declines.
+
+| Tool, set E's eight counted cases | Correct asserted | Wrong asserted | Not asserted | Error |
+|---|---|---|---|---|
+| `fdop` `7e66501` (pinned) | 0 | 0 | 8: 2 low, 6 no location | 0 |
+| `fdop-9087ec4` | 0 | 0 | 8: 2 low, 6 no location | 0 |
+| `fdop-6914ab7`, as Addendum 21 gave it | 0 | 0 | 8: 2 low, 6 no location | 0 |
+| `dopplerprint` (`dp`), as Addendum 21 gave it | 0 | **1** | 7 declined | 0 |
+| `dopplerprint` with the ground model (`dpdem`) | 0 | 0 | 8 declined: 7 "needs_input", 1 "inconclusive" | 0 |
+
+- **The claim.** Every `fdop` build meets the rule against `dp` on set E's R3, by `dp`'s wrong answer at `e_tehachapi`, not
+  by a right one of its own. None meets it against `dpdem`: each ties it at no correct and no wrong answer. Falsifier 3 does
+  not fire for any build on set E's R3.
+- **`e_olympia`.** `fdop-9087ec4` put it 66 m from the truth and graded it low, as `fdop-6914ab7` did. The pinned build put it
+  1,778 km off, low.
+- **`e_tehachapi`.** The pinned build 3,564 km off and `fdop-9087ec4` 3,560 km off, both low.
+- **The other six** gave no location from any `fdop` build.
+- **Development cases.** On A+B+C (12 cases) the pinned build gave 2 correct and 0 wrong (`a_ref` 312 m and `b1_osprey_1101`
+  203 m, both high), so falsifier 1 (2 or fewer correct asserted answers on A+B+C) fires for it in R3, as it did in R2
+  (Addendum 14). `fdop-9087ec4` gave 3 and 0 (`a_ref` 288 m, `b1_osprey_1101` 105 m and `b3_duke` 963 m, all high), the same as
+  `fdop-6914ab7`. `dpdem` gave 1 correct (`b1_osprey_1031`, 87 m, high) and 3 wrong, all at high: `b3_duke` 2,157 km off,
+  `b3_sapsucker` 3,240 km off and the wrong-date run `c_sapsucker_1101`, 314 km off; `b2_eagle` was an error. `dp` gave 1 and 2
+  with one error (Addendum 21). Every `fdop` run at a wrong date was low. These are development cases, and falsifier 2 has
+  already fired for both later builds (Addenda 8 and 11).
+
+### Three `dpdem` R1 rows crashed in the allocator
+
+Stage 5, `dpdem`'s R1 rows alone, started at 13:53:42Z. Three of its development rows ended rc 133 in the fault of Addendum 23:
+
+| Row | Start | End | Crash report (bench local time, UTC−5) |
+|---|---|---|---|
+| `runs/r1_dpdem/b3_sapsucker` | 14:11:01Z | rc 133, 14:11:20Z | `python3.12-2026-11-07-091133.ips` |
+| `runs/r1_dpdem/c_ref_0909` | 14:16:35Z | rc 133, 14:16:46Z | `python3.12-2026-11-07-091646.000.ips` |
+| `runs/r1_dpdem/b1_osprey_1101` | 14:29:32Z | rc 133, 14:33:12Z | `python3.12-2026-11-07-093313.ips` |
+
+- Each report reads `BUG IN LIBMALLOC: malloc assertion "err == VM_RECLAIM_SUCCESS" failed`, and each `.err` says the command
+  terminated abnormally. These are the first crashes of these three `dpdem` rows.
+- The first two ran with no compiler on the machine and swap flat at 2.5 GB (`runs/mem_log.txt`). The third ran while the
+  operator was building and testing two development builds of `fdop` (below), so it did not run alone.
+- Regime `libm2` (`tools/fix17.py`; copy at `tools/start_chains.sh.pre17`) was started at 14:38:04Z (`runs/libm2.out`). It waits
+  until `libm` is done and no `fdop` or `dopplerprint` process runs. Then it moves every `dpdem` development or set E R1 row
+  that ended rc 133 with an abnormal ending to `<case>_fault_libmalloc`, and each chain's `CHAIN_DONE` to
+  `CHAIN_DONE_before_libmalloc`, so no read starts before those rows run. It then runs `jobs/r1_dpdem.sh` and
+  `jobs/e2_r1_dpdem.sh`, which run only those rows, with their original commands. Nothing is deleted.
+- By Addendum 23's rule, a row that ends rc 133 in the same assertion a second time counts as an error of `dopplerprint`'s
+  run on this machine and is not run a third time.
+- Set E's R1 for the pinned build and `dpdem` is read once, into a new file, when `libm2` is done. Set F's R1 for `dp` and
+  `dpdem` is read once when `libm` is done.
+
+### Bench notes
+
+- From 14:20:59Z to 14:39:52Z the operator built two development builds of `fdop`, from `main` `0abfbe9` with and without a
+  change to `trace.rs`, in `fdop_replay` (`cargo build` and `cargo test`, 4 jobs, `nice` 5). They ran beside stage 5's
+  `dpdem` R1 rows, which `dpwin` meant to run alone. Neither build is registered, and neither ran a benchmark row.
