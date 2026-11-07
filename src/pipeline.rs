@@ -592,9 +592,13 @@ fn curve_catalog_span(
     adsb_end: f64,
 ) -> (f64, f64) {
     let day = 86_400.0;
+    // Fetch windows include both endpoints. End inside the final required UTC day,
+    // not at the following midnight, which would demand an unrelated extra store.
+    // A real padded endpoint exactly at midnight does require that new day.
+    let last_day = ((clock.1 + duration + 1200.0) / day).floor();
     let limits = (
         ((clock.0 - 1200.0) / day).floor() * day,
-        (((clock.1 + duration + 1200.0) / day).ceil() * day).min(adsb_end),
+        ((last_day + 1.0) * day).next_down().min(adsb_end),
     );
     curvematch::catalog_span(p, clock.0, clock.1, duration, limits)
 }
@@ -2778,6 +2782,168 @@ mod tests {
                 (expected.0 - 3600.0, expected.1 + 3600.0)
             );
             assert!(catalog.1 <= end);
+        }
+    }
+
+    #[test]
+    fn late_curve_match_uses_one_cached_day_and_keeps_all_decoys() {
+        use fdop_types::store::{FlightLeg, TrackPoint, alt_src};
+        let mut a = offline_test_args("late-curve-catalog");
+        a.curve_match = true;
+        let day = unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let midnight = day + 86_400.0;
+        let clock = (day + 23.0 * 3600.0 + 600.0, day + 23.0 * 3600.0 + 840.0);
+        let duration = 120.0;
+        let (lat, lon) = (40.876466, -73.524951);
+        let bbox = BBox::new(lat - 0.001, lon - 0.001, lat + 0.001, lon + 0.001);
+        let fetch_box = bbox.padded_km(30.0);
+        let leg = FlightLeg {
+            key: "synthetic-evening".into(),
+            icao: "000001".into(),
+            reg: String::new(),
+            typ: "C172".into(),
+            source: "synthetic".into(),
+            engine: fdop_types::engine::EngineClass::Piston,
+            points: [(clock.0 + 80.0, lon - 0.01), (clock.0 + 100.0, lon + 0.01)]
+                .into_iter()
+                .map(|(t, lon)| TrackPoint {
+                    t,
+                    lat,
+                    lon,
+                    alt_m: 1000.0,
+                    gs_mps: f32::NAN,
+                    track_deg: f32::NAN,
+                    vrate_mps: f32::NAN,
+                    alt_src: alt_src::GEOM,
+                    flags: 0,
+                })
+                .collect(),
+        };
+        cache_test_day(&a, fetch_box, (2026, 9, 8), vec![leg]);
+        // Only the spectral bank is reduced; production clock and decoy parameters stay
+        // unchanged. This runs the actual cache fetch, track builder and curve matcher.
+        let p = curvematch::MatchParams {
+            v_grid: vec![84.0],
+            d_grid: vec![1000.0],
+            f0_lo: 100.0,
+            f0_hi: 105.0,
+            ..Default::default()
+        };
+        let catalog = curve_catalog_span(&p, clock, duration, f64::INFINITY);
+        assert_eq!(catalog, (day + 19.5 * 3600.0, midnight.next_down()));
+        assert!(catalog.0 <= clock.0 - 1200.0);
+        assert!(catalog.1 >= clock.1 + duration + 1200.0);
+        // The old inclusive midnight limit really requires an unavailable second store.
+        let error = fdop_data::fetch_window(
+            &fdop_data::IngestSpec {
+                bbox: fetch_box,
+                t_start: catalog.0,
+                t_end: midnight,
+                geoid_n_m: -30.0,
+                keep_unknown: true,
+            },
+            &a.cache,
+            &fdop_data::FetchOptions {
+                offline: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("2026-09-09 (offline, not cached)")
+        );
+        let image = curvematch::build_image(&vec![0.0; 120 * 4000], 4000, &p).unwrap();
+        let dem = fdop_types::FlatElevation(0.0);
+        let atmo = fdop_types::atmo::StandardAtmosphere::new(15.0, 0.0, 0.5);
+        let result = run_curve_match(
+            &a,
+            &p,
+            &image,
+            bbox,
+            fetch_box,
+            clock,
+            duration,
+            f64::INFINITY,
+            -30.0,
+            &dem,
+            &dem,
+            &atmo,
+            &Log::new(true),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.n_tracks, 1);
+        assert_eq!(result.decoys.len(), 48);
+        let mut shifts: Vec<_> = result.decoys.iter().map(|d| d.shift_s).collect();
+        shifts.sort_by(f64::total_cmp);
+        assert_eq!(
+            shifts,
+            (-40..=8)
+                .filter(|&k| k != 0)
+                .map(|k| k as f64 * 300.0)
+                .collect::<Vec<_>>()
+        );
+        for shift in std::iter::once(0.0).chain(shifts) {
+            // catalogue_span clips its preferred 1200 s padding at day boundaries;
+            // every real/decoy recording must still retain its required 60 s guard.
+            assert!(
+                clock.0 + shift - catalog.0 >= 60.0,
+                "start at shift {shift}"
+            );
+            assert!(
+                catalog.1 - (clock.1 + shift + duration) >= 60.0,
+                "end at shift {shift}"
+            );
+        }
+    }
+
+    #[test]
+    fn curve_catalog_keeps_required_midnight_timestamps_and_crossings() {
+        let a = offline_test_args("curve-midnight-coverage");
+        let day = unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let midnight = day + 86_400.0;
+        let bbox = BBox::new(40.8, -73.6, 40.9, -73.5);
+        cache_test_day(&a, bbox, (2026, 9, 8), Vec::new());
+        let p = curvematch::MatchParams::default();
+        let duration = 120.0;
+        let hi_at_midnight_padding = midnight - duration - 1200.0;
+        for (hi, needs_next_day) in [
+            (hi_at_midnight_padding.next_down(), false),
+            (hi_at_midnight_padding, true),
+            (hi_at_midnight_padding.next_up(), true),
+            // The recording itself crosses midnight, independent of the extra padding.
+            (midnight + 180.0, true),
+        ] {
+            let clock = (hi - 240.0, hi);
+            let catalog = curve_catalog_span(&p, clock, duration, f64::INFINITY);
+            assert!(catalog.0 <= clock.0 - 1200.0);
+            assert!(catalog.1 >= clock.1 + duration + 1200.0);
+            let result = fdop_data::fetch_window(
+                &fdop_data::IngestSpec {
+                    bbox,
+                    t_start: catalog.0,
+                    t_end: catalog.1,
+                    geoid_n_m: -30.0,
+                    keep_unknown: true,
+                },
+                &a.cache,
+                &fdop_data::FetchOptions {
+                    offline: true,
+                    ..Default::default()
+                },
+            );
+            if needs_next_day {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("2026-09-09 (offline, not cached)")
+                );
+            } else {
+                assert_eq!(result.unwrap().meta.stats["days"], json!(["2026-09-08"]));
+            }
         }
     }
 

@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep late-evening curve searches inside their required archive days
+
+- Stop the curve catalogue inside its final required UTC day rather than at the following midnight.
+  Inclusive archive fetching previously demanded an unrelated extra day, preventing an evening curve
+  search from using an otherwise complete offline cache. Derive the final day from the real recording's
+  padded endpoint, preserving exact-midnight and crossing coverage and the published archive limit.
+- Add an actual cached-store/matcher regression for a 23:10–23:14Z clock and 120-second recording.
+  It requires all 48 intended decoys, the real recording's padding and every decoy's existing 60-second
+  catalogue guard. Additional cached-fetch cases cover just before, exactly at and just after the
+  padded midnight boundary, plus a recording crossing midnight.
+- **Validation limit:** formatting and independent source review passed, and an independent arithmetic
+  check confirmed the day boundaries and 40 earlier / 8 later decoys. These are not Rust test results.
+  Application test compilation did not reach these regressions before the executor became unavailable;
+  their Rust execution and full workspace checks remain pending. No measured accuracy or runtime
+  improvement is claimed.
+
 ### Recover a narrow observer region between cross-track samples
 
 - A valid region can lie entirely between the regular 350 m cross-track samples, while the

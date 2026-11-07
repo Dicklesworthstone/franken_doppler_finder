@@ -578,8 +578,10 @@ attempt can therefore run offline with just its required cached UTC day, even wh
 uncached surrounding days. If its archive cannot be loaded, or neither search finds an answer, the
 full-date attempt loads its own tracks and weather and rebuilds the wind-dependent speed gates. An
 eligible curve match still needs its wider decoy catalogue; weather covers those same decoy times,
-including the radiosonde brackets, before adding the normal padding. Dates spanning UTC midnight
-still require every day used by the attempted recording and track coverage.
+including the radiosonde brackets, before adding the normal padding. An evening catalogue that fits
+inside one UTC day can use just that day's archive; its rounded day limit does not require an
+unrelated following day. If the recording's padded window reaches or crosses UTC midnight, the
+next day is still required.
 
 With `--start`, its clock window is intersected with the local dates before checking archive availability or
 fetching weather and tracks. Only the UTC days needed by that window, the recording duration and track padding
