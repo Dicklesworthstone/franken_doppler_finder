@@ -198,18 +198,35 @@ pub fn releases_complete(v: &[DayRelease]) -> bool {
 /// True when the UTC day ended more than [`crate::fetch::PUBLISH_LAG_S`] ago: whatever releases
 /// it has now are all it will ever have.
 pub fn day_settled(y: i64, m: u32, d: u32) -> bool {
-    let end = (fdop_types::time::days_from_civil(y, m, d) + 1) as f64 * 86_400.0;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|t| t.as_secs_f64())
         .unwrap_or(f64::INFINITY);
-    end + crate::fetch::PUBLISH_LAG_S < now
+    day_settled_at(y, m, d, now)
+}
+
+fn day_settled_at(y: i64, m: u32, d: u32, checked_at: f64) -> bool {
+    let end = (fdop_types::time::days_from_civil(y, m, d) + 1) as f64 * 86_400.0;
+    end + crate::fetch::PUBLISH_LAG_S < checked_at
+}
+
+/// An incomplete listing is final only if it was fetched after the publication window.
+/// A prod-only listing fetched before MLAT appeared does not become complete by ageing.
+/// The atomic cache write records the successful lookup time in the file's mtime; if that
+/// evidence is unavailable, an online caller must check again.
+fn cached_listing_final(v: &[DayRelease], y: i64, m: u32, d: u32, path: &Path) -> bool {
+    releases_complete(v)
+        || std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|t| day_settled_at(y, m, d, t.as_secs_f64()))
 }
 
 /// [`find_day_releases`] with a JSON cache at `<dir>/releases.json`. Only non-empty results are
-/// cached, and an incomplete cached listing (no prod or no mlatonly) of a day that is not
-/// [settled](day_settled) is re-checked, since the missing release may have been published
-/// since. `offline` never touches the network.
+/// cached. An incomplete listing (no prod or no mlatonly) fetched before the day
+/// [settled](day_settled) is re-checked, even on later runs: the missing release may have been
+/// published since that lookup. `offline` never touches the network.
 pub fn find_day_releases_cached(
     net: Option<&Net>,
     y: i64,
@@ -224,7 +241,7 @@ pub fn find_day_releases_cached(
         .and_then(|b| serde_json::from_slice::<Vec<DayRelease>>(&b).ok())
         .filter(|v| !v.is_empty());
     if let Some(v) = &cached
-        && (offline || releases_complete(v) || day_settled(y, m, d))
+        && (offline || cached_listing_final(v, y, m, d, &path))
     {
         return Ok(v.clone());
     }
@@ -260,6 +277,108 @@ pub fn find_day_releases_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cached_release(feed: Feed) -> DayRelease {
+        DayRelease {
+            feed,
+            repo: repo_for_year(2026),
+            tag: tag_for(2026, 9, 8, feed, 0),
+            parts: vec![AssetPart {
+                name: format!("{}.tar", feed.tag_word()),
+                url: format!("https://example.invalid/{}.tar", feed.tag_word()),
+                size: 1024,
+            }],
+        }
+    }
+
+    fn cache_dir(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-release-cache-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_listing(path: &Path, releases: &[DayRelease], checked_at: f64) {
+        std::fs::write(path, serde_json::to_vec(releases).unwrap()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(checked_at))
+            .unwrap();
+    }
+
+    #[test]
+    fn provisional_release_cache_does_not_become_final_with_age() {
+        let dir = cache_dir("provisional");
+        let path = dir.join("releases.json");
+        let end = fdop_types::time::unix_from_utc(2026, 9, 9, 0, 0, 0.0);
+        let settled = end + crate::fetch::PUBLISH_LAG_S;
+        let releases = vec![cached_release(Feed::Prod)];
+
+        // A lookup just after the day ended can precede MLAT publication. Even when
+        // the day is long settled now, that listing still needs an online refresh.
+        write_listing(&path, &releases, end + 3600.0);
+        assert!(day_settled_at(2026, 9, 8, settled + 30.0 * 86_400.0));
+        assert!(!cached_listing_final(&releases, 2026, 9, 8, &path));
+        assert_eq!(
+            find_day_releases_cached(None, 2026, 9, 8, &dir, true).unwrap(),
+            releases,
+            "offline runs must keep using the available partial listing"
+        );
+
+        // Once a successful lookup after the publication window still finds no MLAT,
+        // the missing feed is genuinely settled and later runs need no new API lookup.
+        write_listing(&path, &releases, settled + 1.0);
+        assert!(cached_listing_final(&releases, 2026, 9, 8, &path));
+        for checked_at in [settled - 1.0, settled] {
+            write_listing(&path, &releases, checked_at);
+            assert!(!cached_listing_final(&releases, 2026, 9, 8, &path));
+        }
+    }
+
+    #[test]
+    fn complete_release_cache_is_final_before_the_day_settles() {
+        let dir = cache_dir("complete");
+        let path = dir.join("releases.json");
+        let checked_at = fdop_types::time::unix_from_utc(2026, 9, 9, 1, 0, 0.0);
+        let prod = cached_release(Feed::Prod);
+        let mlat = cached_release(Feed::Mlatonly);
+        let staging = cached_release(Feed::Staging);
+        for releases in [vec![prod.clone(), mlat.clone()], vec![staging, mlat]] {
+            write_listing(&path, &releases, checked_at);
+            assert_eq!(
+                cached_listing_final(&releases, 2026, 9, 8, &path),
+                releases_complete(&releases),
+                "staging plus MLAT still needs a later check for prod"
+            );
+            assert_eq!(
+                find_day_releases_cached(None, 2026, 9, 8, &dir, true).unwrap(),
+                releases
+            );
+        }
+        let absent = dir.join("missing.json");
+        assert!(!cached_listing_final(
+            std::slice::from_ref(&prod),
+            2026,
+            9,
+            8,
+            &absent
+        ));
+        assert!(cached_listing_final(
+            &[prod, cached_release(Feed::Mlatonly)],
+            2026,
+            9,
+            8,
+            &absent
+        ));
+    }
 
     #[test]
     fn tags_and_parts_order() {

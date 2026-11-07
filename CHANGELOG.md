@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Refresh early partial ADS-B listings after publication
+
+- **The fault.** A cached release listing was accepted as final once the archived day was more than
+  two days past its end, even if the lookup itself happened before MLAT or prod was published. An early
+  prod-only lookup could therefore keep later runs on an incomplete catalogue indefinitely.
+- **The change.** An incomplete listing is final only when its successful cache write occurred after
+  the publication window. Earlier listings are rechecked online; complete prod-plus-MLAT listings and
+  offline reads retain their existing behavior. A missing modification time also requires an online check.
+- **Regression coverage added.** Two deterministic on-disk tests cover a provisional listing on an old
+  day, a settled partial listing, exact publication boundaries, complete early listings, staging plus
+  MLAT still missing prod, unavailable timestamp evidence, and the public offline cache-reading path.
+- **Validation.** The initial repair passed the pinned rustfmt check; a subsequent test-only slice cleanup was
+  reviewed without an executor. Workspace test compilation was
+  killed with exit 137; a focused fdop-data test build then lost its executor before completion. Test,
+  Clippy and selftest results are unconfirmed. No real-recording accuracy improvement is claimed.
+
 ### Score a compressed survey image once more, contrast first
 
 - **The fault.** A loud nearby pass swells a short clip's level by 20 dB or more around its CPA. The survey

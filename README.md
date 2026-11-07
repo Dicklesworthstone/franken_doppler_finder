@@ -727,6 +727,11 @@ or incomplete cache is identified in the progress output, and other eligible cac
 downloading again or failing in `--offline` mode. Partial feeds retain their missing-feed warnings. A larger
 region on the same day downloads that day again if no usable cache covers it.
 
+An incomplete release listing captured before the publication window closes is rechecked online until
+both prod and MLAT are present or a successful post-window lookup confirms the missing feed. An early
+prod-only listing therefore cannot become permanent merely because the day has aged. Offline runs
+continue to use the cached listing and report missing feeds.
+
 Archive ingestion and cached-window slicing retain the original samples bracketing a sparse segment that
 crosses the requested region and time window, even when neither sample is inside. The segment must enter
 both at the same time. Ingestion does not infer a crossing across a ground report or restart marker;
