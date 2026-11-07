@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Remove exact-score evidence jumps between calibration templates
+
+- Replace nearest-template null selection for an exact trajectory with bilinear interpolation
+  of fitted median and tail scale on the existing log-speed/log-distance grid. These weights
+  interpolate the fitted median and upper-tail quantile together, preserve a positive scale,
+  reproduce bank nodes exactly and clamp outside the grid, including singleton axes.
+- Use the interpolated scale in the existing tone adjustment and evidence conversion. Real
+  and decoy windows share the same scorer; coarse voting, bank density, frequency sampling,
+  acceptance lines and the synthetic recording remain unchanged. Work per pass uses at most
+  four existing nulls, with no new spectrogram or bank sweep.
+- **Observed defect:** on `e925900`,
+  `alternative_clock_peaks_recover_the_three_flight_recording` recovered the true clock and all
+  three flights but failed its 200 m position assertion at about 213.6 m. The displaced point
+  put two passes below the 858.53 m nearest-null boundary. For one, the true raw score was
+  158.404 with 9.641 nats, while the weaker displaced score was 147.723 with 15.230 nats.
+  All three clock-selector Rust regressions passed. These were real RCH runs, not model results.
+- Add focused interpolation regressions for exact nodes, clamped corners, fitted quantiles,
+  evidence continuity and singleton axes. Keep the original PCM and 200 m assertion.
+- **Validation limit:** independent source reviews and JavaScript f32 arithmetic checks passed.
+  The new Rust implementation, interpolation tests, unchanged PCM location assertion, formatting,
+  full workspace gates and field replays remain unrun after executor loss. This is a smooth
+  approximation to the bank's fitted nulls, not a new calibration proof or an observed recovery.
+
 ### Detect fast flyovers near recording boundaries
 
 - Extend the supplemental fast-aircraft bank into the existing short edge-template path.

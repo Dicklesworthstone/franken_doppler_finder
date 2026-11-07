@@ -375,6 +375,11 @@ in `crates/fdop-core/src/curvematch.rs`:
   within one six-minute chunk. A shared sampling lattice and chunk ownership give each visit one vote per
   place. Interior approach times use the curvature of squared range and the interpolated trajectory;
   real track endpoints remain eligible, while an artificial catalogue boundary cannot create a pass.
+  Exact trajectories between bank shapes use interpolated fitted null quantiles on the existing
+  log-speed/log-distance grid. This removes evidence jumps caused solely by selecting a neighbouring
+  calibration template. Bank nodes remain exact, exterior values clamp to the endpoints, and real
+  and decoy scoring share the same interpolation and tone adjustment. It uses at most four existing
+  nulls per pass, with no additional image scan or denser bank.
 - **How far it hears.** A pass is credited by how likely it was to be heard at its slant range: a logistic in dB
   around the range heard half the time. That range depends on the microphone, wind and noise, and is not known
   before the match: the osprey cam's 10-31 recording has 9- to 12-nat curves from passes 4 to 6 km out. So every
@@ -1143,18 +1148,25 @@ frontend and backend job. The metadata/offline pipeline tests, full workspace ga
 selftest and reference-recording replay therefore remain unconfirmed; the external selftest does
 not replace them.
 
-The clock-alternative repair adds three selector regressions and a 400-second synthetic PCM case.
-Two earlier matching paths and extra parallel flights create a competing coarse explanation; the
-new case requires the true recording clock within 3 s, the observer within 200 m and all three
-independently heard flight identities. Neither the old-code failure nor the new Rust recovery has
-executed. Independent source review and JavaScript selector checks passed: 16,200 plateau cases
-retained every candidate and required sweep timestamp, and 2,000 fractional/large-epoch cases
-had no unsafe timestamp suppression. A 2,001-bin plateau needed 225 initial exact starts to cover
-2,009 timestamps in that model. These are component-model results, not Rust or PCM timings.
-The coverage guard tracks timestamps, not equivalence of physical pass reconstruction from
-different seeds. Formatting, compilation, the new Rust tests, production runtime and recording
-replays remain unverified. More clock peaks can add substantial work; progress logs expose
-candidate counts and initial exact starts separately from refinement and diagnostic probes.
+**Clock-alternative execution on `e925900`.** All three selector regressions passed through real
+RCH on the pinned nightly. The 400-second PCM case recovered the correct recording clock and all
+three true flight identities, but **failed** its unchanged 200 m position assertion at about
+213.6 m. Its known observer had higher raw acoustic scores for two flights but lower evidence:
+the displaced point crossed the nearest-null bank boundary at about 858.53 m slant range.
+For one pass the true point scored 158.404 / 9.641 nats, versus 147.723 / 15.230 nats at the
+displaced point. The diagnostic rerun confirmed this; it is not a passing location regression.
+
+The null-interpolation repair replaces that discontinuous lookup with interpolation of the fitted
+quantiles. Model checks cover exact bank nodes, clamping, singleton axes, quantile arithmetic and
+continuity at the former cell boundaries. Independent source review and JavaScript f32 arithmetic
+checks passed. The original PCM, bank, frequency resolution and 200 m assertion remain unchanged.
+The new Rust implementation, its model tests and the PCM recovery assertion remain **unrun**
+after the executor disconnected. No corrected position or field-accuracy improvement is claimed.
+
+The clock coverage guard tracks timestamps, not equivalence of physical pass reconstruction from
+different seeds. More clock peaks can add work; progress logs expose candidate counts and initial
+exact starts separately from refinement and diagnostic probes. Full workspace checks, formatting,
+the CLI release selftest, field replays and runtime effects of the new changes remain unverified.
 
 The historical-radiosonde repair adds lifetime-boundary checks and an offline cached-profile
 regression, including a closed station with usable historical winds and a station opening at

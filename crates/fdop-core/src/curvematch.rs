@@ -515,6 +515,34 @@ struct Bank {
 }
 
 impl Bank {
+    /// Interpolate the fitted median and upper-tail quantile on the log(v, d) grid.
+    /// Since q90 = q50 + beta * ln(5), the same convex weights on q50 and beta
+    /// interpolate both fitted quantiles and keep the tail scale positive. Choosing
+    /// the nearest null instead creates evidence jumps at artificial cell boundaries.
+    fn null_at(&self, p: &MatchParams, v: f64, d: f64) -> Null {
+        let (v0, v1, vw) = log_bracket(&p.v_grid, v);
+        let (d0, d1, dw) = log_bracket(&p.d_grid, d);
+        let at = |vi: usize, di: usize| self.surfaces[vi * p.d_grid.len() + di].null;
+        if v0 == v1 && d0 == d1 {
+            return at(v0, d0);
+        }
+        let (mut q50, mut beta) = (0.0, 0.0);
+        for (vi, wv) in [(v0, 1.0 - vw), (v1, vw)] {
+            for (di, wd) in [(d0, 1.0 - dw), (d1, dw)] {
+                let weight = wv * wd;
+                if weight > 0.0 {
+                    let null = at(vi, di);
+                    q50 += weight * f64::from(null.q50);
+                    beta += weight * f64::from(null.beta);
+                }
+            }
+        }
+        Null {
+            q50: q50 as f32,
+            beta: beta as f32,
+        }
+    }
+
     fn tone_of(&self, typ: &str) -> Option<&[f32]> {
         if self.tones.is_empty() {
             return None;
@@ -524,6 +552,24 @@ impl Bank {
             .position(|(types, _)| types.contains(&typ))?;
         Some(&self.tones[i])
     }
+}
+
+/// Bracket a positive coordinate on an ascending positive grid. Outside coordinates
+/// clamp to an endpoint; an exact node (including a singleton grid) remains exact.
+fn log_bracket(grid: &[f64], x: f64) -> (usize, usize, f64) {
+    let hi = grid.partition_point(|&g| g < x);
+    if hi == 0 {
+        return (0, 0, 0.0);
+    }
+    if hi == grid.len() {
+        return (hi - 1, hi - 1, 0.0);
+    }
+    if x == grid[hi] {
+        return (hi, hi, 0.0);
+    }
+    let lo = hi - 1;
+    let weight = ((x / grid[lo]).ln() / (grid[hi] / grid[lo]).ln()).clamp(0.0, 1.0);
+    (lo, hi, weight)
 }
 
 struct Sample {
@@ -1172,9 +1218,7 @@ fn score_exact(
             }
             let half = (p.half_k * cpa.d / cpa.speed).clamp(p.half_min_s, p.half_max_s);
             let scale = BASE_C / m.c;
-            let tv = nearest_log(&p.v_grid, cpa.speed * scale);
-            let td = nearest_log(&p.d_grid, cpa.d * scale);
-            let null = bank.surfaces[tv * p.d_grid.len() + td].null;
+            let null = bank.null_at(p, cpa.speed * scale, cpa.d * scale);
             // the curve is fixed in UNIX time; a clock step only moves it along the frames
             let nj = (half / im.dt).round() as i64;
             let f_arr = (aud / im.dt).round() as i64;
@@ -2561,6 +2605,141 @@ mod tests {
     }
 
     #[test]
+    fn bank_null_interpolates_quantiles_without_nearest_cell_evidence_cliffs() {
+        let p = MatchParams {
+            v_grid: vec![40.0, 160.0],
+            d_grid: vec![100.0, 1600.0],
+            ..Default::default()
+        };
+        let nulls = [
+            Null {
+                q50: 10.0,
+                beta: 2.0,
+            },
+            Null {
+                q50: 18.0,
+                beta: 4.0,
+            },
+            Null {
+                q50: 26.0,
+                beta: 6.0,
+            },
+            Null {
+                q50: 42.0,
+                beta: 12.0,
+            },
+        ];
+        let bank = Bank {
+            surfaces: nulls
+                .into_iter()
+                .map(|null| Surface {
+                    null,
+                    peaks: Vec::new(),
+                })
+                .collect(),
+            r0: 0,
+            nf0: 0,
+            tones: Vec::new(),
+        };
+        // Exact nodes and clamped corners preserve their stored null bit for bit.
+        for (v, d, i) in [
+            (40.0, 100.0, 0),
+            (40.0, 1600.0, 1),
+            (160.0, 100.0, 2),
+            (160.0, 1600.0, 3),
+            (1.0, 1.0, 0),
+            (1.0, 100_000.0, 1),
+            (1000.0, 1.0, 2),
+            (1000.0, 100_000.0, 3),
+        ] {
+            let n = bank.null_at(&p, v, d);
+            assert_eq!(n.q50.to_bits(), nulls[i].q50.to_bits());
+            assert_eq!(n.beta.to_bits(), nulls[i].beta.to_bits());
+        }
+        // The geometric midpoint has equal weights on the four fitted quantiles.
+        let middle = bank.null_at(&p, 80.0, 400.0);
+        assert_eq!((middle.q50, middle.beta), (24.0, 6.0));
+        let q90 = |n: Null| f64::from(n.q50) + f64::from(n.beta) * 5f64.ln();
+        let mean_q90 = nulls.into_iter().map(q90).sum::<f64>() / 4.0;
+        assert!((q90(middle) - mean_q90).abs() < 1e-6);
+        // Unequal log-axis fractions distinguish quantile interpolation from nearest lookup.
+        let asymmetric = bank.null_at(&p, 40.0 * 2f64.sqrt(), 800.0);
+        assert!((asymmetric.q50 - 21.5).abs() < 2e-6);
+        assert!((asymmetric.beta - 5.25).abs() < 2e-6);
+        assert!(asymmetric.beta > 0.0);
+        // A fixed acoustic score cannot jump in evidence at either old Voronoi boundary.
+        for ((v0, d0), (v1, d1)) in [
+            ((80.0 * (1.0 - 1e-6), 400.0), (80.0 * (1.0 + 1e-6), 400.0)),
+            ((80.0, 400.0 * (1.0 - 1e-6)), (80.0, 400.0 * (1.0 + 1e-6))),
+        ] {
+            let left = bank.null_at(&p, v0, d0);
+            let right = bank.null_at(&p, v1, d1);
+            assert!((left.nats(50.0) - right.nats(50.0)).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn bank_null_interpolation_handles_singleton_axes() {
+        let nulls = [
+            Null {
+                q50: 10.0,
+                beta: 2.0,
+            },
+            Null {
+                q50: 30.0,
+                beta: 6.0,
+            },
+        ];
+        let bank = Bank {
+            surfaces: nulls
+                .into_iter()
+                .map(|null| Surface {
+                    null,
+                    peaks: Vec::new(),
+                })
+                .collect(),
+            r0: 0,
+            nf0: 0,
+            tones: Vec::new(),
+        };
+        for (v_grid, d_grid, v, d) in [
+            (vec![80.0], vec![100.0, 1600.0], 2.0, 400.0),
+            (vec![40.0, 160.0], vec![400.0], 80.0, 1.0),
+        ] {
+            let p = MatchParams {
+                v_grid,
+                d_grid,
+                ..Default::default()
+            };
+            let n = bank.null_at(&p, v, d);
+            assert_eq!((n.q50, n.beta), (20.0, 4.0));
+        }
+        let p = MatchParams {
+            v_grid: vec![80.0],
+            d_grid: vec![400.0],
+            ..Default::default()
+        };
+        let single = Null {
+            q50: -0.0,
+            beta: 0.05,
+        };
+        let bank = Bank {
+            surfaces: vec![Surface {
+                null: single,
+                peaks: Vec::new(),
+            }],
+            r0: 0,
+            nf0: 0,
+            tones: Vec::new(),
+        };
+        for (v, d) in [(80.0, 400.0), (2.0, 1e6), (1e6, 2.0)] {
+            let n = bank.null_at(&p, v, d);
+            assert_eq!(n.q50.to_bits(), single.q50.to_bits());
+            assert_eq!(n.beta.to_bits(), single.beta.to_bits());
+        }
+    }
+
+    #[test]
     fn alternative_clock_sweeps_keep_unvisited_tails_and_fractional_phases() {
         let wide = (-10.0, 10.0);
         // The centre at 2 was visited from 0, but its far edge at 4 was not.
@@ -2942,6 +3121,7 @@ mod tests {
         let truth = r.probe.first().expect("the known observer scores");
         assert!(truth.n_heard >= 3, "{truth:?}");
         let top = r.modes.first().expect("the recording seeds an exact match");
+        println!("known observer: {truth:?}");
         println!(
             "clock alternatives: {:.3} s total; stages {:?}; true evidence {:.3}, found {:.3}, clock error {:+.3} s",
             started.elapsed().as_secs_f64(),
