@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Release completed archive-day tracks while other downloads continue
+
+- Once a newly downloaded day is atomically cached, release its built point arrays immediately.
+  Retain only the open cache file, original metadata, leg count and per-aircraft bounds until
+  every day is ready for global aircraft selection. Active/incomplete ingests and final selected
+  tracks still use memory; this removes accumulated completed-day histories, not all memory use.
+- Add `TrackStore::save_open`, returning the same exclusively created, finished, synced and
+  rewound file that was renamed into place. A competing writer replacing the cache pathname
+  cannot substitute different points behind a day's bounds. Existing `save` remains compatible.
+- Use one compact representation for both pre-existing caches and newly published days. Fresh
+  bounds are derived from the built reports without a first decompression; selected fresh files
+  are decoded once before the unchanged geoid, merge and final filtering stages.
+- Add retained-generation and concurrent-writer checks, full-merge equivalence after replacing
+  every fresh cache path, and an updated bounded-channel publication/reload regression. Exact
+  keys, sources, points, day metadata, geoid values and both unknown-type policies are checked.
+- **Validation:** independent source review completed. New Rust regressions, formatting, Clippy,
+  workspace gates and recording replays remain unrun after the executor disconnected before
+  the first edit could be installed locally. The prior 24 types and 31 offline component passes
+  belong to `a48f935`; they do not validate this publication handoff. No RSS or speedup is claimed.
+
 ### Read cached tracks selectively without losing cross-day flights
 
 - Add a streaming `TrackStore::read_legs` reader. Existing `load` uses it, and every read still

@@ -10,7 +10,7 @@ use flate2::Compression;
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -130,6 +130,7 @@ fn create_staging_file(path: &Path, next_id: &AtomicU64) -> io::Result<(PathBuf,
         let id = next_id.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("fdtrk.part.{}.{id}", std::process::id()));
         match std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&tmp)
@@ -148,11 +149,17 @@ impl TrackStore {
 
     /// Write atomically (exclusive staging file + sync + rename), including concurrent saves.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        self.save_open(path).map(drop)
+    }
+
+    /// Publish atomically and return the same completed file, positioned at its beginning.
+    /// The handle keeps this store available if another writer later replaces `path`.
+    pub fn save_open(&self, path: &Path) -> io::Result<std::fs::File> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }
         let (tmp, f) = create_staging_file(path, &NEXT_STAGING_ID)?;
-        {
+        let mut file = {
             let mut w = GzEncoder::new(BufWriter::with_capacity(1 << 20, f), Compression::fast());
             w.write_all(MAGIC)?;
             let meta = serde_json::to_vec(&self.meta).map_err(io::Error::other)?;
@@ -181,9 +188,12 @@ impl TrackStore {
                 w.write_all(&buf)?;
             }
             let inner = w.finish()?;
-            inner.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
+            inner.into_inner().map_err(|e| e.into_error())?
+        };
+        file.sync_all()?;
+        file.rewind()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(file)
     }
 
     /// Read one complete gzip member, checking its checksum and rejecting trailing data.
@@ -459,6 +469,53 @@ mod tests {
     }
 
     #[test]
+    fn save_open_keeps_the_published_inode_after_replacement() {
+        let path = test_path("save-open");
+        let mut original = sample_store();
+        original.legs[0].reg = "TEST".into();
+        for p in &mut original.legs[0].points {
+            p.lat = 40.876466;
+            p.lon = -73.524951;
+            p.gs_mps = 70.0;
+        }
+        let mut published = Vec::new();
+        for generation in 0..3 {
+            let mut store = original.clone();
+            store.meta.stats = serde_json::json!({"generation": generation});
+            for p in &mut store.legs[0].points {
+                p.alt_m += generation as f32;
+            }
+            let mut file = store.save_open(&path).unwrap();
+            assert_eq!(file.stream_position().unwrap(), 0);
+            published.push((store, file));
+        }
+        // Each returned descriptor must outlive replacement of the public name.
+        let mut replacement = original.clone();
+        replacement.legs.clear();
+        replacement.meta.sources = vec!["replacement".into()];
+        replacement.save(&path).unwrap();
+        assert!(TrackStore::load(&path).unwrap().legs.is_empty());
+        for (expected, file) in published {
+            let mut legs = Vec::new();
+            let meta = TrackStore::read_legs(file, &path, |leg| legs.push(leg)).unwrap();
+            assert_eq!(
+                serde_json::to_value(&meta).unwrap(),
+                serde_json::to_value(&expected.meta).unwrap()
+            );
+            assert_eq!(legs.len(), expected.legs.len());
+            for (got, want) in legs.iter().zip(&expected.legs) {
+                assert_eq!(got.key, want.key);
+                assert_eq!(got.icao, want.icao);
+                assert_eq!(got.reg, want.reg);
+                assert_eq!(got.typ, want.typ);
+                assert_eq!(got.source, want.source);
+                assert_eq!(got.engine, want.engine);
+                assert_eq!(got.points, want.points);
+            }
+        }
+    }
+
+    #[test]
     fn streamed_legs_preserve_order_payload_and_the_open_file() {
         use std::io::Seek;
         let mut original = sample_store();
@@ -638,9 +695,17 @@ mod tests {
                     let (path, barrier, running) = (&path, &barrier, &running);
                     scope.spawn(move || {
                         barrier.wait();
-                        let result = store.save(path);
+                        let result = store.save_open(path);
                         running.fetch_sub(1, Ordering::Release);
-                        result
+                        result.and_then(|file| {
+                            let mut points = 0;
+                            let meta = TrackStore::read_legs(file, path, |leg| {
+                                points += leg.points.len();
+                            })?;
+                            assert_eq!(meta.stats, store.meta.stats);
+                            assert_eq!(points, store.n_points());
+                            Ok(())
+                        })
                     })
                 })
                 .collect();

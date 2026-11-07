@@ -783,8 +783,12 @@ For uncached multi-day searches, each UTC day is built and atomically cached as 
 requested feeds finish, while the remaining days continue downloading. Completed raw feeds pass through
 a bounded queue instead of accumulating until the last download. A failed feed prevents publication
 of its own day; other completed days remain reusable. Cache-write failures remain errors, after the
-other days receive their save attempts. This bounds the queue of completed raw releases, not total
-process memory: active ingestion, incomplete days and built track stores still need memory.
+other days receive their save attempts. After publication, a completed day keeps its actual open cache
+file, original metadata and aircraft bounds; its point arrays are released while other downloads run.
+Fresh bounds come directly from the built reports, and selected fresh files are decoded once when all
+days are ready for the final merge. The saved handle stays attached to that day's data if another writer
+replaces its public cache pathname. Active ingestion, incomplete days, the day currently being built,
+and the final selected tracks still consume memory; this is not a total process-memory bound.
 
 An incomplete release listing captured before the publication window closes is rechecked online until
 both prod and MLAT are present or a successful post-window lookup confirms the missing feed. An early
@@ -1115,7 +1119,15 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ### Recovery changes (2026-11-07): validation incomplete
 
-**Cached-track memory and incremental ADS-B day publication.** All 31 offline component tests passed
+**Fresh-day publication handoff.** Completed days now release their built point arrays after atomic
+publication and retain the same opened cache inode for later selective loading. New regressions cover
+three retained generations across cache replacement, concurrent writers reading their own published
+files, and full-merge equivalence after every fresh cache pathname is replaced. The existing bounded
+channel test now uses this handoff and reloads its published days. Independent source review found no
+blocker; the new native tests, formatting and Clippy remain unrun after another executor disconnection.
+No peak-RSS or runtime improvement has been measured.
+
+**Cached-track memory and incremental ADS-B day publication at `a48f935` (before the fresh-day handoff).** All 31 offline component tests passed
 using the complete, unchanged production `fetch.rs`, `ingest.rs`, `build.rs` and `geoid.rs` files, the
 real `fdop-types` crate and the pinned parsing/compression/parallelism dependencies. The harness replaces
 only HTTP, release discovery and download adapters with panic-on-use adapters; none were called. It

@@ -201,6 +201,24 @@ struct CachedDay {
 }
 
 impl CachedDay {
+    /// Summarize a freshly built day before releasing its point arrays. Saving returns
+    /// the actual published inode, so a concurrent replacement cannot change the data
+    /// behind these bounds. The later selected-aircraft read checks the completed gzip.
+    fn publish(store: TrackStore, path: &Path) -> std::io::Result<Self> {
+        let mut bounds = HashMap::new();
+        for leg in &store.legs {
+            include_leg_bounds(&mut bounds, leg);
+        }
+        let file = store.save_open(path)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            leg_count: store.legs.len(),
+            meta: store.meta,
+            bounds,
+        })
+    }
+
     fn scan(path: &Path) -> std::io::Result<Self> {
         let mut file = File::open(path)?;
         let mut bounds = HashMap::new();
@@ -239,31 +257,17 @@ impl CachedDay {
     }
 }
 
-enum DayStore {
-    Cached(CachedDay),
-    Built(TrackStore),
-}
-
-/// Scan every store before selecting aircraft: a new cross-day segment can cross the
-/// requested box even though neither day's separate leg does. Retain all of each chosen
-/// aircraft, then let the existing merge and final filter make their original decisions.
+/// Combine all day summaries before selecting aircraft: a new cross-day segment can
+/// cross the requested box even though neither day's separate leg does. Retain all of
+/// each chosen aircraft, then leave the existing merge and final filter authoritative.
 fn load_selected_stores(
-    stores: Vec<DayStore>,
+    stores: Vec<CachedDay>,
     spec: &IngestSpec,
 ) -> Result<Vec<TrackStore>, DataError> {
     let mut bounds: HashMap<String, AircraftBounds> = HashMap::new();
     for store in &stores {
-        match store {
-            DayStore::Cached(c) => {
-                for (id, b) in &c.bounds {
-                    bounds.entry(id.clone()).or_default().extend(b);
-                }
-            }
-            DayStore::Built(s) => {
-                for leg in &s.legs {
-                    include_leg_bounds(&mut bounds, leg);
-                }
-            }
+        for (id, b) in &store.bounds {
+            bounds.entry(id.clone()).or_default().extend(b);
         }
     }
     let selected: HashSet<String> = bounds
@@ -272,13 +276,7 @@ fn load_selected_stores(
         .collect();
     stores
         .into_iter()
-        .map(|store| match store {
-            DayStore::Cached(c) => c.load_selected(&selected).map_err(DataError::from),
-            DayStore::Built(mut s) => {
-                s.legs.retain(|l| selected.contains(&l.icao));
-                Ok(s)
-            }
-        })
+        .map(|store| store.load_selected(&selected).map_err(DataError::from))
         .collect()
 }
 
@@ -525,7 +523,7 @@ pub fn fetch_window(
     };
     let (rbox, key) = bbox_key(&spec.bbox);
     let days = utc_days(spec.t_start, spec.t_end);
-    let mut day_stores: Vec<Option<DayStore>> = (0..days.len()).map(|_| None).collect();
+    let mut day_stores: Vec<Option<CachedDay>> = (0..days.len()).map(|_| None).collect();
     let mut notes: Vec<String> = Vec::new();
     let mut cache_hits = 0usize;
     let mut jobs: Vec<Job> = Vec::new();
@@ -550,7 +548,7 @@ pub fn fetch_window(
                 p.display(),
                 s.leg_count
             ));
-            day_stores[i] = Some(DayStore::Cached(s));
+            day_stores[i] = Some(s);
             cache_hits += 1;
             continue;
         }
@@ -571,7 +569,7 @@ pub fn fetch_window(
                     s.leg_count
                 ));
                 notes.extend(feedset_gaps(&label, fs, opts.include_mlat));
-                day_stores[i] = Some(DayStore::Cached(s));
+                day_stores[i] = Some(s);
                 cache_hits += 1;
                 break;
             }
@@ -701,7 +699,8 @@ pub fn fetch_window(
                 let store = build_store(parts, &day_spec(day), tags);
                 let dir = day_dir(cache_dir, day);
                 let path = dir.join(format!("{fs}_{key}.fdtrk"));
-                store.save(&path).map_err(|e| {
+                let (legs, points) = (store.legs.len(), store.n_points());
+                let published = CachedDay::publish(store, &path).map_err(|e| {
                     DataError(format!(
                         "could not cache completed day {}: {e}",
                         path.display()
@@ -712,11 +711,11 @@ pub fn fetch_window(
                     day.0,
                     day.1,
                     day.2,
-                    store.legs.len(),
-                    store.n_points(),
+                    legs,
+                    points,
                     path.display()
                 ));
-                day_stores[di] = Some(DayStore::Built(store));
+                day_stores[di] = Some(published);
                 Ok(())
             })
         });
@@ -743,7 +742,7 @@ pub fn fetch_window(
     }
 
     // ---- combine ----
-    let stores: Vec<DayStore> = day_stores.into_iter().flatten().collect();
+    let stores: Vec<CachedDay> = day_stores.into_iter().flatten().collect();
     if stores.is_empty() {
         return Err(DataError(
             "no ADS-B day stores available for the window".into(),
@@ -846,6 +845,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let (cached_tx, cached_rx) = std::sync::mpsc::sync_channel(0);
         let mut published = Vec::new();
+        let mut retained: Vec<Option<CachedDay>> = (0..paths.len()).map(|_| None).collect();
         let failures = std::thread::scope(|s| {
             let paths = &paths;
             s.spawn(move || {
@@ -868,7 +868,7 @@ mod tests {
             });
             collect_streamed_days(rx, vec![2, 1, 1], |di, parts, tags| {
                 let store = build_store(parts, &sp, tags);
-                store.save(&paths[di])?;
+                retained[di] = Some(CachedDay::publish(store, &paths[di])?);
                 published.push(di);
                 if di == 0 {
                     cached_tx.send(()).unwrap();
@@ -884,6 +884,12 @@ mod tests {
         let last = TrackStore::load(&paths[2]).unwrap();
         assert_eq!(last.legs.len(), 1);
         assert_eq!(last.meta.sources, ["prod"]);
+        let selected = load_selected_stores(retained.into_iter().flatten().collect(), &sp).unwrap();
+        assert_eq!(selected.len(), 3);
+        assert!(selected.iter().all(|store| store.legs.len() == 1));
+        assert_eq!(selected[0].meta.sources, ["mlat", "prod"]);
+        assert_eq!(selected[1].meta.sources, ["prod"]);
+        assert_eq!(selected[2].meta.sources, ["prod"]);
     }
 
     #[test]
@@ -1306,12 +1312,12 @@ mod tests {
             })
         );
 
-        // The same selection works with one fresh in-memory day. It discards unrelated
+        // The same selection works with one freshly published day. It discards unrelated
         // aircraft but retains the selected aircraft's earlier leg and both original metas.
         let selected = load_selected_stores(
             vec![
-                DayStore::Cached(CachedDay::scan(&paths[0]).unwrap()),
-                DayStore::Built(original[1].clone()),
+                CachedDay::scan(&paths[0]).unwrap(),
+                CachedDay::publish(original[1].clone(), &paths[1]).unwrap(),
             ],
             &spec,
         )
@@ -1347,7 +1353,7 @@ mod tests {
         let empty = load_selected_stores(
             paths
                 .iter()
-                .map(|p| DayStore::Cached(CachedDay::scan(p).unwrap()))
+                .map(|p| CachedDay::scan(p).unwrap())
                 .collect(),
             &empty_spec,
         )
@@ -1359,6 +1365,101 @@ mod tests {
                 serde_json::to_value(&kept.meta).unwrap(),
                 serde_json::to_value(&all.meta).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn published_days_match_the_full_merge_after_cache_replacement() {
+        let (mut spec, mut original) = cached_subset_fixture();
+        let mut later = original[1].clone();
+        later.legs.retain(|leg| leg.icao == "000002");
+        for leg in &mut later.legs {
+            for p in &mut leg.points {
+                p.t += 86_400.0;
+            }
+        }
+        later.meta.t_start += 86_400.0;
+        later.meta.t_end += 86_400.0;
+        later.meta.created_unix += 86_400.0;
+        later.meta.sources = vec!["synthetic-day-2".into()];
+        later.meta.stats = serde_json::json!({"fixture_day": 2, "legs": later.legs.len()});
+        original.push(later);
+        spec.t_end += 86_400.0;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-published-days-{}-{nonce}",
+            std::process::id()
+        ));
+        for keep_unknown in [true, false] {
+            spec.keep_unknown = keep_unknown;
+            let published: Vec<_> = original
+                .iter()
+                .enumerate()
+                .map(|(i, store)| {
+                    let path = dir.join(format!("day-{i}.fdtrk"));
+                    let day = CachedDay::publish(store.clone(), &path).unwrap();
+                    assert_eq!(day.leg_count, store.legs.len());
+                    // Another publisher can replace every public cache name while
+                    // later downloads continue. Our summaries still describe our files.
+                    let mut replacement = store.clone();
+                    replacement.legs.clear();
+                    replacement.meta.sources = vec!["replacement".into()];
+                    replacement.save(&path).unwrap();
+                    assert!(TrackStore::load(&path).unwrap().legs.is_empty());
+                    day
+                })
+                .collect();
+            let selected = load_selected_stores(published, &spec).unwrap();
+            assert_eq!(selected.len(), 3);
+            assert!(selected[2].legs.is_empty());
+            assert!(
+                selected.iter().map(TrackStore::n_points).sum::<usize>()
+                    < original.iter().map(TrackStore::n_points).sum::<usize>()
+            );
+            for (kept, all) in selected.iter().zip(&original) {
+                assert_eq!(
+                    serde_json::to_value(&kept.meta).unwrap(),
+                    serde_json::to_value(&all.meta).unwrap()
+                );
+            }
+            let finish = |mut stores: Vec<TrackStore>| {
+                for store in &mut stores {
+                    adjust_geoid(store, spec.geoid_n_m);
+                    if !keep_unknown {
+                        store.legs.retain(|leg| leg.engine != EngineClass::Unknown);
+                    }
+                }
+                merge_stores(stores, DAY_JOIN_GAP_S)
+                    .filtered(&spec.bbox, spec.t_start, spec.t_end)
+            };
+            let expected = finish(original.clone());
+            let got = finish(selected);
+            assert_eq!(got.legs.len(), expected.legs.len());
+            for (actual, expected) in got.legs.iter().zip(&expected.legs) {
+                assert_eq!(actual.key, expected.key);
+                assert_eq!(actual.icao, expected.icao);
+                assert_eq!(actual.reg, expected.reg);
+                assert_eq!(actual.typ, expected.typ);
+                assert_eq!(actual.engine, expected.engine);
+                assert_eq!(actual.source, expected.source);
+                assert_eq!(actual.points, expected.points);
+            }
+            let crossing = got.legs.iter().find(|leg| leg.icao == "000001").unwrap();
+            assert_eq!(crossing.key, "000001_20260908_1");
+            assert_eq!(crossing.points.len(), 6);
+            assert_eq!(got.legs.iter().any(|leg| leg.icao == "000004"), keep_unknown);
+            let adjusted = got.legs.iter().find(|leg| leg.icao == "000005").unwrap();
+            assert_eq!(adjusted.points[0].alt_src, alt_src::BARO_RAW);
+            assert_eq!(adjusted.points[0].alt_m, 1200.0);
+            assert_eq!(adjusted.points[1].alt_m, 1208.0);
+            assert_eq!(got.meta.sources, expected.meta.sources);
+            assert_eq!(got.meta.bbox, expected.meta.bbox);
+            assert_eq!(got.meta.t_start, expected.meta.t_start);
+            assert_eq!(got.meta.t_end, expected.meta.t_end);
+            assert_eq!(got.meta.geoid_n_m, expected.meta.geoid_n_m);
         }
     }
 
