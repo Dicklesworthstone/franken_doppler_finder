@@ -172,9 +172,9 @@ pass in the pass list, out to 15 km. Most of those passes are more than 3 km awa
 lines of passes within 3 km can score differently from those of passes beyond it. For the tonal oracle, at St.
 Augustine Beach and Deerfield Beach the near ones score higher (pilot medians 1.75 against 1.58, and 2.27 against
 1.49), so a close pass looked heard when it scored only as a close pass scores by chance. At the busiest sites the far
-ones score higher (Bryant Park 4.87 against 5.45, Fremont Street 2.71 against 4.39), which hides close passes instead.
-Band power splits at some sites too. On Deerfield Beach's pilot its near chance lines score far lower (1.49 dB against
-4.20), which hid that pilot's close passes.
+ones score higher (Bryant Park 4.87 against 5.45, Fremont Street 2.71 against 4.39), which works against close passes
+instead. Band power splits at some sites too. On Deerfield Beach's pilot its near chance lines score far lower (1.49
+dB against 4.20), which hid that pilot's close passes.
 
 The rule is not changed, and set H's result stands as the rule's result. What it shows changes.
 
@@ -196,18 +196,28 @@ site, on the pilot or on the test hour. South Ponte Vedra's 6 of 40 (0.67, `SET_
 
 Read this way, St. Augustine Beach pier would not have qualified: the tonal result that set H was made for does not
 hold. Deerfield Beach would have qualified on band power instead (n 7, m 0.75, 28 chance lines), and band power hears
-its test hour too. No other pilot of sets G or H qualifies on either method under this read. So Deerfield Beach is
+its test hour too. No other pilot read in sets G or H qualifies on either method under this read. So Deerfield Beach is
 the one case where any method hears the aircraft, and that method is band power, which fdop does not use.
 
 The tonal method's control (step 8) ran on the development recordings, whose passes are loud. It showed that the
 method can hear a loud pass. It did not test whether its chance level is fair at a quiet site.
 
+### Checked where nothing can be heard
+
+The split is in the tonal score, not in the sound at these sites. The tonal oracle was run with St. Augustine's and
+Deerfield's test pass lists on `g_mackinawcity`'s test audio, where none of those aircraft can be heard, so every line
+is chance. The near lines still score higher (medians 1.66 against 1.46, and 1.67 against 1.47). Read as step 8 reads,
+both lists qualify as heard (6 of 18, 0.79; 2 of 10, 0.73). Against the close passes' own chance lines, both are out
+(1 of 18, 0.63; 1 of 10, 0.53). Band power on the same audio splits little and qualifies neither (0.41 and 0.41 as
+read, 0.44 and 0.51 against close chance lines), so its 0.80 on Deerfield's own test audio is not the read's doing.
+
 ### What this changes above
 
 - "Found after the runs": its tonal counts (7 of 18 and 6 of 10) carry the same bias. Its statement that the aimed
   filter finds the aircraft on the test hours is wrong for the tonal filter. It holds for band power at Deerfield
-  Beach. Its comparisons of best scores do not depend on the pool and stand: against only the close passes' chance
-  lines, the best is still 2.15 against the true passes' 2.01 at St. Augustine, and 2.79 against 2.49 at Deerfield.
+  Beach. Its comparisons of best scores stand: against only the close passes' chance lines, the best is still 2.15
+  against the true passes' 2.01 at St. Augustine, and 2.79 against 2.49 at Deerfield. Its "10 pilots in sets G and H
+  that had a close pass and were heard" are the 10 whose hearing read ran, not 10 heard above chance.
 - "So set H's cases are solvable in the sense its rule fixed": true only in the letter of the rule. fdop's tonal
   filter, aimed with the true passes, does not find either case's aircraft above chance.
 
