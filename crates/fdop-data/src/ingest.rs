@@ -587,11 +587,42 @@ pub(crate) fn retain_with_neighbours(pts: &[RawPoint], keep: &[bool], k: usize) 
 struct CountingReader<R> {
     inner: R,
     count: Arc<AtomicU64>,
+    saw_eof: bool,
+}
+
+impl<R: Read> CountingReader<R> {
+    /// The tar iterator accepts bare EOF and stops after its first zero block. Require
+    /// both end blocks, then drain padding through transport EOF before publishing a day.
+    fn finish_tar(mut self) -> Result<(), DataError> {
+        if self.saw_eof {
+            return Err(DataError("tar is missing the end-of-archive marker".into()));
+        }
+        let mut block = [0u8; 512];
+        self.read_exact(&mut block)
+            .map_err(|e| DataError(format!("tar end marker: {e}")))?;
+        if block.iter().any(|b| *b != 0) {
+            return Err(DataError("tar end marker contains nonzero bytes".into()));
+        }
+        let mut padding = [0u8; 8192];
+        loop {
+            match self.read(&mut padding) {
+                Ok(0) => return Ok(()),
+                Ok(n) => {
+                    if padding[..n].iter().any(|b| *b != 0) {
+                        return Err(DataError("tar has nonzero data after its end marker".into()));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(DataError(format!("tar transport completion: {e}"))),
+            }
+        }
+    }
 }
 
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
+        self.saw_eof |= n == 0 && !buf.is_empty();
         self.count.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
@@ -639,6 +670,7 @@ pub fn ingest_reader<R: Read + Send>(
     let reader = CountingReader {
         inner: r,
         count: count.clone(),
+        saw_eof: false,
     };
     let (tx, rx) = sync_channel::<Vec<(String, Vec<u8>)>>(2);
     let started = Instant::now();
@@ -679,6 +711,7 @@ pub fn ingest_reader<R: Read + Send>(
                     }
                 }
             }
+            archive.into_inner().finish_tar()?;
             if !batch.is_empty() {
                 let _ = tx.send(batch);
             }
@@ -845,6 +878,72 @@ pub(crate) mod tests {
             b.append_data(&mut h, name, data.as_slice()).unwrap();
         }
         b.into_inner().unwrap()
+    }
+
+    #[test]
+    fn tar_requires_both_end_blocks_after_the_last_member() {
+        let bytes = tar_of(&[("trace_full_a1b2c3.json", gz(&pc12_json()))]);
+        let payload_end = bytes.len() - 1024;
+        for tail in [0, 1, 511, 512, 513, 1023] {
+            let result =
+                ingest_reader(&bytes[..payload_end + tail], "prod", &spec(), &|_| {});
+            assert!(result.is_err(), "accepted only {tail} end-marker bytes");
+        }
+        let mut corrupt = bytes;
+        let second_block = corrupt.len() - 512;
+        corrupt[second_block] = 1;
+        assert!(ingest_reader(corrupt.as_slice(), "prod", &spec(), &|_| {}).is_err());
+    }
+
+    #[test]
+    fn tar_checks_transport_completion_after_the_end_marker() {
+        struct FailsAtEof<R>(R);
+        impl<R: Read> Read for FailsAtEof<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.read(buf)? {
+                    0 if !buf.is_empty() => Err(std::io::Error::other("transport incomplete")),
+                    n => Ok(n),
+                }
+            }
+        }
+        let bytes = tar_of(&[("trace_full_a1b2c3.json", gz(&pc12_json()))]);
+        let error = ingest_reader(FailsAtEof(bytes.as_slice()), "prod", &spec(), &|_| {})
+            .expect_err("tar end markers cannot prove the HTTP response completed");
+        assert!(error.to_string().contains("transport incomplete"));
+    }
+
+    #[test]
+    fn tar_drains_zero_padding_and_keeps_split_member_boundaries() {
+        struct Chunks<R>(R, usize);
+        impl<R: Read> Read for Chunks<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(self.1);
+                self.0.read(&mut buf[..n])
+            }
+        }
+        let mut bytes = tar_of(&[("trace_full_a1b2c3.json", gz(&pc12_json()))]);
+        bytes.resize(bytes.len() + 9 * 512, 0); // normal tar blocking-factor padding
+        for split in [1, 17, 511, 512, 1025] {
+            let (head, tail) = bytes.split_at(split);
+            let reader = head.chain(tail);
+            let (aircraft, stats) =
+                ingest_reader(Chunks(reader, 37), "prod", &spec(), &|_| {}).unwrap();
+            assert_eq!(aircraft.len(), 1);
+            assert_eq!(aircraft[0].icao, "a1b2c3");
+            assert_eq!(stats.members, 1);
+            assert_eq!(stats.bytes, bytes.len() as u64);
+        }
+        let empty = tar_of(&[]);
+        let (aircraft, stats) = ingest_reader(empty.as_slice(), "prod", &spec(), &|_| {}).unwrap();
+        assert!(aircraft.is_empty());
+        assert_eq!(stats.bytes, empty.len() as u64);
+    }
+
+    #[test]
+    fn tar_rejects_nonzero_data_after_the_end_marker() {
+        let mut bytes = tar_of(&[("trace_full_a1b2c3.json", gz(&pc12_json()))]);
+        bytes.extend_from_slice(b"unexpected second archive or damaged padding");
+        assert!(ingest_reader(bytes.as_slice(), "prod", &spec(), &|_| {}).is_err());
     }
 
     /// PC-12: 10 rows, rows 0-1 outside bbox (west), row 2 "ground", rows 3-9 inside, a

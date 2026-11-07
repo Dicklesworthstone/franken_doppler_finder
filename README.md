@@ -810,10 +810,19 @@ days are ready for the final merge. The saved handle stays attached to that day'
 replaces its public cache pathname. Active ingestion, incomplete days, the day currently being built,
 and the final selected tracks still consume memory; this is not a total process-memory bound.
 
-An incomplete release listing captured before the publication window closes is rechecked online until
-both prod and MLAT are present or a successful post-window lookup confirms the missing feed. An early
-prod-only listing therefore cannot become permanent merely because the day has aged. Offline runs
-continue to use the cached listing and report missing feeds.
+Every release listing captured before the publication window closes is rechecked online. Split-archive
+listings are also rechecked before each uncached online download, regardless of age: a contiguous
+`.aa`, `.ab`, ... prefix cannot prove that its final piece is present. Existing complete day-store hits
+bypass that lookup, and settled whole-tar metadata remains reusable. Archive parts must be one matching
+tar or a contiguous split sequence; checksum sidecars are ignored, and missing, duplicate, empty or
+unfinished parts are rejected. Offline runs use valid cached listings and retain missing-feed warnings.
+
+An ingested archive is complete only after both tar end blocks and the entire transport have been
+read. Missing end blocks, a late download failure or nonzero trailing data prevent that feed's day
+store from being published; ordinary zero padding is consumed. This also catches a missing final split
+part even if every listed part downloaded successfully. Existing day stores cannot reveal whether an
+older ingester accepted an incomplete source archive; recovering such missing data requires fresh
+ingestion.
 
 When neighboring track stores overlap, reports within the existing 0.05 s duplicate interval
 prefer non-MLAT positions even if an MLAT report arrived slightly earlier. The merge preserves
@@ -1166,6 +1175,15 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Complete archive ingestion (2026-11-07): native validation pending
+
+New regressions require both tar end blocks, surface errors reported after the marker, accept zero
+padding and short reads across split boundaries, and reject nonzero trailing data. Release tests cover
+sidecar exclusion, contiguous parts, unfinished uploads, malformed cached parts, early listings and
+post-window split listings that still need refresh. These native tests remain unrun because the executor
+became unavailable; independent source review does not establish an end-to-end archive replay or
+workspace pass.
 
 ### Conservative trajectory bounds (2026-11-07): native validation pending
 

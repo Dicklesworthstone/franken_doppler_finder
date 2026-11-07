@@ -108,31 +108,58 @@ fn api_headers() -> Vec<(String, String)> {
     h
 }
 
-/// Parse a GitHub release JSON object into a [`DayRelease`] (tar parts only, name-ordered).
+/// A release is either one tar or the consecutive split pieces of that same tar.
+/// A final missing piece is detected by the tar terminator when the stream is ingested.
+fn valid_archive_parts(tag: &str, parts: &[AssetPart]) -> bool {
+    if parts.is_empty()
+        || parts.len() > 26 * 26
+        || parts.iter().any(|p| p.size == 0 || p.url.is_empty())
+    {
+        return false;
+    }
+    let stem = format!("{tag}.tar");
+    if parts.len() == 1 && parts[0].name == stem {
+        return true;
+    }
+    parts.iter().enumerate().all(|(i, p)| {
+        p.name
+            == format!(
+                "{stem}.{}{}",
+                char::from(b'a' + (i / 26) as u8),
+                char::from(b'a' + (i % 26) as u8)
+            )
+    })
+}
+
+/// Parse a usable uploaded tar asset set, ignoring sidecars and unrelated files.
+/// Split parts must start at .aa with no gaps or duplicates; an incomplete upload
+/// or a mixture of the full tar and split pieces is not a usable release.
 pub fn parse_release_json(v: &serde_json::Value, feed: Feed, repo: &str) -> Option<DayRelease> {
     let tag = v.get("tag_name")?.as_str()?.to_string();
-    let mut parts: Vec<AssetPart> = v
-        .get("assets")?
-        .as_array()?
-        .iter()
-        .filter_map(|a| {
-            let name = a.get("name")?.as_str()?.to_string();
-            let is_tar = name.ends_with(".tar") || name.contains(".tar.");
-            if !is_tar {
-                return None;
-            }
-            Some(AssetPart {
-                url: a.get("browser_download_url")?.as_str()?.to_string(),
-                size: a.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
-                name,
-            })
-        })
-        .collect();
-    if parts.is_empty() {
-        return None;
+    let stem = format!("{tag}.tar");
+    let prefix = format!("{stem}.");
+    let mut parts = Vec::new();
+    for asset in v.get("assets")?.as_array()? {
+        let Some(name) = asset.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let split = name.strip_prefix(&prefix).is_some_and(|suffix| {
+            suffix.len() == 2 && suffix.bytes().all(|b| b.is_ascii_lowercase())
+        });
+        if name != stem && !split {
+            continue;
+        }
+        if asset.get("state").is_some_and(|s| s.as_str() != Some("uploaded")) {
+            return None;
+        }
+        parts.push(AssetPart {
+            name: name.to_string(),
+            url: asset.get("browser_download_url")?.as_str()?.to_string(),
+            size: asset.get("size")?.as_u64()?,
+        });
     }
     parts.sort_by(|a, b| a.name.cmp(&b.name));
-    Some(DayRelease {
+    valid_archive_parts(&tag, &parts).then_some(DayRelease {
         feed,
         repo: repo.to_string(),
         tag,
@@ -210,13 +237,15 @@ fn day_settled_at(y: i64, m: u32, d: u32, checked_at: f64) -> bool {
     end + crate::fetch::PUBLISH_LAG_S < checked_at
 }
 
-/// An incomplete listing is final only if it was fetched after the publication window.
-/// A prod-only listing fetched before MLAT appeared does not become complete by ageing.
-/// The atomic cache write records the successful lookup time in the file's mtime; if that
-/// evidence is unavailable, an online caller must check again.
+/// Only whole-tar listings fetched after the publication window can be final.
+/// Split releases have no asset-count manifest: even a contiguous prefix can omit the
+/// last piece. Re-list them before an uncached download; complete day-store hits bypass
+/// release lookup altogether. Missing lookup-time evidence also requires an online check.
 fn cached_listing_final(v: &[DayRelease], y: i64, m: u32, d: u32, path: &Path) -> bool {
-    releases_complete(v)
-        || std::fs::metadata(path)
+    !v.is_empty()
+        && v.iter().all(|r| valid_archive_parts(&r.tag, &r.parts))
+        && v.iter().all(|r| r.parts.len() == 1 && r.parts[0].name.ends_with(".tar"))
+        && std::fs::metadata(path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -224,9 +253,9 @@ fn cached_listing_final(v: &[DayRelease], y: i64, m: u32, d: u32, path: &Path) -
 }
 
 /// [`find_day_releases`] with a JSON cache at `<dir>/releases.json`. Only non-empty results are
-/// cached. An incomplete listing (no prod or no mlatonly) fetched before the day
-/// [settled](day_settled) is re-checked, even on later runs: the missing release may have been
-/// published since that lookup. `offline` never touches the network.
+/// cached. Every listing fetched before the day [settled](day_settled), and every split-archive
+/// listing regardless of age, is re-checked: missing feeds or final split assets may have been
+/// published since that lookup. `offline` never touches the network and uses valid cached sets.
 pub fn find_day_releases_cached(
     net: Option<&Net>,
     y: i64,
@@ -239,7 +268,7 @@ pub fn find_day_releases_cached(
     let cached = std::fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice::<Vec<DayRelease>>(&b).ok())
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty() && v.iter().all(|r| valid_archive_parts(&r.tag, &r.parts)));
     if let Some(v) = &cached
         && (offline || cached_listing_final(v, y, m, d, &path))
     {
@@ -257,19 +286,12 @@ pub fn find_day_releases_cached(
         }
     };
     let rels = find_day_releases(net, y, m, d)?;
-    if rels.is_empty()
-        && let Some(v) = cached
-    {
-        return Ok(v);
-    }
     if !rels.is_empty() {
         std::fs::create_dir_all(dir)?;
-        let tmp = dir.join("releases.json.part");
-        std::fs::write(
-            &tmp,
-            serde_json::to_vec_pretty(&rels).map_err(|e| DataError(e.to_string()))?,
+        fdop_http::write_atomic(
+            &path,
+            &serde_json::to_vec_pretty(&rels).map_err(|e| DataError(e.to_string()))?,
         )?;
-        std::fs::rename(&tmp, &path)?;
     }
     Ok(rels)
 }
@@ -284,7 +306,7 @@ mod tests {
             repo: repo_for_year(2026),
             tag: tag_for(2026, 9, 8, feed, 0),
             parts: vec![AssetPart {
-                name: format!("{}.tar", feed.tag_word()),
+                name: format!("{}.tar", tag_for(2026, 9, 8, feed, 0)),
                 url: format!("https://example.invalid/{}.tar", feed.tag_word()),
                 size: 1024,
             }],
@@ -344,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_release_cache_is_final_before_the_day_settles() {
+    fn both_feed_release_cache_stays_provisional_while_assets_can_arrive() {
         let dir = cache_dir("complete");
         let path = dir.join("releases.json");
         let checked_at = fdop_types::time::unix_from_utc(2026, 9, 9, 1, 0, 0.0);
@@ -353,15 +375,17 @@ mod tests {
         let staging = cached_release(Feed::Staging);
         for releases in [vec![prod.clone(), mlat.clone()], vec![staging, mlat]] {
             write_listing(&path, &releases, checked_at);
-            assert_eq!(
-                cached_listing_final(&releases, 2026, 9, 8, &path),
-                releases_complete(&releases),
-                "staging plus MLAT still needs a later check for prod"
+            assert!(
+                !cached_listing_final(&releases, 2026, 9, 8, &path),
+                "both feed releases can exist before the final split asset is uploaded"
             );
             assert_eq!(
                 find_day_releases_cached(None, 2026, 9, 8, &dir, true).unwrap(),
                 releases
             );
+            let settled = checked_at - 3600.0 + crate::fetch::PUBLISH_LAG_S + 1.0;
+            write_listing(&path, &releases, settled);
+            assert!(cached_listing_final(&releases, 2026, 9, 8, &path));
         }
         let absent = dir.join("missing.json");
         assert!(!cached_listing_final(
@@ -371,7 +395,7 @@ mod tests {
             8,
             &absent
         ));
-        assert!(cached_listing_final(
+        assert!(!cached_listing_final(
             &[prod, cached_release(Feed::Mlatonly)],
             2026,
             9,
@@ -412,5 +436,102 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn release_parts_ignore_sidecars_and_require_a_complete_ordered_prefix() {
+        let release = |names: &[&str]| {
+            serde_json::json!({
+                "tag_name": "day",
+                "assets": names.iter().map(|name| serde_json::json!({
+                    "name": name,
+                    "size": 1024,
+                    "state": "uploaded",
+                    "browser_download_url": format!("https://example.invalid/{name}")
+                })).collect::<Vec<_>>()
+            })
+        };
+        for (names, expected_len) in [
+            (vec!["day.tar", "day.tar.sha256", "notes.txt"], 1),
+            (vec!["day.tar.ab", "day.tar.sha256", "day.tar.aa"], 2),
+        ] {
+            let parsed = parse_release_json(&release(&names), Feed::Prod, "r").unwrap();
+            assert!(parsed.parts.iter().all(|p| !p.name.ends_with("sha256")));
+            assert_eq!(parsed.parts.len(), expected_len);
+        }
+        for names in [
+            vec!["day.tar.ab"],
+            vec!["day.tar.aa", "day.tar.ac"],
+            vec!["day.tar", "day.tar.aa"],
+            vec!["day.tar.aa", "day.tar.aa"],
+            vec!["unrelated.tar"],
+        ] {
+            assert!(
+                parse_release_json(&release(&names), Feed::Prod, "r").is_none(),
+                "{names:?}"
+            );
+        }
+        for (key, value) in [
+            ("size", serde_json::json!(0)),
+            ("state", serde_json::json!("starter")),
+            ("browser_download_url", serde_json::json!(null)),
+        ] {
+            let mut incomplete = release(&["day.tar.aa", "day.tar.ab"]);
+            incomplete["assets"][1][key] = value;
+            assert!(
+                parse_release_json(&incomplete, Feed::Prod, "r").is_none(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_cached_parts_do_not_become_a_final_release_listing() {
+        let dir = cache_dir("missing-part");
+        let path = dir.join("releases.json");
+        let mut prod = cached_release(Feed::Prod);
+        prod.parts[0].name.push_str(".ab"); // the .aa prefix is missing
+        let checked_at = fdop_types::time::unix_from_utc(2026, 9, 11, 1, 0, 0.0);
+        let releases = vec![prod, cached_release(Feed::Mlatonly)];
+        write_listing(&path, &releases, checked_at);
+        assert!(!cached_listing_final(&releases, 2026, 9, 8, &path));
+        assert!(
+            find_day_releases_cached(None, 2026, 9, 8, &dir, true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn split_release_listings_remain_refreshable_after_the_publication_window() {
+        let dir = cache_dir("late-split-part");
+        let path = dir.join("releases.json");
+        let checked_at = fdop_types::time::unix_from_utc(2026, 9, 11, 1, 0, 0.0);
+        assert!(day_settled_at(2026, 9, 8, checked_at));
+        let mut prod = cached_release(Feed::Prod);
+        prod.parts = ["aa", "ab"]
+            .iter()
+            .map(|suffix| AssetPart {
+                name: format!("{}.tar.{suffix}", prod.tag),
+                url: format!("https://example.invalid/archive.tar.{suffix}"),
+                size: 2_000_000_000,
+            })
+            .collect();
+        for part_count in [1, 2] {
+            let mut partial = prod.clone();
+            partial.parts.truncate(part_count);
+            let releases = vec![partial, cached_release(Feed::Mlatonly)];
+            write_listing(&path, &releases, checked_at);
+            assert!(releases_complete(&releases));
+            assert!(
+                !cached_listing_final(&releases, 2026, 9, 8, &path),
+                "feed presence and a contiguous split prefix cannot prove the final part exists"
+            );
+            assert_eq!(
+                find_day_releases_cached(None, 2026, 9, 8, &dir, true).unwrap(),
+                releases,
+                "offline access preserves the available listing"
+            );
+        }
     }
 }

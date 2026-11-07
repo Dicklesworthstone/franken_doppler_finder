@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Require complete flight archives before publishing a day's tracks
+
+- Require both tar end blocks and drain the complete underlying stream before ingestion succeeds.
+  A missing final archive part, truncation at a member boundary, a late HTTP error or nonzero trailing
+  bytes can no longer be mistaken for a complete feed. Normal zero padding remains accepted.
+- Select only the release's own full tar or contiguous two-letter split pieces. Ignore checksum
+  sidecars; reject gaps, duplicates, mixed full/split sets, empty assets and unfinished uploads.
+  Validate cached part lists too, and publish release metadata through private atomic staging.
+- Keep every pre-publication listing provisional, including ones containing both prod and MLAT.
+  Always re-list split archives before an uncached online download: a valid prefix cannot prove
+  the last part exists, even after the publication window. Complete day-cache hits bypass API
+  lookup, while offline mode still uses valid cached metadata. A newly empty lookup no longer
+  silently restores an older listing.
+- Add termination, transport, split-boundary, sidecar and listing-refresh regressions. These native
+  tests remain unrun after the executor outage; this change has independent source review.
+- Existing day stores do not retain proof of their source tar's completeness. This prevents new
+  incomplete ingestion; it cannot reconstruct tracks absent from an older cache.
+
 ### Skip unreachable trajectories before repeated exact-curve scoring
 
 - Build conservative trajectory bounds once per regional shortlist and reuse them across real and
