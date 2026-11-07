@@ -257,7 +257,7 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
 | no unheard close pass | no tonal aircraft passed much closer than the heard ones without leaving a detection |
 | radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
 | curve match | listed when the [curve match](#the-curve-match) stands: the answer is within 3 km of where it stands. Also listed, failed, on a medium answer when the curve match ran with enough decoy clocks to judge (40) and stands nowhere |
-| measurement line | listed, failed, only on a medium answer that rests on a core match measured past the old line (a detection score under 4.5, past the strongest 24, or found only on the contrast image) when no curve match ran with enough decoy clocks to judge it |
+| measurement line | listed, failed, only on a medium answer that rests on a core match measured past the old line (a detection score under 4.5, past the strongest 24, found only on the contrast image, or recovered from a harmonic after its primary failed) when no curve match ran with enough decoy clocks to judge it |
 
 Refinement uses the grid to find a basin, then improves the observer position with a bounded continuous
 search that evaluates the same physical trace model at every proposed point. The grid spacing controls
@@ -579,9 +579,11 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 ### `fdop detect <MEDIA>`: flyovers only, no ADS-B
 
 Detects flyovers and measures them strongest first, from the silence line up, until 24 independent aircraft
-events survive the same eligibility and harmonic checks used by `locate`. Refused fits, non-aircraft fits and
-duplicate traces of one pass do not consume that allowance. Every measured result remains in `events.json`,
-including duplicates and refusals. A warning on stderr says when either cap omits candidates, when the audio
+events survive the same eligibility and harmonic checks used by `locate`. If a family's primary fails,
+its detected harmonic siblings are tried strongest first until one passes the existing quality and aircraft
+gates. The family supplies at most one result. Refused fits, non-aircraft fits and duplicate traces of one
+pass do not consume that allowance. The selected result for each measured family remains in `events.json`,
+including duplicates and unrecovered refusals. A warning on stderr says when either cap omits candidates, when the audio
 looks high-passed, or when the survey image was raised because its spread was under 0.5. A detection found
 only on the contrast image of such a recording has `"from_contrast": true` in `events.json`. The command
 writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv` for every fitted event. The default
@@ -873,6 +875,12 @@ Design notes:
   accepts it; `reseeded` in `events.json` marks it. Accepted fits, and refusals whose trace held both sides, are
   measured exactly as before. A wrong fit can pass this way too: a climbing pass in a clip that starts mid-drop
   trades speed against distance, and the retry accepts the wrong pair.
+- **A failed primary can yield to a usable harmonic.** A bright harmonic may lose its ridge through the
+  drop while another tone from the same pass remains measurable. Both `locate` and `detect` try the
+  primary first, then its detected siblings in score order only if the primary fails the quality or
+  aircraft bounds. The first usable sibling supplies the family's single event. If none passes, the
+  original primary refusal remains. The recovered detection retains its `harmonic_of` link and always
+  counts as measured past the old line, including when the primary had a strong survey score.
 - **Measurement slots belong to independent aircraft events.** The same measured-curve comparison used by
   the search groups duplicate seeds and harmonics before deciding whether the 24-event allowance is full.
   Fits below the existing aircraft limits (28 m/s or 200 m closest distance) do not fill it either. Later

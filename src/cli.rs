@@ -334,7 +334,8 @@ fn run(cli: Cli) -> Result<i32, String> {
             }
             let mp = fdop_core::measure::MeasureParams::default();
             // As in `locate`: every primary from the silence line up, strongest first, until
-            // MAX_MEASURED independent aircraft events survive the search's existing checks.
+            // MAX_MEASURED independent aircraft events survive the search's existing checks;
+            // a detected harmonic can rescue an unusable primary, once for the whole family.
             let max_measured = fdop_core::measure::MAX_MEASURED;
             let prim: Vec<_> = dets
                 .iter()
@@ -349,10 +350,12 @@ fn run(cli: Cli) -> Result<i32, String> {
                         .par_iter()
                         .enumerate()
                         .map(|(i, det)| {
-                            fdop_core::measure::measure(
+                            fdop_core::measure::measure_family(
                                 &x,
                                 4000,
-                                &fdop_core::detect::refine(&lin, det, dp.c),
+                                &lin,
+                                det,
+                                &dets,
                                 &format!("e{}", ranks.start + i + 1),
                                 &mp,
                             )

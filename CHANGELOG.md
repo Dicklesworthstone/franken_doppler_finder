@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover a usable harmonic when its primary measurement fails
+
+- Measure each detection family's primary first. If it fails the existing quality or aircraft
+  eligibility gates, try its detected harmonic siblings in descending score order, with detection
+  ID breaking ties. Return the first usable sibling, or the original primary refusal when none
+  passes. An already usable primary follows the same measurement path as before.
+- Use the shared family measurement in locate, detect and the detector example. Keep one result
+  and one independent-event opportunity per family, preserve the measured sibling's harmonic link,
+  and retain the existing final duplicate grouping and 24-event cap.
+- Count a recovered harmonic as measured past the old line even when its original primary was
+  strong. A medium answer relying on that added evidence still needs the existing curve-match
+  judgment; recovery does not grant the primary's old calibration status.
+- Add three PCM regressions for a broken bright harmonic with a recoverable fundamental and
+  another independent flyover, an unchanged usable primary, and retention of the primary refusal
+  when no sibling is usable. Extend the measurement-line regression for recovery provenance.
+- **Validation.** Synthetic regressions were added, but core compilation and test execution did
+  not complete before the executor became unavailable. The recovered source has not been rerun;
+  real-recording accuracy and confidence calibration remain unvalidated.
+
 ### Bound STFT working storage for long recordings
 
 - Replace the complete column-major spectrogram and its per-frame allocations with a reusable block

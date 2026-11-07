@@ -86,8 +86,7 @@ fn main() {
     let evs: Vec<_> = prim
         .par_iter()
         .map(|d| {
-            let r = detect::refine(&lin, d, p.c);
-            fdop_core::measure::measure(&x, sr, &r, &format!("d{}", d.id), &mp)
+            fdop_core::measure::measure_family(&x, sr, &lin, d, &dets, &format!("d{}", d.id), &mp)
         })
         .collect();
     println!(

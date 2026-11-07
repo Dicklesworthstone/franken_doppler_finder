@@ -161,6 +161,16 @@ impl MeasuredEvent {
     pub fn t_rec(&self) -> f64 {
         self.fit.as_ref().map_or(self.detection.t0r, |f| f.best.t0r)
     }
+
+    /// The search's existing aircraft bounds, in addition to the measurement gates. A
+    /// quality-passing fit to a nearby slow source must not consume an aircraft's place.
+    pub fn is_aircraft_like(&self) -> bool {
+        self.quality.ok
+            && self
+                .fit
+                .as_ref()
+                .is_some_and(|f| f.best.v >= 28.0 && f.best.d >= 200.0)
+    }
 }
 
 fn model_fn(f0: f64, v: f64, d: f64, t0r: f64, c: f64) -> impl Fn(f64) -> f64 {
@@ -359,6 +369,45 @@ fn guided_trace_with_background(
 /// Measure one detection. `x` is the whole recording at `sr`; times are recording seconds.
 pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams) -> MeasuredEvent {
     measure_with_fit(x, sr, det, id, p, prepare_constant_velocity)
+}
+
+/// Refine and measure a detection family's primary, then try its detected harmonics only if
+/// the primary cannot supply an aircraft event. A strong survey harmonic can lose its ridge
+/// around the CPA while another harmonic of the same pass remains measurable.
+///
+/// A usable primary is returned unchanged. Otherwise the first usable sibling, strongest
+/// survey score first, supplies the family's one event; if none succeeds, keep the primary's
+/// refusal. The selected detection retains its `harmonic_of` link, so callers can distinguish
+/// a recovery from an event measured by the primary alone when grading the expanded search.
+pub fn measure_family(
+    x: &[f32],
+    sr: u32,
+    survey: &Spec,
+    primary: &Detection,
+    detections: &[Detection],
+    id: &str,
+    p: &MeasureParams,
+) -> MeasuredEvent {
+    let attempt = |d: &Detection| {
+        let refined = crate::detect::refine(survey, d, p.c);
+        measure(x, sr, &refined, id, p)
+    };
+    let first = attempt(primary);
+    if first.is_aircraft_like() {
+        return first;
+    }
+    let mut siblings: Vec<_> = detections
+        .iter()
+        .filter(|d| d.harmonic_of == Some(primary.id))
+        .collect();
+    siblings.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    for sibling in siblings {
+        let recovered = attempt(sibling);
+        if recovered.is_aircraft_like() {
+            return recovered;
+        }
+    }
+    first
 }
 
 /// Least number of points a guided trace needs to be fitted (and so to be followed afresh).
@@ -800,6 +849,162 @@ mod tests {
             })
             .collect();
         measure(&x, sr, &det, "e1", p)
+    }
+
+    /// Two aircraft in real PCM, the first with a strong second harmonic and a weaker
+    /// fundamental. The supplied survey seeds identify their already-grouped family; the
+    /// tests exercise actual refinement, ridge measurement, fitting and search selection.
+    fn harmonic_family_scene(broken_primary: bool, fundamental: bool) -> (Vec<f32>, Vec<Detection>) {
+        let (sr, c) = (4000u32, 343.0);
+        let primary = Detection {
+            id: 41,
+            t0r: 110.0,
+            f0: 236.0,
+            v: 120.0,
+            d: 1500.0,
+            score: 12.0,
+            score_approach: 12.0,
+            score_recede: 12.0,
+            half_s: 60.0,
+            harmonic_of: None,
+            harmonics: vec![0.5],
+            from_contrast: false,
+        };
+        let sibling = Detection {
+            id: 7,
+            f0: 118.0,
+            score: 8.0,
+            score_approach: 8.0,
+            score_recede: 8.0,
+            harmonic_of: Some(primary.id),
+            harmonics: Vec::new(),
+            ..primary.clone()
+        };
+        let other = Detection {
+            id: 23,
+            t0r: 270.0,
+            f0: 165.0,
+            v: 76.0,
+            d: 1800.0,
+            score: 10.0,
+            score_approach: 10.0,
+            score_recede: 10.0,
+            harmonics: Vec::new(),
+            ..primary.clone()
+        };
+        let asymptotes = readouts(primary.f0, primary.v, primary.d, c);
+        let tones = [&primary, &sibling, &other];
+        let (mut seed, mut phases) = (789u64, [0.0f64; 3]);
+        let x = (0..sr as usize * 360)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr as f64;
+                let mut sample = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+                for (k, d) in tones.iter().enumerate() {
+                    let f = cv_curve(t, d.f0, d.v, d.d, d.t0r - d.d / c, c);
+                    phases[k] += std::f64::consts::TAU * f / sr as f64;
+                    let way = (asymptotes.f_pre - f) / (asymptotes.f_pre - asymptotes.f_post);
+                    let quiet = (k == 0 && broken_primary && (0.03..=0.97).contains(&way))
+                        || (k == 1 && !fundamental);
+                    if !quiet {
+                        sample += [0.24, 0.08, 0.10][k] * phases[k].sin();
+                    }
+                }
+                sample as f32
+            })
+            .collect();
+        // Family membership is by ID, not slice index or adjacency.
+        (x, vec![sibling, other, primary])
+    }
+
+    #[test]
+    fn harmonic_sibling_recovers_a_refused_primary_as_one_aircraft_event() {
+        let (x, detections) = harmonic_family_scene(true, true);
+        let dp = DetectParams::default();
+        let (_, lin) = survey(&x, 4000, &dp).unwrap();
+        let mp = MeasureParams::default();
+        let primary = &detections[2];
+        let original = measure(&x, 4000, &refine(&lin, primary, mp.c), "e1", &mp);
+        assert!(!original.is_aircraft_like(), "{:?}", original.quality);
+
+        let primaries = [primary, &detections[1]];
+        let events = measure_ranked_counted(
+            primaries.len(),
+            2,
+            |ranks| {
+                ranks
+                    .map(|k| {
+                        measure_family(
+                            &x,
+                            4000,
+                            &lin,
+                            primaries[k],
+                            &detections,
+                            &format!("e{}", k + 1),
+                            &mp,
+                        )
+                    })
+                    .collect()
+            },
+            |events| crate::search::independent_measured_events(events, 0.0).len(),
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].detection.id, detections[0].id);
+        assert_eq!(events[0].detection.harmonic_of, Some(primary.id));
+        assert_eq!(events[1].detection.id, detections[1].id);
+        assert_eq!(
+            crate::search::independent_measured_events(&events, 0.0).len(),
+            2
+        );
+        for (event, truth) in events.iter().zip([&detections[0], &detections[1]]) {
+            assert!(event.is_aircraft_like(), "{:?}", event.quality);
+            let b = event.fit.as_ref().unwrap().best;
+            assert!((b.f0 - truth.f0).abs() < 0.3, "{b:?}");
+            assert!((b.t0r - truth.t0r).abs() < 0.3, "{b:?}");
+            assert!((b.v - truth.v).abs() < 4.0, "{b:?}");
+            assert!((b.d / truth.d - 1.0).abs() < 0.08, "{b:?}");
+        }
+    }
+
+    #[test]
+    fn harmonic_family_preserves_a_usable_primary_unchanged() {
+        let (x, detections) = harmonic_family_scene(false, true);
+        let dp = DetectParams::default();
+        let (_, lin) = survey(&x, 4000, &dp).unwrap();
+        let mp = MeasureParams::default();
+        let primary = &detections[2];
+        let original = measure(&x, 4000, &refine(&lin, primary, mp.c), "e1", &mp);
+        assert!(original.is_aircraft_like(), "{:?}", original.quality);
+        let selected = measure_family(&x, 4000, &lin, primary, &detections, "e1", &mp);
+        assert_eq!(
+            serde_json::to_value(&selected).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(
+            selected.spec.as_ref().unwrap().db,
+            original.spec.as_ref().unwrap().db
+        );
+    }
+
+    #[test]
+    fn harmonic_family_preserves_refusal_when_its_siblings_fail() {
+        let (x, detections) = harmonic_family_scene(true, false);
+        let dp = DetectParams::default();
+        let (_, lin) = survey(&x, 4000, &dp).unwrap();
+        let mp = MeasureParams::default();
+        let primary = &detections[2];
+        let original = measure(&x, 4000, &refine(&lin, primary, mp.c), "e1", &mp);
+        assert!(!original.is_aircraft_like(), "{:?}", original.quality);
+        let selected = measure_family(&x, 4000, &lin, primary, &detections, "e1", &mp);
+        // An unrelated aircraft is audible, but it must not substitute for this family.
+        assert_eq!(
+            serde_json::to_value(&selected).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(selected.detection.id, primary.id);
+        assert!(!selected.is_aircraft_like());
     }
 
     #[test]

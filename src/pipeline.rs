@@ -335,10 +335,19 @@ fn curve_call(
 }
 
 /// Whether the measurement at rank `k`, of detection `d`, is one the old measurement line would not
-/// have made: past the strongest `max_measured`, a primary whose detection scored under `thr_db`, or
-/// one found only on the contrast image (`Detection::from_contrast`), which no null run has tested.
-fn past_the_old_line(k: usize, d: &Detection, max_measured: usize, thr_db: f64) -> bool {
-    k >= max_measured || d.score < thr_db || d.from_contrast
+/// have made: past the strongest `max_measured`, a primary whose detection scored under `thr_db`,
+/// one found only on the contrast image, or a harmonic that rescued an unusable primary.
+fn past_the_old_line(
+    k: usize,
+    primary: &Detection,
+    measured: &Detection,
+    max_measured: usize,
+    thr_db: f64,
+) -> bool {
+    k >= max_measured
+        || primary.score < thr_db
+        || primary.from_contrast
+        || measured.harmonic_of.is_some()
 }
 
 /// A trace answer graded medium whose core matches include an event the old measurement line would
@@ -819,8 +828,9 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     };
     // Every primary detection from the silence line up is a candidate, strongest first: the
     // detection score does not separate flyovers from tones (pure noise peaks near 3), the
-    // measurement gates do. Duplicate or non-aircraft fits do not use up the allowance:
-    // measuring goes down the list until MAX_MEASURED independent aircraft events survive.
+    // measurement gates do. An unusable primary gets one chance from each detected harmonic,
+    // keeping at most one event for its family. Duplicate or non-aircraft fits do not use up
+    // the allowance: continue until MAX_MEASURED independent aircraft events survive.
     let max_measured = measure::MAX_MEASURED;
     let prim: Vec<&Detection> = dets
         .iter()
@@ -834,8 +844,15 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                 .par_iter()
                 .enumerate()
                 .map(|(i, d)| {
-                    let r = detect::refine(&lin, d, c);
-                    measure::measure(&x, a.sr, &r, &format!("e{}", ranks.start + i + 1), &mp)
+                    measure::measure_family(
+                        &x,
+                        a.sr,
+                        &lin,
+                        d,
+                        &dets,
+                        &format!("e{}", ranks.start + i + 1),
+                        &mp,
+                    )
                 })
                 .collect()
         },
@@ -852,7 +869,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     // curve match to judge it, an answer that rests on one of them cannot be medium
     // (`leans_on_added`).
     let added_ranks: std::collections::HashSet<String> = (0..events.len())
-        .filter(|&k| past_the_old_line(k, prim[k], max_measured, dp.thr_db))
+        .filter(|&k| past_the_old_line(k, prim[k], &events[k].detection, max_measured, dp.thr_db))
         .map(|k| format!("e{}", k + 1))
         .collect();
     drop(x);
@@ -866,7 +883,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         e.id = id;
     }
     log.say(&format!(
-        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, or found only on the contrast image)",
+        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, found only on the contrast image, or recovered from a harmonic)",
         added.len(),
         dp.thr_db
     ));
@@ -2159,9 +2176,9 @@ mod tests {
     }
 
     /// The old line measured the strongest `max_measured` primaries scoring `thr_db` or more on the
-    /// survey image; anything else, including a contrast-stage find however strong, is added.
+    /// survey image; anything else, including contrast finds and harmonic recoveries, is added.
     #[test]
-    fn contrast_stage_finds_are_measured_past_the_old_line() {
+    fn contrast_and_harmonic_recoveries_are_measured_past_the_old_line() {
         let det = |score: f64, from_contrast: bool| Detection {
             id: 0,
             t0r: 30.0,
@@ -2176,11 +2193,40 @@ mod tests {
             harmonics: Vec::new(),
             from_contrast,
         };
-        assert!(!past_the_old_line(0, &det(6.0, false), 24, 4.5));
-        assert!(!past_the_old_line(23, &det(4.5, false), 24, 4.5));
-        assert!(past_the_old_line(24, &det(9.0, false), 24, 4.5));
-        assert!(past_the_old_line(0, &det(4.4, false), 24, 4.5));
-        assert!(past_the_old_line(0, &det(9.0, true), 24, 4.5));
+        let primary_only = |rank, d: Detection| past_the_old_line(rank, &d, &d, 24, 4.5);
+        assert!(!primary_only(0, det(6.0, false)));
+        assert!(!primary_only(23, det(4.5, false)));
+        assert!(primary_only(24, det(9.0, false)));
+        assert!(primary_only(0, det(4.4, false)));
+        assert!(primary_only(0, det(9.0, true)));
+
+        let primary = det(9.0, false);
+        let mut measured = primary.clone();
+        // Refinement replaces the survey score with a different statistic. A normal primary
+        // is still judged by its original score, not the refined one.
+        measured.score = 1.0;
+        assert!(!past_the_old_line(0, &primary, &measured, 24, 4.5));
+        measured.id = 3;
+        measured.harmonic_of = Some(primary.id);
+        let added = if past_the_old_line(0, &primary, &measured, 24, 4.5) {
+            ["e1".to_string()].into()
+        } else {
+            std::collections::HashSet::new()
+        };
+        assert!(leans_on_added(
+            "medium",
+            CurveCall::Silent,
+            false,
+            &["e1"],
+            &added
+        ));
+        assert!(!leans_on_added(
+            "medium",
+            CurveCall::Agrees,
+            true,
+            &["e1"],
+            &added
+        ));
     }
 
     /// Events measured past the old line hold up a medium answer only where the curve match judged it.
