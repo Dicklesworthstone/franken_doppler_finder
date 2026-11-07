@@ -1,8 +1,9 @@
 //! Media probing (ffprobe) and decoding to mono f32 PCM (ffmpeg).
 
 use serde::Serialize;
+use std::io::{self, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Zero-based audio-stream ordinal and optional channel within that stream. With no
 /// channel selected, FFmpeg downmixes the selected stream to mono as before.
@@ -189,6 +190,103 @@ pub fn decode(path: &Path, start: f64, dur: Option<f64>, sr: u32) -> Result<Vec<
     decode_with_selection(path, start, dur, sr, AudioSelection::default())
 }
 
+// Keep the conversion buffer and error output bounded. The final samples remain in memory
+// for detection, but decoding must not also retain the entire byte representation of them.
+const DECODE_BUFFER_BYTES: usize = 64 * 1024;
+
+fn read_pcm(mut input: impl Read) -> io::Result<Vec<f32>> {
+    let mut samples = Vec::new();
+    let mut buffer = [0u8; DECODE_BUFFER_BYTES];
+    let mut pending = 0;
+    loop {
+        let read = match input.read(&mut buffer[pending..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let available = pending + read;
+        let complete = available / 4 * 4;
+        let (words, _) = buffer[..complete].as_chunks::<4>();
+        samples.try_reserve(words.len()).map_err(|e| {
+            io::Error::new(io::ErrorKind::OutOfMemory, format!("decoded audio: {e}"))
+        })?;
+        samples.extend(words.iter().map(|word| f32::from_le_bytes(*word)));
+        buffer.copy_within(complete..available, 0);
+        pending = available - complete;
+    }
+    if pending != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "ffmpeg ended inside a 32-bit PCM sample",
+        ));
+    }
+    Ok(samples)
+}
+
+fn read_decoder_errors(mut input: impl Read) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    input
+        .by_ref()
+        .take(DECODE_BUFFER_BYTES as u64)
+        .read_to_end(&mut bytes)?;
+    // Continue draining even after retaining enough diagnostics, or a full stderr pipe
+    // could stop FFmpeg while the sample reader waits for its next block.
+    let omitted = io::copy(&mut input, &mut io::sink())?;
+    let mut text = String::from_utf8_lossy(&bytes).trim().to_owned();
+    if omitted > 0 {
+        text.push_str(&format!(
+            "\n[ffmpeg stderr truncated; {omitted} further bytes omitted]"
+        ));
+    }
+    Ok(text)
+}
+
+fn decode_command(mut cmd: Command) -> Result<Vec<f32>, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ffmpeg not runnable ({e}); install ffmpeg"))?;
+    let stderr = child.stderr.take().expect("piped ffmpeg stderr");
+    let errors = match std::thread::Builder::new().spawn(move || read_decoder_errors(stderr)) {
+        Ok(reader) => reader,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("ffmpeg error reader could not start: {e}"));
+        }
+    };
+    let samples = read_pcm(child.stdout.take().expect("piped ffmpeg stdout"));
+    if samples.is_err() {
+        // Reap our decoder even after an input/allocation error; it may otherwise be
+        // blocked writing samples that the caller can no longer consume.
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let errors = errors
+        .join()
+        .map_err(|_| "ffmpeg error reader panicked".to_string())?
+        .map_err(|e| format!("ffmpeg error output: {e}"))?;
+    let samples = samples.map_err(|e| {
+        if errors.is_empty() {
+            format!("ffmpeg PCM output: {e}")
+        } else {
+            format!("ffmpeg PCM output: {e}; {errors}")
+        }
+    })?;
+    let status = status.map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    if !status.success() {
+        return Err(format!("ffmpeg decode failed: {errors}"));
+    }
+    Ok(samples)
+}
+
 /// Decode one audio stream, optionally taking one channel instead of downmixing. The
 /// selected channel retains its amplitude and container-relative packet timestamps.
 pub fn decode_with_selection(
@@ -243,22 +341,127 @@ pub fn decode_with_selection(
         cmd.args(["-t", &format!("{d:.3}")]);
     }
     cmd.args(["-f", "f32le", "-"]);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("ffmpeg not runnable ({e}); install ffmpeg"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "ffmpeg decode failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let (chunks, _) = out.stdout.as_chunks::<4>();
-    Ok(chunks.iter().map(|c| f32::from_le_bytes(*c)).collect())
+    decode_command(cmd)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_pcm_preserves_samples_across_partial_reads() {
+        struct Fragments<'a> {
+            bytes: &'a [u8],
+            limit: usize,
+            interrupt: bool,
+        }
+        impl Read for Fragments<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.interrupt {
+                    self.interrupt = false;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.interrupt = true;
+                let n = buffer.len().min(self.limit);
+                self.bytes.read(&mut buffer[..n])
+            }
+        }
+        let values = [0.0, -0.0, 1.0, -1.0, f32::MIN_POSITIVE, f32::MAX, f32::NAN];
+        let expected: Vec<u32> = (0..40_001)
+            .map(|i| values[i % values.len()].to_bits())
+            .collect();
+        let bytes: Vec<u8> = expected
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        for limit in [1, 2, 3, 4, 7, 4093, DECODE_BUFFER_BYTES] {
+            let actual = read_pcm(Fragments {
+                bytes: &bytes,
+                limit,
+                interrupt: true,
+            })
+            .unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected,
+                "read fragment size {limit}"
+            );
+        }
+        assert!(read_pcm(&[][..]).unwrap().is_empty());
+        for missing in 1..=3 {
+            let err = read_pcm(&bytes[..bytes.len() - missing]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[test]
+    fn decoder_errors_are_bounded_and_fully_drained() {
+        let bytes = vec![b'x'; DECODE_BUFFER_BYTES * 3 + 7];
+        let mut cursor = io::Cursor::new(&bytes);
+        let errors = read_decoder_errors(&mut cursor).unwrap();
+        assert_eq!(cursor.position() as usize, bytes.len());
+        assert!(errors.starts_with(&"x".repeat(DECODE_BUFFER_BYTES)));
+        assert!(errors.ends_with(&format!(
+            "[ffmpeg stderr truncated; {} further bytes omitted]",
+            bytes.len() - DECODE_BUFFER_BYTES
+        )));
+        assert!(errors.len() < DECODE_BUFFER_BYTES + 100);
+        assert_eq!(
+            read_decoder_errors(&b"  real decoder error\n"[..]).unwrap(),
+            "real decoder error"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg"]
+    fn streamed_ffmpeg_matches_buffered_decode_and_reports_failure() {
+        let command = || {
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=137:sample_rate=4000:duration=17",
+                "-f",
+                "f32le",
+                "-",
+            ]);
+            cmd
+        };
+        let expected = command().output().unwrap();
+        assert!(expected.status.success());
+        let actual = decode_command(command()).unwrap();
+        assert_eq!(actual.len() * 4, expected.stdout.len());
+        assert!(
+            actual
+                .iter()
+                .zip(expected.stdout.chunks_exact(4))
+                .all(|(sample, word)| sample.to_le_bytes().as_slice() == word)
+        );
+        let mut invalid = Command::new("ffmpeg");
+        invalid.args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "fdop_filter_that_does_not_exist",
+            "-f",
+            "f32le",
+            "-",
+        ]);
+        let error = decode_command(invalid).unwrap_err();
+        assert!(error.contains("ffmpeg decode failed"), "{error}");
+        assert!(error.contains("fdop_filter_that_does_not_exist"), "{error}");
+    }
 
     #[test]
     fn iso6709() {

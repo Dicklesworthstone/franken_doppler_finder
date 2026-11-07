@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Stream decoded audio without retaining a second full PCM recording
+
+- Convert FFmpeg stdout incrementally into the final sample vector with a 64 KiB byte buffer.
+  Preserve partial sample words across reads, retry interrupted reads and reject truncated words.
+  This removes the full raw-byte copy previously held alongside the decoded floats (57.6 MB per
+  hour at 4 kHz mono); the final vector remains resident and may have spare capacity. No measured
+  total-memory reduction or end-to-end speedup is claimed.
+- Drain decoder stderr concurrently while retaining at most 64 KiB of its original bytes. Keep
+  truncation visible, preserve failure diagnostics, close stdin as before, and reap the decoder
+  on sample-read or worker-start failure. Keep the existing selection and timestamp filters.
+- Add fragmented/interrupted-read and bounded-diagnostic regressions, plus a real FFmpeg
+  integration comparing every decoded sample byte with the old buffered path and checking
+  nonzero decoder failures.
+- **Validation:** the complete actual audio module, built with the pinned nightly and real
+  shared-type/serde dependencies, passed four ordinary tests and all four opt-in FFmpeg/FFprobe
+  integrations, including the existing channel/timestamp cases. Formatting passed. The published
+  source was checked against the tested snapshot's SHA-256 after executor recovery failed.
+  These are component checks; workspace gates, release selftest and real-recording replay were
+  not completed for this change.
+- Follow-up validation of the earlier weather-deadline repair: all 13 actual helper/test component
+  checks passed with the real atmospheric types, including the seven new regressions; weather
+  and pipeline formatting passed. This does not validate the full data crate or network pipeline.
+
 ### Load the metadata attempt before requiring the full date range
 
 - Resolve the recording's metadata clock before archive availability and data loading. A timestamp
