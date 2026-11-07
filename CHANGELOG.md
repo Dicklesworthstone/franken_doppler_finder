@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Scale candidate deduplication without dropping comparisons
+
+- Large candidate groups sharing the same event-flight matches now use a spatial/clock index before
+  the original strict 300 m and 5 s duplicate test. Small groups retain the direct scan; unusual
+  coordinates or clocks retain the original fallback. Only retained candidates enter the index,
+  preserving greedy representatives and output order without introducing a search cap.
+- A copy of the previous algorithm is the regression oracle. Tests cover shuffled candidate clouds,
+  reordered match sets, strict distance/clock boundaries, discarded-middle-point chains, cell edges,
+  poles, the antimeridian and nonfinite or out-of-domain inputs.
+- `benchmark_dedupe_large_clouds`, compiled from the actual code with pinned optimized Rust on a
+  shared AMD EPYC 9V74 host, preserved the exact retained identities and order in both 16,000-candidate
+  cases. At 100 m spacing, 1,370 were retained: 300.219 ms before, 27.336 ms indexed. At 1 km spacing,
+  all were retained: 3.885 s before, 62.172 ms indexed. These single trials measure deduplication only;
+  no whole-search or real-recording speedup is claimed.
+- **Validation.** Both new regressions and the benchmark passed in the standalone actual-code harness;
+  the changed source passed rustfmt. The focused Cargo build was killed by SIGKILL inside upstream
+  `fsci-linalg`, before compiling `fdop-core`. Workspace tests, core Clippy, selftest and reference/negative
+  replays remain unconfirmed. Separately, the integrated cache changes now passed all 22 `fdop-types`
+  tests (including seven store tests) and that crate's all-target Clippy check with warnings denied.
+
 ### Say which scatter the model-misfit warning divided by
 
 - **The fault.** The model-misfit test divides a fit's RMS by the trace's local scatter, floored at 0.03 Hz, but

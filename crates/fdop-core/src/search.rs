@@ -2378,11 +2378,100 @@ fn finalize_candidates(
     }
 }
 
-/// Same place (300 m), clock (5 s) and set of event-flight matches.
+/// Conservative Cartesian/clock cell for duplicate lookup. On the same sphere as haversine,
+/// chord distance is at most arc distance: a duplicate must be in an adjacent cell on every
+/// axis. The extra metre covers rounding, including at poles and the antimeridian. Clock
+/// cells use exact binary division and are wider than the unchanged five-second predicate.
+fn dedupe_cell(c: &Candidate) -> Option<[i64; 4]> {
+    if !(-90.0..=90.0).contains(&c.lat)
+        || !(-180.0..=180.0).contains(&c.lon)
+        || !c.t_start_utc.is_finite()
+        || c.t_start_utc.abs() > (1_u64 << 52) as f64
+    {
+        return None;
+    }
+    let (sp, cp) = c.lat.to_radians().sin_cos();
+    let (sl, cl) = c.lon.to_radians().sin_cos();
+    let scale = fdop_types::geo::EARTH_R / 301.0;
+    Some([
+        (scale * cp * cl).floor() as i64,
+        (scale * cp * sl).floor() as i64,
+        (scale * sp).floor() as i64,
+        (c.t_start_utc / 8.0).floor() as i64,
+    ])
+}
+
+#[derive(Default)]
+struct DedupeGroup {
+    kept: Vec<usize>,
+    cells: HashMap<[i64; 4], Vec<usize>>,
+    unindexed: Vec<usize>,
+}
+
+impl DedupeGroup {
+    // Avoid hash-neighbor probes for small groups, which are cheaper to scan directly.
+    const INDEX_AT: usize = 64;
+
+    fn is_duplicate(&self, f: &Candidate, out: &[Candidate]) -> bool {
+        let near = |&i: &usize| {
+            let o = &out[i];
+            haversine_m(o.lat, o.lon, f.lat, f.lon) < 300.0
+                && (o.t_start_utc - f.t_start_utc).abs() < 5.0
+        };
+        if self.kept.len() < Self::INDEX_AT {
+            return self.kept.iter().any(near);
+        }
+        let Some([x, y, z, t]) = dedupe_cell(f) else {
+            return self.kept.iter().any(near);
+        };
+        // An out-of-domain longitude can still represent the same place. Both lookup
+        // directions must retain the original predicate rather than silently losing it.
+        if self.unindexed.iter().any(near) {
+            return true;
+        }
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for dt in -1..=1 {
+                        if self
+                            .cells
+                            .get(&[x + dx, y + dy, z + dz, t + dt])
+                            .is_some_and(|indices| indices.iter().any(near))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn index(&mut self, i: usize, c: &Candidate) {
+        if let Some(cell) = dedupe_cell(c) {
+            self.cells.entry(cell).or_default().push(i);
+        } else {
+            self.unindexed.push(i);
+        }
+    }
+
+    fn push(&mut self, i: usize, out: &[Candidate]) {
+        self.kept.push(i);
+        if self.kept.len() == Self::INDEX_AT {
+            for j in 0..self.kept.len() {
+                let k = self.kept[j];
+                self.index(k, &out[k]);
+            }
+        } else if self.kept.len() > Self::INDEX_AT {
+            self.index(i, &out[i]);
+        }
+    }
+}
+
+/// Same place (300 m), clock (5 s) and set of event-flight matches. Preserve the sorted
+/// input's greedy representatives; large groups only compare nearby retained candidates.
 fn dedupe(sorted: Vec<Candidate>) -> Vec<Candidate> {
-    // only candidates with the same matches can be duplicates, so compare with those alone: a
-    // complete search keeps hundreds of thousands of candidates
-    let mut kept_with: HashMap<Vec<(String, String)>, Vec<usize>> = HashMap::new();
+    let mut kept_with: HashMap<Vec<(String, String)>, DedupeGroup> = HashMap::new();
     let mut out: Vec<Candidate> = Vec::new();
     for f in sorted {
         let mut matches: Vec<(String, String)> = f
@@ -2392,14 +2481,9 @@ fn dedupe(sorted: Vec<Candidate>) -> Vec<Candidate> {
             .collect();
         matches.sort();
         let kept = kept_with.entry(matches).or_default();
-        let dup = kept.iter().any(|&i| {
-            let o: &Candidate = &out[i];
-            haversine_m(o.lat, o.lon, f.lat, f.lon) < 300.0
-                && (o.t_start_utc - f.t_start_utc).abs() < 5.0
-        });
-        if !dup {
-            kept.push(out.len());
+        if !kept.is_duplicate(&f, &out) {
             out.push(f);
+            kept.push(out.len() - 1, &out);
         }
     }
     out
@@ -4396,6 +4480,231 @@ mod tests {
         assert_eq!(top.events[1].event, "e3");
         assert!(top.events.iter().all(|m| m.core));
         assert!((top.t_start_utc - true_clock).abs() < 1.0);
+    }
+
+    // The pre-index implementation is an independent oracle for greedy representative
+    // selection, including unusual floating-point inputs and differently ordered matches.
+    fn dedupe_linear_oracle(sorted: Vec<Candidate>) -> Vec<Candidate> {
+        let mut kept_with: HashMap<Vec<(String, String)>, Vec<usize>> = HashMap::new();
+        let mut out: Vec<Candidate> = Vec::new();
+        for f in sorted {
+            let mut matches: Vec<(String, String)> = f
+                .events
+                .iter()
+                .map(|m| (m.event.clone(), m.flight.clone()))
+                .collect();
+            matches.sort();
+            let kept = kept_with.entry(matches).or_default();
+            let dup = kept.iter().any(|&i| {
+                let o = &out[i];
+                haversine_m(o.lat, o.lon, f.lat, f.lon) < 300.0
+                    && (o.t_start_utc - f.t_start_utc).abs() < 5.0
+            });
+            if !dup {
+                kept.push(out.len());
+                out.push(f);
+            }
+        }
+        out
+    }
+
+    fn dedupe_fixture(lat: f64, lon: f64, t_start_utc: f64) -> Candidate {
+        Candidate {
+            lat,
+            lon,
+            t_start_utc,
+            events: [("e1", "A"), ("e2", "B")]
+                .into_iter()
+                .map(|(e, f)| EventMatch {
+                    event: e.into(),
+                    flight: f.into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn dedupe_signature(candidates: &[Candidate]) -> Vec<[u64; 4]> {
+        candidates
+            .iter()
+            .map(|c| {
+                [
+                    c.score.to_bits(),
+                    c.lat.to_bits(),
+                    c.lon.to_bits(),
+                    c.t_start_utc.to_bits(),
+                ]
+            })
+            .collect()
+    }
+
+    fn checked_dedupe(mut input: Vec<Candidate>) -> Vec<Candidate> {
+        // Unique identities let the comparison check representatives and order even when
+        // all the position/clock fields are identical or contain NaNs.
+        for (i, c) in input.iter_mut().enumerate() {
+            c.score = i as f64;
+        }
+        let expected = dedupe_linear_oracle(input.clone());
+        let actual = dedupe(input);
+        assert_eq!(dedupe_signature(&actual), dedupe_signature(&expected));
+        actual
+    }
+
+    #[test]
+    fn dedupe_index_preserves_boundaries_and_greedy_representatives() {
+        let check = |tail: Vec<(f64, f64, f64)>, expected_kept: Option<usize>| {
+            // Retain enough earlier candidates with this match set to activate the index.
+            let mut input: Vec<_> = (0..96)
+                .map(|i| dedupe_fixture(20.0, 30.0, -10_000.0 - 16.0 * i as f64))
+                .collect();
+            input.extend(tail.into_iter().map(|(a, b, t)| dedupe_fixture(a, b, t)));
+            let out = checked_dedupe(input);
+            if let Some(n) = expected_kept {
+                assert_eq!(out.len(), 96 + n);
+            }
+            out.into_iter().skip(96).collect::<Vec<_>>()
+        };
+        let deg = |m: f64| (m / fdop_types::geo::EARTH_R).to_degrees();
+        let chain = check(
+            vec![
+                (0.0, 0.0, 0.0),
+                (0.0, deg(250.0), 0.0),
+                (0.0, deg(500.0), 0.0),
+            ],
+            Some(2),
+        );
+        assert_eq!(chain[0].score, 96.0);
+        assert_eq!(
+            chain[1].score, 98.0,
+            "a discarded middle point cannot suppress a later one"
+        );
+        check(
+            vec![
+                (0.0, 0.0, 0.0),
+                (0.0, deg(299.999_999), 0.0),
+                (0.0, deg(300.0), 0.0),
+                (0.0, deg(300.000_001), 0.0),
+            ],
+            Some(2),
+        );
+        let clocks = check(
+            vec![
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 4.999_999),
+                (0.0, 0.0, 5.0),
+                (0.0, 0.0, -5.0),
+            ],
+            Some(3),
+        );
+        assert_eq!(
+            clocks.iter().map(|c| c.score).collect::<Vec<_>>(),
+            [96.0, 98.0, 99.0]
+        );
+
+        let r = fdop_types::geo::EARTH_R;
+        let x_edge = ((r / 301.0).floor() * 301.0 / r).acos().to_degrees();
+        let yz_edge = (301.0 / r).asin().to_degrees();
+        for (lat, lon) in [(0.0, x_edge), (0.0, yz_edge), (yz_edge, 0.0), (0.0, 0.0)] {
+            for clock in [-8.0, 0.0, 8.0, 1_789_574_400.0] {
+                check(
+                    vec![
+                        (lat - 1e-8, lon - 1e-8, clock - 1e-6),
+                        (lat + 1e-8, lon + 1e-8, clock + 1e-6),
+                    ],
+                    Some(1),
+                );
+            }
+        }
+        for points in [
+            [(0.0, 179.9999, 0.0), (0.0, -179.9999, 0.0)],
+            [(89.9999, 0.0, 0.0), (89.9999, 180.0, 0.0)],
+            [(-89.9999, 0.0, 0.0), (-89.9999, 180.0, 0.0)],
+            [(0.0, 0.0, 0.0), (0.0, 360.0, 0.0)],
+            [(0.0, 360.0, 0.0), (0.0, 0.0, 0.0)],
+        ] {
+            check(points.to_vec(), Some(1));
+        }
+        let huge = (1_u64 << 52) as f64;
+        for (a, b) in [
+            (huge, huge + 1.0),
+            (huge + 1.0, huge),
+            (-huge, -huge - 1.0),
+            (1e300, 1e300),
+        ] {
+            check(vec![(0.0, 0.0, a), (0.0, 0.0, b)], Some(1));
+        }
+        for (lat, lon, clock) in [
+            (f64::NAN, 0.0, 0.0),
+            (0.0, f64::NAN, 0.0),
+            (f64::INFINITY, 0.0, 0.0),
+            (0.0, f64::NEG_INFINITY, 0.0),
+            (f64::MAX, f64::MAX, 0.0),
+            (0.0, 0.0, f64::NAN),
+            (0.0, 0.0, f64::INFINITY),
+            (0.0, 0.0, f64::NEG_INFINITY),
+        ] {
+            check(vec![(lat, lon, clock); 2], None);
+        }
+    }
+
+    #[test]
+    fn dedupe_index_matches_oracle_on_shuffled_clouds() {
+        let mut seed = 0x5129_4389_1234_5678_u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 32) as f64 / u32::MAX as f64
+        };
+        let mut input = Vec::new();
+        for i in 0..2_000 {
+            let mut c = dedupe_fixture(
+                20.0 + next() * 0.2,
+                30.0 + next() * 0.2,
+                [-12.0, 0.0, 1_789_574_400.0][i % 3] + next() * 24.0,
+            );
+            c.events[1].flight = format!("B{}", i % 3);
+            input.push(c.clone());
+            c.lat += 0.0001;
+            c.t_start_utc += 0.25;
+            c.events.reverse();
+            input.push(c);
+        }
+        for i in (1..input.len()).rev() {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            input.swap(i, (seed as usize) % (i + 1));
+        }
+        checked_dedupe(input);
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run with --release --ignored --nocapture"]
+    fn benchmark_dedupe_large_clouds() {
+        for spacing_m in [100.0, 1_000.0] {
+            let step = (spacing_m / fdop_types::geo::EARTH_R).to_degrees();
+            let input: Vec<_> = (0..16_000)
+                .map(|i| {
+                    let mut c = dedupe_fixture(
+                        20.0 + (i / 200) as f64 * step,
+                        30.0 + (i % 200) as f64 * step / 20.0_f64.to_radians().cos(),
+                        1_789_574_400.0,
+                    );
+                    c.score = i as f64;
+                    c
+                })
+                .collect();
+            let reference_input = input.clone();
+            let start = std::time::Instant::now();
+            let expected = dedupe_linear_oracle(reference_input);
+            let linear = start.elapsed();
+            let start = std::time::Instant::now();
+            let actual = dedupe(input);
+            let indexed = start.elapsed();
+            assert_eq!(dedupe_signature(&actual), dedupe_signature(&expected));
+            eprintln!(
+                "dedupe 16000 candidates, {spacing_m:.0} m spacing, {} retained: linear {linear:?}, indexed {indexed:?}",
+                actual.len()
+            );
+        }
     }
 
     #[test]

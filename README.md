@@ -997,6 +997,14 @@ timings show no material improvement in these probes; the clean-pair result does
 search speedup. The direct frequency kernel is algebraically equivalent, with worst observed relative
 error below 6e-15 against the previous formula in the numerical sweep.
 
+Candidate deduplication now indexes large groups by spherical position and clock while retaining the
+same 300 m / 5 s test, match sets, greedy representatives and ordering. The saved
+`benchmark_dedupe_large_clouds` compared 16,000 synthetic candidates against the previous algorithm on
+a shared AMD EPYC 9V74 host, using the pinned nightly and optimized standalone Rust: 300.2 ms to 27.3 ms
+at 100 m spacing (1,370 retained), and 3.885 s to 62.2 ms at 1 km spacing (16,000 retained).
+Both outputs matched exactly. These are single-trial deduplication measurements, not total search
+timings; real-recording runtime has not been remeasured.
+
 Weather retrieval overlaps audio analysis. After audio analysis, the pipeline waits up to 190 s for weather:
 the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. This retains
 the configured fallback allowance after the preferred request has been tried.
@@ -1007,9 +1015,15 @@ the configured fallback allowance after the preferred request has been tried.
 
 ### Recovery changes (2026-11-07): validation incomplete
 
-The cache-concurrency changes passed five store tests on the pinned nightly through RCH before
-integration with the concurrent upstream gzip-footer fix. The combined seven-test store suite has
-not been rerun. Compilation of the core changes was interrupted when the executor became unavailable.
+The integrated `fdop-types` crate passed all 22 library tests on the pinned nightly, including all seven
+store tests for footer validation, trailing members, staging collisions and concurrent writers.
+`cargo clippy -p fdop-types --all-targets --locked --offline -- -D warnings` also passed. These ran directly
+with one build job and unoptimized profiles because RCH is unavailable in this environment.
+
+The indexed-deduplication regressions and timing benchmark passed in an optimized standalone Rust
+harness extracted from the actual production functions, candidate fields, geodesy and saved tests.
+A focused `fdop-core` Cargo build then stopped in upstream `fsci-linalg` when rustc was killed by SIGKILL,
+before compiling the core crate. The standalone checks do not replace the complete crate or pipeline tests.
 
 The harmonic-family, nearby-return and bounded-STFT regressions are present but have not completed
 compilation or execution. The final patches were recovered through GitHub after the outage; full
