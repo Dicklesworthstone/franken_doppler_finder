@@ -442,8 +442,8 @@ mod tests {
         assert!(
             actual
                 .iter()
-                .zip(expected.stdout.chunks_exact(4))
-                .all(|(sample, word)| sample.to_le_bytes().as_slice() == word)
+                .zip(expected.stdout.as_chunks::<4>().0)
+                .all(|(sample, word)| sample.to_le_bytes() == *word)
         );
         let mut invalid = Command::new("ffmpeg");
         invalid.args([
