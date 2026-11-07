@@ -39,9 +39,10 @@ at that commit, not per-change commits.
 - **What did not work.** Replacing the survey image with the contrast image found 39 passes but was right at
   22 / 29 / 29 / 31 / 33, under `3f408f4`. Scoring the second image from the silence line gave the same
   answers as the strong line with 101 added events on set D instead of 54. Taking it from the levels without
-  the 20 dB ceiling made fewer strong curves of its own on swells of noise alone (top added scores 4.07 at 35 dB
-  and 4.82 at 40 dB, against 5.26 and 9.58), but N814SR_R07's first event became 91 m/s at 565 m, wrong at
-  15/30 and 20/40 %. The strong line and the ceiling were chosen on this development set.
+  the 20 dB ceiling made weaker curves of its own in a probe on swelled scenes (strongest 4.07 at 35 dB and 4.82
+  at 40 dB from the silence line, against 5.26 and 9.58 with the ceiling). At the strong line, though, it put
+  N814SR_R07's first event at 91 m/s and 565 m, right only at 30/60 % (right from 15/30 % on `3f408f4`), and set
+  D was right at 22 / 28 / 30 / 33 / 37. The strong line and the ceiling were chosen on this development set.
 - **Evidence.**
   - Metamorphic, on 11 scenes: an image at or above the floor has no contrast image and detects exactly as
     before. Under it, every detection without the stage is in the result with it, first and in order, field for
@@ -55,8 +56,8 @@ at that commit, not per-change commits.
     up to 16 from the contrast stage), give nothing that passes.
 - **Set D** (`fdop detect` on the 40 Livermore clips, read with `bench` `tools/score_d.py`; local runs of the
   bench-built binary `e93a269d`). With the stage: 39 found (38), 37 first event right (36), medians 5.5 m/s
-  (6.2 %) and 164.1 m (11.5 %), against 212.2 m. Right at 10/20, 15/30, 20/40, 25/50 and 30/60 % of speed and
-  distance:
+  (6.2 %) and 164.1 m (11.5 %), against 5.5 m/s (6.5 %) and 212.2 m (11.0 %). Right at 10/20, 15/30, 20/40,
+  25/50 and 30/60 % of speed and distance:
 
   | Tool | Found | Right at the five tolerances |
   |---|---|---|
@@ -67,8 +68,9 @@ at that commit, not per-change commits.
   | dopplertrack 40-450 Hz | 38 | 19 / 23 / 26 / 30 / 36 |
 
   The stage adds 54 events on 11 of the 12 clips under the floor; 18 pass the gates, 15 of them within 15 s of
-  the true CPA. Three clips' answers changed. N1387U_R44 is found, 41.4 m/s at 476 m, right from 25/50 %. On
-  N814SR_R07 (90 m/s, 1166 m) a new 249 Hz line comes first, 98.2 m/s at 1142 m, right from 10/20 %.
+  the true CPA (two of the other three are on clips with no trusted time). Three clips' answers changed.
+  N1387U_R44 is found, 41.4 m/s at 476 m, right from 25/50 %. On N814SR_R07 (90 m/s, 1166 m) a new 248 Hz line
+  comes first, 98.2 m/s at 1142 m, right from 10/20 %.
   N451EE_R45's first event is now a contrast detection on a 271 Hz line, 61.1 m/s at 531 m for 64 m/s and
   695 m, right from 15/30 % (54.5 m/s at 431 m, right from 20/40 %, before). Every other clip's answer is the
   same. fdop now has more right answers than every rival at every tolerance and finds as many passes as
