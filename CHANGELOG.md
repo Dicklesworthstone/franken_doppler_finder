@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve the physical pass when an aircraft returns nearby
+
+- Add a streaming iterator over local closest approaches within a time window. It retains the
+  existing two-second coarse scan and millisecond refinement, with constant scan storage. The
+  original globally closest approach remains available to callers that need it.
+- When a hypothesis already identifies a pass time, recover the interior local approach nearest
+  that time. Use it throughout pair evaluation, null calibration, clock checks, refinement and
+  explain-at diagnostics, so a closer return does not silently replace the selected pass.
+- Confirmation examines each local approach and applies the existing distance, speed, clock,
+  coverage and trace-fit gates to it. Duplicate exclusion compares the recovered physical pass:
+  a returning aircraft can confirm another event, while the same pass cannot count twice.
+- Add straight-pass and window-boundary regressions plus an independently synthesized narrow
+  circuit case. The circuit checks pair identity, confirmation and duplicate exclusion in still
+  air and wind, and the full search/refinement path with a third event used only as a confirmer.
+- **Validation.** These regressions were added but have not completed compilation or execution:
+  the executor disconnected during the core build and remained unavailable during recovery.
+  Workspace tests, Clippy, selftest and reference-recording replay remain unconfirmed.
+
 ### Recover a usable harmonic when its primary measurement fails
 
 - Measure each detection family's primary first. If it fails the existing quality or aircraft

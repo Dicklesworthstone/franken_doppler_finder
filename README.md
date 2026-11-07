@@ -912,11 +912,14 @@ Design notes:
 - **A location still needs two events after clock checks.** A candidate pruned to one flyover is removed.
   Newly promoted leaders receive the same clock checks before the winner is chosen, even when many higher
   scoring coincidences fail first. Separate passes by the same aircraft remain supported.
-- **Returning aircraft can confirm, and unheard returns still count.** Confirmation excludes an already
-  assigned physical pass rather than its entire track. A later pass by that aircraft can provide another
-  match, using the pair join's existing 30 s emission-CPA separation. An aircraft already heard once is
-  also checked for later, much closer passes with no detection; the half-distance and 25 s hearing rules
-  apply to those passes too.
+- **Returning aircraft keep distinct physical passes.** A hypothesis's emission time selects the
+  nearest interior local closest approach in time, so a closer return elsewhere in the window does not
+  replace its pass during pair scoring, clock checks or refinement. Confirmation considers each local
+  approach inside its existing window and applies the same timing, geometry and trace-fit gates.
+  It excludes an already assigned physical pass rather than its entire track, using the pair join's
+  existing 30 s emission-CPA separation. Another pass by that aircraft can therefore provide a match.
+  An aircraft already heard once is also checked for later, much closer passes with no detection;
+  the half-distance and 25 s hearing rules apply to those passes too.
 - **Repeated flight pairs keep their alternative recording clocks.** Quick-check survivors retain the
   pair join's 20 s clock cells when they merge into 1 km spatial cells. Two aircraft repeating their routes
   can therefore reach fine scoring at both plausible recording times, where another event can distinguish
@@ -1002,7 +1005,19 @@ the configured fallback allowance after the preferred request has been tried.
 
 ## Testing
 
-### Current checks (2026-11-06)
+### Recovery changes (2026-11-07): validation incomplete
+
+The cache-concurrency changes passed five store tests on the pinned nightly through RCH before
+integration with the concurrent upstream gzip-footer fix. The combined seven-test store suite has
+not been rerun. Compilation of the core changes was interrupted when the executor became unavailable.
+
+The harmonic-family, nearby-return and bounded-STFT regressions are present but have not completed
+compilation or execution. The final patches were recovered through GitHub after the outage; full
+workspace tests, Clippy, selftest and reference-recording replay remain unconfirmed. These changes
+make no claim of improved real-recording accuracy or calibrated confidence. See [CHANGELOG.md](CHANGELOG.md)
+for the exact scope and validation record; results below belong to the earlier builds identified there.
+
+### Previous checks (2026-11-06)
 
 These cover `c1cfa61`, the budget cap on `main`'s tip. They ran on its code: a `git archive` of an unpushed commit with the
 same code and older docs, built with the pinned `nightly-2026-08-31` toolchain and direct cargo on the benchmark machine, an

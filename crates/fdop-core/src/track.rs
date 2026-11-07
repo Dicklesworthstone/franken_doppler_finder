@@ -504,7 +504,8 @@ impl TrackModel {
             .then_some((te, r, ratio))
     }
 
-    /// Closest approach to `x` near `t_guess` (emission time): (t_e, d, speed, interior).
+    /// Smallest range to `x` near `t_guess` (emission time). A returning aircraft can have
+    /// several local CPAs in this interval; this chooses the closest in distance, not time.
     pub fn cpa_near(&self, x: V3, t_guess: f64, half: f64) -> Option<Cpa> {
         let lo = (t_guess - half).max(self.t0());
         let hi = (t_guess + half).min(self.t1());
@@ -526,10 +527,69 @@ impl TrackModel {
             }
         }
         let step = (hi - lo) / n as f64;
-        let (mut a, mut b) = (
+        let (a, b) = (
             lo + step * kb.saturating_sub(1) as f64,
             (lo + step * (kb + 1) as f64).min(hi),
         );
+        Some(self.refine_cpa(x, a, b, lo, hi))
+    }
+
+    /// Local range minima in an emission-time interval, in time order. As in `cpa_near`, a
+    /// minimum at a clipped boundary is returned with `interior = false`; it cannot pass the
+    /// search's CPA gate. The 2 s survey uses constant scratch space and refines only minima.
+    pub fn local_cpas(&self, x: V3, ta: f64, tb: f64) -> impl Iterator<Item = Cpa> + '_ {
+        let (lo, hi) = (ta.max(self.t0()), tb.min(self.t1()));
+        let n = if hi > lo {
+            (((hi - lo) / 2.0).ceil() as usize).max(4)
+        } else {
+            0
+        };
+        let step = if n > 0 { (hi - lo) / n as f64 } else { 0.0 };
+        let dist2 = move |t: f64| {
+            let rv = sub(self.pos_at(t), x);
+            dot(rv, rv)
+        };
+        let (mut k, mut left, mut here) = (0usize, f64::INFINITY, dist2(lo));
+        std::iter::from_fn(move || {
+            while n > 0 && k <= n {
+                let right = if k < n {
+                    dist2(lo + (hi - lo) * (k + 1) as f64 / n as f64)
+                } else {
+                    f64::INFINITY
+                };
+                // A tie belongs to its first sample, matching `cpa_near` and avoiding two
+                // refinements when a CPA sits halfway between survey samples.
+                let minimum = here.is_finite() && here < left && here <= right;
+                let a = lo + k.saturating_sub(1) as f64 * step;
+                let b = (lo + (k + 1) as f64 * step).min(hi);
+                k += 1;
+                left = here;
+                here = right;
+                if minimum {
+                    return Some(self.refine_cpa(x, a, b, lo, hi));
+                }
+            }
+            None
+        })
+    }
+
+    /// Recover the pass identified by an emission-time hypothesis. A closer return elsewhere
+    /// in the window must not replace it. Boundary minima are a fallback only, still marked as
+    /// non-interior so callers retain their existing gates.
+    pub fn cpa_nearest_time(&self, x: V3, t_guess: f64, half: f64) -> Option<Cpa> {
+        self.local_cpas(x, t_guess - half, t_guess + half)
+            .min_by(|a, b| {
+                b.interior
+                    .cmp(&a.interior)
+                    .then_with(|| (a.t_e - t_guess).abs().total_cmp(&(b.t_e - t_guess).abs()))
+            })
+    }
+
+    fn refine_cpa(&self, x: V3, mut a: f64, mut b: f64, lo: f64, hi: f64) -> Cpa {
+        let dist2 = |t: f64| {
+            let rv = sub(self.pos_at(t), x);
+            dot(rv, rv)
+        };
         // golden-section to 1 ms
         let gr = 0.618_033_988_749_895;
         let mut c1 = b - gr * (b - a);
@@ -555,14 +615,14 @@ impl TrackModel {
         let d = norm(sub(p, x));
         let interior =
             te > self.t0() + 0.5 && te < self.t1() - 0.5 && te > lo + 0.5 && te < hi - 0.5;
-        Some(Cpa {
+        Cpa {
             t_e: te,
             d,
             speed: norm(v),
             interior,
             rv: sub(p, x),
             vel: v,
-        })
+        }
     }
 }
 
@@ -1157,6 +1217,64 @@ mod tests {
                 && (cpa.d - d).abs() < 0.5
                 && (cpa.speed - v).abs() < 1e-6
         );
+    }
+
+    #[test]
+    fn local_cpas_agree_with_the_global_minimum_on_a_single_pass() {
+        let enu = Enu::new(40.8765, -73.525, 0.0);
+        let tr = straight_track(
+            &enu,
+            [0.0, 800.0, 600.0],
+            [80.0, 0.0, 0.0],
+            1000.0,
+            600.0,
+            1400.0,
+            20.0,
+        );
+        let x = enu.to_ecef([0.0; 3]);
+        for guess in [965.0, 995.0, 1050.0] {
+            let global = tr.cpa_near(x, guess, 150.0).unwrap();
+            let local: Vec<_> = tr.local_cpas(x, guess - 150.0, guess + 150.0).collect();
+            assert_eq!(local.len(), 1, "{local:?}");
+            let nearest = tr.cpa_nearest_time(x, guess, 150.0).unwrap();
+            assert!(nearest.interior);
+            assert!((nearest.t_e - 1000.0).abs() < 0.001, "{nearest:?}");
+            assert_eq!(nearest.t_e, global.t_e);
+            assert_eq!(nearest.d, global.d);
+            assert_eq!(nearest.speed, global.speed);
+        }
+    }
+
+    #[test]
+    fn local_cpas_keep_the_interior_gate_at_clipped_boundaries() {
+        let enu = Enu::new(40.8765, -73.525, 0.0);
+        let tr = straight_track(
+            &enu,
+            [0.0, 800.0, 600.0],
+            [80.0, 0.0, 0.0],
+            100.0,
+            0.0,
+            200.0,
+            5.0,
+        );
+        let x = enu.to_ecef([0.0; 3]);
+        for (lo, hi, expected_time, interior) in [
+            (20.0, 80.0, 80.0, false),
+            (120.0, 180.0, 120.0, false),
+            (99.75, 120.0, 100.0, false),
+            (80.0, 100.25, 100.0, false),
+            (99.0, 102.0, 100.0, true),
+            (-50.0, 250.0, 100.0, true),
+        ] {
+            let cpas: Vec<_> = tr.local_cpas(x, lo, hi).collect();
+            assert_eq!(cpas.len(), 1, "[{lo}, {hi}]: {cpas:?}");
+            assert_eq!(cpas[0].interior, interior, "[{lo}, {hi}]: {cpas:?}");
+            assert!((cpas[0].t_e - expected_time).abs() < 0.001, "{cpas:?}");
+        }
+        assert_eq!(tr.local_cpas(x, 220.0, 250.0).count(), 0);
+        assert_eq!(tr.local_cpas(x, -50.0, -10.0).count(), 0);
+        assert_eq!(tr.local_cpas(x, 120.0, 100.0).count(), 0);
+        assert_eq!(tr.local_cpas(x, 100.0, 100.0).count(), 0);
     }
 
     /// An archived leg (shape of a real 2026-11-01 P28R) where the genuine level track at

@@ -1236,7 +1236,7 @@ fn eval_point_weighted(
     for &(ei, ti, te_guess) in assign {
         let ev = &evs[ei];
         let tr = &tracks[ti as usize];
-        let cpa = tr.cpa_near(x, te_guess, 150.0)?;
+        let cpa = tr.cpa_nearest_time(x, te_guess, 150.0)?;
         let prop = prop_for(atmo, o, tr, cpa.t_e);
         if gates
             && (!gates_ok(ev, &cpa, &prop, if quick { 0.12 } else { 0.0 })
@@ -1542,7 +1542,7 @@ fn calibrate(
             ] {
                 let (la, lo, _) = enu.to_geodetic([de, dn, 0.0]);
                 let o = observer(la, lo, dem);
-                let Some(cpa) = tr.cpa_near(o.x, h.t_e as f64 + t_base, 60.0) else {
+                let Some(cpa) = tr.cpa_nearest_time(o.x, h.t_e as f64 + t_base, 60.0) else {
                     continue;
                 };
                 let prop = prop_for(atmo, &o, tr, cpa.t_e);
@@ -1666,57 +1666,54 @@ fn best_confirmer(
         if p.tonal_only && !tr.engine.tonal() {
             continue;
         }
-        let Some(cpa) = tr.cpa_near(
-            o.x,
-            t_heard - 1.1 * ev.d_gate[1].min(12_000.0) / c * 0.5,
-            200.0,
-        ) else {
-            continue;
-        };
-        // A returning aircraft can explain another event, but one physical pass cannot.
-        // Stored matches provide heard-CPA times: re-find their emission CPAs from the
-        // approximate still-air seeds before applying the same separation as the pair join.
-        // If a prior CPA cannot be recovered, retain the exclusion for that track.
-        if exclude.iter().any(|&(used_track, t_e_guess)| {
-            used_track == ti
-                && tr
-                    .cpa_near(o.x, t_e_guess, SAME_FLIGHT_MIN_DT_S)
-                    .is_none_or(|used| {
-                        !used.interior || (cpa.t_e - used.t_e).abs() < SAME_FLIGHT_MIN_DT_S
-                    })
-        }) {
-            continue;
-        }
-        if cpa.d > 1.15 * ev.d_gate[1] {
-            continue;
-        }
-        let prop = prop_for(atmo, o, tr, cpa.t_e);
-        if !gates_ok(ev, &cpa, &prop, 0.0)
-            || (cpa.t_r_p(&prop) - t_heard).abs() > ev.t_tol + 3.0
-            || tr.gap_at(cpa.t_e) > p.max_gap_s
-        {
-            continue;
-        }
-        let lo = t_start + ev.tr_t[0] - 1.0;
-        let hi = t_start + ev.tr_t[ev.tr_t.len() - 1] + 1.0;
-        let g = RatioGrid::build(tr, o.x, &prop, lo, hi, 0.2, p.max_gap_s);
-        let chi = trace_chi(
-            &ev.tr_t,
-            &ev.tr_f,
-            &|tu| g.at(tu),
-            t_start,
-            ev,
-            ev.sigma_hz,
-            p.cap_sigma,
-            true,
-            &mut scratch,
-        );
-        if chi.chi <= p.kappa && chi.cov >= 0.6 && best.as_ref().is_none_or(|b| chi.chi < b.0) {
-            best = Some((
-                chi.chi,
-                make_match(ev, tr, &cpa, chi, &prop, "confirmer"),
-                ti,
-            ));
+        // Keep the existing propagation window, but test every visit inside it: its closest
+        // pass may be at the wrong recording time while a farther return explains this event.
+        let guess = t_heard - 1.1 * ev.d_gate[1].min(12_000.0) / c * 0.5;
+        for cpa in tr.local_cpas(o.x, guess - 200.0, guess + 200.0) {
+            if cpa.d > 1.15 * ev.d_gate[1] {
+                continue;
+            }
+            let prop = prop_for(atmo, o, tr, cpa.t_e);
+            if !gates_ok(ev, &cpa, &prop, 0.0)
+                || (cpa.t_r_p(&prop) - t_heard).abs() > ev.t_tol + 3.0
+                || tr.gap_at(cpa.t_e) > p.max_gap_s
+            {
+                continue;
+            }
+            // A returning aircraft can explain another event, but one physical pass cannot.
+            // Recover each excluded pass from its own emission-time seed, not the nearest
+            // return in range. A missing prior CPA conservatively excludes that track.
+            if exclude.iter().any(|&(used_track, t_e_guess)| {
+                used_track == ti
+                    && tr
+                        .cpa_nearest_time(o.x, t_e_guess, SAME_FLIGHT_MIN_DT_S)
+                        .is_none_or(|used| {
+                            !used.interior || (cpa.t_e - used.t_e).abs() < SAME_FLIGHT_MIN_DT_S
+                        })
+            }) {
+                continue;
+            }
+            let lo = t_start + ev.tr_t[0] - 1.0;
+            let hi = t_start + ev.tr_t[ev.tr_t.len() - 1] + 1.0;
+            let g = RatioGrid::build(tr, o.x, &prop, lo, hi, 0.2, p.max_gap_s);
+            let chi = trace_chi(
+                &ev.tr_t,
+                &ev.tr_f,
+                &|tu| g.at(tu),
+                t_start,
+                ev,
+                ev.sigma_hz,
+                p.cap_sigma,
+                true,
+                &mut scratch,
+            );
+            if chi.chi <= p.kappa && chi.cov >= 0.6 && best.as_ref().is_none_or(|b| chi.chi < b.0) {
+                best = Some((
+                    chi.chi,
+                    make_match(ev, tr, &cpa, chi, &prop, "confirmer"),
+                    ti,
+                ));
+            }
         }
     }
     best
@@ -1872,11 +1869,7 @@ fn harmonic_events(a: &SearchEvent, b: &SearchEvent, cap_sigma: f64) -> bool {
 pub fn independent_measured_events(events: &[MeasuredEvent], wind_mps: f64) -> Vec<SearchEvent> {
     let eligible = events
         .iter()
-        .filter(|e| {
-            e.fit
-                .as_ref()
-                .is_some_and(|f| f.best.v >= 28.0 && f.best.d >= 200.0)
-        })
+        .filter(|e| e.is_aircraft_like())
         .filter_map(|e| SearchEvent::from_measured(e, wind_mps))
         .collect();
     independent_events(eligible, DEFAULT_CAP_SIGMA)
@@ -2487,7 +2480,7 @@ fn free_clocks(
         .map(|(&(ei, ti), m)| {
             let ev = &evs[ei];
             let tr = &tracks[ti as usize];
-            let cpa = tr.cpa_near(o.x, m.t_cpa_heard_utc - m.d / m.c_path, 30.0)?;
+            let cpa = tr.cpa_nearest_time(o.x, m.t_cpa_heard_utc - m.d / m.c_path, 30.0)?;
             let prop = prop_for(atmo, o, tr, cpa.t_e);
             let (lo, hi) = (cand.t_start_utc - 30.0, cand.t_start_utc + 30.0);
             let g = RatioGrid::build(
@@ -2569,7 +2562,7 @@ fn refresh_refined_candidate(
         let fitted = (|| {
             let ev = evs.get(ei)?;
             let tr = inp.tracks.get(ti as usize)?;
-            let cpa = tr.cpa_near(o.x, old.t_cpa_heard_utc - old.d / old.c_path, 150.0)?;
+            let cpa = tr.cpa_nearest_time(o.x, old.t_cpa_heard_utc - old.d / old.c_path, 150.0)?;
             let prop = prop_for(inp.atmo, &o, tr, cpa.t_e);
             // An optional confirmer stays under `best_confirmer`'s rule, with no slack.
             let slack = if required(k) {
@@ -2740,7 +2733,7 @@ pub fn explain_at(
             .ok_or_else(|| format!("no track {key} around {t_heard:.0}"))?;
         let tr = &inp.tracks[ti];
         let cpa = tr
-            .cpa_near(o.x, t_heard - ev.d_gate[1].min(12_000.0) / p.c * 0.5, 300.0)
+            .cpa_nearest_time(o.x, t_heard - ev.d_gate[1].min(12_000.0) / p.c * 0.5, 300.0)
             .ok_or("no CPA")?;
         assign.push((ei, ti as u32, cpa.t_e));
     }
@@ -4929,6 +4922,188 @@ mod tests {
             t_s,
             obs: (lat, lon),
         }
+    }
+
+    /// A 120 s circuit at 63 m/s, with a slow climb/descent giving alternating 800 m and
+    /// 400 m heights at the near side. The farther visit at 300 s has closer neighbours on
+    /// both sides inside the old CPA windows; it must still match its own recording time.
+    fn narrow_circuit_case(med: fdop_types::atmo::Medium) -> TwoCase {
+        let (lat, lon) = (40.8765, -73.5250);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let t_s = 1_788_895_000.0;
+        let omega = std::f64::consts::TAU / 120.0;
+        let mut circuit = straight_track(
+            &enu,
+            [300.0, 0.0, 800.0],
+            [0.0, 1200.0 * omega, 0.0],
+            t_s + 300.0,
+            t_s,
+            t_s + 900.0,
+            2.0,
+        );
+        circuit.key = "narrow-circuit".into();
+        for (i, &t) in circuit.t.iter().enumerate() {
+            let theta = omega * (t - t_s - 300.0);
+            let (sin, cos) = theta.sin_cos();
+            let (zsin, zcos) = (0.5 * theta).sin_cos();
+            circuit.pos[i] =
+                enu.to_ecef([1500.0 - 1200.0 * cos, 1200.0 * sin, 600.0 + 200.0 * zcos]);
+            circuit.vel[i] = enu.vec_to_ecef([
+                1200.0 * omega * sin,
+                1200.0 * omega * cos,
+                -100.0 * omega * zsin,
+            ]);
+        }
+        let prop = Prop::from_medium(&med, &enu);
+        // Synthesize each known pass on a separately clipped copy, so event creation cannot
+        // accidentally choose its closer neighbour or rely on the new CPA selector.
+        let event = |id: &str, at: f64, f0: f64| {
+            let lo = circuit.t.partition_point(|&t| t < t_s + at - 80.0);
+            let hi = circuit.t.partition_point(|&t| t <= t_s + at + 80.0);
+            let isolated = TrackModel {
+                t: circuit.t[lo..hi].to_vec(),
+                pos: circuit.pos[lo..hi].to_vec(),
+                vel: circuit.vel[lo..hi].to_vec(),
+                ..circuit.clone()
+            };
+            synth_event(id, &isolated, x, t_s, f0, 343.0, t_s + at, &prop)
+        };
+        let near = event("near-visit", 420.0, 112.7);
+        let mut far = event("far-visit", 300.0, 151.2);
+        far.quality = 90.0;
+        let mut crossing = straight_track(
+            &enu,
+            [0.0, 1500.0, 900.0],
+            [90.0, 0.0, 0.0],
+            t_s + 650.0,
+            t_s + 100.0,
+            t_s + 850.0,
+            5.0,
+        );
+        crossing.key = "crossing".into();
+        let other = synth_event(
+            "crossing",
+            &crossing,
+            x,
+            t_s,
+            129.5,
+            343.0,
+            t_s + 650.0,
+            &prop,
+        );
+        let region = BBox::new(lat - 0.015, lon - 0.02, lat + 0.015, lon + 0.02);
+        let mut p = SearchParams::new(t_s - 10.0, t_s + 10.0, 850.0, region);
+        p.max_events = 2;
+        p.refine_half_m = 400.0;
+        TwoCase {
+            tracks: vec![circuit, crossing],
+            events: vec![near, other, far],
+            p,
+            t_s,
+            obs: (lat, lon),
+        }
+    }
+
+    #[test]
+    fn narrow_circuit_pair_preserves_both_emission_hypotheses() {
+        for med in [
+            fdop_types::atmo::Medium::still(343.0),
+            fdop_types::atmo::Medium {
+                c: 339.0,
+                wind_e: 7.0,
+                wind_n: -5.0,
+            },
+        ] {
+            let case = narrow_circuit_case(med);
+            let dem = FlatElevation(0.0);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let atmo = fdop_types::atmo::UniformAtmosphere(med);
+            let nearer = case.tracks[0]
+                .cpa_near(o.x, case.t_s + 300.0, 150.0)
+                .unwrap();
+            assert!((nearer.t_e - case.t_s - 300.0).abs() > 100.0);
+            assert!(nearer.d < case.events[2].d_gate[0]);
+            let assign = [(2, 0, case.t_s + 300.0), (0, 0, case.t_s + 420.0)];
+            for quick in [true, false] {
+                let pe = eval_point(
+                    &o,
+                    &assign,
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &atmo,
+                    true,
+                    true,
+                    quick,
+                )
+                .expect("both known passes must survive their pair's clock and trace checks");
+                assert!((pe.cpas[0].t_e - case.t_s - 300.0).abs() < 0.01);
+                assert!((pe.cpas[1].t_e - case.t_s - 420.0).abs() < 0.01);
+                assert!((pe.t_s - case.t_s).abs() < 0.1, "{}", pe.t_s - case.t_s);
+                assert!(pe.chis.iter().all(|c| c.chi < 1.0 && c.cov >= 0.99));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_circuit_confirmer_uses_the_clock_and_excludes_only_the_used_pass() {
+        for med in [
+            fdop_types::atmo::Medium::still(343.0),
+            fdop_types::atmo::Medium {
+                c: 339.0,
+                wind_e: 7.0,
+                wind_n: -5.0,
+            },
+        ] {
+            let case = narrow_circuit_case(med);
+            let dem = FlatElevation(0.0);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let atmo = fdop_types::atmo::UniformAtmosphere(med);
+            let tix = TimeIndex::new(&case.tracks);
+            let explain = |exclude: &[(u32, f64)]| {
+                best_confirmer(
+                    &o,
+                    case.t_s,
+                    &case.events[2],
+                    &case.tracks,
+                    &tix,
+                    &case.p,
+                    &atmo,
+                    exclude,
+                )
+            };
+            let (chi, matched, track) = explain(&[(0, case.t_s + 420.0)])
+                .expect("a closer pass already heard must not hide the farther return");
+            assert_eq!(track, 0);
+            assert!(chi < 1.0, "{matched:?}");
+            assert!(
+                (matched.t_cpa_heard_utc - case.t_s - case.events[2].t_rec).abs() < 0.01,
+                "{matched:?}"
+            );
+            let emission_seed = matched.t_cpa_heard_utc - matched.d / matched.c_path;
+            assert!(
+                explain(&[(0, emission_seed)]).is_none(),
+                "a second tone cannot count the same physical pass twice"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_circuit_farther_visit_survives_search_and_refinement() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let case = narrow_circuit_case(med);
+        let result = run_case(&case, med);
+        assert!(result.funnel.hypotheses[2].1.is_none());
+        let top = result.candidates.first().expect("two locating passes");
+        assert_eq!(top.n_explained, 3, "{:?}", top.events);
+        let far = top.events.iter().find(|e| e.event == "far-visit").unwrap();
+        assert_eq!(far.flight, "narrow-circuit");
+        assert_eq!(far.role, "confirmer");
+        assert!(far.core, "{far:?}");
+        assert!((top.t_start_utc - case.t_s).abs() < 1.0);
+        let refined = result.refine.as_ref().expect("all three passes refine");
+        assert!(haversine_m(refined.lat, refined.lon, case.obs.0, case.obs.1) < 60.0);
     }
 
     #[test]
