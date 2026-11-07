@@ -233,3 +233,18 @@ is 0.71 at St. Augustine (18 passes) and 0.47 at Deerfield (10). Of the scored p
 68 of 191 and 170 of 382 score as high, the best 3.97 and 3.79. That is chance, as the read above predicts, and the
 idea is refuted on these cases. Its null case, `g_mackinawcity`, could not be scored: no place in its circle had a
 pass within 3 km, and the ADS-B store holds one pass within 80 km of the site in the two hours.
+
+The statistic has a flaw, found afterwards. It sums z scores taken from the copies' median and spread, so under chance
+its mean is not 0 but the square root of the number of passes times the copies' own mean z, which is set by the
+score's skew. Averaged over the places, the sums are +0.35 at Deerfield and +0.42 at St. Augustine, against +0.41 and
++0.49 predicted from the skew alone. With a statistic that is centred (each pass's percentile among its place's
+copies, through the normal quantile), the true place ranks 59th of 199 at St. Augustine and 103rd of 389 at
+Deerfield, so the refutation stands.
+
+The same test was run with band power's score on the same lines, fixed before it ran, and was refuted too. At
+Deerfield the true place's sum is 1.17, and 2 places more than 3 km away score higher. With Deerfield's lines scored on
+`g_mackinawcity`'s audio, one line whose window holds a sound 22 dB above its surroundings, 25 s into that capture,
+gives a place 20.6. With the centred statistic, chosen after that verdict, Deerfield's true place ranks first of 389
+(2.77, against 2.59 for the best place more than 3 km away), and St. Augustine's 15th of 199. Deerfield was picked
+because band power heard its true passes, and the statistic was picked after the result, so this shows nothing yet.
+It is the one lead left, for a new set chosen without listening at the truth.
