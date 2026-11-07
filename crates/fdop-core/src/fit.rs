@@ -50,8 +50,10 @@ pub struct Diagnostics {
     pub split_recede: Option<SideFit>,
     pub sides_disagree: bool,
     pub resid_autocorr: f64,
-    /// Robust point-to-point scatter of the trace (Hz) and RMS / that scatter.
+    /// The trace's local scatter (Hz): 1.4826 x the median distance of each point from the median
+    /// of the points within +-1 s, mostly 0 on a monotone trace. NaN when too few points measure it.
     pub local_sigma: f64,
+    /// RMS / `local_sigma`, with the scatter floored at `LOCAL_SIGMA_FLOOR_HZ` (0.03 Hz).
     pub misfit: f64,
     pub c: f64,
 }
@@ -66,6 +68,30 @@ pub struct FitResult {
     pub max_roc: f64,
     pub diagnostics: Diagnostics,
     pub warnings: Vec<String>,
+}
+
+/// Least local scatter (Hz) the misfit ratio divides by ([`Diagnostics::local_sigma`]).
+const LOCAL_SIGMA_FLOOR_HZ: f64 = 0.03;
+
+/// The misfit ratio of a fit with RMS `rmse` (Hz) on a trace of local scatter `local_sigma` (Hz;
+/// NaN when too few points measure it), and the model-misfit warning when it flags one: RMS over
+/// 0.3 Hz and over 10 times the scatter, floored at `LOCAL_SIGMA_FLOOR_HZ`.
+fn misfit_warning(rmse: f64, local_sigma: f64) -> (f64, Option<String>) {
+    let misfit = rmse / local_sigma.max(LOCAL_SIGMA_FLOOR_HZ);
+    if !(local_sigma.is_finite() && misfit > 10.0 && rmse > 0.3) {
+        return (misfit, None);
+    }
+    // Say which scatter the ratio used: "13.0x ... (0.00 Hz)" reads as a contradiction. Three
+    // decimals under the floor, so a scatter of 0.027 Hz does not print as the floor itself.
+    let scatter = if local_sigma < LOCAL_SIGMA_FLOOR_HZ {
+        format!("{local_sigma:.3} Hz, taken as the {LOCAL_SIGMA_FLOOR_HZ} Hz floor")
+    } else {
+        format!("{local_sigma:.2} Hz")
+    };
+    let note = format!(
+        "model misfit: RMS {rmse:.2} Hz is {misfit:.1}x the trace's local scatter ({scatter}); the source frequency or the flight path changed during the pass; generous floors x3"
+    );
+    (misfit, Some(note))
 }
 
 fn bounds(tmin: f64, tmax: f64, c: f64) -> ([f64; 4], [f64; 4]) {
@@ -816,7 +842,10 @@ fn finish_fit(prepared: PreparedFit) -> FitResult {
     }
     // Misfit relative to the trace's own local scatter: a curve the straight-line model cannot
     // follow (power/RPM changes, turns, climbs) leaves an RMS far above the point-to-point noise
-    // even when neither side test nor the autocorrelation test fires.
+    // even when neither side test nor the autocorrelation test fires. The scatter is each point's
+    // distance from the median of its +-1 s neighbours, and on a monotone run (most of a Doppler
+    // curve, sampled every frame) that median is the point itself. It is therefore mostly at or
+    // near 0, the floor decides, and the test reads as RMS over 10 x LOCAL_SIGMA_FLOOR_HZ.
     let local_sigma = {
         let (mut res_loc, mut j0) = (Vec::with_capacity(n), 0usize);
         let mut win = Vec::new();
@@ -841,14 +870,11 @@ fn finish_fit(prepared: PreparedFit) -> FitResult {
             f64::NAN
         }
     };
-    let misfit = rmse / local_sigma.max(0.03);
-    if local_sigma.is_finite() && misfit > 10.0 && rmse > 0.3 {
-        warnings.push(format!(
-            "model misfit: RMS {rmse:.2} Hz is {misfit:.1}x the trace's local scatter ({local_sigma:.2} Hz); the source frequency or the flight path changed during the pass; generous floors x3"
-        ));
-    }
+    let (misfit, misfit_note) = misfit_warning(rmse, local_sigma);
+    let misfit_flagged = misfit_note.is_some();
+    warnings.extend(misfit_note);
     warnings.extend(edge_notes);
-    let severe = sides_disagree || (local_sigma.is_finite() && misfit > 10.0 && rmse > 0.3);
+    let severe = sides_disagree || misfit_flagged;
     let kf = if severe {
         3.0
     } else if warnings.is_empty() {
@@ -1318,5 +1344,51 @@ mod tests {
             g.d,
             r.warnings
         );
+    }
+
+    /// The misfit ratio divides by the trace's local scatter or the 0.03 Hz floor, whichever is
+    /// larger, and the warning says which: a scatter under the floor printed beside a ratio taken
+    /// from the floor contradicts itself. A trace sampled densely along a monotone curve has a local
+    /// scatter of 0 (each point is the median of its +-1 s neighbours), so the floor decides.
+    #[test]
+    fn misfit_warning_names_the_scatter_it_divides_by() {
+        let (m, w) = misfit_warning(0.39, 0.0);
+        assert!((m - 13.0).abs() < 1e-9, "{m}");
+        let w = w.expect("RMS 0.39 Hz on a scatter of 0 is a misfit");
+        assert!(
+            w.starts_with(
+                "model misfit: RMS 0.39 Hz is 13.0x the trace's local scatter (0.000 Hz, taken as the 0.03 Hz floor);"
+            ),
+            "{w}"
+        );
+        let (m, w) = misfit_warning(0.9, 0.027);
+        assert!((m - 30.0).abs() < 1e-9, "{m}");
+        let w = w.expect("RMS 0.9 Hz on a scatter of 0.027 Hz is a misfit");
+        assert!(
+            w.contains("30.0x the trace's local scatter (0.027 Hz, taken as the 0.03 Hz floor);"),
+            "{w}"
+        );
+        let (m, w) = misfit_warning(0.9, 0.05);
+        assert!((m - 18.0).abs() < 1e-9, "{m}");
+        let w = w.expect("RMS 0.9 Hz on a scatter of 0.05 Hz is a misfit");
+        assert!(
+            w.contains("18.0x the trace's local scatter (0.05 Hz);"),
+            "{w}"
+        );
+        // Not over 0.3 Hz, not over 10 times the scatter, or no scatter measured: no warning.
+        assert!(misfit_warning(0.29, 0.0).1.is_none());
+        assert!(misfit_warning(0.9, 0.1).1.is_none());
+        assert!(misfit_warning(0.9, f64::NAN).1.is_none());
+
+        let c = 343.0;
+        let (f0, v, d, t0r) = (150.0, 60.0, 800.0, 1000.0);
+        // 0.125 s steps are exact, so every interior +-1 s window holds the same 17 points.
+        let t: Vec<f64> = (0..=960).map(|i| t0r - 60.0 + i as f64 * 0.125).collect();
+        let f: Vec<f64> = t
+            .iter()
+            .map(|&tt| cv_curve(tt, f0, v, d, t0r - d / c, c))
+            .collect();
+        let r = fit_constant_velocity(&t, &f, c, Side::Both).unwrap();
+        assert_eq!(r.diagnostics.local_sigma, 0.0, "{:?}", r.diagnostics);
     }
 }

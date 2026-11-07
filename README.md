@@ -1414,7 +1414,10 @@ audio or video recorded somewhere sensitive:
 - **A stationary recorder, and simple passes.**
   - Detection and fitting assume a straight, constant-speed, constant-pitch pass. A likely manoeuvre raises
     a warning and widens the ranges. A model misfit, or approach and recede halves that disagree, also
-    halves the event's weight in the search.
+    halves the event's weight in the search. In practice a fit is a model misfit when its RMS is over 0.3 Hz:
+    the test divides by the trace's local scatter, which is 0 on most traces, so its 0.03 Hz floor decides.
+    That flagged 92 of the 123 events that passed the quality gates on the six recordings the development rows
+    and nulls use, and 62 of 92 on set D.
   - The search follows each aircraft's real ADS-B path. For misfit events it also allows one change of tone,
     such as an RPM or power change.
 - **Detection envelope:** 35–1100 Hz, about 40–175 m/s and 250 m–12 km at detection, with the decode at

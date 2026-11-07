@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Say which scatter the model-misfit warning divided by
+
+- **The fault.** The model-misfit test divides a fit's RMS by the trace's local scatter, floored at 0.03 Hz, but
+  the warning printed the measured scatter beside a ratio taken from the floor: "RMS 0.39 Hz is 13.0x the
+  trace's local scatter (0.00 Hz)". `Diagnostics::local_sigma` was documented as a point-to-point scatter. It is
+  1.4826 x the median distance of each point from the median of the points within +-1 s, and on a monotone run
+  of points sampled every frame that median is the point itself. The scatter is therefore 0 on most traces, and
+  the test reads as an RMS over 0.3 Hz.
+- **The change.** When the floor was used the warning says so ("(0.000 Hz, taken as the 0.03 Hz floor)"), the
+  floor is the constant `LOCAL_SIGMA_FLOOR_HZ`, and the docs say what the scatter measures. The misfit test
+  itself, the warning's place among the others, its `model misfit` prefix (which the search reads) and every
+  answer are unchanged. A unit test covers the ratio and wording on either side of the floor, the cases with no
+  warning, and a scatter of exactly 0 on a densely sampled constant-velocity curve. On the six recordings the
+  development rows and nulls use, `fdop detect` with this change (bench-built on `6c48541`, binary `d50592c8`)
+  writes the same traces, images, stdout and stderr as `e93a269d`, byte for byte, and the same `events.json`
+  apart from 189 reworded misfit warnings, so no null, development or wrong-date answer can change.
+- **Evidence.** `fdop detect` with the bench-built binary `e93a269d` (the contrast stage's tree), its traces
+  re-read with a replica of the estimator. On the six recordings the development rows and nulls use, the replica
+  agrees with `fdop` on which of the 328 fitted events have a scatter of 0 for 324. Of the 123 events that
+  passed the quality gates, 88 have a scatter of 0 and 92 carry the warning. On set D, 72 of the 92 events that
+  passed have a scatter of 0 and 62 carry it. A second-difference estimate of the same traces' noise is 0.002 Hz
+  at the median (0.001-0.008 at the 10th and 90th percentiles) on the six recordings and 0.008 Hz on set D
+  (0.002-0.031), also mostly under the floor: the points are 0.1 s apart from frames of at least 0.5 s, so
+  neighbours share most of their audio and scatter far less than the 0.25 Hz bins. Measuring the scatter that
+  way instead would add the warning to 3 and 9 events and take it from none, so no estimator change is made
+  here. Every event under the warning is also weighted half in the search and may take one change of tone. On
+  `9087ec4`'s R1 development rows (`bench` `runs/r1_fdop_9087ec4`), four right answers (osprey_1031,
+  osprey_1101, eagle, duke) have a core match that uses a tone change, and so does the one wrong medium
+  (osprey_1102b, e12), so removing that freedom is not a clean change either.
+
 ### Preserve the physical pass when an aircraft returns nearby
 
 - Add a streaming iterator over local closest approaches within a time window. It retains the
