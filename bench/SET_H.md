@@ -162,3 +162,64 @@ solve them. Nothing here shows that it would.
 
 Set H's test audio and outcomes have now been read. No change made from here can be scored on set H as a gain, and its
 captures are development material from now on.
+
+## 2026-11-07, a correction: the tonal read's chance lines
+
+### What was wrong
+
+The hearing read (step 8) sets each close pass's score against chance lines, and takes the chance lines from every
+pass in the pass list, out to 15 km. Most of those passes are more than 3 km away. But on the same audio, the chance
+lines of passes within 3 km can score differently from those of passes beyond it. For the tonal oracle, at St.
+Augustine Beach and Deerfield Beach the near ones score higher (pilot medians 1.75 against 1.58, and 2.27 against
+1.49), so a close pass looked heard when it scored only as a close pass scores by chance. At the busiest sites the far
+ones score higher (Bryant Park 4.87 against 5.45, Fremont Street 2.71 against 4.39), which hides close passes instead.
+Band power splits at some sites too. On Deerfield Beach's pilot its near chance lines score far lower (1.49 dB against
+4.20), which hid that pilot's close passes.
+
+The rule is not changed, and set H's result stands as the rule's result. What it shows changes.
+
+### The same reads, against the close passes' own chance lines
+
+Here the chance lines are only those of passes within 3 km (their shifted copies). Everything else is as in step 8
+(k above the chance lines' 90th percentile, of n close passes; m their mean percentile):
+
+| Capture | Tonal, as read | Tonal, close chance lines | Band power, as read | Band power, close chance lines |
+|---|---|---|---|---|
+| St. Augustine Beach pier, pilot (set G) | 8 of 19, 0.79 | 2 of 19, 0.54 | 0 of 19, 0.35 | 0 of 19, 0.34 |
+| Deerfield Beach, pilot | 4 of 7, 0.92 | 2 of 7, 0.52 | 0 of 7, 0.65 | 1 of 7, 0.75 |
+| St. Augustine Beach pier, test | 7 of 18, 0.78 | 1 of 18, 0.52 | 2 of 18, 0.58 | 2 of 18, 0.57 |
+| Deerfield Beach, test | 6 of 10, 0.91 | 0 of 10, 0.54 | 5 of 10, 0.74 | 5 of 10, 0.80 |
+
+Against each pass's own shifted lines alone (up to four; passes with fewer than three left out), the tonal mean
+percentiles are 0.43, 0.54, 0.47 and 0.45 in the same order, where chance is 0.5. So the tonal oracle hears neither
+site, on the pilot or on the test hour. South Ponte Vedra's 6 of 40 (0.67, `SET_G.md`) becomes 2 of 40, 0.47.
+
+Read this way, St. Augustine Beach pier would not have qualified: the tonal result that set H was made for does not
+hold. Deerfield Beach would have qualified on band power instead (n 7, m 0.75, 28 chance lines), and band power hears
+its test hour too. No other pilot of sets G or H qualifies on either method under this read. So Deerfield Beach is
+the one case where any method hears the aircraft, and that method is band power, which fdop does not use.
+
+The tonal method's control (step 8) ran on the development recordings, whose passes are loud. It showed that the
+method can hear a loud pass. It did not test whether its chance level is fair at a quiet site.
+
+### What this changes above
+
+- "Found after the runs": its tonal counts (7 of 18 and 6 of 10) carry the same bias. Its statement that the aimed
+  filter finds the aircraft on the test hours is wrong for the tonal filter. It holds for band power at Deerfield
+  Beach. Its comparisons of best scores do not depend on the pool and stand: against only the close passes' chance
+  lines, the best is still 2.15 against the true passes' 2.01 at St. Augustine, and 2.79 against 2.49 at Deerfield.
+- "So set H's cases are solvable in the sense its rule fixed": true only in the letter of the rule. fdop's tonal
+  filter, aimed with the true passes, does not find either case's aircraft above chance.
+
+### Adding evidence over places, tried
+
+The last paragraph of "Found after the runs" asked whether adding faint evidence over many passes under each
+candidate place might solve these cases. It was tried as a development experiment, with its statistic and its
+falsifier fixed before it ran. At the true place and at each of 489 places on a 2 km grid over the case's R2 circle,
+every pass within 3 km of the place was scored by the tonal oracle, along with 16 time-shifted copies of each. Each
+pass's z score was taken against all the copies at that place, and the z scores were summed and divided by the square
+root of the number of passes. A place was scored if it had at least 4 passes and 40 copies. At the true place the sum
+is 0.71 at St. Augustine (18 passes) and 0.47 at Deerfield (10). Of the scored places more than 3 km from the truth,
+68 of 191 and 170 of 382 score as high, the best 3.97 and 3.79. That is chance, as the read above predicts, and the
+idea is refuted on these cases. Its null case, `g_mackinawcity`, could not be scored: no place in its circle had a
+pass within 3 km, and the ADS-B store holds one pass within 80 km of the site in the two hours.

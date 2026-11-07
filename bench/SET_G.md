@@ -182,3 +182,11 @@ ADS-B pass, against the same chance lines. It hears St. Augustine Beach pier at 
 0.79, where the band-level method heard none. South Ponte Vedra came out at 6 of 40, 0.67; the other three show
 nothing. So the band-level screen misses propeller tones that fdop's method can use, and set G's "no solvable case" is
 partly a property of that screen. Set G is not changed; `SET_H.md` is a new set.
+
+## 2026-11-07, a correction to the section above
+
+The tonal counts above took their chance lines from passes out to 15 km. At these sites the tonal score's chance level
+is higher for passes within 3 km than for those beyond. Against only the close passes' own chance lines, St. Augustine
+Beach pier is 2 of 19, 0.54, and South Ponte Vedra 2 of 40, 0.47: neither is heard. So that section's conclusion,
+that the band-level screen misses tones fdop's method can use, is not shown. The details are in `SET_H.md`, its
+2026-11-07 section.
