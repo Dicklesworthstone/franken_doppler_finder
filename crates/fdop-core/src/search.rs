@@ -418,6 +418,81 @@ fn interior_cross_track_offset(d_lo: f64, d_hi: f64, distance: impl Fn(f64) -> f
     None
 }
 
+/// A narrow region can lie entirely between regular cross-track samples. Clip the affine
+/// latitude/longitude ray before probing its interior, so an otherwise valid offset outside
+/// the box does not hide the permitted strip. Terrain still supplies every slant distance;
+/// bisection accepts an actual in-gate point, never an interpolated height across a cliff.
+fn region_cross_track_offset(
+    d_lo: f64,
+    d_hi: f64,
+    region: &BBox,
+    origin: (f64, f64),
+    direction: (f64, f64),
+    distance: impl Fn(f64) -> f64,
+) -> Option<f64> {
+    if !d_lo.is_finite() || !d_hi.is_finite() || d_lo < 0.0 || d_hi <= d_lo {
+        return None;
+    }
+    let (mut lo, mut hi) = (0.0f64, d_hi);
+    for (start, slope, min, max) in [
+        (origin.0, direction.0, region.south, region.north),
+        (origin.1, direction.1, region.west, region.east),
+    ] {
+        if ![start, slope, min, max].into_iter().all(f64::is_finite) || min > max {
+            return None;
+        }
+        if slope == 0.0 {
+            if start < min || start > max {
+                return None;
+            }
+        } else {
+            let (a, b) = ((min - start) / slope, (max - start) / slope);
+            lo = lo.max(a.min(b));
+            hi = hi.min(a.max(b));
+        }
+        if lo > hi {
+            return None;
+        }
+    }
+    let middle = 0.5 * (lo + hi);
+    let dm = distance(middle);
+    if !dm.is_finite() {
+        return None;
+    }
+    if (d_lo..=d_hi).contains(&dm) {
+        return Some(middle);
+    }
+    for edge in [lo, hi] {
+        let de = distance(edge);
+        if !de.is_finite() {
+            continue;
+        }
+        let lower = dm.min(de).max(d_lo);
+        let upper = dm.max(de).min(d_hi);
+        if lower > upper {
+            continue;
+        }
+        let target = 0.5 * (lower + upper);
+        let (mut a, mut b) = (middle, edge);
+        for _ in 0..24 {
+            let offset = 0.5 * (a + b);
+            let d = distance(offset);
+            if !d.is_finite() {
+                break;
+            }
+            if (d_lo..=d_hi).contains(&d) {
+                return Some(offset);
+            }
+            if (d < target) == (dm < target) {
+                a = offset;
+            } else {
+                b = offset;
+            }
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hypotheses(
     ev: &SearchEvent,
@@ -524,17 +599,29 @@ fn hypotheses(
                         // A close pass can have its whole allowed annulus between grid lines.
                         // Only an accepted hypothesis replaces the interior sample: a point
                         // outside the region or clock window cannot cover this side.
-                        if !has_hypothesis
-                            && let Some(b) = interior_cross_track_offset(d_lo, d_hi, |b| {
+                        if !has_hypothesis {
+                            let fallback = interior_cross_track_offset(d_lo, d_hi, |b| {
                                 if b == 0.0 {
                                     center.3
                                 } else {
                                     cross_point(side, b).3
                                 }
                             })
-                            && let Some(hyp) = to_hyp(cross_point(side, b))
-                        {
-                            out.push(hyp, ti, cap, &count);
+                            .and_then(|b| to_hyp(cross_point(side, b)))
+                            .or_else(|| {
+                                region_cross_track_offset(
+                                    d_lo,
+                                    d_hi,
+                                    &p.region,
+                                    (center.0, center.1),
+                                    (side * ny / mlat, side * nx / mlon),
+                                    |b| cross_point(side, b).3,
+                                )
+                                .and_then(|b| to_hyp(cross_point(side, b)))
+                            });
+                            if let Some(hyp) = fallback {
+                                out.push(hyp, ti, cap, &count);
+                            }
                         }
                     }
                 }
@@ -5166,6 +5253,79 @@ mod tests {
     }
 
     #[test]
+    fn narrow_region_between_cross_track_samples_locates_observer() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let t_s = 1_788_895_000.0;
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let prop = Prop::from_medium(&med, &enu);
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        // The roughly 200 m-wide box lies between b=0 and b=350 m on both tracks.
+        // The original distance-only fallback also lands outside it, even though the
+        // observer and both complete traces satisfy the unchanged acoustic gates.
+        for (key, position, velocity, t_cpa, f0) in [
+            ("A", [0.0, 175.0, 1000.0], [90.0, 0.0, 0.0], 120.0, 112.7),
+            ("B", [175.0, 0.0, 1000.0], [0.0, 95.0, 0.0], 360.0, 149.3),
+        ] {
+            let mut tr = straight_track(
+                &enu,
+                position,
+                velocity,
+                t_s + t_cpa,
+                t_s - 200.0,
+                t_s + 800.0,
+                5.0,
+            );
+            tr.key = key.into();
+            let ev = synth_event(key, &tr, x, t_s, f0, 343.0, t_s + t_cpa, &prop);
+            let cpa = tr.cpa_nearest_time(x, t_s + t_cpa, 30.0).unwrap();
+            assert!(gates_ok(&ev, &cpa, &prop, 0.0));
+            tracks.push(tr);
+            events.push(ev);
+        }
+        let mut p = SearchParams::new(
+            t_s,
+            t_s,
+            600.0,
+            BBox::new(lat - 0.0009, lon - 0.0012, lat + 0.0009, lon + 0.0012),
+        );
+        p.refine_half_m = 200.0;
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let frame = Frame::new(&p.region);
+        let counts: Vec<_> = events
+            .iter()
+            .map(|ev| {
+                hypotheses(ev, &tracks, &p, &frame, &dem, &atmo, t_s - 86_400.0, 10_000).count
+            })
+            .collect();
+        assert!(
+            counts.iter().all(|&n| n > 0),
+            "both in-region flyovers need hypotheses: {counts:?}"
+        );
+        let inputs = SearchInputs {
+            heard_times: events.iter().map(|ev| ev.t_rec).collect(),
+            events,
+            tracks: &tracks,
+            coarse_dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let result = run(&inputs, &p, &|_| {});
+        let winner = result.candidates.first().unwrap_or_else(|| {
+            panic!("in-region flyovers were lost: {:?}", result.funnel)
+        });
+        for key in ["A", "B"] {
+            assert!(winner.events.iter().any(|m| m.event == key && m.flight == key));
+        }
+        assert!(haversine_m(lat, lon, winner.lat, winner.lon) < 75.0);
+        assert!((winner.t_start_utc - t_s).abs() < 0.2);
+        assert!(result.funnel.truncated.is_empty());
+    }
+
+    #[test]
     fn narrow_region_does_not_skip_close_fast_flyovers() {
         let (lat, lon) = (40.876466, -73.524951);
         let enu = Enu::new(lat, lon, 0.0);
@@ -6100,6 +6260,84 @@ mod tests {
                 top.events
             );
         }
+    }
+
+    #[test]
+    fn region_cross_track_offsets_stay_inside_the_box_and_distance_gate() {
+        let region = BBox::new(-0.001, -0.001, 0.001, 0.001);
+        for (origin, direction) in [
+            ((0.002, 0.0), (-0.00001, 0.0)),
+            ((-0.002, 0.0), (0.00001, 0.0)),
+            ((0.0, 0.002), (0.0, -0.00001)),
+            ((0.0, -0.002), (0.0, 0.00001)),
+            ((0.002, 0.002), (-0.00001, -0.00001)),
+        ] {
+            let b = region_cross_track_offset(800.0, 1500.0, &region, origin, direction, |b| {
+                b.hypot(1000.0)
+            })
+            .unwrap();
+            assert!((b - 200.0).abs() < 1e-10);
+            assert!(region.contains(origin.0 + b * direction.0, origin.1 + b * direction.1));
+            assert!((800.0..=1500.0).contains(&b.hypot(1000.0)));
+        }
+        // Only a small part of the clipped strip meets the distance gate. Exercise
+        // both increasing slant range and falling range over rising terrain.
+        for descending in [false, true] {
+            let distance = |b: f64| {
+                if descending {
+                    1500.0 - b
+                } else {
+                    b.hypot(1000.0)
+                }
+            };
+            let (d_lo, d_hi) = if descending {
+                (1220.0, 1240.0)
+            } else {
+                (270.0f64.hypot(1000.0), 290.0f64.hypot(1000.0))
+            };
+            let b = region_cross_track_offset(
+                d_lo,
+                d_hi,
+                &region,
+                (0.002, 0.0),
+                (-0.00001, 0.0),
+                distance,
+            )
+            .unwrap();
+            assert!(b > 200.0 && b < 300.0);
+            assert!(region.contains(0.002 - b * 0.00001, 0.0));
+            assert!((d_lo..=d_hi).contains(&distance(b)));
+        }
+    }
+
+    #[test]
+    fn region_cross_track_offsets_do_not_invent_eligible_points() {
+        let region = BBox::new(-0.001, -0.001, 0.001, 0.001);
+        for direction in [(0.0, 0.00001), (0.00001, 0.0)] {
+            assert!(
+                region_cross_track_offset(800.0, 1500.0, &region, (0.002, 0.0), direction, |b| {
+                    b.hypot(1000.0)
+                })
+                .is_none(),
+                "a parallel or outward ray cannot enter the region"
+            );
+        }
+        let probe = |d_lo, d_hi, distance: fn(f64) -> f64| {
+            region_cross_track_offset(
+                d_lo,
+                d_hi,
+                &region,
+                (0.002, 0.0),
+                (-0.00001, 0.0),
+                distance,
+            )
+        };
+        assert!(probe(10.0, 50.0, |b| b).is_none(), "region is beyond reach");
+        assert!(probe(800.0, 1500.0, |b| b.hypot(2000.0)).is_none());
+        assert!(
+            probe(1200.0, 1500.0, |b| if b < 260.0 { 1000.0 } else { 2000.0 }).is_none()
+        );
+        assert!(probe(800.0, 1500.0, |_| f64::NAN).is_none());
     }
 
     #[test]

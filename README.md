@@ -941,6 +941,11 @@ Design notes:
   and outside the box now use the existing distance/velocity timestep, before the same speed,
   distance, terrain and gap checks. This adds samples on outside segments; its runtime and
   real-recording effects have not been measured.
+- **A narrow region can lie between cross-track grid samples.** When a side has no accepted
+  hypothesis after the regular grid and its distance fallback, clip the cross-track ray to the
+  requested box and probe that interval. Every added point still passes the terrain, distance,
+  region and clock checks. This recovers an in-box strip without changing the regular grid;
+  it is not an exhaustive search of disconnected terrain pockets.
 - **Terrain is checked across the full cross-track reach.** A hillside can bring a later observer point back
   inside the slant-distance gate after a valley falls outside it. One failed point no longer cuts off that side.
 - **A location still needs two events after clock checks.** A candidate pruned to one flyover is removed.
@@ -1090,6 +1095,12 @@ and workspace Clippy were killed by SIGKILL in upstream `asupersync`, including 
 frontend and backend job. The metadata/offline pipeline tests, full workspace gates, CLI release
 selftest and reference-recording replay therefore remain unconfirmed; the external selftest does
 not replace them.
+
+The cross-track region-clipping repair adds two geometry regressions and a two-flight full-search
+case where the observer's box lies between the 350 m samples. Independent source review and
+JavaScript arithmetic checks cover the clipped ray and range bracketing, including terrain jumps.
+A current-core Cargo build was killed in upstream `fsci-linalg` before compiling the core crate;
+the Rust regressions, formatting and recording replays remain unrun after another executor outage.
 
 The outside-region sampling repair adds a full-search regression with two close synthetic passes
 at 250 and 263 m/s. Independent geometry checks confirm that every old ten-second probe misses

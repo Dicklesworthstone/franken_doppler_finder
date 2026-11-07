@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover a narrow observer region between cross-track samples
+
+- A valid region can lie entirely between the regular 350 m cross-track samples, while the
+  existing distance-only fallback chooses an otherwise valid point outside that box. Such a
+  pass previously contributed no hypotheses despite its observer satisfying the acoustic gates.
+- Preserve the regular grid and original distance fallback. Only when a side still has no
+  accepted point, clip its affine latitude/longitude ray to the requested box and probe the
+  clipped interval. Bound distance bracketing to 24 bisections per half; accept only actual
+  terrain-dependent samples through the unchanged height, range, region and clock predicate.
+- Add compact regressions for axis directions, diagonal clipping, rising/falling range
+  brackets, missed boxes, invalid values and discontinuous terrain, plus a full two-flight
+  search requiring both intended matches, less than 75 m position error, less than 0.2 s clock
+  error and no comparison truncation.
+- **Validation limit:** independent source reviews and 13 JavaScript arithmetic cases passed.
+  These are not Rust tests. The fresh core build was killed by SIGKILL in upstream
+  `fsci-linalg` before compiling project code; Rust regressions, formatting, workspace gates
+  and reference replays remain unrun after the executor disconnected. This is targeted strip
+  recovery, not exhaustive recovery of every terrain pocket or a measured accuracy claim.
+
 ### Keep better flight positions when cached track stores overlap
 
 - Prefer a non-MLAT report over a duplicate MLAT report even when the MLAT timestamp is
