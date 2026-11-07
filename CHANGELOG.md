@@ -19,6 +19,31 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Read cached tracks selectively without losing cross-day flights
+
+- Add a streaming `TrackStore::read_legs` reader. Existing `load` uses it, and every read still
+  validates record lengths, the gzip checksum, the complete footer and trailing compressed data,
+  even when the caller discards all legs. The `FDOPTRK1` format is unchanged.
+- Scan each cached day one leg at a time, combine conservative per-aircraft time/position bounds
+  across all cached and newly built stores, and then retain every leg of selected aircraft.
+  This avoids holding complete unrelated cached histories while preserving midnight crossings,
+  leg IDs, duplicate-position preference, unknown-type policy, geoid adjustment and original
+  metadata/source order. The second pass rewinds the same open file across atomic cache replacement.
+- Keep wraparound and exact dateline endpoints, nonfinite reports and floating-point endpoint
+  hits conservative in the prefilter; the original merge and final filter remain authoritative.
+  Files with selected aircraft are decompressed twice. Broad requests may save little memory;
+  no peak-RSS or overall speedup measurement is claimed.
+- Correct two offline location regressions to require the exact canonical cached flight-leg IDs
+  `a1dfeb_20260908_0` and `ace391_20260908_0`. The direct selftest's uppercase names are not the
+  report's `icao_date_leg` identities. Both aircraft and every physical accuracy assertion remain
+  required; the previously reported `missing A1DFEB` failure is not evidence of a lost flight.
+- **Validation:** all 24 real `fdop-types` library tests passed for the exact reader. All 31
+  offline component tests passed with the complete unchanged fetch/ingest/build/geoid source,
+  real types and pinned data dependencies; panic-on-use HTTP/discovery/download adapters were
+  never called. Both data files pass focused rustfmt. The full data-lib Cargo build was killed
+  in upstream `asupersync 0.6.2` before our crate compiled. Corrected pipeline assertions, full
+  HTTP integration, workspace gates, release selftest and recording replays remain unrun.
+
 ### Keep valid closest approaches between range samples
 
 - Refine finite local range minima before applying the physical reach gate in coarse curve

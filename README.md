@@ -766,6 +766,15 @@ or incomplete cache is identified in the progress output, and other eligible cac
 downloading again or failing in `--offline` mode. Partial feeds retain their missing-feed warnings. A larger
 region on the same day downloads that day again if no usable cache covers it.
 
+Cached day stores are scanned one leg at a time to summarize each aircraft across all requested days,
+then rewound on the same open files to retain every leg of aircraft that may intersect the requested
+region and time. Combining bounds before selection preserves a flight crossing the region between two
+UTC days; keeping the whole aircraft also preserves merge keys, feed preference and interpolation
+anchors. Original day metadata and altitude references remain available even when no aircraft from a
+day is selected. This reduces retained track data for selective requests. A cached file containing
+selected aircraft is decompressed twice, so broad requests may save little memory and pay for the extra
+scan. The store format and final spatial/time filter are unchanged.
+
 Concurrent searches publish track stores through separate, exclusively created staging files, so one
 writer cannot truncate another writer's cache. A load also rejects bytes after its compressed member,
 including additional gzip members; a damaged cache goes through the recovery path above.
@@ -1106,12 +1115,21 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ### Recovery changes (2026-11-07): validation incomplete
 
-**Incremental ADS-B day publication.** Two offline regressions exercise real synthetic tar ingestion,
-store building and compressed cache writes. One uses a bounded channel whose last download waits for
-an earlier day's readable cache; the other covers early and late feed failures plus a cache-write
-failure while another day succeeds. These new regressions and the revised scheduling code received
-source review, but have not run: the executor disconnected before their test harness could start.
-No live-download, end-to-end runtime or peak-memory improvement is claimed.
+**Cached-track memory and incremental ADS-B day publication.** All 31 offline component tests passed
+using the complete, unchanged production `fetch.rs`, `ingest.rs`, `build.rs` and `geoid.rs` files, the
+real `fdop-types` crate and the pinned parsing/compression/parallelism dependencies. The harness replaces
+only HTTP, release discovery and download adapters with panic-on-use adapters; none were called. It
+exercises the actual offline `fetch_window`, including streamed day publication, feed and cache-write
+failures, full-versus-selected cross-day results, exact flight keys and points, metadata and geoid
+preservation, partial feeds, malformed-cache recovery, and dateline/rounded-endpoint cases. These checks
+cover all eight merge regressions as well.
+
+The exact streaming reader passed all 24 `fdop-types` library tests. Focused formatting checks passed
+for both changed data files. The full `cargo test -p fdop-data --lib --locked --offline` attempt stopped
+when rustc compiling upstream `asupersync 0.6.2` was killed by SIGKILL, before `fdop-http` or `fdop-data`
+compiled. The component results therefore do not establish full HTTP integration. The corrected
+pipeline flight-ID assertions, workspace gates, release selftest and recording replays remain unrun.
+No live-download runtime, peak-RSS reduction or overall speedup measurement is claimed.
 
 **Checks before the final boundary correction (through `51d9bb0`).** Real RCH with the pinned nightly
 ran six guided-ridge/background-restoration tests and the harmonic-family recovery PCM case together.
@@ -1202,7 +1220,10 @@ formatting did not run before the executor disconnected again.
 The selected-audio coverage repair adds an offline known-location case with 1,300 seconds of
 audio inside a longer video. A fixed publication clock makes the container request reach an
 unpublished day while the audio fits its cached day. It also checks missing/nonfinite duration
-metadata and the container-end tag convention. These Rust/FFmpeg regressions remain unrun.
+metadata and the container-end tag convention. The two location cases were reported failing at
+`missing A1DFEB`; those assertions compared direct-selftest names with canonical cached flight-leg IDs.
+They now require `a1dfeb_20260908_0` and `ace391_20260908_0`, retaining both aircraft and all physical
+accuracy checks. The corrected Rust/FFmpeg cases have not been rerun.
 The region-clipping follow-up adds eight boundary cases covering both interval endpoints in four
 directions; independent arithmetic checks support them, with Rust execution still unconfirmed.
 

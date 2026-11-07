@@ -12,9 +12,11 @@ use crate::build::{build_store, merge_stores};
 use crate::ingest::{IngestProgress, IngestSpec, IngestStats, RawAircraft, ingest_reader};
 use fdop_types::BBox;
 use fdop_types::engine::EngineClass;
-use fdop_types::store::{TrackStore, alt_src};
+use fdop_types::store::{FlightLeg, StoreMeta, TrackStore, alt_src};
 use fdop_types::time::{civil_from_days, days_from_civil};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -99,6 +101,187 @@ fn day_dir(cache: &Path, (y, m, d): (i64, u32, u32)) -> PathBuf {
     cache.join("adsb").join(format!("{y:04}-{m:02}-{d:02}"))
 }
 
+/// A conservative envelope of every report for one aircraft. Whole-aircraft selection
+/// preserves leg joins and key counters, including legs outside the final requested slice.
+#[derive(Clone, Copy)]
+struct AircraftBounds {
+    t0: f64,
+    t1: f64,
+    bbox: BBox,
+    uncertain: bool,
+}
+
+impl Default for AircraftBounds {
+    fn default() -> Self {
+        Self {
+            t0: f64::INFINITY,
+            t1: f64::NEG_INFINITY,
+            bbox: BBox::new(
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ),
+            uncertain: false,
+        }
+    }
+}
+
+impl AircraftBounds {
+    fn extend(&mut self, other: &Self) {
+        self.t0 = self.t0.min(other.t0);
+        self.t1 = self.t1.max(other.t1);
+        self.bbox = self.bbox.union(&other.bbox);
+        self.uncertain |= other.uncertain;
+    }
+
+    fn overlaps(&self, spec: &IngestSpec) -> bool {
+        self.uncertain
+            || (bounds_overlap_axis(self.t0, self.t1, spec.t_start, spec.t_end)
+                && bounds_overlap_axis(
+                    self.bbox.south,
+                    self.bbox.north,
+                    spec.bbox.south,
+                    spec.bbox.north,
+                )
+                // A short segment can wrap across the dateline instead of taking the
+                // ordinary longitude interval. Keep that aircraft at any longitude.
+                && (self.bbox.east - self.bbox.west > 180.0
+                    || [-360.0, 0.0, 360.0].into_iter().any(|shift| {
+                        bounds_overlap_axis(
+                            self.bbox.west,
+                            self.bbox.east,
+                            spec.bbox.west + shift,
+                            spec.bbox.east + shift,
+                        )
+                    })))
+    }
+}
+
+/// A conservative prefilter for the existing floating-point segment clip. Its endpoint
+/// subtraction and division can round an intersection onto an endpoint just outside the
+/// exact envelope. Expand only this prefilter by a few arithmetic ulps; the final filter
+/// remains authoritative. Include both intervals' magnitudes (and shifted longitudes).
+fn bounds_overlap_axis(lo: f64, hi: f64, query_lo: f64, query_hi: f64) -> bool {
+    if lo > hi {
+        return false;
+    }
+    let scale = lo
+        .abs()
+        .max(hi.abs())
+        .max(query_lo.abs())
+        .max(query_hi.abs())
+        .max(1.0);
+    let roundoff = 8.0 * f64::EPSILON * scale;
+    lo - roundoff <= query_hi && hi + roundoff >= query_lo
+}
+
+fn include_leg_bounds(bounds: &mut HashMap<String, AircraftBounds>, leg: &FlightLeg) {
+    let b = bounds.entry(leg.icao.clone()).or_default();
+    for p in &leg.points {
+        if ![p.t, p.lat, p.lon].into_iter().all(f64::is_finite) {
+            b.uncertain = true;
+            continue;
+        }
+        b.t0 = b.t0.min(p.t);
+        b.t1 = b.t1.max(p.t);
+        b.bbox.south = b.bbox.south.min(p.lat);
+        b.bbox.north = b.bbox.north.max(p.lat);
+        b.bbox.west = b.bbox.west.min(p.lon);
+        b.bbox.east = b.bbox.east.max(p.lon);
+    }
+}
+
+struct CachedDay {
+    file: File,
+    path: PathBuf,
+    meta: StoreMeta,
+    leg_count: usize,
+    bounds: HashMap<String, AircraftBounds>,
+}
+
+impl CachedDay {
+    fn scan(path: &Path) -> std::io::Result<Self> {
+        let mut file = File::open(path)?;
+        let mut bounds = HashMap::new();
+        let mut leg_count = 0;
+        let meta = TrackStore::read_legs(&mut file, path, |leg| {
+            leg_count += 1;
+            include_leg_bounds(&mut bounds, &leg);
+        })?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            meta,
+            leg_count,
+            bounds,
+        })
+    }
+
+    fn load_selected(mut self, selected: &HashSet<String>) -> std::io::Result<TrackStore> {
+        let needed = self.bounds.keys().any(|id| selected.contains(id));
+        drop(self.bounds);
+        let mut legs = Vec::new();
+        if needed {
+            self.file.rewind()?;
+            TrackStore::read_legs(&mut self.file, &self.path, |leg| {
+                if selected.contains(&leg.icao) {
+                    legs.push(leg);
+                }
+            })?;
+        }
+        // Keep even empty stores and their original metadata: store indices, source
+        // attribution, per-day statistics and altitude references must not change.
+        Ok(TrackStore {
+            meta: self.meta,
+            legs,
+        })
+    }
+}
+
+enum DayStore {
+    Cached(CachedDay),
+    Built(TrackStore),
+}
+
+/// Scan every store before selecting aircraft: a new cross-day segment can cross the
+/// requested box even though neither day's separate leg does. Retain all of each chosen
+/// aircraft, then let the existing merge and final filter make their original decisions.
+fn load_selected_stores(
+    stores: Vec<DayStore>,
+    spec: &IngestSpec,
+) -> Result<Vec<TrackStore>, DataError> {
+    let mut bounds: HashMap<String, AircraftBounds> = HashMap::new();
+    for store in &stores {
+        match store {
+            DayStore::Cached(c) => {
+                for (id, b) in &c.bounds {
+                    bounds.entry(id.clone()).or_default().extend(b);
+                }
+            }
+            DayStore::Built(s) => {
+                for leg in &s.legs {
+                    include_leg_bounds(&mut bounds, leg);
+                }
+            }
+        }
+    }
+    let selected: HashSet<String> = bounds
+        .into_iter()
+        .filter_map(|(id, b)| b.overlaps(spec).then_some(id))
+        .collect();
+    stores
+        .into_iter()
+        .map(|store| match store {
+            DayStore::Cached(c) => c.load_selected(&selected).map_err(DataError::from),
+            DayStore::Built(mut s) => {
+                s.legs.retain(|l| selected.contains(&l.icao));
+                Ok(s)
+            }
+        })
+        .collect()
+}
+
 /// Smallest readable cached day store for `feedset` covering the requested day slice.
 fn find_cached(
     dir: &Path,
@@ -106,7 +289,7 @@ fn find_cached(
     want: &IngestSpec,
     label: &str,
     opts: &FetchOptions,
-) -> Option<(PathBuf, TrackStore)> {
+) -> Option<(PathBuf, CachedDay)> {
     let rd = std::fs::read_dir(dir).ok()?;
     let mut candidates = Vec::new();
     for e in rd.flatten() {
@@ -120,7 +303,7 @@ fn find_cached(
     }
     candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     for (_, p) in candidates {
-        match TrackStore::load(&p) {
+        match CachedDay::scan(&p) {
             Ok(s)
                 if covers(&s.meta.bbox, &want.bbox)
                     && s.meta.t_start <= want.t_start
@@ -342,7 +525,7 @@ pub fn fetch_window(
     };
     let (rbox, key) = bbox_key(&spec.bbox);
     let days = utc_days(spec.t_start, spec.t_end);
-    let mut day_stores: Vec<Option<TrackStore>> = vec![None; days.len()];
+    let mut day_stores: Vec<Option<DayStore>> = (0..days.len()).map(|_| None).collect();
     let mut notes: Vec<String> = Vec::new();
     let mut cache_hits = 0usize;
     let mut jobs: Vec<Job> = Vec::new();
@@ -365,9 +548,9 @@ pub fn fetch_window(
             opts.say(&format!(
                 "[adsb] {label}: cached {} ({} legs)",
                 p.display(),
-                s.legs.len()
+                s.leg_count
             ));
-            day_stores[i] = Some(s);
+            day_stores[i] = Some(DayStore::Cached(s));
             cache_hits += 1;
             continue;
         }
@@ -385,10 +568,10 @@ pub fn fetch_window(
                 opts.say(&format!(
                     "[adsb] {label}: cached {} ({} legs; {fs} only, nothing better is published)",
                     p.display(),
-                    s.legs.len()
+                    s.leg_count
                 ));
                 notes.extend(feedset_gaps(&label, fs, opts.include_mlat));
-                day_stores[i] = Some(s);
+                day_stores[i] = Some(DayStore::Cached(s));
                 cache_hits += 1;
                 break;
             }
@@ -533,7 +716,7 @@ pub fn fetch_window(
                     store.n_points(),
                     path.display()
                 ));
-                day_stores[di] = Some(store);
+                day_stores[di] = Some(DayStore::Built(store));
                 Ok(())
             })
         });
@@ -560,12 +743,13 @@ pub fn fetch_window(
     }
 
     // ---- combine ----
-    let mut stores: Vec<TrackStore> = day_stores.into_iter().flatten().collect();
+    let stores: Vec<DayStore> = day_stores.into_iter().flatten().collect();
     if stores.is_empty() {
         return Err(DataError(
             "no ADS-B day stores available for the window".into(),
         ));
     }
+    let mut stores = load_selected_stores(stores, spec)?;
     let mut day_stats = Vec::new();
     for s in &mut stores {
         adjust_geoid(s, spec.geoid_n_m);
@@ -633,7 +817,11 @@ mod tests {
     }
 
     fn synthetic_store(sp: &IngestSpec) -> TrackStore {
-        build_store(vec![synthetic_part(sp, "prod")], sp, vec!["synthetic".into()])
+        build_store(
+            vec![synthetic_part(sp, "prod")],
+            sp,
+            vec!["synthetic".into()],
+        )
     }
 
     #[test]
@@ -644,10 +832,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "fdop-streamed-days-{}-{nonce}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("fdop-streamed-days-{}-{nonce}", std::process::id()));
         let paths: Vec<_> = (0..3)
             .map(|di| dir.join(format!("day-{di}.fdtrk")))
             .collect();
@@ -899,6 +1085,389 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    fn cached_subset_fixture() -> (IngestSpec, Vec<TrackStore>) {
+        use fdop_types::store::{TrackPoint, pt_flags};
+        let (lat, lon) = (40.876466, -73.524951);
+        let midnight = fdop_types::time::unix_from_utc(2026, 9, 9, 0, 0, 0.0);
+        let spec = IngestSpec {
+            bbox: BBox::new(lat - 0.002, lon - 0.002, lat + 0.002, lon + 0.002),
+            t_start: midnight - 10.0,
+            t_end: midnight + 10.0,
+            geoid_n_m: -28.0,
+            keep_unknown: true,
+        };
+        let point = |t: f64, dx: f64, dy: f64| TrackPoint {
+            t: midnight + t,
+            lat: lat + dy,
+            lon: lon + dx,
+            alt_m: 1200.0,
+            gs_mps: 70.0,
+            track_deg: 90.0,
+            vrate_mps: 0.0,
+            alt_src: alt_src::GEOM,
+            flags: 0,
+        };
+        let leg = |icao: &str, tag: &str, engine, points| FlightLeg {
+            key: format!("{icao}_{tag}"),
+            icao: icao.into(),
+            reg: "TEST".into(),
+            typ: if engine == EngineClass::Unknown {
+                ""
+            } else {
+                "C172"
+            }
+            .into(),
+            source: "prod".into(),
+            engine,
+            points,
+        };
+        let early = leg(
+            "000001",
+            "early",
+            EngineClass::Piston,
+            vec![point(-7200.0, 1.0, 0.1), point(-7100.0, 1.1, 0.1)],
+        );
+        let left = leg(
+            "000001",
+            "left",
+            EngineClass::Piston,
+            vec![
+                point(-120.0, -0.09, 0.0),
+                point(-80.0, -0.06, 0.0),
+                point(-40.0, -0.03, 0.0),
+            ],
+        );
+        let mut right = leg(
+            "000001",
+            "right",
+            EngineClass::Piston,
+            vec![
+                point(40.0, 0.03, 0.0),
+                point(80.0, 0.06, 0.0),
+                point(120.0, 0.09, 0.0),
+            ],
+        );
+        right.source = "mlat".into();
+        let far = leg(
+            "000002",
+            "far",
+            EngineClass::Piston,
+            vec![point(-120.0, 1.0, 1.0), point(120.0, 1.1, 1.0)],
+        );
+        let past = leg(
+            "000003",
+            "past",
+            EngineClass::Piston,
+            vec![point(-4000.0, -0.01, 0.0), point(-3900.0, 0.01, 0.0)],
+        );
+        let unknown = leg(
+            "000004",
+            "unknown",
+            EngineClass::Unknown,
+            vec![point(-20.0, -0.015, 0.0), point(20.0, 0.015, 0.0)],
+        );
+        let mut noisy = leg(
+            "000005",
+            "noisy",
+            EngineClass::Piston,
+            vec![
+                point(-100.0, -0.075, 0.001),
+                point(0.0, 0.0, 0.001),
+                point(100.0, 0.075, 0.001),
+            ],
+        );
+        for p in &mut noisy.points {
+            p.flags = pt_flags::MLAT;
+        }
+        noisy.points[0].alt_src = alt_src::BARO_RAW;
+        let precise = leg(
+            "000005",
+            "precise",
+            EngineClass::Piston,
+            vec![point(0.03125, 0.0, 0.0), point(100.03125, 0.075, 0.0)],
+        );
+        let stores = [
+            vec![early, left, far.clone(), past, unknown, noisy],
+            vec![right, precise, far],
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, legs)| {
+            let day = midnight + (i as f64 - 1.0) * 86_400.0;
+            TrackStore {
+                meta: StoreMeta {
+                    version: 1,
+                    bbox: BBox::new(lat - 2.0, lon - 2.0, lat + 2.0, lon + 2.0),
+                    t_start: day - 3600.0,
+                    t_end: day + 86_400.0 + 3600.0,
+                    geoid_n_m: if i == 0 { -32.0 } else { -20.0 },
+                    sources: vec![format!("synthetic-day-{i}")],
+                    stats: serde_json::json!({"fixture_day": i, "legs": legs.len()}),
+                    created_unix: day,
+                },
+                legs,
+            }
+        })
+        .collect();
+        (spec, stores)
+    }
+
+    #[test]
+    fn cached_subset_matches_the_full_cross_day_merge_and_metadata() {
+        let (mut spec, original) = cached_subset_fixture();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("fdop-cached-subset-{}-{nonce}", std::process::id()));
+        let mut paths = Vec::new();
+        for (i, store) in original.iter().enumerate() {
+            let day = (2026, 9, 8 + i as u32);
+            let (_, key) = bbox_key(&store.meta.bbox);
+            // The second day deliberately uses a partial feed cache.
+            let feed = if i == 0 { "prod+mlatonly" } else { "prod" };
+            let path = day_dir(&dir, day).join(format!("{feed}_{key}.fdtrk"));
+            store.save(&path).unwrap();
+            paths.push(path);
+            assert!(
+                store
+                    .filtered(&spec.bbox, spec.t_start, spec.t_end)
+                    .legs
+                    .iter()
+                    .all(|l| l.icao != "000001"),
+                "neither separate day contains the requested crossing"
+            );
+        }
+        // An earlier, smaller candidate has intact records but a truncated footer.
+        // A scanner must validate discarded data before admitting any of its summaries.
+        let (_, small_key) = bbox_key(&spec.bbox);
+        let bad = day_dir(&dir, (2026, 9, 8)).join(format!("prod+mlatonly_{small_key}.fdtrk"));
+        original[0].save(&bad).unwrap();
+        let bytes = std::fs::read(&bad).unwrap();
+        std::fs::write(&bad, &bytes[..bytes.len() - 4]).unwrap();
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let captured = messages.clone();
+        let opts = FetchOptions {
+            offline: true,
+            progress: Some(Arc::new(move |s| {
+                captured.lock().unwrap().push(s.to_string());
+            })),
+            ..Default::default()
+        };
+        for keep_unknown in [true, false] {
+            spec.keep_unknown = keep_unknown;
+            let mut full = original.clone();
+            for store in &mut full {
+                adjust_geoid(store, spec.geoid_n_m);
+                if !keep_unknown {
+                    store.legs.retain(|l| l.engine != EngineClass::Unknown);
+                }
+            }
+            let expected =
+                merge_stores(full, DAY_JOIN_GAP_S).filtered(&spec.bbox, spec.t_start, spec.t_end);
+            let got = fetch_window(&spec, &dir, &opts).unwrap();
+            assert_eq!(got.legs.len(), expected.legs.len());
+            for (actual, expected) in got.legs.iter().zip(&expected.legs) {
+                assert_eq!(actual.key, expected.key);
+                assert_eq!(actual.icao, expected.icao);
+                assert_eq!(actual.reg, expected.reg);
+                assert_eq!(actual.typ, expected.typ);
+                assert_eq!(actual.engine, expected.engine);
+                assert_eq!(actual.source, expected.source);
+                assert_eq!(actual.points, expected.points);
+            }
+            let crossing = got.legs.iter().find(|l| l.icao == "000001").unwrap();
+            assert_eq!(crossing.key, "000001_20260908_1");
+            assert_eq!(crossing.points.len(), 6);
+            assert_eq!(got.legs.iter().any(|l| l.icao == "000004"), keep_unknown);
+            assert_eq!(got.meta.sources, expected.meta.sources);
+            assert_eq!(got.meta.bbox, spec.bbox);
+            assert_eq!(
+                (got.meta.t_start, got.meta.t_end),
+                (spec.t_start, spec.t_end)
+            );
+            assert_eq!(got.meta.geoid_n_m, spec.geoid_n_m);
+            assert_eq!(got.meta.stats["cache_hits"], 2);
+            let day_stats: Vec<_> = original
+                .iter()
+                .map(|s| serde_json::json!({"sources": s.meta.sources, "stats": s.meta.stats}))
+                .collect();
+            assert_eq!(got.meta.stats["day_stores"], serde_json::json!(day_stats));
+            let notes = got.meta.stats["notes"].as_array().unwrap();
+            assert_eq!(notes.len(), 1);
+            assert!(notes[0].as_str().unwrap().contains(NO_MLATONLY));
+        }
+        assert!(
+            messages.lock().unwrap().iter().any(|s| {
+                s.contains("unreadable cache") && s.contains(&bad.display().to_string())
+            })
+        );
+
+        // The same selection works with one fresh in-memory day. It discards unrelated
+        // aircraft but retains the selected aircraft's earlier leg and both original metas.
+        let selected = load_selected_stores(
+            vec![
+                DayStore::Cached(CachedDay::scan(&paths[0]).unwrap()),
+                DayStore::Built(original[1].clone()),
+            ],
+            &spec,
+        )
+        .unwrap();
+        assert!(
+            selected.iter().map(TrackStore::n_points).sum::<usize>()
+                < original.iter().map(TrackStore::n_points).sum::<usize>()
+        );
+        assert_eq!(
+            selected[0]
+                .legs
+                .iter()
+                .filter(|l| l.icao == "000001")
+                .count(),
+            2
+        );
+        for (kept, all) in selected.iter().zip(&original) {
+            assert!(
+                kept.legs
+                    .iter()
+                    .all(|l| matches!(l.icao.as_str(), "000001" | "000004" | "000005"))
+            );
+            assert_eq!(
+                serde_json::to_value(&kept.meta).unwrap(),
+                serde_json::to_value(&all.meta).unwrap()
+            );
+        }
+        let (lat, lon) = spec.bbox.center();
+        let empty_spec = IngestSpec {
+            bbox: BBox::new(lat + 0.4, lon, lat + 0.5, lon + 0.1),
+            ..spec
+        };
+        let empty = load_selected_stores(
+            paths
+                .iter()
+                .map(|p| DayStore::Cached(CachedDay::scan(p).unwrap()))
+                .collect(),
+            &empty_spec,
+        )
+        .unwrap();
+        assert_eq!(empty.len(), original.len());
+        for (kept, all) in empty.iter().zip(&original) {
+            assert!(kept.legs.is_empty());
+            assert_eq!(
+                serde_json::to_value(&kept.meta).unwrap(),
+                serde_json::to_value(&all.meta).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn aircraft_bounds_keep_wraparound_and_uncertain_reports() {
+        let (spec, stores) = cached_subset_fixture();
+        let mut b = AircraftBounds {
+            t0: spec.t_start,
+            t1: spec.t_end,
+            bbox: BBox::new(-1.0, -179.0, 1.0, 179.0),
+            uncertain: false,
+        };
+        let dateline = IngestSpec {
+            bbox: BBox::new(-0.5, 179.5, 0.5, 180.0),
+            ..spec
+        };
+        assert!(
+            b.overlaps(&dateline),
+            "a wrapped segment can enter this box"
+        );
+        b.bbox = BBox::new(-1.0, -10.0, 1.0, 10.0);
+        assert!(!b.overlaps(&dateline));
+        assert!(!AircraftBounds::default().overlaps(&spec));
+        let mut leg = stores[0].legs[0].clone();
+        leg.points[0].t = f64::NAN;
+        let mut bounds = HashMap::new();
+        include_leg_bounds(&mut bounds, &leg);
+        assert!(bounds[&leg.icao].overlaps(&dateline));
+    }
+
+    #[test]
+    fn aircraft_bounds_preserve_exact_dateline_and_rounded_endpoint_hits() {
+        let (base, stores) = cached_subset_fixture();
+        let (lat, lon) = base.bbox.center();
+        let check = |name: &str, a: (f64, f64, f64), b: (f64, f64, f64), spec: IngestSpec| {
+            let mut leg = stores[0].legs[0].clone();
+            for (p, (t, lat, lon)) in leg.points.iter_mut().zip([a, b]) {
+                p.t = t;
+                p.lat = lat;
+                p.lon = lon;
+            }
+            let full = TrackStore {
+                meta: stores[0].meta.clone(),
+                legs: vec![leg],
+            };
+            let expected = full.filtered(&spec.bbox, spec.t_start, spec.t_end);
+            assert_eq!(expected.legs.len(), 1, "existing filter must keep {name}");
+            assert_eq!(expected.legs[0].points.len(), 2);
+            let mut bounds = HashMap::new();
+            include_leg_bounds(&mut bounds, &full.legs[0]);
+            assert!(
+                bounds[&full.legs[0].icao].overlaps(&spec),
+                "the prefilter must retain the existing filter's {name}"
+            );
+        };
+        // The existing clip treats -180 and +180 as the same meridian, including
+        // constant-longitude segments and a segment touching only at its endpoint.
+        for sign in [-1.0, 1.0] {
+            let west = if sign < 0.0 { 179.5 } else { -180.0 };
+            let spec = IngestSpec {
+                bbox: BBox::new(lat - 0.01, west, lat + 0.01, west + 0.5),
+                t_start: 0.0,
+                t_end: 10.0,
+                ..base
+            };
+            for end_lon in [sign * 180.0, sign * 170.0] {
+                check(
+                    "equivalent dateline meridian",
+                    (0.0, lat, sign * 180.0),
+                    (10.0, lat, end_lon),
+                    spec,
+                );
+            }
+        }
+        // These probes deliberately sit one representable step outside the exact
+        // endpoint. The existing clip's subtraction/division rounds them onto it.
+        let just_after_one = 1.0 + f64::EPSILON;
+        check(
+            "rounded longitude",
+            (0.0, lat, -179.0),
+            (10.0, lat, 1.0),
+            IngestSpec {
+                bbox: BBox::new(lat - 0.01, just_after_one, lat + 0.01, 1.1),
+                t_start: 0.0,
+                t_end: 10.0,
+                ..base
+            },
+        );
+        check(
+            "rounded latitude",
+            (0.0, -89.0, lon),
+            (10.0, 1.0, lon),
+            IngestSpec {
+                bbox: BBox::new(just_after_one, lon - 0.01, 1.1, lon + 0.01),
+                t_start: 0.0,
+                t_end: 10.0,
+                ..base
+            },
+        );
+        check(
+            "rounded time",
+            (-179.0, lat, lon),
+            (1.0, lat, lon),
+            IngestSpec {
+                t_start: just_after_one,
+                t_end: 2.0,
+                ..base
+            },
+        );
     }
 
     #[test]

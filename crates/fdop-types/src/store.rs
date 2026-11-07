@@ -188,8 +188,21 @@ impl TrackStore {
 
     /// Read one complete gzip member, checking its checksum and rejecting trailing data.
     pub fn load(path: &Path) -> io::Result<Self> {
-        let f = std::fs::File::open(path)?;
-        let mut r = BufReader::with_capacity(1 << 20, GzDecoder::new(BufReader::new(f)));
+        let mut legs = Vec::new();
+        let meta = Self::read_legs(std::fs::File::open(path)?, path, |leg| legs.push(leg))?;
+        Ok(Self { meta, legs })
+    }
+
+    /// Visit legs without retaining the rest of a store in memory. `path` labels errors;
+    /// `source` may be an already-open file, so a caller can rewind the same inode later.
+    /// The complete gzip member and its trailing bytes are checked, including discarded
+    /// legs. Visits happen before final validation: discard their results if this errors.
+    pub fn read_legs(
+        source: impl Read,
+        path: &Path,
+        mut visit: impl FnMut(FlightLeg),
+    ) -> io::Result<StoreMeta> {
+        let mut r = BufReader::with_capacity(1 << 20, GzDecoder::new(BufReader::new(source)));
         let magic = r_exact::<_, 8>(&mut r)?;
         if &magic != MAGIC {
             return Err(io::Error::new(
@@ -202,7 +215,6 @@ impl TrackStore {
         r.read_exact(&mut mb)?;
         let meta: StoreMeta = serde_json::from_slice(&mb).map_err(io::Error::other)?;
         let n_legs = u32::from_le_bytes(r_exact::<_, 4>(&mut r)?) as usize;
-        let mut legs = Vec::with_capacity(n_legs);
         let mut pb = Vec::new();
         for _ in 0..n_legs {
             let key = r_str(&mut r)?;
@@ -231,7 +243,7 @@ impl TrackStore {
                     flags: c[41],
                 });
             }
-            legs.push(FlightLeg {
+            visit(FlightLeg {
                 key,
                 icao,
                 reg,
@@ -253,7 +265,7 @@ impl TrackStore {
                 format!("{} has trailing track-store data", path.display()),
             ));
         }
-        Ok(Self { meta, legs })
+        Ok(meta)
     }
 
     /// Keep points inside `bbox` and `[t0, t1]`, or bracketing a segment that crosses both,
@@ -444,6 +456,85 @@ mod tests {
             .as_nanos();
         let name = format!("fdop-store-{label}-{}-{nonce}", std::process::id());
         std::env::temp_dir().join(name).join("t.fdtrk")
+    }
+
+    #[test]
+    fn streamed_legs_preserve_order_payload_and_the_open_file() {
+        use std::io::Seek;
+        let mut original = sample_store();
+        for p in &mut original.legs[0].points {
+            p.lat = 40.876466;
+            p.lon = -73.524951;
+            p.gs_mps = 70.0;
+        }
+        original.legs[0].reg = "TEST".into();
+        let leg = original.legs[0].clone();
+        original.legs = (0..3)
+            .map(|i| FlightLeg {
+                key: format!("synthetic_{i}"),
+                icao: format!("{i:06x}"),
+                ..leg.clone()
+            })
+            .collect();
+        let path = test_path("stream");
+        original.save(&path).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut visited = Vec::new();
+        let meta = TrackStore::read_legs(&mut file, &path, |leg| visited.push(leg)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&meta).unwrap(),
+            serde_json::to_value(&original.meta).unwrap()
+        );
+        assert_eq!(visited.len(), original.legs.len());
+        for (got, expected) in visited.iter().zip(&original.legs) {
+            assert_eq!(got.key, expected.key);
+            assert_eq!(got.icao, expected.icao);
+            assert_eq!(got.reg, expected.reg);
+            assert_eq!(got.typ, expected.typ);
+            assert_eq!(got.source, expected.source);
+            assert_eq!(got.engine, expected.engine);
+            assert_eq!(got.points, expected.points);
+        }
+        // A concurrent atomic save changes the name, not the already-open inode. A
+        // second pass must read the same dataset whose first-pass summaries it used.
+        let mut replacement = original.clone();
+        replacement.legs.clear();
+        replacement.save(&path).unwrap();
+        assert!(TrackStore::load(&path).unwrap().legs.is_empty());
+        file.rewind().unwrap();
+        let mut selected = Vec::new();
+        TrackStore::read_legs(&mut file, &path, |leg| {
+            if leg.icao == "000001" {
+                selected.push(leg);
+            }
+        })
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].key, original.legs[1].key);
+        assert_eq!(selected[0].points, original.legs[1].points);
+    }
+
+    #[test]
+    fn streamed_legs_validate_discarded_payloads_and_footer() {
+        let path = test_path("stream-validation");
+        sample_store().save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let read = |bytes: &[u8]| TrackStore::read_legs(bytes, &path, |_| {});
+        assert!(read(&bytes).is_ok());
+        assert!(read(&bytes[..bytes.len() / 2]).is_err());
+        for missing in 1..=8 {
+            assert!(read(&bytes[..bytes.len() - missing]).is_err());
+        }
+        let mut corrupt = bytes.clone();
+        let crc = corrupt.len() - 8;
+        corrupt[crc] ^= 1;
+        assert!(read(&corrupt).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0xa5);
+        assert!(read(&trailing).is_err());
+        let mut second_member = bytes.clone();
+        second_member.extend_from_slice(&bytes);
+        assert!(read(&second_member).is_err());
     }
 
     #[test]

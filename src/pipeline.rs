@@ -2415,7 +2415,9 @@ mod tests {
             "clock offset {} s",
             clock - fixture.start
         );
-        for flight in ["A1DFEB", "ACE391"] {
+        // Unlike the direct selftest, this path reloads a merged day store, whose flight
+        // keys are canonical {lowercase ICAO}_{UTC date}_{leg number} identities.
+        for flight in ["a1dfeb_20260908_0", "ace391_20260908_0"] {
             assert!(
                 best.matches.iter().any(|m| m.flight == flight),
                 "missing {flight}"
