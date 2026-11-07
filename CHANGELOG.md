@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve the original sub-bin correction at a spectral basin boundary
+
+- The multi-bin restoration walk could reach the neighbouring basin-boundary bin and discard a
+  valid three-bin interpolation that the original code accepted. With normalized samples
+  `[8, 12, 10]` and restored samples `[12, 11, 5]`, the concave raw vertex is -0.7 bins,
+  safely between the selected bin and its boundary; retaining the normalized vertex instead
+  creates a 0.216667 Hz error at 0.25 Hz spacing.
+- Try that original concave, finite, at-most-one-bin correction first, with the current guide-band
+  guard. When it is unavailable, retain the multi-bin basin walk unchanged. Qualification, SNR/z,
+  gates, fixtures and tolerances are unchanged. Add an analytic regression mirrored across both
+  boundaries, checking the exact vertex and unchanged normalized evidence.
+- **Validation limit.** Independent source review and exact f32 fixture arithmetic support this
+  narrow correction. The executor became unavailable before its Rust formatting, compilation or
+  regression could run. Earlier passing tests and Clippy cover the preceding source through
+  `51d9bb0`, not this follow-up.
+- **Known unresolved test failure.** The broader checks reached 128 distinct passing core tests,
+  but `a_one_sided_refusal_is_measured_from_a_free_trace_of_its_ridge_and_tones_are_not` reported
+  failure before the process was killed by SIGKILL. Its captured assertion was not printed, and
+  a focused rerun was also killed after the clean positive recovery. The failing assertion and
+  cause remain unknown; this separate boundary correction is not claimed to resolve it. The
+  full core suite, application gates and field-recording replays remain incomplete.
+
 ### Stream decoded audio without retaining a second full PCM recording
 
 - Convert FFmpeg stdout incrementally into the final sample vector with a 64 KiB byte buffer.

@@ -275,6 +275,20 @@ fn profile_peak(
             }
             (count >= need).then_some(sum / count as f64)
         };
+        // Preserve the original three-bin correction before walking. A raw maximum
+        // on a basin-boundary bin can still have its interpolated vertex inside the
+        // basin; the whole [k - 1, k + 1] neighbourhood belongs to the selected peak.
+        if let (Some(a), Some(b), Some(c)) = (raw(k - 1), raw(k), raw(k + 1)) {
+            let curvature = a - 2.0 * b + c;
+            let offset = 0.5 * (a - c) / curvature;
+            if curvature < 0.0
+                && offset.is_finite()
+                && offset.abs() <= 1.0
+                && (offs[k] + offset * df).abs() <= band
+            {
+                return Some((f_pred + offs[k] + offset * df, snr, snr / mad));
+            }
+        }
         let (mut left, mut right) = (k - 1, k + 1);
         while left > 0 && prof[left - 1].is_finite() && prof[left - 1] < prof[left] {
             left -= 1;
@@ -584,6 +598,44 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn background_restoration_keeps_a_sub_bin_vertex_inside_a_basin_boundary() {
+        for direction in [-1.0, 1.0] {
+            let level = |f: f64| match (((f - 100.0) / 0.25) * direction).round() as i32 {
+                -2 => 16.0,
+                -1 => 8.0,
+                0 => 12.0,
+                1 => 10.0,
+                2 => 4.0,
+                _ => 0.0,
+            };
+            let spec = spec_from_profile(level);
+            let background: Vec<f32> = spec
+                .f
+                .iter()
+                .map(|&f| {
+                    let bin = (f - 100.0) / spec.df() * direction;
+                    let raw = (12.225 - 2.5 * (bin + 0.7).powi(2)).max(0.0);
+                    (raw - level(f)) as f32
+                })
+                .collect();
+            let peak = |offsets| {
+                guided_ridge_peak(&spec, 1, 100.0, |_| 0.0, 5.0, 12.0, 1, 3.0, 4.0, offsets)
+                    .unwrap()
+            };
+            let normalized = peak(None);
+            let restored = peak(Some(background.as_slice()));
+            // The nearer normalised peak clears its separating valley by 4 dB.
+            // Its raw neighbours [12, 11, 5] have a vertex at -0.7 bins, between
+            // the selected bin and the valley at -1. Mirror both directions.
+            let expected = 100.0 - 0.7 * spec.df() * direction;
+            let normalized_vertex = 100.0 + spec.df() * direction / 6.0;
+            assert!((normalized.0 - normalized_vertex).abs() < 2e-5, "{normalized:?}");
+            assert!((restored.0 - expected).abs() < 2e-5, "{restored:?}");
+            assert_eq!((restored.1, restored.2), (normalized.1, normalized.2));
         }
     }
 

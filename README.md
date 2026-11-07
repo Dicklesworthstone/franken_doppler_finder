@@ -872,10 +872,12 @@ Design notes:
   along the full Doppler curve. Noise exclusion accounts for the Hann main lobe and chirp smear, so
   narrowing the frequency tolerance does not count the signal as its own noise. Normalized spectra
   still select and qualify peaks. Only after qualification, local frequency interpolation restores
-  the removed row background; its slope must not shift the measured tone. If normalization moved
-  that peak by several FFT bins, restoration climbs only within its original spectral lobe, stopping
-  at a valley or flat noise floor. A concave local parabola gives the frequency, inside the original
-  frequency tolerance. Restoration cannot cross to another ridge or a removed hum, and the original
+  the removed row background; its slope must not shift the measured tone. Preserve a valid concave
+  three-bin interpolation first, including a vertex between the selected bin and a neighbouring
+  basin boundary. If that correction is unavailable and normalization moved the peak by several FFT
+  bins, restoration climbs only within its original spectral lobe, stopping at a valley or flat noise
+  floor. Every restored vertex stays inside the original frequency tolerance. Restoration cannot
+  cross to another ridge or a removed hum, and the original
   SNR/z thresholds stay in force. No extra full spectrogram is retained.
 - **Steep passes get a matched window.** A 0.5 s main window stops holding a chirp at 1/win² = 4 Hz/s. Frames
   steeper than that read a second spectrogram, with the window that matches the latest fit's chirp. There the
@@ -1048,20 +1050,36 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ### Recovery changes (2026-11-07): validation incomplete
 
-**Latest focused checks.** The executor recovered, and real RCH with the pinned nightly now runs
-the core tests. Six guided-ridge/background-restoration tests and the harmonic-family recovery PCM
-case pass together on the final frequency-restoration code. All three harmonic-family cases, the
-five local-approach/search regressions, the three coarse curve-stamping regressions, all four fast-bank
-tests and the STFT bitwise-reference test have also passed. Core/shared-type all-target Clippy passes
-with warnings denied, and workspace formatting passes. These use one build job, two Rayon workers,
-optimization level 1 for workspace crates, unoptimized dependencies and no debug information.
+**Checks before the final boundary correction (through `51d9bb0`).** Real RCH with the pinned nightly
+ran six guided-ridge/background-restoration tests and the harmonic-family recovery PCM case together.
+All three harmonic-family cases, five local-approach/search regressions, three coarse curve-stamping
+regressions, four fast-bank tests and the STFT bitwise-reference test also passed. Core/shared-type
+all-target Clippy passed with warnings denied, and workspace formatting passed. These used one build
+job, two Rayon workers, optimization level 1 for workspace crates, unoptimized dependencies and no
+debug information.
 
-The actual `src/selftest.rs`, compiled unchanged through an external entry point against fresh core
-libraries, passes the real decode/detect/measure/search chain: both intended flights, 2.365 m position
-error, 0.0249 s clock error and the existing 75 m radius. The complete application build and workspace
-Clippy were killed by SIGKILL in upstream `asupersync`, including a retry with one compiler frontend
-and backend job. The metadata/offline pipeline tests, full workspace gates, CLI release selftest and
-reference-recording replay therefore remain unconfirmed; the external selftest does not replace them.
+**Known unresolved failure.** Across the focused and partial broader runs, 128 distinct core tests
+passed, but
+`measure::tests::a_one_sided_refusal_is_measured_from_a_free_trace_of_its_ridge_and_tones_are_not`
+reported **FAILED**. The broader process was subsequently killed by SIGKILL before its captured
+assertion diagnostic was printed. A focused rerun was also killed, after printing the clean positive
+case's accurate recovery. The failing assertion and cause remain unknown; the complete core suite
+has not passed. Existing fixtures, acceptance gates and tolerances were not relaxed.
+
+An independent source review found that the new basin walk could discard a valid original three-bin
+correction at a basin boundary. The final follow-up preserves that correction first and adds a mirrored
+analytic regression with unchanged normalized SNR/z. Its exact f32 sample arithmetic was checked, but
+the executor disconnected before Rust formatting, compilation or tests could run on that follow-up.
+It is **not established** that this separate correction resolves the one-sided failure, and the earlier
+passing checks do not validate the final source.
+
+Before that follow-up, the actual `src/selftest.rs`, compiled unchanged through an external entry point
+against fresh core libraries, passed the real decode/detect/measure/search chain: both intended flights,
+2.365 m position error, 0.0249 s clock error and the existing 75 m radius. The complete application build
+and workspace Clippy were killed by SIGKILL in upstream `asupersync`, including a retry with one compiler
+frontend and backend job. The metadata/offline pipeline tests, full workspace gates, CLI release
+selftest and reference-recording replay therefore remain unconfirmed; the external selftest does
+not replace them.
 
 **Earlier recovery checks.**
 
