@@ -375,9 +375,12 @@ pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams)
 /// the primary cannot supply an aircraft event. A strong survey harmonic can lose its ridge
 /// around the CPA while another harmonic of the same pass remains measurable.
 ///
-/// A usable primary is returned unchanged. Otherwise the first usable sibling, strongest
-/// survey score first, supplies the family's one event; if none succeeds, keep the primary's
-/// refusal. The selected detection retains its `harmonic_of` link, so callers can distinguish
+/// A usable primary is returned unchanged, and so is one whose ridge was traced through the
+/// CPA ([`lost_ridge`]): a sibling of the same pass shares its speed and distance, so a sibling
+/// that passes where such a primary was refused (fit RMS) or fell under the aircraft bounds is a
+/// different curve, not a recovery. Otherwise the first usable sibling, strongest survey score
+/// first, supplies the family's one event; if none succeeds, keep the primary's refusal. The
+/// selected detection retains its `harmonic_of` link, so callers can distinguish
 /// a recovery from an event measured by the primary alone when grading the expanded search.
 pub fn measure_family(
     x: &[f32],
@@ -393,7 +396,7 @@ pub fn measure_family(
         measure(x, sr, &refined, id, p)
     };
     let first = attempt(primary);
-    if first.is_aircraft_like() {
+    if first.is_aircraft_like() || !lost_ridge(&first, p) {
         return first;
     }
     let mut siblings: Vec<_> = detections
@@ -408,6 +411,19 @@ pub fn measure_family(
         }
     }
     first
+}
+
+/// Whether a measurement lost its ridge around the CPA, the failure a harmonic sibling can
+/// recover: no fit, too few trace points, a trace short of the CPA on either side, or too little
+/// of the frequency drop followed. A NaN reading counts as lost.
+fn lost_ridge(m: &MeasuredEvent, p: &MeasureParams) -> bool {
+    let q = &m.quality;
+    let short = |x: f64, min: f64| x.is_nan() || x < min;
+    m.fit.is_none()
+        || q.n_points < p.min_points
+        || short(q.span_approach_s, p.min_side_s)
+        || short(q.span_recede_s, p.min_side_s)
+        || short(q.drop_traversed, p.min_drop_traversed)
 }
 
 /// Least number of points a guided trace needs to be fitted (and so to be followed afresh).
@@ -1008,6 +1024,44 @@ mod tests {
         );
         assert_eq!(selected.detection.id, primary.id);
         assert!(!selected.is_aircraft_like());
+    }
+
+    /// Only a primary whose ridge is missing around the CPA may yield to a sibling. A primary that
+    /// traced both sides and the drop was measured: a sibling of the same pass shares its speed
+    /// and distance, so one that passes where this primary was refused for its RMS, or measured
+    /// under the aircraft bounds, is a different curve (set D's N456CS_R38 and feederwatch's slow
+    /// source both took one that way).
+    #[test]
+    fn only_a_primary_that_lost_its_ridge_tries_its_siblings() {
+        let (x, detections) = harmonic_family_scene(false, true);
+        let dp = DetectParams::default();
+        let (_, lin) = survey(&x, 4000, &dp).unwrap();
+        let mp = MeasureParams::default();
+        let primary = &detections[2];
+        let measured = measure(&x, 4000, &refine(&lin, primary, mp.c), "e1", &mp);
+        assert!(measured.is_aircraft_like(), "{:?}", measured.quality);
+        assert!(!lost_ridge(&measured, &mp));
+
+        let with = |f: &dyn Fn(&mut MeasuredEvent)| {
+            let mut m = measured.clone();
+            m.quality.ok = false;
+            f(&mut m);
+            lost_ridge(&m, &mp)
+        };
+        // refused, but traced through the CPA: keeps its own result
+        assert!(!with(&|m| m.quality.rmse_hz = 2.1));
+        // measured, but slower than the aircraft bound: keeps its own result
+        assert!(!with(&|m| {
+            m.quality.ok = true;
+            m.fit.as_mut().unwrap().best.v = 26.0;
+        }));
+        // the ridge is missing around the CPA: the siblings are tried
+        assert!(with(&|m| m.quality.drop_traversed = 0.5 * mp.min_drop_traversed));
+        assert!(with(&|m| m.quality.drop_traversed = f64::NAN));
+        assert!(with(&|m| m.quality.span_approach_s = 0.5 * mp.min_side_s));
+        assert!(with(&|m| m.quality.span_recede_s = 0.5 * mp.min_side_s));
+        assert!(with(&|m| m.quality.n_points = mp.min_points - 1));
+        assert!(with(&|m| m.fit = None));
     }
 
     #[test]

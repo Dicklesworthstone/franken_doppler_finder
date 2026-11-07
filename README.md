@@ -606,9 +606,9 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 ### `fdop detect <MEDIA>`: flyovers only, no ADS-B
 
 Detects flyovers and measures them in detector order, strongest first within each stage, until 24 independent aircraft
-events survive the same eligibility and harmonic checks used by `locate`. If a family's primary fails,
-its detected harmonic siblings are tried strongest first until one passes the existing quality and aircraft
-gates. The family supplies at most one result. Refused fits, non-aircraft fits and duplicate traces of one
+events survive the same eligibility and harmonic checks used by `locate`. If a family's primary lost its
+ridge around the closest approach, its detected harmonic siblings are tried strongest first until one passes
+the existing quality and aircraft gates. The family supplies at most one result. Refused fits, non-aircraft fits and duplicate traces of one
 pass do not consume that allowance. The selected result for each measured family remains in `events.json`,
 including duplicates and unrecovered refusals. A warning on stderr says when either cap omits candidates, when the audio
 looks high-passed, or when the survey image was raised because its spread was under 0.5. A detection found
@@ -926,10 +926,14 @@ Design notes:
   accepts it; `reseeded` in `events.json` marks it. Accepted fits, and refusals whose trace held both sides, are
   measured exactly as before. A wrong fit can pass this way too: a climbing pass in a clip that starts mid-drop
   trades speed against distance, and the retry accepts the wrong pair.
-- **A failed primary can yield to a usable harmonic.** A bright harmonic may lose its ridge through the
-  drop while another tone from the same pass remains measurable. Both `locate` and `detect` try the
-  primary first, then its detected siblings in score order only if the primary fails the quality or
-  aircraft bounds. The first usable sibling supplies the family's single event. If none passes, the
+- **A primary that lost its ridge can yield to a usable harmonic.** A bright harmonic may lose its ridge
+  through the drop while another tone from the same pass remains measurable. Both `locate` and `detect`
+  try the primary first, then its detected siblings in score order only if the primary has no fit, fewer
+  than 80 trace points, less than 8 s of trace on either side of the closest approach, or less than 15 %
+  of its frequency drop followed. A primary that was traced but refused for another reason (such as its
+  fit RMS) or measured below the aircraft limits keeps its own result: on the recordings
+  checked, every sibling chosen over such a primary measured the pass worse. The first usable sibling
+  supplies the family's single event. If none passes, the
   original primary refusal remains. The recovered detection retains its `harmonic_of` link and always
   counts as measured past the old line, including when the primary had a strong survey score.
 - **Measurement slots belong to independent aircraft events.** The same measured-curve comparison used by

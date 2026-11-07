@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Try a harmonic sibling only when its primary lost its ridge
+
+- A family's harmonic siblings are now measured only when its primary has no fit, fewer than the
+  minimum trace points, a trace short of the closest approach on either side, or too little of its
+  frequency drop followed. Before this, any refusal or any fit below the aircraft limits sent the family
+  to its siblings, and on real recordings that only replaced right measurements with wrong ones.
+- On Livermore set D, clip N456CS_R38 (truth 68 m/s at 2,511 m) had been measured from its primary as
+  62 m/s at 2,398 m. Its 392.9 Hz primary was then refused for fit RMS alone (2.13 Hz > 1.50), its
+  193.8 Hz half-frequency sibling fitted 109 m/s at 4,914 m, and that event became the clip's scored
+  answer, so set D at 30 %/60 % fell from 37 to 36 right. After 82f26a9's trace change also lost
+  N1387U_R44, main stood at 35, one below dopplertrack's wide setting (36); with this change it is 36.
+  On the seven screening recordings the only other changed event was a feederwatch primary measured
+  under 28 m/s and replaced by a 1.5x sibling.
+- The designed case, a primary whose ridge breaks through the drop while a sibling stays measurable,
+  recovers as before. A new test checks which refusals count as a lost ridge, including a NaN reading.
+
 ### Cache completed ADS-B days while other downloads continue
 
 - Drain a bounded queue of completed raw releases inside the download-worker scope. Build and
