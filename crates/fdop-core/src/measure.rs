@@ -2514,8 +2514,9 @@ mod tests {
                 );
             }
         }
-        // A refusal whose trace held both sides (here a fit of 6 m/s) is not followed afresh: the
-        // result is the first attempt's, unchanged.
+        // This same PCM and wrong seed formerly gave a two-sided 6 m/s misfit.
+        // Restoring the raw peak leaves a one-sided first trace, so the free retry
+        // must now recover the physical pass within the same accuracy bounds.
         let x = wrong_shape_audio(Some((250.0, 110.0, 900.0)), None, t0r, dur, 0.15);
         let det = det_of((250.0 * 0.96, 110.0 * 1.25, 900.0 * 1.8), t0r + 14.0);
         let (a, b) = (
@@ -2524,14 +2525,70 @@ mod tests {
         );
         let q = &b.quality;
         assert!(
-            !q.ok && q.span_approach_s >= off.min_side_s && q.span_recede_s >= off.min_side_s,
-            "{:?} {} {}",
-            q.reasons,
-            q.span_approach_s,
-            q.span_recede_s
+            !q.ok
+                && !q.reseeded
+                && (q.span_approach_s < off.min_side_s || q.span_recede_s < off.min_side_s),
+            "first fit {:?}; quality {q:?}",
+            b.fit.as_ref().map(|f| f.best)
         );
-        assert!(!a.quality.reseeded);
-        assert_eq!(json(&a), json(&b));
+        assert!(a.quality.ok && a.quality.reseeded, "{:?}", a.quality);
+        let fit = a.fit.as_ref().unwrap().best;
+        eprintln!("recovered receding seed: {fit:?}");
+        assert!((fit.f0 - 250.0).abs() <= 0.005 * 250.0, "{fit:?}");
+        assert!((fit.v - 110.0).abs() <= 0.03 * 110.0, "{fit:?}");
+        assert!((fit.d - 900.0).abs() <= 0.05 * 900.0, "{fit:?}");
+        assert!((fit.t0r - t0r).abs() <= 0.5, "{fit:?}");
+        assert_eq!(a.detection.v, det.v);
+    }
+
+    #[test]
+    fn a_two_sided_slow_pass_stays_refused_without_a_free_retry() {
+        // Use an actual slow source for the two-sided refusal policy, independent
+        // of how an aircraft pass happens to fit from an incorrect survey seed.
+        let (dur, t0r) = (240.0, 120.0);
+        let (f0, v, d) = (250.0, 6.0, 200.0);
+        let x = wrong_shape_audio(Some((f0, v, d)), None, t0r, dur, 0.15);
+        let det = Detection {
+            id: 0,
+            t0r,
+            f0,
+            v,
+            d,
+            score: 8.0,
+            score_approach: 8.0,
+            score_recede: 8.0,
+            half_s: 60.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+            from_contrast: false,
+        };
+        let on = MeasureParams::default();
+        let off = MeasureParams {
+            free_reseed: false,
+            ..on.clone()
+        };
+        let (a, b) = (
+            measure(&x, 4000, &det, "e1", &on),
+            measure(&x, 4000, &det, "e1", &off),
+        );
+        let q = &b.quality;
+        assert!(
+            !q.ok && q.span_approach_s >= off.min_side_s && q.span_recede_s >= off.min_side_s,
+            "{q:?}"
+        );
+        assert!(!a.quality.reseeded, "{:?}", a.quality);
+        assert_eq!(q.reasons.len(), 1, "{q:?}");
+        assert!(q.reasons[0].starts_with("implausible speed"), "{q:?}");
+        let fit = b.fit.as_ref().unwrap().best;
+        eprintln!("two-sided slow pass: {fit:?}");
+        assert!((fit.f0 - f0).abs() <= 0.005 * f0, "{fit:?}");
+        assert!((fit.v - v).abs() <= 0.03 * v, "{fit:?}");
+        assert!((fit.d - d).abs() <= 0.05 * d, "{fit:?}");
+        assert!((fit.t0r - t0r).abs() <= 0.5, "{fit:?}");
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            serde_json::to_value(&b).unwrap()
+        );
     }
 
     /// `dur` s at 4 kHz of a pass's tone with the skirts of a real one, in uniform noise of

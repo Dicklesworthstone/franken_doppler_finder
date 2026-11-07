@@ -1075,22 +1075,30 @@ all-target Clippy passed with warnings denied, and workspace formatting passed. 
 job, two Rayon workers, optimization level 1 for workspace crates, unoptimized dependencies and no
 debug information.
 
-**Known unresolved failure.** Across the focused and partial broader runs, 128 distinct core tests
-passed, but
-`measure::tests::a_one_sided_refusal_is_measured_from_a_free_trace_of_its_ridge_and_tones_are_not`
-reported **FAILED**. The broader process was subsequently killed by SIGKILL before its captured
-assertion diagnostic was printed. A focused rerun was also killed, after printing the clean positive
-case's accurate recovery. The failing assertion and cause remain unknown; the complete core suite
-has not passed. Existing fixtures, acceptance gates and tolerances were not relaxed.
+**Follow-up checks and the reported recovery failure.** On `697eb4a`, all seven guided-ridge tests
+passed through real RCH, including the previously unrun basin-boundary regression. The focused
+`a_one_sided_refusal_is_measured_from_a_free_trace_of_its_ridge_and_tones_are_not` test completed its
+three original recovery cases, their physical accuracy checks, direct-seed equality checks and all
+reversed-audio, steady-tone and noise controls. It then failed at the final fixture's obsolete
+assertion that the guided-only trace still covered both sides.
 
-An independent source review found that the new basin walk could discard a valid original three-bin
-correction at a basin boundary. The final follow-up preserves that correction first and adds a mirrored
-analytic regression with unchanged normalized SNR/z. Its exact f32 sample arithmetic was checked, but
-the executor disconnected before Rust formatting, compilation or tests could run on that follow-up.
-It is **not established** that this separate correction resolves the one-sided failure, and the earlier
-passing checks do not validate the final source.
+That unchanged 250 Hz, 110 m/s, 900 m PCM fixture now has zero approach support and 61.11 s of recede
+support on its first attempt. The existing retry correctly runs, and its result passes the quality
+gates with `reseeded=true`. The retried fit's complete parameter values were not printed, so this run
+does not establish its newly added accuracy assertions. The test now keeps that same PCM and seed,
+requires a one-sided initial refusal and successful recovery, and applies the same 0.5% tone,
+3% speed, 5% distance and 0.5 s timing bounds used by the original positive cases. A separate real
+6 m/s PCM source checks accurate two-sided measurement, refusal specifically by the unchanged speed
+gate, no reseeding, and identical complete results with retry enabled and disabled.
 
-Before that follow-up, the actual `src/selftest.rs`, compiled unchanged through an external entry point
+Those revised assertions and the new slow-source control received independent source review but
+remain **unrun**. A subsequent core test build was killed by SIGKILL before the new clock-alternative
+regression could execute, then the executor disconnected. Across the earlier focused and partial
+broader runs, 128 distinct core tests passed; no complete current-core or workspace suite pass is
+claimed. Production acceptance gates, the original PCM fixtures and accuracy tolerances were not
+relaxed.
+
+Before the basin-boundary correction, the actual `src/selftest.rs`, compiled unchanged through an external entry point
 against fresh core libraries, passed the real decode/detect/measure/search chain: both intended flights,
 2.365 m position error, 0.0249 s clock error and the existing 75 m radius. The complete application build
 and workspace Clippy were killed by SIGKILL in upstream `asupersync`, including a retry with one compiler

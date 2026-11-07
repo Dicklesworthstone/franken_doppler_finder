@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Check the newly recovered pass against its physical truth
+
+- Diagnose the previously reported one-sided-recovery test failure on `697eb4a`: all three original
+  positive cases, their accuracy/direct-seed checks and their reversed, steady-tone and noise controls
+  passed. The failure was the final real-pass fixture's assumption that its first trace still covered
+  both sides. With restored frequencies it has zero approach support and 61.11 s of recede support;
+  the existing retry runs and returns a quality-passing, reseeded event.
+- Keep that fixture's PCM and survey seed unchanged, require its one-sided refusal and recovery, and
+  check the original 0.5% tone, 3% speed, 5% distance and 0.5 s timing bounds. Preserve independent
+  two-sided-refusal coverage with a real 6 m/s source: require an accurate fit, speed-only rejection,
+  no retry and identical complete results with retry enabled or disabled. Production code is unchanged.
+- **Validation:** all seven trace tests, including the prior boundary correction, passed through real
+  RCH. The diagnostic recovery run reached the identified assertion after 303.09 s. Its final retried
+  fit parameters were not printed, so its new accuracy checks and the separate slow-source control
+  remain unrun after the executor disconnected. Independent source review passed; this is not a
+  complete-suite pass and no field-accuracy claim is made.
+
 ### Keep late-evening curve searches inside their required archive days
 
 - Stop the curve catalogue inside its final required UTC day rather than at the following midnight.
