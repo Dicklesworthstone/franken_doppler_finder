@@ -878,12 +878,17 @@ Design notes:
   curves of its own, and the measurement gates refuse them.
 - **A final bank covers faster subsonic passes.** After the primary, edge and contrast stages, templates
   continue the original speed spacing above 175 m/s, up to the existing measurement bound of 0.8 times
-  sound speed (about 194, 215, 238 and 263 m/s at 343 m/s). They use residual evidence, the remaining
-  candidate budget and detection slots, and must clear the existing strong line. Earlier detections keep
-  their order. Refinement permits these faster seeds inside the same measurement bound; legacy seeds
-  keep their original refinement path. A faster coarse seed counts as measured past the old line even
-  if refinement lowers its speed. A fixed 14-scene synthetic signal-strength sweep establishes one new
-  faint 215 m/s recovery with no baseline event; it does not establish recovery of a real field miss.
+  sound speed (about 194, 215, 238 and 263 m/s at 343 m/s). Full-length fast templates run first, followed
+  by their short edge templates near the recording's ends. The fast edge scan uses the ordinary edge
+  bank's coverage guard, so it supplies only cells the corresponding full-length template cannot cover.
+  Both fast stages use residual evidence, share the remaining candidate budget and detection slots,
+  and must clear the existing strong line. Ordinary edge templates still use the silence line.
+  Earlier detections keep their order. Refinement permits these faster seeds inside the same measurement
+  bound and preserves an edge seed's short half; legacy seeds keep their original refinement path.
+  A faster coarse seed counts as measured past the old line even if refinement lowers its speed.
+  A fixed 14-scene synthetic signal-strength sweep establishes one new faint 215 m/s full-length
+  recovery with no baseline event; it does not establish recovery of a real field miss. The new
+  fast-edge PCM recovery assertions remain unrun (Testing).
 - **STFT working storage stays bounded as recordings grow.** Frames transform into a reusable block of
   at most 256 columns and 4 MiB of frequency values, then copy into the final row-major spectrogram.
   A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
@@ -1155,6 +1160,13 @@ The historical-radiosonde repair adds lifetime-boundary checks and an offline ca
 regression, including a closed station with usable historical winds and a station opening at
 the following sounding bracket. The provider date contract and production/parser paths were
 reviewed independently; the new Rust regressions and formatting remain unrun.
+
+The fast-edge extension adds 30-second PCM cases for early and late fast flyovers, through
+survey, detection, refinement, measurement and independent-event selection, plus reversed,
+steady-tone and noise/hum controls. The old implementation failed the early 215 m/s case:
+all five fixed attenuations supplied no fast-edge candidate. Production source review checked
+the reused speed ladder, coverage guard, residual mask, stage order and shared budgets. The
+new implementation and recovery/control assertions remain unrun after the executor disconnected.
 
 The US radiosonde-prefix repair adds an offline cached-profile regression for Alaska-style,
 Hawaii-style, continental and legacy station identifiers. It requires both sounding brackets

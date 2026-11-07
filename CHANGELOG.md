@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Detect fast flyovers near recording boundaries
+
+- Extend the supplemental fast-aircraft bank into the existing short edge-template path.
+  Full-length fast templates retain priority; fast edges run afterward only near the recording
+  ends and only where their corresponding full-length template lacks enough coverage.
+- Reuse the original fast speed ladder and edge-window calculation. Both supplemental stages
+  share the residual mask, remaining candidate allowance and detection cap, and require the
+  existing strong threshold. Keep ordinary-edge silence-line behavior, physical measurement
+  tolerances, original-stage order and the extra-measurement confidence gate.
+- Add 30-second physical-phase PCM cases for early 215 m/s and late 245 m/s passes across a fixed
+  attenuation ladder. Every new accepted event must satisfy the existing tone, speed, distance
+  and timing bounds; at least one recovery per end is required. Noise/hum, steady-tone and
+  reversed-pass controls must supply no aircraft event. Extend stage-order and speed-bound
+  checks to include the new edge stage.
+- **Validation:** on the old production code, the early 215 m/s case failed as expected with
+  zero fast-edge candidates at all five attenuations. The test-only source compiled through
+  real RCH on the pinned nightly after serializing compiler frontend/backend jobs. Independent
+  source review found no concrete blocker. New production compilation, formatting, positive
+  recovery, negative controls, workspace gates and recording replays remain unrun after
+  executor loss; no measured new recovery or runtime improvement is claimed.
+
 ### Try a harmonic sibling only when its primary lost its ridge
 
 - A family's harmonic siblings are now measured only when its primary has no fit, fewer than the

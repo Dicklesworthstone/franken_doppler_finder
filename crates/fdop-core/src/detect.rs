@@ -32,7 +32,8 @@ pub struct DetectParams {
     pub v_grid: Vec<f64>,
     /// After the existing banks, search their residual with faster subsonic templates. Their
     /// spacing continues the primary bank's last ratio, up to the measurement bound, 0.8 c.
-    /// They only fill unused detection slots and must clear the strong detection line.
+    /// Full-length templates run before their edge templates. Each only fills unused detection
+    /// slots and must clear the strong detection line.
     pub fast_templates: bool,
     pub d_grid: Vec<f64>,
     /// Spacing (s) of the path samples.
@@ -469,9 +470,9 @@ fn build_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
 
 /// Continue the established speed spacing without changing any primary template. Only the
 /// existing subsonic measurement domain is added; no detection or measurement line is relaxed.
-fn build_fast_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
+fn fast_template_params(p: &DetectParams) -> Option<DetectParams> {
     if !p.fast_templates || !p.c.is_finite() || 0.8 * p.c <= PRIMARY_MAX_SPEED_MPS {
-        return Vec::new();
+        return None;
     }
     let ratio = PRIMARY_MAX_SPEED_MPS / PRIMARY_SPEED_GRID[PRIMARY_SPEED_GRID.len() - 2];
     let mut speeds = Vec::new();
@@ -480,13 +481,18 @@ fn build_fast_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
         speeds.push(speed);
         speed *= ratio;
     }
-    build_templates(
-        &DetectParams {
-            v_grid: speeds,
-            ..p.clone()
-        },
-        hop,
-    )
+    Some(DetectParams {
+        v_grid: speeds,
+        ..p.clone()
+    })
+}
+
+fn build_fast_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
+    fast_template_params(p).map_or_else(Vec::new, |p| build_templates(&p, hop))
+}
+
+fn build_fast_edge_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
+    fast_template_params(p).map_or_else(Vec::new, |p| build_edge_templates(&p, hop))
 }
 
 /// The edge bank: for each (v, d) whose shortest half is the `min_half_s` floor, that template
@@ -518,6 +524,18 @@ fn build_edge_templates(p: &DetectParams, hop: f64) -> Vec<Template> {
     out
 }
 
+/// Only frames near a recording end can need the shorter coverage of an edge template.
+fn edge_windows(ls: &LogSpec, min_half_s: f64) -> Vec<(usize, usize)> {
+    let nt = ls.nt();
+    let head = ls.t.partition_point(|&x| x - ls.t[0] < min_half_s);
+    let tail = ls.t.partition_point(|&x| ls.t[nt - 1] - x >= min_half_s);
+    if tail <= head {
+        vec![(0, nt)]
+    } else {
+        vec![(0, head), (tail, nt)]
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Detection {
     pub id: usize,
@@ -543,8 +561,9 @@ pub struct Detection {
 }
 
 /// Run the template banks. Primary/edge detections come first, then the contrast stage's, then
-/// the fast stage's; each group is strongest first. All clear `thr_silence_db`, and the two
-/// supplemental groups also clear `thr_db`. Family primaries are the measurement candidates.
+/// the fast full-length and fast edge stages'; each group is strongest first. All clear
+/// `thr_silence_db`, and the supplemental groups also clear `thr_db`. Family primaries are
+/// the measurement candidates.
 pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
     detect_counted(ls, p).0
 }
@@ -612,13 +631,7 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
     let edge = build_edge_templates(p, ls.hop_s);
     if !edge.is_empty() && out.len() < p.max_detections * 3 && remaining_candidates > 0 {
         // Edge templates score only cells within the base half of the first or last frame.
-        let head = ls.t.partition_point(|&x| x - ls.t[0] < p.min_half_s);
-        let tail = ls.t.partition_point(|&x| ls.t[nt - 1] - x >= p.min_half_s);
-        let windows = if tail <= head {
-            vec![(0, nt)]
-        } else {
-            vec![(0, head), (tail, nt)]
-        };
+        let windows = edge_windows(ls, p.min_half_s);
         zero_known(&mut lp, &known);
         let (bs, bi) = score_bank(ls, &edge, &lp, &windows);
         let threshold = p.thr_silence_db;
@@ -694,18 +707,36 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
     }
     // Faster passes were outside the original bank. Search only evidence its detections and
     // the contrast stage left unexplained, and append rather than displacing their candidates.
-    let room = p.max_detections - out.len();
-    if p.fast_templates && room > 0 && remaining_candidates > 0 {
-        let fast = build_fast_templates(p, ls.hop_s);
-        if !fast.is_empty() {
+    if p.fast_templates {
+        // Full-length seeds keep priority. Their edge scan uses only the remaining slots and
+        // evidence, and the ordinary edge bank's exact same base-coverage guard.
+        for edges_only in [false, true] {
+            let room = p.max_detections - out.len();
+            if room == 0 || remaining_candidates == 0 {
+                break;
+            }
+            let fast = if edges_only {
+                build_fast_edge_templates(p, ls.hop_s)
+            } else {
+                build_fast_templates(p, ls.hop_s)
+            };
+            if fast.is_empty() {
+                continue;
+            }
+            let windows = if edges_only {
+                edge_windows(ls, p.min_half_s)
+            } else {
+                vec![(0, nt)]
+            };
             zero_known(&mut lp, &known);
-            let (bs, bi) = score_bank(ls, &fast, &lp, &[(0, nt)]);
+            let (bs, bi) = score_bank(ls, &fast, &lp, &windows);
             let threshold = p.thr_db.max(p.thr_silence_db);
             let mut cand: Vec<usize> = (0..nr * nt)
                 .filter(|&k| bs[k] as f64 >= threshold)
                 .collect();
             cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
             cand.truncate(remaining_candidates);
+            remaining_candidates -= cand.len();
             let before = out.len();
             accept_candidates(
                 ls,
@@ -1092,6 +1123,7 @@ mod tests {
             ..Default::default()
         };
         assert!(build_fast_templates(&off, 1.0).is_empty());
+        assert!(build_fast_edge_templates(&off, 1.0).is_empty());
         for (c, empty) in [
             (200.0, true),
             (300.0, false),
@@ -1103,12 +1135,154 @@ mod tests {
                 ..Default::default()
             };
             let fast = build_fast_templates(&p, 1.0);
+            let edge = build_fast_edge_templates(&p, 1.0);
             assert_eq!(p.v_grid, PRIMARY_SPEED_GRID);
             assert!(
                 fast.iter()
                     .all(|t| t.v > PRIMARY_MAX_SPEED_MPS && t.v <= 0.8 * c)
             );
             assert_eq!(fast.is_empty(), empty);
+            assert_eq!(edge.is_empty(), empty);
+            assert!(
+                edge.iter()
+                    .all(|t| t.v > PRIMARY_MAX_SPEED_MPS && t.v <= 0.8 * c)
+            );
+            for half in [0.0, p.min_half_s] {
+                assert!(
+                    build_fast_edge_templates(
+                        &DetectParams {
+                            edge_half_s: half,
+                            ..p.clone()
+                        },
+                        1.0
+                    )
+                    .is_empty()
+                );
+            }
+        }
+    }
+
+    fn measure_edge_families(
+        x: &[f32],
+        survey: &Spec,
+        detections: &[Detection],
+    ) -> Vec<crate::measure::MeasuredEvent> {
+        let p = crate::measure::MeasureParams::default();
+        detections
+            .iter()
+            .filter(|d| d.harmonic_of.is_none())
+            .map(|d| {
+                crate::measure::measure_family(
+                    x,
+                    4000,
+                    survey,
+                    d,
+                    detections,
+                    &format!("edge-{}", d.id),
+                    &p,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fast_edge_passes_reach_measurement_at_both_recording_ends() {
+        let p = DetectParams::default();
+        let off = DetectParams {
+            fast_templates: false,
+            ..p.clone()
+        };
+        // Thirty seconds cannot cover both halves of any full-length template. Keep
+        // enough audio on either side for the unchanged eight-second measurement gate.
+        for pass @ (f0, v, d, t0r) in [
+            (118.0, 215.0, 900.0, 10.13),
+            (83.0, 245.0, 700.0, 19.37),
+        ] {
+            let mut recovered = 0;
+            // A complete attenuation ladder: measure every new fast seed, not a case
+            // chosen after looking at its fit. At least one real recovery per end is required.
+            for quieter_db in (0..=12).step_by(3) {
+                let amplitude = 0.32 * 10.0f64.powf(-(quieter_db as f64) / 20.0);
+                let mut x = fast_pass_scene(pass, amplitude);
+                x.truncate(30 * 4000);
+                let (ls, lin) = survey(&x, 4000, &p).unwrap();
+                let old = detect(&ls, &off);
+                let new = detect(&ls, &p);
+                let added: Vec<_> = new
+                    .iter()
+                    .filter(|seed| {
+                        seed.v > PRIMARY_MAX_SPEED_MPS
+                            && seed.half_s == p.edge_half_s
+                            && seed.harmonic_of.is_none()
+                    })
+                    .collect();
+                eprintln!(
+                    "fast edge v={v} t={t0r} attenuation={quieter_db} dB: {} old seeds, new {added:?}",
+                    old.len()
+                );
+                if added.is_empty() {
+                    continue;
+                }
+                let baseline = measure_edge_families(&x, &lin, &old);
+                assert!(
+                    crate::search::independent_measured_events(&baseline, 0.0).is_empty(),
+                    "v={v} t={t0r} attenuation={quieter_db}: the original bank already supplied an event"
+                );
+                let events = measure_edge_families(&x, &lin, &new);
+                let independent = crate::search::independent_measured_events(&events, 0.0);
+                let diagnostics: Vec<_> = events
+                    .iter()
+                    .map(|e| (&e.id, &e.quality, e.fit.as_ref().map(|f| f.best)))
+                    .collect();
+                assert_eq!(independent.len(), 1, "v={v} t={t0r}: {diagnostics:?}");
+                let event = events.iter().find(|e| e.id == independent[0].id).unwrap();
+                let seed = &new[event.detection.id];
+                assert!(seed.v > PRIMARY_MAX_SPEED_MPS && seed.half_s == p.edge_half_s);
+                assert!(seed.score >= p.thr_db);
+                let b = event.fit.as_ref().unwrap().best;
+                eprintln!("fast edge v={v} t={t0r} attenuation={quieter_db} dB: {b:?}");
+                assert!((b.f0 - f0).abs() < 0.3, "v={v} t={t0r}: {b:?}");
+                assert!((b.t0r - t0r).abs() < 0.3, "v={v} t={t0r}: {b:?}");
+                assert!((b.v - v).abs() < 4.0, "v={v} t={t0r}: {b:?}");
+                assert!((b.d / d - 1.0).abs() < 0.08, "v={v} t={t0r}: {b:?}");
+                recovered += 1;
+            }
+            assert!(recovered > 0, "no fast edge pass recovered at v={v}, t={t0r}");
+        }
+    }
+
+    #[test]
+    fn fast_edge_noise_tones_and_reversed_passes_supply_no_aircraft_event() {
+        let p = DetectParams::default();
+        let early = (118.0, 215.0, 900.0, 10.13);
+        let late = (83.0, 245.0, 700.0, 19.37);
+        let mut noise = fast_pass_scene(early, 0.0);
+        noise.truncate(30 * 4000);
+        let tone: Vec<_> = noise
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| x + (0.4 * (std::f64::consts::TAU * 118.0 * i as f64 / 4000.0).sin()) as f32)
+            .collect();
+        let mut cases = vec![("noise and hum", noise), ("steady tone", tone)];
+        for (label, pass) in [("early reversed", early), ("late reversed", late)] {
+            let mut x = fast_pass_scene(pass, 0.32);
+            x.truncate(30 * 4000);
+            x.reverse();
+            cases.push((label, x));
+        }
+        for (label, x) in cases {
+            let (ls, lin) = survey(&x, 4000, &p).unwrap();
+            let detections = detect(&ls, &p);
+            let events = measure_edge_families(&x, &lin, &detections);
+            let diagnostics: Vec<_> = events
+                .iter()
+                .map(|e| (&e.id, &e.quality, e.fit.as_ref().map(|f| f.best)))
+                .collect();
+            assert!(
+                events.iter().all(|event| !event.is_aircraft_like()),
+                "{label}: {diagnostics:?}"
+            );
+            assert!(crate::search::independent_measured_events(&events, 0.0).is_empty());
         }
     }
 
@@ -1165,7 +1339,14 @@ mod tests {
                 );
                 assert!(d.score >= p.thr_db && !d.from_contrast, "{name}: {d:?}");
             }
-            assert!(added.windows(2).all(|w| w[0].score >= w[1].score), "{name}");
+            let full = added
+                .iter()
+                .take_while(|d| d.half_s >= p.min_half_s)
+                .count();
+            assert!(added[full..].iter().all(|d| d.half_s == p.edge_half_s));
+            for stage in [&added[..full], &added[full..]] {
+                assert!(stage.windows(2).all(|w| w[0].score >= w[1].score), "{name}");
+            }
             if !without.is_empty() {
                 let capped = DetectParams {
                     max_detections: 1,
