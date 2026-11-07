@@ -761,6 +761,13 @@ Concurrent searches publish track stores through separate, exclusively created s
 writer cannot truncate another writer's cache. A load also rejects bytes after its compressed member,
 including additional gzip members; a damaged cache goes through the recovery path above.
 
+For uncached multi-day searches, each UTC day is built and atomically cached as soon as all of its
+requested feeds finish, while the remaining days continue downloading. Completed raw feeds pass through
+a bounded queue instead of accumulating until the last download. A failed feed prevents publication
+of its own day; other completed days remain reusable. Cache-write failures remain errors, after the
+other days receive their save attempts. This bounds the queue of completed raw releases, not total
+process memory: active ingestion, incomplete days and built track stores still need memory.
+
 An incomplete release listing captured before the publication window closes is rechecked online until
 both prod and MLAT are present or a successful post-window lookup confirms the missing feed. An early
 prod-only listing therefore cannot become permanent merely because the day has aged. Offline runs
@@ -1080,6 +1087,13 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ## Testing
 
 ### Recovery changes (2026-11-07): validation incomplete
+
+**Incremental ADS-B day publication.** Two offline regressions exercise real synthetic tar ingestion,
+store building and compressed cache writes. One uses a bounded channel whose last download waits for
+an earlier day's readable cache; the other covers early and late feed failures plus a cache-write
+failure while another day succeeds. These new regressions and the revised scheduling code received
+source review, but have not run: the executor disconnected before their test harness could start.
+No live-download, end-to-end runtime or peak-memory improvement is claimed.
 
 **Checks before the final boundary correction (through `51d9bb0`).** Real RCH with the pinned nightly
 ran six guided-ridge/background-restoration tests and the harmonic-family recovery PCM case together.

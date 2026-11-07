@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Cache completed ADS-B days while other downloads continue
+
+- Drain a bounded queue of completed raw releases inside the download-worker scope. Build and
+  atomically save each day as soon as all of its requested feeds arrive, instead of holding every
+  raw feed until the final download finishes.
+- Drop a failed day's buffered raw parts immediately. Other complete days still reach the cache;
+  cache-write errors remain fatal even when missing archive days may be skipped.
+- Add offline regressions using actual synthetic tar ingestion, store construction and cache
+  round-trips. A bounded-channel handshake requires an earlier day to be readable before the last
+  download completes; failure cases check that partial days are never published and unrelated
+  successes survive.
+- **Validation limit:** source review only for the scheduler and its new tests. The executor
+  disconnected before these tests could run. No live-download, whole-pipeline timing or measured
+  memory reduction is claimed; active ingests and retained track stores still consume memory.
+
 ### Use Alaska and Hawaii radiosonde archives
 
 - Select valid four-character US station identifiers using the provider's country metadata,

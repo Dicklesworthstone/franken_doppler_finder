@@ -285,6 +285,50 @@ struct Job {
 type Part = (Vec<RawAircraft>, IngestStats);
 type JobResult = (usize, String, Result<Part, DataError>);
 
+#[derive(Debug, Default)]
+struct StreamedDayFailures {
+    feeds: Vec<(usize, String)>,
+    caches: Vec<(usize, String)>,
+}
+
+/// Publish a day as soon as all of its requested feeds have arrived. A failed feed
+/// discards that day's other raw parts immediately, without holding up usable days.
+/// The caller drains a bounded channel while download workers are still running.
+fn collect_streamed_days(
+    results: impl IntoIterator<Item = JobResult>,
+    mut remaining: Vec<usize>,
+    mut finish: impl FnMut(usize, Vec<Part>, Vec<String>) -> Result<(), DataError>,
+) -> StreamedDayFailures {
+    let mut pending: BTreeMap<usize, (Vec<Part>, Vec<String>)> = BTreeMap::new();
+    let mut failed_days = vec![false; remaining.len()];
+    let mut failures = StreamedDayFailures::default();
+    for (di, tag, result) in results {
+        remaining[di] -= 1;
+        match result {
+            Ok(part) if !failed_days[di] => {
+                let (parts, tags) = pending.entry(di).or_default();
+                parts.push(part);
+                tags.push(tag);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                failed_days[di] = true;
+                pending.remove(&di);
+                failures.feeds.push((di, e.0));
+            }
+        }
+        if remaining[di] == 0
+            && let Some((parts, mut tags)) = pending.remove(&di)
+        {
+            tags.sort();
+            if let Err(e) = finish(di, parts, tags) {
+                failures.caches.push((di, e.0));
+            }
+        }
+    }
+    failures
+}
+
 /// Tracks for `spec` (bbox + window), downloading and caching whole UTC days as needed.
 pub fn fetch_window(
     spec: &IngestSpec,
@@ -410,8 +454,7 @@ pub fn fetch_window(
         geoid_n_m: spec.geoid_n_m,
         keep_unknown: true,
     };
-    let mut per_day: BTreeMap<usize, (Vec<Part>, Vec<String>)> = BTreeMap::new();
-    let mut failed: Vec<(usize, String)> = Vec::new();
+    let mut failed = StreamedDayFailures::default();
     if !jobs.is_empty() {
         let total: u64 = jobs.iter().map(|j| j.rel.total_bytes()).sum();
         opts.say(&format!(
@@ -420,11 +463,21 @@ pub fn fetch_window(
             mib(total),
             opts.parallel.max(1)
         ));
+        let mut remaining = vec![0usize; days.len()];
+        for job in &jobs {
+            remaining[job.day_idx] += 1;
+        }
+        let workers = opts.parallel.max(1).min(jobs.len());
         let queue = Mutex::new(jobs.into_iter().collect::<VecDeque<Job>>());
-        let results: Mutex<Vec<JobResult>> = Mutex::new(Vec::new());
-        std::thread::scope(|s| {
-            for _ in 0..opts.parallel.max(1) {
-                s.spawn(|| {
+        // Backpressure bounds completed raw releases while one day is built and saved.
+        // Receiving must happen inside the scope, before joining the producers.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<JobResult>(workers);
+        failed = std::thread::scope(|s| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let queue = &queue;
+                let day_spec = &day_spec;
+                s.spawn(move || {
                     loop {
                         let job = match queue.lock() {
                             Ok(mut q) => q.pop_front(),
@@ -450,64 +503,56 @@ pub fn fetch_window(
                         };
                         let res = ingest_reader(reader, job.rel.feed.label(), &sp, &cb)
                             .map_err(|e| DataError(format!("{label} ({}): {e}", job.rel.tag)));
-                        if let Ok(mut r) = results.lock() {
-                            r.push((job.day_idx, job.rel.tag.clone(), res));
+                        if tx.send((job.day_idx, job.rel.tag.clone(), res)).is_err() {
+                            break;
                         }
                     }
                 });
             }
+            drop(tx);
+            collect_streamed_days(rx, remaining, |di, parts, tags| {
+                let day = days[di];
+                // Name the cache by what was actually streamed, so a missing feed
+                // cannot make a partial day look complete on a later run.
+                let fs = feedset_of_tags(&tags);
+                let store = build_store(parts, &day_spec(day), tags);
+                let dir = day_dir(cache_dir, day);
+                let path = dir.join(format!("{fs}_{key}.fdtrk"));
+                store.save(&path).map_err(|e| {
+                    DataError(format!(
+                        "could not cache completed day {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                opts.say(&format!(
+                    "[adsb] {:04}-{:02}-{:02}: built {} legs / {} points -> {}",
+                    day.0,
+                    day.1,
+                    day.2,
+                    store.legs.len(),
+                    store.n_points(),
+                    path.display()
+                ));
+                day_stores[di] = Some(store);
+                Ok(())
+            })
         });
-        let results = results
-            .into_inner()
-            .map_err(|_| DataError("result lock poisoned".into()))?;
-        // keep every day whose releases all streamed; a failed stream must not throw away the
-        // other days' finished (and expensive) downloads
-        for (di, tag, res) in results {
-            match res {
-                Ok(part) => {
-                    let e = per_day.entry(di).or_default();
-                    e.0.push(part);
-                    e.1.push(tag);
-                }
-                Err(e) => failed.push((di, e.0)),
-            }
-        }
-        for (di, _) in &failed {
-            per_day.remove(di);
-        }
-    }
-    for (di, (parts, mut tags)) in per_day {
-        tags.sort();
-        let day = days[di];
-        // named by what was actually streamed, so a day fetched before its mlatonly (or prod)
-        // release existed is not mistaken for a complete one later
-        let fs = feedset_of_tags(&tags);
-        let store = build_store(parts, &day_spec(day), tags);
-        let dir = day_dir(cache_dir, day);
-        let path = dir.join(format!("{fs}_{key}.fdtrk"));
-        store.save(&path)?;
-        opts.say(&format!(
-            "[adsb] {:04}-{:02}-{:02}: built {} legs / {} points -> {}",
-            day.0,
-            day.1,
-            day.2,
-            store.legs.len(),
-            store.n_points(),
-            path.display()
-        ));
-        day_stores[di] = Some(store);
     }
 
-    if !failed.is_empty() {
+    if !failed.feeds.is_empty() || !failed.caches.is_empty() {
         let msg = format!(
-            "ADS-B download failed (finished days were cached; rerun to retry the rest): {}",
+            "ADS-B fetch failed (finished days were cached; rerun to retry the rest): {}",
             failed
+                .feeds
                 .iter()
+                .chain(&failed.caches)
                 .map(|(_, e)| e.as_str())
                 .collect::<Vec<_>>()
                 .join("; ")
         );
-        if !opts.allow_missing {
+        // A missing release may be skipped explicitly; inability to persist a completed
+        // day remains fatal, after giving the other completed days their save attempts.
+        if !opts.allow_missing || !failed.caches.is_empty() {
             return Err(DataError(msg));
         }
         opts.say(&format!("[adsb] WARNING {msg}"));
@@ -581,11 +626,114 @@ mod tests {
         );
     }
 
-    fn synthetic_store(sp: &IngestSpec) -> TrackStore {
+    fn synthetic_part(sp: &IngestSpec, feed: &str) -> Part {
         use crate::ingest::tests::{gz, pc12_json, tar_of};
         let tarb = tar_of(&[("./traces/c3/trace_full_a1b2c3.json", gz(&pc12_json()))]);
-        let part = ingest_reader(std::io::Cursor::new(tarb), "prod", sp, &|_| {}).unwrap();
-        build_store(vec![part], sp, vec!["synthetic".into()])
+        ingest_reader(std::io::Cursor::new(tarb), feed, sp, &|_| {}).unwrap()
+    }
+
+    fn synthetic_store(sp: &IngestSpec) -> TrackStore {
+        build_store(vec![synthetic_part(sp, "prod")], sp, vec!["synthetic".into()])
+    }
+
+    #[test]
+    fn streamed_days_are_cached_before_unrelated_downloads_finish() {
+        use crate::ingest::tests::spec;
+        let sp = spec();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-streamed-days-{}-{nonce}",
+            std::process::id()
+        ));
+        let paths: Vec<_> = (0..3)
+            .map(|di| dir.join(format!("day-{di}.fdtrk")))
+            .collect();
+        let arrivals: Vec<JobResult> = vec![
+            (0, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
+            (1, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
+            (0, "mlat".into(), Ok(synthetic_part(&sp, "mlat"))),
+            (2, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
+        ];
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (cached_tx, cached_rx) = std::sync::mpsc::sync_channel(0);
+        let mut published = Vec::new();
+        let failures = std::thread::scope(|s| {
+            let paths = &paths;
+            s.spawn(move || {
+                let mut arrivals = arrivals.into_iter();
+                for result in arrivals.by_ref().take(3) {
+                    tx.send(result).unwrap();
+                }
+                // The final download waits for a real readable cache. Joining producers
+                // before draining their bounded results would deadlock this handshake.
+                cached_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                let first = TrackStore::load(&paths[0]).unwrap();
+                assert_eq!(first.meta.sources, ["mlat", "prod"]);
+                assert_eq!(first.legs.len(), 1);
+                assert!(!first.legs[0].points.is_empty());
+                assert!(paths[1].is_file());
+                assert!(!paths[2].exists());
+                tx.send(arrivals.next().unwrap()).unwrap();
+            });
+            collect_streamed_days(rx, vec![2, 1, 1], |di, parts, tags| {
+                let store = build_store(parts, &sp, tags);
+                store.save(&paths[di])?;
+                published.push(di);
+                if di == 0 {
+                    cached_tx.send(()).unwrap();
+                }
+                Ok(())
+            })
+        });
+        assert!(
+            failures.feeds.is_empty() && failures.caches.is_empty(),
+            "{failures:?}"
+        );
+        assert_eq!(published, [1, 0, 2]);
+        let last = TrackStore::load(&paths[2]).unwrap();
+        assert_eq!(last.legs.len(), 1);
+        assert_eq!(last.meta.sources, ["prod"]);
+    }
+
+    #[test]
+    fn streamed_day_failures_do_not_publish_partial_feeds_or_lose_other_days() {
+        use crate::ingest::tests::spec;
+        let sp = spec();
+        let arrivals = vec![
+            (0, "prod".into(), Err(DataError("early failed feed".into()))),
+            (1, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
+            (0, "mlat".into(), Ok(synthetic_part(&sp, "mlat"))),
+            (1, "mlat".into(), Err(DataError("late failed feed".into()))),
+            (2, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
+            (3, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
+        ];
+        let mut completed = Vec::new();
+        let mut usable = Vec::new();
+        let failures = collect_streamed_days(arrivals, vec![2, 2, 1, 1], |di, parts, tags| {
+            completed.push(di);
+            if di == 2 {
+                return Err(DataError("cache write failed".into()));
+            }
+            let store = build_store(parts, &sp, tags);
+            assert_eq!(store.legs.len(), 1);
+            usable.push(di);
+            Ok(())
+        });
+        assert_eq!(completed, [2, 3]);
+        assert_eq!(usable, [3]);
+        assert_eq!(
+            failures.feeds,
+            [
+                (0, "early failed feed".to_string()),
+                (1, "late failed feed".to_string()),
+            ]
+        );
+        assert_eq!(failures.caches, [(2, "cache write failed".to_string())]);
     }
 
     #[test]
