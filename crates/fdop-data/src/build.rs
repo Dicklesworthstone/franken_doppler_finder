@@ -459,7 +459,12 @@ pub fn merge_stores(stores: Vec<TrackStore>, join_gap_s: f64) -> TrackStore {
                             .then((a.flags & pt_flags::MLAT).cmp(&(b.flags & pt_flags::MLAT)))
                     });
                     anchors.dedup_by(|b, a| (g.points[*b].t - g.points[*a].t).abs() < DEDUPE_S);
-                    if g.typ.is_empty() {
+                    // An unrecognized designator is no stronger than a missing one.
+                    // Prefer a recognized adjoining-day type without changing the
+                    // first recognized type's precedence over another known type.
+                    if g.typ.is_empty()
+                        || (g.engine == EngineClass::Unknown && l.engine != EngineClass::Unknown)
+                    {
                         g.typ = l.typ.clone();
                         g.engine = l.engine;
                     }
@@ -702,14 +707,42 @@ mod tests {
     }
 
     #[test]
+    fn cross_day_type_recovery_keeps_first_recognized_type() {
+        for (first_known, later_known) in [("PC12", "C172"), ("C172", "PC12")] {
+            let stores = ["ZZZZ9", first_known, later_known]
+                .into_iter()
+                .enumerate()
+                .map(|(i, typ)| {
+                    let start = T0 + i as f64 * 20.0;
+                    let mut store = merge_test_store(
+                        vec![
+                            merge_test_point(start, 0),
+                            merge_test_point(start + 10.0, 0),
+                        ],
+                        typ,
+                    );
+                    store.legs[0].typ = typ.into();
+                    store.legs[0].engine = engine_class(typ);
+                    store
+                })
+                .collect();
+            let merged = merge_stores(stores, 300.0);
+            assert_eq!(merged.legs.len(), 1);
+            assert_eq!(merged.legs[0].points.len(), 6);
+            assert_eq!(merged.legs[0].typ, first_known);
+            assert_eq!(merged.legs[0].engine, engine_class(first_known));
+        }
+    }
+
+    #[test]
     fn cross_day_merge_keeps_non_mlat_geometry() {
         let midnight = T0 + 86_400.0;
         let point = |offset: f64, mlat: bool| {
             let mut p = merge_test_point(midnight + offset, 0);
             // A 90 m/s eastbound flight. The duplicate MLAT reports have an independent
             // 1.1 km northward error and a 200 m height error; they must not bend its seam.
-            p.lon += (90.0 * offset / fdop_types::geo::EARTH_R).to_degrees()
-                / p.lat.to_radians().cos();
+            p.lon +=
+                (90.0 * offset / fdop_types::geo::EARTH_R).to_degrees() / p.lat.to_radians().cos();
             if mlat {
                 p.lat += 0.01;
                 p.alt_m -= 200.0;
@@ -732,7 +765,11 @@ mod tests {
                     vec![point(0.0, false), point(10.0, false), point(20.0, false)],
                     "day2",
                 );
-                let stores = if reverse_stores { vec![b, a] } else { vec![a, b] };
+                let stores = if reverse_stores {
+                    vec![b, a]
+                } else {
+                    vec![a, b]
+                };
                 let merged = merge_stores(stores, 300.0);
                 assert_eq!(merged.legs.len(), 1);
                 let leg = &merged.legs[0];
@@ -768,7 +805,13 @@ mod tests {
         // either immediately or when the already merged leg is joined to a third store.
         assert_eq!(
             merged.legs[0].points,
-            [p(0.03125, 0), p(0.0625, 0), p(5.0, 0), p(10.0, 0), p(20.0, 0)]
+            [
+                p(0.03125, 0),
+                p(0.0625, 0),
+                p(5.0, 0),
+                p(10.0, 0),
+                p(20.0, 0)
+            ]
         );
         let at_boundary = merge_stores(
             vec![
@@ -779,7 +822,12 @@ mod tests {
         );
         assert_eq!(
             at_boundary.legs[0].points,
-            [p(0.0, pt_flags::MLAT), p(DEDUPE_S, 0), p(10.0, 0), p(20.0, 0)]
+            [
+                p(0.0, pt_flags::MLAT),
+                p(DEDUPE_S, 0),
+                p(10.0, 0),
+                p(20.0, 0)
+            ]
         );
     }
 
@@ -797,7 +845,10 @@ mod tests {
         // The preferred point is later, but choosing it does not close a gap that the
         // original duplicate group left beyond the join limit.
         assert_eq!(merged.legs.len(), 2);
-        assert_eq!(merged.legs[0].points, [p(-10.0, 0), p(-5.0, 0), p(0.03125, 0)]);
+        assert_eq!(
+            merged.legs[0].points,
+            [p(-10.0, 0), p(-5.0, 0), p(0.03125, 0)]
+        );
         assert_eq!(merged.legs[1].points, [p(300.015625, 0), p(320.0, 0)]);
         assert_eq!(merged.meta.stats["cross_store_joins"], 1);
     }
@@ -808,7 +859,12 @@ mod tests {
         let merged = merge_stores(
             vec![
                 merge_test_store(
-                    vec![p(-10.0, 0), p(0.0, pt_flags::MLAT), p(0.0625, 0), p(10.0, 0)],
+                    vec![
+                        p(-10.0, 0),
+                        p(0.0, pt_flags::MLAT),
+                        p(0.0625, 0),
+                        p(10.0, 0),
+                    ],
                     "a",
                 ),
                 merge_test_store(vec![p(-5.0, 0), p(0.046875, 0), p(10.0, 0)], "b"),
@@ -852,7 +908,11 @@ mod tests {
                     second.alt_m += 50.0;
                     let a = merge_test_store(vec![first, merge_test_point(10.0, flags)], "a");
                     let b = merge_test_store(vec![second, merge_test_point(20.0, flags)], "b");
-                    let stores = if reverse_stores { vec![b, a] } else { vec![a, b] };
+                    let stores = if reverse_stores {
+                        vec![b, a]
+                    } else {
+                        vec![a, b]
+                    };
                     let merged = merge_stores(stores, 300.0);
                     let expected = if offset == 0.0 && reverse_stores {
                         second
@@ -942,7 +1002,10 @@ mod tests {
         let b = merge_test_store(vec![p(10.03125, 0), p(20.0, 0)], "b");
         let merged = merge_stores(vec![a, b], 300.0);
         assert_eq!(merged.legs.len(), 2);
-        assert_eq!(merged.legs[0].points, [p(0.0, 0), p(10.03125, 0), p(20.0, 0)]);
+        assert_eq!(
+            merged.legs[0].points,
+            [p(0.0, 0), p(10.03125, 0), p(20.0, 0)]
+        );
         assert_eq!(merged.legs[1].points, [p(30.0, 0), p(40.0, 0)]);
         assert_eq!(merged.legs[0].key, "abc123_19700101_0");
         assert_eq!(merged.legs[1].key, "abc123_19700101_1");

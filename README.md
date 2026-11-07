@@ -824,6 +824,14 @@ part even if every listed part downloaded successfully. Existing day stores cann
 older ingester accepted an incomplete source archive; recovering such missing data requires fresh
 ingestion.
 
+Day caches retain aircraft with unknown types. For data API callers using
+`IngestSpec.keep_unknown = false`, that policy is applied after cross-day legs are merged:
+a recognized type on either adjoining day identifies the complete joined flight, preserving
+both halves of its geometry. A missing or unrecognized designator can be replaced by a known
+one; the first recognized type still takes precedence over a later conflicting known type.
+Only flight segments that actually join share this metadata. Separate flights of the same
+aircraft and flights whose type remains unknown are still excluded by the strict policy.
+
 When neighboring track stores overlap, reports within the existing 0.05 s duplicate interval
 prefer non-MLAT positions even if an MLAT report arrived slightly earlier. The merge preserves
 the previous flight-leg joins and same-quality choices, including interleaved overlaps from
@@ -1201,14 +1209,15 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
-### Complete archive ingestion (2026-11-07): native validation pending
+### Complete archive ingestion (2026-11-07): native reader component verified
 
 New regressions require both tar end blocks, surface errors reported after the marker, accept zero
-padding and short reads across split boundaries, and reject nonzero trailing data. Release tests cover
-sidecar exclusion, contiguous parts, unfinished uploads, malformed cached parts, early listings and
-post-window split listings that still need refresh. These native tests remain unrun because the executor
-became unavailable; independent source review does not establish an end-to-end archive replay or
-workspace pass.
+padding and short reads across split boundaries, and reject nonzero trailing data. These archive-reader
+regressions pass as part of 20 production build/ingest tests in a native component using the unchanged
+modules, real `fdop-types`, pinned nightly and exact locked dependencies. The component also verifies
+recognized-type precedence across joined days. It does not include the fetch or release-discovery
+modules: their offline-cache, sidecar, contiguous-part, unfinished-upload and listing-refresh tests
+still await the full data-crate build. This is not an end-to-end archive replay or workspace pass.
 
 ### Conservative trajectory bounds (2026-11-07): native validation pending
 

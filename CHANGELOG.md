@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve complete cross-day flights when an adjoining day supplies their type
+
+- Apply the data API's strict `keep_unknown = false` policy after cross-day merging. A flight
+  identified by either day now retains its missing-type half and the same canonical key as
+  an inclusive query. Separate flights of the same aircraft do not inherit that metadata.
+- Prefer a recognized aircraft type over a nonempty unrecognized designator as well as an
+  empty one. Preserve the first recognized type when later joined segments disagree.
+- Add an offline fetch regression using real day-cache files, missing and unrecognized types
+  in both day orders, separate same-aircraft flights, and strict/inclusive geometry and key
+  comparisons. Add a merge regression covering conflicting recognized types in both orders.
+- **Validation:** all 20 production build/ingest module tests pass in a native component build
+  using unchanged source modules, the real `fdop-types`, the pinned nightly and exact locked
+  dependencies. This includes recognized-type precedence and the archive-completion tests.
+  Independent source review and focused formatting/whitespace checks also pass. The full
+  data-crate build and its new offline-fetch regression remain pending; the component excludes
+  `fetch.rs` and is not an HTTP, workspace or recording-accuracy result.
+
 ### Release rejected pair seeds and completed search stages promptly
 
 - Run the unchanged quick trace check immediately after each event-pair join. Only survivors

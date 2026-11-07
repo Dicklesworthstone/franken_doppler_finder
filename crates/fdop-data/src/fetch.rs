@@ -4,7 +4,7 @@
 //! Cache layout: `<cache>/adsb/<YYYY-MM-DD>/<feedset>_<S>_<W>_<N>_<E>.fdtrk` (bbox rounded
 //! outward to 0.1 degree; the whole UTC day is kept, the window is applied at load) and
 //! `<cache>/adsb/<YYYY-MM-DD>/releases.json`. Day stores are always built with unknown types
-//! kept; `keep_unknown = false` is applied at load.
+//! kept; `keep_unknown = false` is applied after cross-day metadata reconciliation.
 
 use crate::DataError;
 use crate::adsblol::{DayRelease, Feed, find_day_releases_cached};
@@ -752,12 +752,14 @@ pub fn fetch_window(
     let mut day_stats = Vec::new();
     for s in &mut stores {
         adjust_geoid(s, spec.geoid_n_m);
-        if !spec.keep_unknown {
-            s.legs.retain(|l| l.engine != EngineClass::Unknown);
-        }
         day_stats.push(serde_json::json!({"sources": s.meta.sources, "stats": s.meta.stats}));
     }
-    let merged = merge_stores(stores, DAY_JOIN_GAP_S);
+    let mut merged = merge_stores(stores, DAY_JOIN_GAP_S);
+    // An adjoining day's type can identify the whole flight. Dropping its unknown
+    // half before the merge would discard geometry that now has a known type.
+    if !spec.keep_unknown {
+        merged.legs.retain(|l| l.engine != EngineClass::Unknown);
+    }
     let mut out = merged.filtered(&spec.bbox, spec.t_start, spec.t_end);
     out.meta.geoid_n_m = spec.geoid_n_m;
     out.meta.stats = serde_json::json!({
@@ -998,6 +1000,133 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.legs.len(), 1);
+    }
+
+    #[test]
+    fn offline_strict_type_policy_keeps_geometry_when_adjacent_day_supplies_type() {
+        use fdop_types::store::TrackPoint;
+        let midnight = fdop_types::time::unix_from_utc(2026, 9, 9, 0, 0, 0.0);
+        let spec = IngestSpec {
+            bbox: BBox::new(-0.02, -0.05, 0.02, 0.05),
+            t_start: midnight - 1100.0,
+            t_end: midnight + 1.0,
+            geoid_n_m: 0.0,
+            keep_unknown: false,
+        };
+        let point = |dt, lon| TrackPoint {
+            t: midnight + dt,
+            lat: 0.0,
+            lon,
+            alt_m: 1000.0,
+            gs_mps: 70.0,
+            track_deg: 90.0,
+            vrate_mps: 0.0,
+            alt_src: alt_src::GEOM,
+            flags: 0,
+        };
+        let leg = |icao: &str, typ: &str, points| FlightLeg {
+            key: format!("{icao}_original"),
+            icao: icao.into(),
+            reg: "TEST".into(),
+            typ: typ.into(),
+            source: "prod".into(),
+            engine: fdop_types::engine::engine_class(typ),
+            points,
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-cross-day-type-{}-{nonce}",
+            std::process::id()
+        ));
+        let (_, key) = bbox_key(&spec.bbox);
+        let opts = FetchOptions {
+            include_mlat: false,
+            offline: true,
+            ..Default::default()
+        };
+        // Either UTC day may have a missing or unrecognized aircraft type. The query
+        // ends before the second day's reports, so losing the first half can lose the match.
+        for (known_first, unknown_type) in
+            [(false, ""), (true, ""), (false, "ZZZZ9"), (true, "ZZZZ9")]
+        {
+            for i in 0..2 {
+                let points = if i == 0 {
+                    vec![point(-20.0, -0.012), point(-10.0, -0.006)]
+                } else {
+                    vec![point(10.0, 0.006), point(20.0, 0.012)]
+                };
+                let mut legs = vec![
+                    leg(
+                        "000001",
+                        if known_first == (i == 0) {
+                            "PC12"
+                        } else {
+                            unknown_type
+                        },
+                        points.clone(),
+                    ),
+                    leg("000002", unknown_type, points),
+                ];
+                if i == 0 {
+                    // This separate flight of the same aircraft must stay unknown;
+                    // metadata is reconciled only across an actual day-store join.
+                    legs.insert(
+                        0,
+                        leg(
+                            "000001",
+                            unknown_type,
+                            vec![point(-1000.0, -0.003), point(-990.0, 0.003)],
+                        ),
+                    );
+                }
+                let day = midnight + (i as f64 - 1.0) * 86_400.0;
+                TrackStore {
+                    meta: StoreMeta {
+                        version: 1,
+                        bbox: spec.bbox,
+                        t_start: day - 3600.0,
+                        t_end: day + 86_400.0 + 3600.0,
+                        geoid_n_m: 0.0,
+                        sources: vec![format!("synthetic-day-{i}")],
+                        stats: serde_json::json!({}),
+                        created_unix: day,
+                    },
+                    legs,
+                }
+                .save(&day_dir(&dir, (2026, 9, 8 + i)).join(format!("prod_{key}.fdtrk")))
+                .unwrap();
+            }
+            let strict = fetch_window(&spec, &dir, &opts).unwrap();
+            assert_eq!(
+                strict.legs.len(),
+                1,
+                "known_first={known_first}, unknown_type={unknown_type}"
+            );
+            let flight = &strict.legs[0];
+            assert_eq!(flight.key, "000001_20260908_1");
+            assert_eq!(flight.typ, "PC12");
+            assert_eq!(flight.engine, EngineClass::Turboprop);
+            assert_eq!(flight.points.len(), 4, "both halves must survive");
+            assert_eq!(flight.t0(), midnight - 20.0);
+            assert_eq!(flight.t1(), midnight + 20.0);
+            assert_eq!(strict.meta.stats["cache_hits"], 2);
+            let inclusive = fetch_window(
+                &IngestSpec {
+                    keep_unknown: true,
+                    ..spec
+                },
+                &dir,
+                &opts,
+            )
+            .unwrap();
+            assert_eq!(inclusive.legs.len(), 3);
+            let same_flight = inclusive.legs.iter().find(|l| l.typ == "PC12").unwrap();
+            assert_eq!(flight.key, same_flight.key);
+            assert_eq!(flight.points, same_flight.points);
+        }
     }
 
     #[test]
@@ -1268,12 +1397,12 @@ mod tests {
             let mut full = original.clone();
             for store in &mut full {
                 adjust_geoid(store, spec.geoid_n_m);
-                if !keep_unknown {
-                    store.legs.retain(|l| l.engine != EngineClass::Unknown);
-                }
             }
-            let expected =
-                merge_stores(full, DAY_JOIN_GAP_S).filtered(&spec.bbox, spec.t_start, spec.t_end);
+            let mut merged = merge_stores(full, DAY_JOIN_GAP_S);
+            if !keep_unknown {
+                merged.legs.retain(|l| l.engine != EngineClass::Unknown);
+            }
+            let expected = merged.filtered(&spec.bbox, spec.t_start, spec.t_end);
             let got = fetch_window(&spec, &dir, &opts).unwrap();
             assert_eq!(got.legs.len(), expected.legs.len());
             for (actual, expected) in got.legs.iter().zip(&expected.legs) {
@@ -1351,10 +1480,7 @@ mod tests {
             ..spec
         };
         let empty = load_selected_stores(
-            paths
-                .iter()
-                .map(|p| CachedDay::scan(p).unwrap())
-                .collect(),
+            paths.iter().map(|p| CachedDay::scan(p).unwrap()).collect(),
             &empty_spec,
         )
         .unwrap();
@@ -1428,12 +1554,12 @@ mod tests {
             let finish = |mut stores: Vec<TrackStore>| {
                 for store in &mut stores {
                     adjust_geoid(store, spec.geoid_n_m);
-                    if !keep_unknown {
-                        store.legs.retain(|leg| leg.engine != EngineClass::Unknown);
-                    }
                 }
-                merge_stores(stores, DAY_JOIN_GAP_S)
-                    .filtered(&spec.bbox, spec.t_start, spec.t_end)
+                let mut merged = merge_stores(stores, DAY_JOIN_GAP_S);
+                if !keep_unknown {
+                    merged.legs.retain(|leg| leg.engine != EngineClass::Unknown);
+                }
+                merged.filtered(&spec.bbox, spec.t_start, spec.t_end)
             };
             let expected = finish(original.clone());
             let got = finish(selected);
@@ -1450,7 +1576,10 @@ mod tests {
             let crossing = got.legs.iter().find(|leg| leg.icao == "000001").unwrap();
             assert_eq!(crossing.key, "000001_20260908_1");
             assert_eq!(crossing.points.len(), 6);
-            assert_eq!(got.legs.iter().any(|leg| leg.icao == "000004"), keep_unknown);
+            assert_eq!(
+                got.legs.iter().any(|leg| leg.icao == "000004"),
+                keep_unknown
+            );
             let adjusted = got.legs.iter().find(|leg| leg.icao == "000005").unwrap();
             assert_eq!(adjusted.points[0].alt_src, alt_src::BARO_RAW);
             assert_eq!(adjusted.points[0].alt_m, 1200.0);
