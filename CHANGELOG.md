@@ -156,23 +156,24 @@ at that commit, not per-change commits.
   floor is the constant `LOCAL_SIGMA_FLOOR_HZ`, and the docs say what the scatter measures. The misfit test
   itself, the warning's place among the others, its `model misfit` prefix (which the search reads) and every
   answer are unchanged. A unit test covers the ratio and wording on either side of the floor, the cases with no
-  warning, and a scatter of exactly 0 on a densely sampled constant-velocity curve. On the six recordings the
-  development rows and nulls use, `fdop detect` with this change (bench-built on `6c48541`, binary `d50592c8`)
-  writes the same traces, images, stdout and stderr as `e93a269d`, byte for byte, and the same `events.json`
-  apart from 189 reworded misfit warnings, so no null, development or wrong-date answer can change.
+  warning, and a scatter of exactly 0 on a densely sampled constant-velocity curve. On six of the recordings the
+  development rows and nulls use (all but the eagle-nest clip), `fdop detect` with this change (bench-built on
+  `6c48541`, binary `d50592c8`) writes the same traces, images, stdout and stderr as `e93a269d`, byte for byte,
+  and the same `events.json` apart from 189 reworded misfit warnings. Nothing reads the reworded part, so no
+  answer can change on any row.
 - **Evidence.** `fdop detect` with the bench-built binary `e93a269d` (the contrast stage's tree), its traces
-  re-read with a replica of the estimator. On the six recordings the development rows and nulls use, the replica
-  agrees with `fdop` on which of the 328 fitted events have a scatter of 0 for 324. Of the 123 events that
-  passed the quality gates, 88 have a scatter of 0 and 92 carry the warning. On set D, 72 of the 92 events that
-  passed have a scatter of 0 and 62 carry it. A second-difference estimate of the same traces' noise is 0.002 Hz
-  at the median (0.001-0.008 at the 10th and 90th percentiles) on the six recordings and 0.008 Hz on set D
-  (0.002-0.031), also mostly under the floor: the points are 0.1 s apart from frames of at least 0.5 s, so
-  neighbours share most of their audio and scatter far less than the 0.25 Hz bins. Measuring the scatter that
-  way instead would add the warning to 3 and 9 events and take it from none, so no estimator change is made
-  here. Every event under the warning is also weighted half in the search and may take one change of tone. On
-  `9087ec4`'s R1 development rows (`bench` `runs/r1_fdop_9087ec4`), four right answers (osprey_1031,
-  osprey_1101, eagle, duke) have a core match that uses a tone change, and so does the one wrong medium
-  (osprey_1102b, e12), so removing that freedom is not a clean change either.
+  re-read with a replica of the estimator. On those six recordings, the replica agrees with `fdop` on which of
+  the 328 fitted events have a scatter of 0 for 324. Of the 123 events that passed the quality gates, 88 have a
+  scatter of 0 and 92 carry the warning. On set D, 72 of the 92 events that passed have a scatter of 0 and 62
+  carry it. A second-difference estimate of the same traces' noise is 0.002 Hz at the median (0.001-0.008 at the
+  10th and 90th percentiles) on the six recordings and 0.008 Hz on set D (0.002-0.031), also mostly under the
+  floor: the points are 0.1 s apart from frames of at least 0.5 s, so neighbours share most of their audio and
+  scatter far less than the 0.25 Hz bins. Measuring the scatter that way instead would add the warning to 3 and
+  9 events and take it from none, so no estimator change is made here. Every event under the warning is also
+  weighted half in the search and may take one change of tone. On `9087ec4`'s R1 development rows (`bench`
+  `runs/r1_fdop_9087ec4`), four right answers (osprey_1031, osprey_1101, eagle, duke) have a core match that
+  uses a tone change, and so does the one wrong medium (osprey_1102b, e12), so removing that freedom is not a
+  clean change either.
 
 ### Preserve the physical pass when an aircraft returns nearby
 
@@ -339,6 +340,13 @@ at that commit, not per-change commits.
   `detect` writes byte-identical `events.json`, traces, stdout and stderr (46-60 events each) with and without
   the stage. `locate` measures exactly as `detect` does, so no null or development answer can differ from
   `3f408f4`'s.
+- **Correction (2026-11-07): the development rows use a seventh recording.** The eagle-nest clip (b2_eagle,
+  `swfl_20241228.m4a`) is under the floor, so the paragraph above is wrong for it. With the stage, `detect`
+  keeps its 41 events field for field and adds 19 contrast detections after them. 4 of those pass the quality
+  gates, and one (18 m/s) is under the search's aircraft bounds. `locate` with the bench's R2 arguments, run
+  offline from one local cache for both builds (no cached weather, so not comparable with the bench's rows):
+  `3f408f4` is right and low at 0.49 km from the site, and with the stage it is right and low at 0.29 km. Both
+  fail the same gates (core matches, radius). R1 is not reported here.
 
 ### Score a pass heard near a recording's start or end with a short template
 
@@ -398,7 +406,9 @@ at that commit, not per-change commits.
   use, `detect` gives the same events (46-60 each) and the same candidate count with and without the stage. On
   osprey_1031, osprey_1101, duke_1101b and feederwatch the passes stop at the cap (180+ candidates), so the
   stage never runs. On ref_raw (82) and osprey_1102b (125) it runs and adds none. `locate` measures exactly as
-  `detect` does, so no null or development answer can differ from `4c30cd1`'s.
+  `detect` does, so no null or development answer can differ from `4c30cd1`'s. The seventh recording, the
+  eagle-nest clip (b2_eagle), was checked on 2026-11-07: the same 41 events, traces, stdout and stderr,
+  byte for byte, with and without the stage.
 - **The replays the entry below promised** (`44ff60a`, whose locate output `4c30cd1` matches; local runs on an
   Apple M5 Ultra, the later rows written to NFS when the local disk filled). Of the 33 nulls, none is high or
   medium: 27 are low, 6 give no location, and the curve match stands on none. The 15 development rows have the
@@ -462,7 +472,9 @@ at that commit, not per-change commits.
   `locate` of the reference row (`a_ref`) with the retry matches `44ff60a`'s in every field but wall-clock
   timings: the same high answer and radius (402 m), gates, log lines, `search.json`, `candidates.csv` and curve
   match. So no null or development answer can differ from `44ff60a`'s. Those replays are reported in the next
-  entry that reports them.
+  entry that reports them. The development rows also use a seventh recording, the eagle-nest clip (b2_eagle);
+  checked on 2026-11-07, it gives the same 41 events with and without the retry, apart from the new `reseeded`
+  field (false on every event).
 
 ### Keep a steep ridge traced after the guided band narrows
 
