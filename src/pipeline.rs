@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct LocateArgs {
@@ -169,6 +169,56 @@ fn metadata_start_window(
         (creation + tolerance).min(full.1),
     );
     (window.0 <= window.1).then_some(window)
+}
+
+enum WeatherUpdate {
+    Fallback(fdop_data::Weather),
+    Complete(fdop_data::Weather, f64),
+}
+
+/// Keep usable weather while waiting for the final combination. Updates share one wait
+/// budget, and a later surface-only result cannot replace already retrieved winds aloft.
+fn wait_for_weather(
+    rx: &std::sync::mpsc::Receiver<WeatherUpdate>,
+    timeout: Duration,
+) -> (fdop_data::Weather, f64) {
+    let start = Instant::now();
+    let mut fallback: Option<fdop_data::Weather> = None;
+    let stopped = loop {
+        match rx.recv_timeout(timeout.saturating_sub(start.elapsed())) {
+            Ok(WeatherUpdate::Complete(weather, elapsed)) => return (weather, elapsed),
+            Ok(WeatherUpdate::Fallback(weather)) => {
+                if fallback
+                    .as_ref()
+                    .is_none_or(|old| weather.winds_aloft || !old.winds_aloft)
+                {
+                    fallback = Some(weather);
+                }
+            }
+            Err(e) => break e,
+        }
+    };
+    let reason = match stopped {
+        std::sync::mpsc::RecvTimeoutError::Timeout => "weather services did not all answer in time",
+        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+            "weather fetch ended before a final result was available"
+        }
+    };
+    let mut weather = fallback.unwrap_or_else(|| fdop_data::Weather {
+        atmo: Arc::new(fdop_types::atmo::StandardAtmosphere::new(15.0, 0.0, 0.5)),
+        warnings: vec!["no weather profile arrived; using a 15 C standard atmosphere".into()],
+        winds_aloft: false,
+    });
+    weather.warnings.push(format!(
+        "{reason}; using the best available profile{}",
+        if stopped == std::sync::mpsc::RecvTimeoutError::Timeout {
+            " (rerun to use any additional cached profiles once they arrive)"
+        } else {
+            ""
+        },
+    ));
+    // The selected profile may be ready, but the full fetch has not completed.
+    (weather, f64::NAN)
 }
 
 /// serde_json writes non-finite floats as null, so the output is always valid JSON.
@@ -755,8 +805,18 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         );
         std::thread::spawn(move || {
             let t = Instant::now();
-            let r = fdop_data::fetch_atmosphere(&bb, w0, w1, &cache, offline);
-            let _ = tx.send((r, t.elapsed().as_secs_f64()));
+            let fallback_tx = tx.clone();
+            let r = fdop_data::weather::fetch_atmosphere_with_progress(
+                &bb,
+                w0,
+                w1,
+                &cache,
+                offline,
+                move |weather| {
+                    let _ = fallback_tx.send(WeatherUpdate::Fallback(weather));
+                },
+            );
+            let _ = tx.send(WeatherUpdate::Complete(r, t.elapsed().as_secs_f64()));
         });
         rx
     };
@@ -929,17 +989,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     // ---- atmosphere (sound speed and wind profiles) ----------------------------------------
     let t = Instant::now();
     let (wx, weather_fetch_s) =
-        match weather_rx.recv_timeout(fdop_data::weather::FETCH_WAIT_TIMEOUT) {
-            Ok(r) => r,
-            Err(_) => (
-                fdop_data::Weather {
-                    atmo: Arc::new(fdop_types::atmo::StandardAtmosphere::new(15.0, 0.0, 0.5)),
-                    warnings: vec!["weather services did not answer in time; using a 15 C standard atmosphere (rerun to use the cached profiles once they arrive)".into()],
-                    winds_aloft: false,
-                },
-                f64::NAN,
-            ),
-        };
+        wait_for_weather(&weather_rx, fdop_data::weather::FETCH_WAIT_TIMEOUT);
     let fdop_data::Weather {
         atmo,
         warnings: wwarn,
@@ -1879,6 +1929,145 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_weather(source: &str, t_c: f64, winds_aloft: bool) -> fdop_data::Weather {
+        use fdop_types::atmo::{GriddedAtmosphere, standard_levels};
+        fdop_data::Weather {
+            atmo: Arc::new(
+                GriddedAtmosphere::new(
+                    vec![0.0],
+                    vec![0.0],
+                    0.0,
+                    3600.0,
+                    &[standard_levels(t_c, 0.0, 0.5, 1.0, 2.0)],
+                    source.into(),
+                )
+                .unwrap(),
+            ),
+            warnings: vec![source.into()],
+            winds_aloft,
+        }
+    }
+
+    #[test]
+    fn weather_deadline_keeps_available_surface_profile() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(
+            tx.send(WeatherUpdate::Fallback(test_weather(
+                "cold surface",
+                -10.0,
+                false,
+            )))
+            .is_ok()
+        );
+        // The sender remains alive, representing a blocked radiosonde request.
+        let (weather, elapsed) = wait_for_weather(&rx, Duration::ZERO);
+        drop(tx);
+        let expected = test_weather("cold surface", -10.0, false);
+        for z in [0.0, 1000.0, 5000.0] {
+            assert_eq!(
+                weather.atmo.medium(0.0, 0.0, 0.0, 0.0, z),
+                expected.atmo.medium(0.0, 0.0, 0.0, 0.0, z)
+            );
+        }
+        assert!(!weather.winds_aloft);
+        assert!(elapsed.is_nan(), "the full fetch has not completed");
+        assert_eq!(weather.warnings[0], "cold surface");
+        assert!(weather.warnings[1].contains("did not all answer in time"));
+        assert!(!weather.warnings.iter().any(|w| w.contains("15 C")));
+    }
+
+    #[test]
+    fn weather_deadline_keeps_winds_in_either_arrival_order() {
+        for surface_first in [true, false] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let surface = WeatherUpdate::Fallback(test_weather("surface", -10.0, false));
+            let sounding = WeatherUpdate::Fallback(test_weather("soundings", 18.0, true));
+            let updates = if surface_first {
+                [surface, sounding]
+            } else {
+                [sounding, surface]
+            };
+            for update in updates {
+                assert!(tx.send(update).is_ok());
+            }
+            let (weather, _) = wait_for_weather(&rx, Duration::ZERO);
+            drop(tx);
+            let expected = test_weather("soundings", 18.0, true);
+            assert_eq!(weather.atmo.describe(), expected.atmo.describe());
+            assert_eq!(
+                weather.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0),
+                expected.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0)
+            );
+            assert!(weather.winds_aloft);
+        }
+    }
+
+    #[test]
+    fn weather_completion_replaces_provisional_profiles() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for update in [
+            WeatherUpdate::Fallback(test_weather("surface", -10.0, false)),
+            WeatherUpdate::Fallback(test_weather("soundings", 18.0, true)),
+            WeatherUpdate::Complete(test_weather("combined", 8.0, true), 42.0),
+        ] {
+            assert!(tx.send(update).is_ok());
+        }
+        let (weather, elapsed) = wait_for_weather(&rx, Duration::ZERO);
+        let expected = test_weather("combined", 8.0, true);
+        assert_eq!(weather.atmo.describe(), expected.atmo.describe());
+        assert_eq!(
+            weather.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0),
+            expected.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0)
+        );
+        assert_eq!(weather.warnings, ["combined"]);
+        assert!(weather.winds_aloft);
+        assert_eq!(elapsed, 42.0);
+    }
+
+    #[test]
+    fn weather_without_profiles_uses_standard_and_reports_why() {
+        use fdop_types::atmo::{Atmosphere, StandardAtmosphere};
+        for disconnected in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let tx = (!disconnected).then_some(tx);
+            let (weather, elapsed) = wait_for_weather(&rx, Duration::ZERO);
+            drop(tx);
+            let expected = StandardAtmosphere::new(15.0, 0.0, 0.5);
+            assert_eq!(
+                weather.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0),
+                expected.medium(0.0, 0.0, 0.0, 0.0, 2000.0)
+            );
+            assert!(!weather.winds_aloft);
+            assert!(elapsed.is_nan());
+            assert!(weather.warnings[0].contains("using a 15 C standard atmosphere"));
+            if disconnected {
+                assert!(weather.warnings[1].contains("ended before a final result"));
+                assert!(!weather.warnings[1].contains("rerun"));
+            } else {
+                assert!(weather.warnings[1].contains("did not all answer in time"));
+            }
+        }
+    }
+
+    #[test]
+    fn weather_disconnect_keeps_a_received_profile() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(
+            tx.send(WeatherUpdate::Fallback(test_weather("surface", -10.0, false)))
+                .is_ok()
+        );
+        drop(tx);
+        let (weather, elapsed) = wait_for_weather(&rx, Duration::ZERO);
+        let expected = test_weather("surface", -10.0, false);
+        assert_eq!(
+            weather.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0),
+            expected.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0)
+        );
+        assert!(!weather.winds_aloft);
+        assert!(elapsed.is_nan());
+        assert!(weather.warnings[1].contains("ended before a final result"));
+    }
 
     #[test]
     fn dates_and_windows() {

@@ -568,29 +568,102 @@ pub fn fetch_atmosphere(
     cache: &Path,
     offline: bool,
 ) -> Weather {
+    fetch_atmosphere_with_progress(bbox, t_start, t_end, cache, offline, |_| {})
+}
+
+/// Fetch the final atmosphere as in [`fetch_atmosphere`], reporting usable fallback
+/// profiles while the other service is still loading. The callback runs on the source
+/// threads; a caller with a deadline can retain these profiles instead of losing weather
+/// that already arrived. The final return still combines surface data with radiosondes.
+pub fn fetch_atmosphere_with_progress(
+    bbox: &BBox,
+    t_start: f64,
+    t_end: f64,
+    cache: &Path,
+    offline: bool,
+    on_fallback: impl Fn(Weather) + Send + Sync + 'static,
+) -> Weather {
     let (b, c1) = (*bbox, cache.to_path_buf());
     let h_om = std::thread::spawn(move || {
         om_grid(OM_HIST_FORECAST, &b, t_start, t_end, &c1, offline, true)
     });
-    choose_atmosphere(join_weather(h_om), || {
+    let (c2, c3) = (cache.to_path_buf(), cache.to_path_buf());
+    fetch_with_fallbacks(
+        join_weather(h_om),
+        move || om_grid(OM_ARCHIVE, &b, t_start, t_end, &c2, offline, false),
+        move || raob_atmosphere(&b, t_start, t_end, &c3, offline),
+        on_fallback,
+    )
+}
+
+type AtmosphereResult = Result<Arc<dyn Atmosphere>, DataError>;
+
+// The final adjustment and a provisional result share immutable profiles. Keep the
+// public AdjustedAtmosphere interface unchanged while retaining them in both places.
+struct SharedAtmosphere(Arc<dyn Atmosphere>);
+
+impl Atmosphere for SharedAtmosphere {
+    fn medium(&self, lat: f64, lon: f64, t: f64, z_a: f64, z_b: f64) -> fdop_types::atmo::Medium {
+        self.0.medium(lat, lon, t, z_a, z_b)
+    }
+
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+}
+
+fn publish_fallback(
+    result: Result<impl Atmosphere + 'static, DataError>,
+    preferred_failure: &str,
+    winds_aloft: bool,
+    on_fallback: &dyn Fn(Weather),
+) -> AtmosphereResult {
+    let result = result.map(|a| Arc::new(a) as Arc<dyn Atmosphere>);
+    if let Ok(a) = &result {
+        on_fallback(Weather {
+            atmo: Arc::clone(a),
+            warnings: vec![
+                preferred_failure.into(),
+                if winds_aloft {
+                    "hourly surface temperatures not applied; boundary layer from the 12-hourly soundings"
+                } else {
+                    "no upper-air data: standard lapse above the surface and no winds aloft"
+                }
+                .into(),
+            ],
+            winds_aloft,
+        });
+    }
+    result
+}
+
+fn fetch_with_fallbacks(
+    om: Result<GriddedAtmosphere, DataError>,
+    surface: impl FnOnce() -> Result<GriddedAtmosphere, DataError> + Send + 'static,
+    raob: impl FnOnce() -> Result<ScatteredAtmosphere, DataError> + Send + 'static,
+    on_fallback: impl Fn(Weather) + Send + Sync + 'static,
+) -> Weather {
+    choose_atmosphere(om, |preferred_failure| {
         // A pressure-level profile already includes surface weather. Only fetch the
         // alternatives when it fails: radiosondes can require many serial requests.
-        // The two fallback sources are independent and still load concurrently.
-        let (c2, c3) = (cache.to_path_buf(), cache.to_path_buf());
+        // Each source publishes its own usable result before either join can block it.
+        let on_fallback = Arc::new(on_fallback);
+        let surface_update = Arc::clone(&on_fallback);
+        let surface_failure = preferred_failure.to_string();
+        let raob_failure = preferred_failure.to_string();
         let h_sf = std::thread::spawn(move || {
-            om_grid(OM_ARCHIVE, &b, t_start, t_end, &c2, offline, false)
+            publish_fallback(surface(), &surface_failure, false, &*surface_update)
         });
-        let h_rb = std::thread::spawn(move || raob_atmosphere(&b, t_start, t_end, &c3, offline));
+        let h_rb = std::thread::spawn(move || {
+            publish_fallback(raob(), &raob_failure, true, &*on_fallback)
+        });
         (join_weather(h_sf), join_weather(h_rb))
     })
 }
 
 fn choose_atmosphere(
     om: Result<GriddedAtmosphere, DataError>,
-    fallbacks: impl FnOnce() -> (
-        Result<GriddedAtmosphere, DataError>,
-        Result<ScatteredAtmosphere, DataError>,
-    ),
+    fallbacks: impl FnOnce(&str) -> (AtmosphereResult, AtmosphereResult),
 ) -> Weather {
     let weather = |atmo: Arc<dyn Atmosphere>, warnings: Vec<String>, winds_aloft: bool| Weather {
         atmo,
@@ -602,7 +675,7 @@ fn choose_atmosphere(
         Ok(a) => return weather(Arc::new(a), warn, true),
         Err(e) => warn.push(format!("Open-Meteo pressure levels unavailable ({e})")),
     }
-    let (surface, raob) = fallbacks();
+    let (surface, raob) = fallbacks(&warn[0]);
     match raob {
         Ok(r) => {
             // radiosondes give real temperature and wind profiles; with hourly surface
@@ -610,8 +683,8 @@ fn choose_atmosphere(
             return match surface {
                 Ok(s) => weather(
                     Arc::new(AdjustedAtmosphere {
-                        base: Box::new(r),
-                        surface: Box::new(s),
+                        base: Box::new(SharedAtmosphere(r)),
+                        surface: Box::new(SharedAtmosphere(s)),
                         depth: 1500.0,
                     }),
                     warn,
@@ -621,7 +694,7 @@ fn choose_atmosphere(
                     warn.push(format!(
                         "hourly surface temperatures unavailable ({e}); boundary layer from the 12-hourly soundings"
                     ));
-                    weather(Arc::new(r), warn, true)
+                    weather(r, warn, true)
                 }
             };
         }
@@ -632,7 +705,7 @@ fn choose_atmosphere(
             warn.push(
                 "no upper-air data: standard lapse above the surface and no winds aloft".into(),
             );
-            return weather(Arc::new(a), warn, false);
+            return weather(a, warn, false);
         }
         Err(e) => warn.push(format!("surface weather unavailable ({e})")),
     }
@@ -702,9 +775,12 @@ mod tests {
             atmo: a,
             warnings: warn,
             winds_aloft,
-        } = choose_atmosphere(Ok(test_grid("test pressure levels", 25.0)), || {
-            panic!("a successful pressure-level profile must not load fallback weather")
-        });
+        } = fetch_with_fallbacks(
+            Ok(test_grid("test pressure levels", 25.0)),
+            || panic!("pressure levels must not load surface fallback weather"),
+            || panic!("pressure levels must not load radiosonde fallback weather"),
+            |_| panic!("pressure levels must not publish fallback weather"),
+        );
         assert_eq!(a.describe(), expected.describe());
         assert_eq!(
             a.medium(0.0, 0.0, 0.0, 0.0, 2000.0),
@@ -712,6 +788,96 @@ mod tests {
         );
         assert!(warn.is_empty());
         assert!(winds_aloft);
+    }
+
+    #[test]
+    fn fallback_progress_precedes_the_other_service() {
+        for surface_first in [true, false] {
+            let (surface_tx, surface_rx) = std::sync::mpsc::channel();
+            let (raob_tx, raob_rx) = std::sync::mpsc::channel();
+            let (update_tx, update_rx) = std::sync::mpsc::channel();
+            let fetch = std::thread::spawn(move || {
+                fetch_with_fallbacks(
+                    Err(DataError::new("pressure failed")),
+                    move || {
+                        surface_rx.recv().unwrap();
+                        Ok(test_grid("test surface", -10.0))
+                    },
+                    move || {
+                        raob_rx.recv().unwrap();
+                        Ok(test_soundings())
+                    },
+                    move |weather| assert!(update_tx.send(weather).is_ok()),
+                )
+            });
+            if surface_first {
+                surface_tx.send(()).unwrap();
+            } else {
+                raob_tx.send(()).unwrap();
+            }
+            // The other source cannot finish until released below. This timeout only
+            // bounds a broken test; no wall-clock delay selects which source wins.
+            let first = update_rx.recv_timeout(Duration::from_secs(5));
+            let _ = surface_tx.send(());
+            let _ = raob_tx.send(());
+            let final_weather = fetch.join().unwrap();
+            let first = first.expect("a ready source must publish before the other finishes");
+            let expected: Box<dyn Atmosphere> = if surface_first {
+                Box::new(test_grid("test surface", -10.0))
+            } else {
+                Box::new(test_soundings())
+            };
+            assert_eq!(first.atmo.describe(), expected.describe());
+            assert_eq!(first.winds_aloft, !surface_first);
+            assert_eq!(
+                first.warnings[0],
+                "Open-Meteo pressure levels unavailable (pressure failed)"
+            );
+            assert!(first.warnings[1].contains(if surface_first {
+                "no winds aloft"
+            } else {
+                "hourly surface temperatures not applied"
+            }));
+            let combined = AdjustedAtmosphere {
+                base: Box::new(test_soundings()),
+                surface: Box::new(test_grid("test surface", -10.0)),
+                depth: 1500.0,
+            };
+            for z in [0.0, 1000.0, 5000.0] {
+                assert_eq!(
+                    first.atmo.medium(0.0, 0.0, 0.0, 0.0, z),
+                    expected.medium(0.0, 0.0, 0.0, 0.0, z)
+                );
+                assert_eq!(
+                    final_weather.atmo.medium(0.0, 0.0, 0.0, 0.0, z),
+                    combined.medium(0.0, 0.0, 0.0, 0.0, z)
+                );
+            }
+            assert!(final_weather.winds_aloft);
+            assert_eq!(
+                final_weather.warnings,
+                ["Open-Meteo pressure levels unavailable (pressure failed)"]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_fallbacks_do_not_publish_profiles() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let weather = fetch_with_fallbacks(
+            Err(DataError::new("pressure failed")),
+            || Err(DataError::new("surface failed")),
+            || Err(DataError::new("soundings failed")),
+            move |weather| assert!(tx.send(weather).is_ok()),
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!weather.winds_aloft);
+        let expected = StandardAtmosphere::new(15.0, 0.0, 0.5);
+        assert_eq!(
+            weather.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0),
+            expected.medium(0.0, 0.0, 0.0, 0.0, 2000.0)
+        );
+        assert_eq!(weather.warnings.len(), 4);
     }
 
     #[test]
@@ -725,8 +891,11 @@ mod tests {
             atmo: a,
             warnings: warn,
             winds_aloft,
-        } = choose_atmosphere(Err(DataError::new("pressure failed")), || {
-            (Ok(test_grid("test surface", 26.0)), Ok(test_soundings()))
+        } = choose_atmosphere(Err(DataError::new("pressure failed")), |_| {
+            (
+                Ok(Arc::new(test_grid("test surface", 26.0))),
+                Ok(Arc::new(test_soundings())),
+            )
         });
         assert_eq!(a.describe(), expected.describe());
         for z in [0.0, 1000.0, 5000.0] {
@@ -749,8 +918,11 @@ mod tests {
             atmo: a,
             warnings: warn,
             winds_aloft,
-        } = choose_atmosphere(Err(DataError::new("pressure failed")), || {
-            (Err(DataError::new("surface failed")), Ok(test_soundings()))
+        } = choose_atmosphere(Err(DataError::new("pressure failed")), |_| {
+            (
+                Err(DataError::new("surface failed")),
+                Ok(Arc::new(test_soundings())),
+            )
         });
         assert_eq!(a.describe(), expected.describe());
         assert_eq!(
@@ -774,9 +946,9 @@ mod tests {
             atmo: a,
             warnings: warn,
             winds_aloft,
-        } = choose_atmosphere(Err(DataError::new("pressure failed")), || {
+        } = choose_atmosphere(Err(DataError::new("pressure failed")), |_| {
             (
-                Ok(test_grid("test surface", 26.0)),
+                Ok(Arc::new(test_grid("test surface", 26.0))),
                 Err(DataError::new("soundings failed")),
             )
         });
@@ -803,7 +975,7 @@ mod tests {
             atmo: a,
             warnings: warn,
             winds_aloft,
-        } = choose_atmosphere(Err(DataError::new("pressure failed")), || {
+        } = choose_atmosphere(Err(DataError::new("pressure failed")), |_| {
             (
                 Err(DataError::new("surface failed")),
                 Err(DataError::new("soundings failed")),

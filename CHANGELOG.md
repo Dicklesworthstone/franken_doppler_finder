@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep usable weather when another source stalls
+
+- **The fault.** After pressure-level weather failed, the surface and radiosonde requests ran concurrently,
+  but neither result reached the pipeline until both had joined. A slow radiosonde request could therefore
+  exhaust the pipeline deadline and replace already retrieved historical surface temperatures with 15 °C.
+  The reverse stall also discarded usable radiosonde profiles.
+- **The change.** A progress-capable fetch publishes each usable fallback directly from its source thread.
+  The existing synchronous API still returns the same final source selection, including the combined
+  radiosonde/hourly-surface atmosphere when both succeed. Profiles are shared immutably.
+- The pipeline keeps these provisional results under its existing single 190-second wait budget. At a
+  timeout or early channel disconnection, a received profile survives; winds aloft take precedence over a
+  later surface-only update. The standard 15 °C atmosphere is used only if no profile arrived. Warnings
+  describe missing data and incomplete retrieval; an unfinished fetch does not acquire a completed timing.
+- Two weather regressions cover channel-controlled completion in both source orders, the eventual real
+  combined atmosphere, and failed sources producing no provisional success. Five pipeline regressions
+  cover cold surface weather at the deadline, wind preference in either order, final-result replacement,
+  the no-profile default and early disconnection. Existing pressure-level and fallback-selection tests remain.
+- **Validation limit.** Source and independent reviews completed, but the executor became unavailable
+  before rustfmt, compilation or these tests could run. The complete patch was recovered through GitHub.
+  Workspace checks, selftest and reference/negative replays remain unconfirmed; no real-recording accuracy
+  or confidence improvement is claimed.
+
 ### Scale candidate deduplication without dropping comparisons
 
 - Large candidate groups sharing the same event-flight matches now use a spatial/clock index before

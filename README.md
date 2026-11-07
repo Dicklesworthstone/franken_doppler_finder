@@ -758,7 +758,7 @@ and warns when it does. Going offline therefore preserves the altitude reference
 |---|---|---|
 | ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing |
 | Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Jets are dropped; unknown types are kept |
-| Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. Falls back to a 15 °C standard atmosphere with a warning |
+| Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. A slow service does not discard a usable profile from the other source. The 15 °C standard atmosphere is used only if no usable profile arrives, with a warning |
 | Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search; a tile that cannot be fetched counts as 0 m, with a warning giving the number of such tiles. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
 | Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL. Taken once two reads agree, then kept in the cache; −30 m, with a warning, if the reads fail or never agree, or under `--offline` |
 | Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Offline fallback uses the gazetteer's internal points |
@@ -1006,8 +1006,12 @@ Both outputs matched exactly. These are single-trial deduplication measurements,
 timings; real-recording runtime has not been remeasured.
 
 Weather retrieval overlaps audio analysis. After audio analysis, the pipeline waits up to 190 s for weather:
-the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. This retains
-the configured fallback allowance after the preferred request has been tried.
+the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. Usable hourly
+surface weather or radiosonde profiles are retained as they arrive; updates do not restart that deadline.
+If both fallback sources finish, their final combined profile is used. If retrieval times out or stops early,
+the best received profile survives, with winds aloft preferred over surface-only data and warnings describing
+what is missing. The 15 °C standard atmosphere is used only when no usable profile has arrived.
+An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional profile is usable.
 
 ---
 
@@ -1024,6 +1028,11 @@ The indexed-deduplication regressions and timing benchmark passed in an optimize
 harness extracted from the actual production functions, candidate fields, geodesy and saved tests.
 A focused `fdop-core` Cargo build then stopped in upstream `fsci-linalg` when rustc was killed by SIGKILL,
 before compiling the core crate. The standalone checks do not replace the complete crate or pipeline tests.
+
+The weather-deadline repair adds seven deterministic regressions using real atmospheric profiles and
+channel-controlled source completion, and retains the existing final-source selection tests. Its production
+code and tests were recovered through GitHub after another executor outage and reviewed, but have not yet
+been compiled, formatted or executed. No weather accuracy improvement is claimed from those unrun tests.
 
 The harmonic-family, nearby-return and bounded-STFT regressions are present but have not completed
 compilation or execution. The final patches were recovered through GitHub after the outage; full
