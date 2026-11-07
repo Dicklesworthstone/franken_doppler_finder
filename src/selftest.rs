@@ -10,7 +10,7 @@ use fdop_types::geo::{Enu, haversine_m};
 use fdop_types::{BBox, FlatElevation, MIC_HEIGHT_M};
 use rayon::prelude::*;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn write_wav(path: &Path, x: &[f32], sr: u32) -> std::io::Result<()> {
     let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
@@ -44,9 +44,23 @@ pub struct SelftestResult {
     pub no_answer: Option<String>,
 }
 
-pub fn run(dir: &Path, say: &(dyn Fn(&str) + Sync)) -> Result<SelftestResult, String> {
+pub(crate) struct SyntheticRecording {
+    pub wav: PathBuf,
+    pub tracks: Vec<TrackModel>,
+    pub observer: (f64, f64),
+    pub start: f64,
+    pub duration: f64,
+    pub sample_rate: u32,
+}
+
+/// The same known recording for the selftest and offline pipeline regressions. The caller
+/// supplies the atmosphere its real search will use, so fixtures never hide a medium mismatch.
+pub(crate) fn synthesize(
+    dir: &Path,
+    atmo: &dyn Atmosphere,
+    say: &(dyn Fn(&str) + Sync),
+) -> Result<SyntheticRecording, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let c = fdop_types::C_SOUND;
     let (lat0, lon0) = (40.8765, -73.5250);
     let enu = Enu::new(lat0, lon0, 0.0);
     let x_obs = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
@@ -97,8 +111,6 @@ pub fn run(dir: &Path, say: &(dyn Fn(&str) + Sync)) -> Result<SelftestResult, St
             880.0,
         ),
     ];
-    // a warm afternoon with a north-westerly breeze: the search must model both
-    let atmo = fdop_types::atmo::StandardAtmosphere::with_wind(26.0, 0.0, 0.4, 5.0, -4.0);
     let sr = 4000u32;
     let n = (dur * sr as f64) as usize;
     // audible sources: A (f0 112.7) and B (f0 129.5); decoys are far and silent
@@ -150,6 +162,28 @@ pub fn run(dir: &Path, say: &(dyn Fn(&str) + Sync)) -> Result<SelftestResult, St
     let wav = dir.join("selftest.wav");
     write_wav(&wav, &x, sr).map_err(|e| e.to_string())?;
     say(&format!("selftest: wrote {}", wav.display()));
+    Ok(SyntheticRecording {
+        wav,
+        tracks,
+        observer: (lat0, lon0),
+        start: t_s,
+        duration: dur,
+        sample_rate: sr,
+    })
+}
+
+pub fn run(dir: &Path, say: &(dyn Fn(&str) + Sync)) -> Result<SelftestResult, String> {
+    // A warm afternoon with a north-westerly breeze: the search must model both.
+    let atmo = fdop_types::atmo::StandardAtmosphere::with_wind(26.0, 0.0, 0.4, 5.0, -4.0);
+    let SyntheticRecording {
+        wav,
+        tracks,
+        observer: (lat0, lon0),
+        start: t_s,
+        duration: dur,
+        sample_rate: sr,
+    } = synthesize(dir, &atmo, say)?;
+    let c = fdop_types::C_SOUND;
     let xd = audio::decode(&wav, 0.0, None, sr)?;
     let dp = detect::DetectParams::default();
     let (ls, lin) = detect::survey(&xd, sr, &dp)?;

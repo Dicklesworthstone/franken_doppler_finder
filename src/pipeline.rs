@@ -3,7 +3,7 @@
 use fdop_core::curvematch;
 use fdop_core::detect::{self, DetectParams, Detection};
 use fdop_core::measure::{self, MeasureParams, MeasuredEvent};
-use fdop_core::search::{self, SearchEvent, SearchInputs, SearchParams, SearchResult};
+use fdop_core::search::{self, SearchInputs, SearchParams};
 use fdop_core::spectro::{Axes, Overlay, Spec, render_png_axes};
 use fdop_core::{audio, physics, track};
 use fdop_geo::region::{Region, RegionContext, parse_region};
@@ -171,6 +171,114 @@ fn metadata_start_window(
     (window.0 <= window.1).then_some(window)
 }
 
+struct PublishedWindow {
+    clock: (f64, f64),
+    adsb_end: f64,
+    pending: Vec<String>,
+}
+
+impl PublishedWindow {
+    fn track_spec(&self, bbox: BBox, duration: f64, geoid_n_m: f64) -> fdop_data::IngestSpec {
+        fdop_data::IngestSpec {
+            bbox,
+            t_start: self.clock.0 - 1200.0,
+            t_end: (self.clock.1 + duration + 1200.0).min(self.adsb_end),
+            geoid_n_m,
+            keep_unknown: true,
+        }
+    }
+
+    fn weather_span(
+        &self,
+        bbox: BBox,
+        duration: f64,
+        curve: Option<&curvematch::MatchParams>,
+    ) -> (f64, f64) {
+        let mut span = (self.clock.0, self.clock.1 + duration);
+        if let Some(p) = curve
+            && curve_match_skip_reason(p, bbox, self.clock).is_none()
+        {
+            let catalog = curve_catalog_span(p, self.clock, duration, self.adsb_end);
+            span = (span.0.min(catalog.0), span.1.max(catalog.1));
+        }
+        // Soundings must bracket the decoys too. Unlike Open-Meteo's whole-day responses,
+        // a narrow radiosonde request can otherwise miss the previous 00Z/12Z profile.
+        (span.0 - 3600.0, span.1 + 3600.0)
+    }
+}
+
+/// Check only the clock currently being tried. In particular, a metadata hint must not
+/// require the full date range's archive before either search has tried that hint.
+fn published_start_window(
+    a: &LocateArgs,
+    clock: (f64, f64),
+    duration: f64,
+    now: f64,
+    warnings: &mut Vec<String>,
+) -> Result<PublishedWindow, String> {
+    let (end, pending) = fdop_data::published_until(
+        clock.0 - 1200.0,
+        clock.1 + duration + 1200.0,
+        &a.cache,
+        a.offline,
+        now,
+    )
+    .map_err(|e| format!("ADS-B availability: {e}"))?;
+    if pending.is_empty() {
+        return Ok(PublishedWindow {
+            clock,
+            adsb_end: f64::INFINITY,
+            pending,
+        });
+    }
+    // The last flyover needs a couple of minutes of track after the recording ends.
+    let hi = clock.1.min(end - duration - 300.0);
+    let why = format!(
+        "the ADS-B archive for UTC day(s) {} is not published yet{} (adsb.lol releases each UTC day a few hours after it ends)",
+        pending.join(", "),
+        if a.offline { " or not cached" } else { "" }
+    );
+    if hi < clock.0 {
+        return Err(format!(
+            "{why}; no published day covers a {:.0} min recording in the requested start window on {}: rerun later",
+            duration / 60.0,
+            a.dates
+        ));
+    }
+    warnings.push(format!(
+        "{why}: only recording starts up to {} were searched; rerun after the release to cover the rest of {}",
+        iso_utc(hi),
+        a.dates
+    ));
+    Ok(PublishedWindow {
+        clock: (clock.0, hi),
+        adsb_end: end - 1.0,
+        pending,
+    })
+}
+
+/// A hint whose day is not published cannot rule out the published part of the dates.
+/// An explicit clock arrives here without a metadata window and remains binding.
+fn first_published_window(
+    a: &LocateArgs,
+    full: (f64, f64),
+    metadata: Option<(f64, f64)>,
+    duration: f64,
+    now: f64,
+    warnings: &mut Vec<String>,
+) -> Result<(PublishedWindow, bool), String> {
+    match published_start_window(a, metadata.unwrap_or(full), duration, now, warnings) {
+        Ok(w) => Ok((w, metadata.is_some())),
+        Err(e) if metadata.is_some() => {
+            warnings.push(format!(
+                "creation_time window could not be searched ({e}); trying the full date window"
+            ));
+            published_start_window(a, full, duration, now, warnings).map(|w| (w, false))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 enum WeatherUpdate {
     Fallback(fdop_data::Weather),
     Complete(fdop_data::Weather, f64),
@@ -219,6 +327,38 @@ fn wait_for_weather(
     ));
     // The selected profile may be ready, but the full fetch has not completed.
     (weather, f64::NAN)
+}
+
+type WeatherReceiver = std::sync::mpsc::Receiver<WeatherUpdate>;
+
+/// Weather and audio/track preparation are independent. Each attempted clock gets its own
+/// profiles; a wider retry must not extrapolate the metadata window's weather across days.
+fn start_weather(
+    a: &LocateArgs,
+    bbox: BBox,
+    window: &PublishedWindow,
+    duration: f64,
+    curve_params: &curvematch::MatchParams,
+) -> WeatherReceiver {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (cache, offline) = (a.cache.clone(), a.offline);
+    let (w0, w1) = window.weather_span(bbox, duration, a.curve_match.then_some(curve_params));
+    std::thread::spawn(move || {
+        let t = Instant::now();
+        let fallback_tx = tx.clone();
+        let r = fdop_data::weather::fetch_atmosphere_with_progress(
+            &bbox.padded_km(30.0),
+            w0,
+            w1,
+            &cache,
+            offline,
+            move |weather| {
+                let _ = fallback_tx.send(WeatherUpdate::Fallback(weather));
+            },
+        );
+        let _ = tx.send(WeatherUpdate::Complete(r, t.elapsed().as_secs_f64()));
+    });
+    rx
 }
 
 /// serde_json writes non-finite floats as null, so the output is always valid JSON.
@@ -443,6 +583,22 @@ fn curve_flights(r: &curvematch::MatchResult) -> String {
     })
 }
 
+/// The catalogue includes the same decoy clocks for ADS-B and weather, including the
+/// extra clocks placed on one side near UTC midnight or the published archive's end.
+fn curve_catalog_span(
+    p: &curvematch::MatchParams,
+    clock: (f64, f64),
+    duration: f64,
+    adsb_end: f64,
+) -> (f64, f64) {
+    let day = 86_400.0;
+    let limits = (
+        ((clock.0 - 1200.0) / day).floor() * day,
+        (((clock.1 + duration + 1200.0) / day).ceil() * day).min(adsb_end),
+    );
+    curvematch::catalog_span(p, clock.0, clock.1, duration, limits)
+}
+
 /// Fetch the flights of the decoy clocks too and run the curve match. Its own ADS-B fetch keeps the
 /// trace search's tracks exactly as they were. Returns None when this recording's clock or region
 /// is too wide for it, which says nothing about the recording.
@@ -467,12 +623,7 @@ fn run_curve_match(
         log.say(&format!("curve match skipped: {why}"));
         return Ok(None);
     }
-    let day = 86_400.0;
-    let limits = (
-        ((s_lo - 1200.0) / day).floor() * day,
-        (((s_hi + dur + 1200.0) / day).ceil() * day).min(adsb_end),
-    );
-    let (t_start, t_end) = curvematch::catalog_span(p, s_lo, s_hi, dur, limits);
+    let (t_start, t_end) = curve_catalog_span(p, clock, dur, adsb_end);
     let spec = fdop_data::IngestSpec {
         bbox: fetch_box,
         t_start,
@@ -709,118 +860,74 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
         .map(parse_iso_utc)
         .transpose()
         .map_err(|e| format!("--start: {e}"))?;
-    let (mut s_lo, mut s_hi) = requested_start_window(
+    let full_window = requested_start_window(
         start_window(d0, d1, region.utc_offset_h),
         given_start,
         a.clock_tol_s,
     )?;
-    // adsb.lol publishes each UTC day a few hours after it ends, so yesterday's local date
-    // usually reaches into a UTC day without an archive: search the published part, say so
-    let (adsb_end, pending) = fdop_data::published_until(
-        s_lo - 1200.0,
-        s_hi + info.duration_s + 1200.0,
-        &a.cache,
-        a.offline,
-        unix_now(),
-    )
-    .map_err(|e| format!("ADS-B availability: {e}"))?;
-    let adsb_end = if pending.is_empty() {
-        f64::INFINITY
-    } else {
-        // the last flyover needs a couple of minutes of track after the recording ends
-        let hi = s_hi.min(adsb_end - info.duration_s - 300.0);
-        let why = format!(
-            "the ADS-B archive for UTC day(s) {} is not published yet{} (adsb.lol releases each UTC day a few hours after it ends)",
-            pending.join(", "),
-            if a.offline { " or not cached" } else { "" }
-        );
-        if hi < s_lo {
-            return Err(format!(
-                "{why}; no published day covers a {:.0} min recording in the requested start window on {}: rerun later",
-                info.duration_s / 60.0,
-                a.dates
-            ));
-        }
-        warnings.push(format!(
-            "{why}: only recording starts up to {} were searched; rerun after the release to cover the rest of {}",
-            iso_utc(hi),
-            a.dates
-        ));
-        s_hi = hi;
-        adsb_end - 1.0
-    };
-    let full_window = (s_lo, s_hi);
-    let mut window_note = if let Some(t) = given_start {
-        format!(
-            "recording start between {} and {} (--start {} +- {:.0} s, within local dates {})",
-            iso_utc(s_lo),
-            iso_utc(s_hi),
-            iso_utc(t),
-            a.clock_tol_s,
-            a.dates
-        )
-    } else {
-        format!(
-            "recording start between {} and {} (local dates {} at UTC{:+}..{:+})",
-            iso_utc(s_lo),
-            iso_utc(s_hi),
-            a.dates,
-            region.utc_offset_h.0,
-            region.utc_offset_h.1
-        )
-    };
-    if !pending.is_empty() {
-        window_note.push_str(&format!(
-            "; clipped to the published ADS-B archive ({} pending)",
-            pending.join(", ")
-        ));
-    }
-    let mut meta_window = false;
-    if given_start.is_none()
+    let metadata_window = if given_start.is_none()
         && !a.ignore_metadata_time
         && let Some(ct) = info.creation_unix
-        && let Some((lo, hi)) =
-            metadata_start_window(full_window, ct, info.duration_s, a.clock_tol_s)
     {
-        s_lo = lo;
-        s_hi = hi;
-        meta_window = true;
-        window_note = format!(
-            "recording start in [{}, {}] from the file's creation_time {} (start or end convention, +-{:.0} s); full-day fallback if neither search finds an answer",
-            iso_utc(s_lo),
-            iso_utc(s_hi),
-            iso_utc(ct),
-            a.clock_tol_s
-        );
-    }
-    log.say(&window_note);
-    // weather is network-bound and independent of the audio: fetch it in the background
-    let weather_rx = {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (bb, w0, w1, cache, offline) = (
-            region.bbox.padded_km(30.0),
-            full_window.0 - 3600.0,
-            full_window.1 + info.duration_s + 3600.0,
-            a.cache.clone(),
-            a.offline,
-        );
-        std::thread::spawn(move || {
-            let t = Instant::now();
-            let fallback_tx = tx.clone();
-            let r = fdop_data::weather::fetch_atmosphere_with_progress(
-                &bb,
-                w0,
-                w1,
-                &cache,
-                offline,
-                move |weather| {
-                    let _ = fallback_tx.send(WeatherUpdate::Fallback(weather));
-                },
-            );
-            let _ = tx.send(WeatherUpdate::Complete(r, t.elapsed().as_secs_f64()));
-        });
-        rx
+        metadata_start_window(full_window, ct, info.duration_s, a.clock_tol_s)
+    } else {
+        None
     };
+    let (mut archive, mut meta_window) = first_published_window(
+        a,
+        full_window,
+        metadata_window,
+        info.duration_s,
+        unix_now(),
+        &mut warnings,
+    )?;
+    let mut metadata_fallback = metadata_window.is_some() && !meta_window;
+    let describe_window = |w: &PublishedWindow, metadata: bool, fallback: bool| {
+        let (lo, hi) = w.clock;
+        let mut note = if metadata {
+            format!(
+                "recording start in [{}, {}] from the file's creation_time {} (start or end convention, +-{:.0} s); full-day fallback if neither search finds an answer",
+                iso_utc(lo),
+                iso_utc(hi),
+                iso_utc(info.creation_unix.unwrap()),
+                a.clock_tol_s
+            )
+        } else if let Some(t) = given_start {
+            format!(
+                "recording start between {} and {} (--start {} +- {:.0} s, within local dates {})",
+                iso_utc(lo),
+                iso_utc(hi),
+                iso_utc(t),
+                a.clock_tol_s,
+                a.dates
+            )
+        } else if fallback {
+            format!(
+                "recording start between {} and {} (full date window after the creation_time window could not locate the recording)",
+                iso_utc(lo),
+                iso_utc(hi)
+            )
+        } else {
+            format!(
+                "recording start between {} and {} (local dates {} at UTC{:+}..{:+})",
+                iso_utc(lo),
+                iso_utc(hi),
+                a.dates,
+                region.utc_offset_h.0,
+                region.utc_offset_h.1
+            )
+        };
+        if !w.pending.is_empty() {
+            note.push_str(&format!(
+                "; clipped to the published ADS-B archive ({} pending)",
+                w.pending.join(", ")
+            ));
+        }
+        note
+    };
+    log.say(&describe_window(&archive, meta_window, metadata_fallback));
+    let curve_params = curvematch::MatchParams::default();
+    let mut weather_rx = start_weather(a, region.bbox, &archive, info.duration_s, &curve_params);
     let run_dir = a.out.clone().unwrap_or_else(|| default_run_dir(&a.media));
     std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
     // ---- audio --------------------------------------------------------------------------
@@ -830,8 +937,7 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
     log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
     warnings.extend(low_band_warning(&x, a.sr));
     timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
-    let curve_params = curvematch::MatchParams::default();
-    let mut curve_clock = (s_lo, s_hi);
+    let mut curve_clock = archive.clock;
     let curve_skip = curve_match_skip_reason(&curve_params, region.bbox, curve_clock);
     if a.curve_match
         && let Some(why) = &curve_skip
@@ -987,33 +1093,226 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
                 .write_csv(&run_dir.join(format!("{}_trace.csv", e.id)));
         }
     }
-    // ---- atmosphere (sound speed and wind profiles) ----------------------------------------
-    let t = Instant::now();
-    let (wx, weather_fetch_s) =
-        wait_for_weather(&weather_rx, fdop_data::weather::FETCH_WAIT_TIMEOUT);
-    let fdop_data::Weather {
-        atmo,
-        warnings: wwarn,
-        winds_aloft: has_wind,
-    } = wx;
-    for w in &wwarn {
-        log.say(&format!("weather: {w}"));
+    // Wind changes speed gates, not event eligibility, order, distance gates or grouping.
+    // Select the capped event IDs once; rebuild their speed gates for each attempted atmosphere.
+    let mut base_events = search::independent_measured_events(&events, 0.0);
+    let excluded_by_event_limit: std::collections::HashSet<String> = base_events
+        .iter()
+        .skip(max_measured)
+        .map(|e| e.id.clone())
+        .collect();
+    if base_events.len() > max_measured {
+        warnings.push(format!(
+            "measurement produced {} independent aircraft events after regrouping; the {max_measured} strongest were searched and {} omitted by the event limit",
+            base_events.len(),
+            base_events.len() - max_measured,
+        ));
+        base_events.truncate(max_measured);
     }
-    warnings.extend(wwarn);
-    let mid = 0.5 * (full_window.0 + full_window.1) + 0.5 * dur;
+    log.say(&format!(
+        "{} aircraft-like events go to the search",
+        base_events.len()
+    ));
+    let heard: Vec<f64> = dets.iter().map(|d| d.t0r).collect();
+    let d_max = base_events
+        .iter()
+        .map(|e| e.d_gate[1])
+        .fold(5000.0, f64::max)
+        .min(30_000.0);
+    // Aircraft within d_gate of an observer, plus ~2 minutes on each side of the CPA.
+    let fetch_box = region.bbox.padded_km((d_max / 1000.0 + 15.0).min(30.0));
+    let t = Instant::now();
+    let (geoid_n, geoid_src) =
+        fdop_data::geoid_height_with_options(&a.cache, region.center.0, region.center.1, a.offline);
+    if geoid_src != "ngs" {
+        warnings.push(format!(
+            "geoid height N = {geoid_n:.0} m is a default ({}); across CONUS N runs from about -10 to -35 m, so ADS-B GNSS altitudes can be off by up to about 20 m",
+            if a.offline {
+                "--offline and no valid cached NGS height"
+            } else {
+                "the NGS GEOID lookup failed"
+            }
+        ));
+    }
+    let mut adsb_s = t.elapsed().as_secs_f64();
+    let lg = log.clone();
+    let opts = fdop_data::FetchOptions {
+        offline: a.offline,
+        allow_missing: false,
+        progress: Some(Arc::new(move |s: &str| lg.say(s))),
+        ..Default::default()
+    };
+    // Terrain is the same for both clocks and is shared across the attempts.
+    let t = Instant::now();
+    let coarse = fdop_data::TerrariumDem::new(&a.cache, 10)
+        .with_offline(a.offline)
+        .with_fallback(0.0);
+    let fine = fdop_data::TerrariumDem::new(&a.cache, 13)
+        .with_offline(a.offline)
+        .with_fallback(0.0);
+    match coarse.prefetch_bbox(&region.bbox.padded_km(d_max / 1000.0 + 2.0), 4000) {
+        Ok(n) => log.say(&format!("terrain: {n} coarse tiles ready (z10)")),
+        Err(e) => warnings.push(format!(
+            "terrain prefetch: {e}; elevations fall back to 0 m where tiles are missing"
+        )),
+    }
+    let mut tracks_terrain_s = t.elapsed().as_secs_f64();
+    let (mut weather_fetch_s, mut weather_wait_s, mut search_s) = (0.0, 0.0, 0.0);
+    let mut curve_match_s = curve_image_s;
+    let mut curve = None;
+    let (tracks, atmo, has_wind, sevs, res) = loop {
+        // ---- ADS-B for this attempt ------------------------------------------------------
+        let spec = archive.track_spec(fetch_box, dur, geoid_n);
+        log.say(&format!(
+            "ADS-B: {} .. {} over [{:.2},{:.2},{:.2},{:.2}] (geoid N {geoid_n:.2} m, {geoid_src})",
+            iso_utc(spec.t_start),
+            iso_utc(spec.t_end),
+            fetch_box.south,
+            fetch_box.west,
+            fetch_box.north,
+            fetch_box.east
+        ));
+        let t = Instant::now();
+        let fetched = fdop_data::fetch_window(&spec, &a.cache, &opts);
+        adsb_s += t.elapsed().as_secs_f64();
+        let store = match fetched {
+            Ok(s) => s,
+            Err(e) if meta_window => {
+                let why = format!(
+                    "creation_time window could not load ADS-B data ({e}); trying the full date window"
+                );
+                log.say(&why);
+                warnings.push(why);
+                meta_window = false;
+                metadata_fallback = true;
+                archive = published_start_window(a, full_window, dur, unix_now(), &mut warnings)?;
+                weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
+                log.say(&describe_window(&archive, false, true));
+                continue;
+            }
+            Err(e) => return Err(format!("ADS-B fetch: {e}")),
+        };
+        log.say(&format!(
+            "ADS-B: {} legs, {} points",
+            store.legs.len(),
+            store.n_points()
+        ));
+        // A lesser feed can lack aircraft: neither matches nor unheard close passes.
+        if let Some(notes) = store.meta.stats["notes"].as_array() {
+            warnings.extend(
+                notes
+                    .iter()
+                    .filter_map(|n| n.as_str())
+                    .map(|n| format!("ADS-B {n}")),
+            );
+        }
+        let t = Instant::now();
+        let bp = track::BuildParams::default();
+        let tracks: Vec<track::TrackModel> = store
+            .legs
+            .par_iter()
+            .filter(|l| l.engine.tonal())
+            .flat_map_iter(|l| track::build(l, &bp))
+            .collect();
+        let n_jets = store.legs.iter().filter(|l| !l.engine.tonal()).count();
+        log.say(&format!(
+            "track models: {} (excluded {} jet legs)",
+            tracks.len(),
+            n_jets
+        ));
+        drop(store);
+        tracks_terrain_s += t.elapsed().as_secs_f64();
+        // ---- atmosphere for this attempt ------------------------------------------------
+        let t = Instant::now();
+        let (wx, fetch_s) = wait_for_weather(&weather_rx, fdop_data::weather::FETCH_WAIT_TIMEOUT);
+        weather_wait_s += t.elapsed().as_secs_f64();
+        weather_fetch_s += fetch_s;
+        let fdop_data::Weather {
+            atmo,
+            warnings: wwarn,
+            winds_aloft: has_wind,
+        } = wx;
+        for w in &wwarn {
+            log.say(&format!("weather: {w}"));
+        }
+        warnings.extend(wwarn);
+        let wind = if has_wind { 3.0 } else { 10.0 };
+        let mut sevs = search::independent_measured_events(&events, wind);
+        sevs.truncate(max_measured);
+        // ---- search ---------------------------------------------------------------------
+        let t = Instant::now();
+        let mut sp = SearchParams::new(archive.clock.0, archive.clock.1, dur, region.bbox);
+        sp.c = c;
+        sp.tonal_only = true;
+        sp.max_events = a.max_events;
+        (sp.max_hyp_per_event, sp.max_hyp_total) = search::hyp_budget(search::physical_memory());
+        let inp = SearchInputs {
+            events: sevs.clone(),
+            tracks: &tracks,
+            heard_times: heard.clone(),
+            coarse_dem: &coarse,
+            fine_dem: &fine,
+            atmo: &*atmo,
+        };
+        let res = search::run(&inp, &sp, &|s: &str| log.say(s));
+        search_s += t.elapsed().as_secs_f64();
+        // The curve matcher still loads its own decoy-clock catalogue. A narrow verdict
+        // remains diagnostic after a wider retry unless that wider clock is eligible too.
+        if let Some(im) = &curve_image
+            && curve_match_skip_reason(&curve_params, region.bbox, archive.clock).is_none()
+        {
+            let t = Instant::now();
+            curve_clock = archive.clock;
+            curve = match run_curve_match(
+                a,
+                &curve_params,
+                im,
+                region.bbox,
+                fetch_box,
+                curve_clock,
+                dur,
+                archive.adsb_end,
+                geoid_n,
+                &coarse,
+                &fine,
+                &*atmo,
+                log,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    warnings.push(format!("curve match skipped: {e}"));
+                    None
+                }
+            };
+            curve_match_s += t.elapsed().as_secs_f64();
+        }
+        let verdict = curve.as_ref().and_then(curvematch::verdict);
+        if metadata_needs_fallback(meta_window, !res.candidates.is_empty(), verdict.as_ref()) {
+            log.say("neither search located the recording inside the metadata window; widening to the full date window");
+            warnings.push(
+                "creation_time window gave no trace candidate or standing curve match; the full date window was searched. A curve match in the metadata window does not judge the wider search".into(),
+            );
+            meta_window = false;
+            metadata_fallback = true;
+            archive = published_start_window(a, full_window, dur, unix_now(), &mut warnings)?;
+            weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
+            log.say(&describe_window(&archive, false, true));
+            continue;
+        }
+        break (tracks, atmo, has_wind, sevs, res);
+    };
+    drop(curve_image);
+    let curve_verdict = curve.as_ref().and_then(curvematch::verdict);
+    let (s_lo, s_hi) = archive.clock;
+    let window_note = describe_window(&archive, meta_window, metadata_fallback);
+    let mid = 0.5 * (s_lo + s_hi) + 0.5 * dur;
     let (clat, clon) = region.center;
     let m1 = atmo.medium(clat, clon, mid, 10.0, 1500.0);
     let m5 = atmo.medium(clat, clon, mid, 10.0, 5000.0);
     log.say(&format!(
         "atmosphere: {}; mid-window at region centre: c(0-1.5 km) {:.1} m/s, c(0-5 km) {:.1} m/s, wind(0-5 km) {:.1} m/s",
-        atmo.describe(),
-        m1.c,
-        m5.c,
-        m5.wind_e.hypot(m5.wind_n)
+        atmo.describe(), m1.c, m5.c, m5.wind_e.hypot(m5.wind_n)
     ));
-    // the fetch runs in the background from the start; this is how long the pipeline waited
-    timings.insert("weather_wait_s".into(), json!(t.elapsed().as_secs_f64()));
-    timings.insert("weather_fetch_s".into(), json!(weather_fetch_s));
     let atmo_text = format!(
         "{}. At the region centre mid-window: path-mean sound speed {:.1} m/s (0-1.5 km), {:.1} m/s (0-5 km); mean wind (0-5 km) {:.1} m/s from {:.0} deg.{}",
         atmo.describe(),
@@ -1027,214 +1326,10 @@ pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
             " No wind data: speed gates are widened by 10 m/s."
         }
     );
-    // fitted speeds are mapped to ground speeds through the modelled wind; without wind
-    // data the gates must absorb it
-    let wind = if has_wind { 3.0 } else { 10.0 };
-    let mut sevs: Vec<SearchEvent> = search::independent_measured_events(&events, wind);
-    // A newly measured, better representative can change the greedy harmonic grouping of
-    // earlier events. Enforce the same independent-event limit even if that last batch
-    // releases more than its number of new slots; keep every measurement in the report.
-    let excluded_by_event_limit: std::collections::HashSet<String> = sevs
-        .iter()
-        .skip(max_measured)
-        .map(|e| e.id.clone())
-        .collect();
-    if sevs.len() > max_measured {
-        warnings.push(format!(
-            "measurement produced {} independent aircraft events after regrouping; the {max_measured} strongest were searched and {} omitted by the event limit",
-            sevs.len(),
-            sevs.len() - max_measured,
-        ));
-        sevs.truncate(max_measured);
-    }
-    log.say(&format!(
-        "{} aircraft-like events go to the search",
-        sevs.len()
-    ));
-    let heard: Vec<f64> = dets.iter().map(|d| d.t0r).collect();
-    // ---- ADS-B --------------------------------------------------------------------------
-    let t = Instant::now();
-    let d_max = sevs
-        .iter()
-        .map(|e| e.d_gate[1])
-        .fold(5000.0, f64::max)
-        .min(30_000.0);
-    // aircraft within d_gate of an observer inside the region, plus ~2 minutes of flight on
-    // each side of the CPA for the curve; capped so a state-wide search stays one cache box
-    let fetch_box: BBox = region.bbox.padded_km((d_max / 1000.0 + 15.0).min(30.0));
-    let (geoid_n, geoid_src) =
-        fdop_data::geoid_height_with_options(&a.cache, region.center.0, region.center.1, a.offline);
-    if geoid_src != "ngs" {
-        warnings.push(format!(
-            "geoid height N = {geoid_n:.0} m is a default ({}); across CONUS N runs from about -10 to -35 m, so ADS-B GNSS altitudes can be off by up to about 20 m",
-            if a.offline {
-                "--offline and no valid cached NGS height"
-            } else {
-                "the NGS GEOID lookup failed"
-            }
-        ));
-    }
-    let spec = fdop_data::IngestSpec {
-        bbox: fetch_box,
-        t_start: full_window.0 - 1200.0,
-        t_end: (full_window.1 + dur + 1200.0).min(adsb_end),
-        geoid_n_m: geoid_n,
-        keep_unknown: true,
-    };
-    let lg = log.clone();
-    let opts = fdop_data::FetchOptions {
-        offline: a.offline,
-        allow_missing: false,
-        progress: Some(Arc::new(move |s: &str| lg.say(s))),
-        ..Default::default()
-    };
-    log.say(&format!(
-        "ADS-B: {} .. {} over [{:.2},{:.2},{:.2},{:.2}] (geoid N {geoid_n:.2} m, {geoid_src})",
-        iso_utc(spec.t_start),
-        iso_utc(spec.t_end),
-        fetch_box.south,
-        fetch_box.west,
-        fetch_box.north,
-        fetch_box.east
-    ));
-    let store =
-        fdop_data::fetch_window(&spec, &a.cache, &opts).map_err(|e| format!("ADS-B fetch: {e}"))?;
-    log.say(&format!(
-        "ADS-B: {} legs, {} points",
-        store.legs.len(),
-        store.n_points()
-    ));
-    // a day built from a lesser feed can lack aircraft: those can neither match an event nor
-    // count as unheard close passes
-    if let Some(notes) = store.meta.stats["notes"].as_array() {
-        warnings.extend(
-            notes
-                .iter()
-                .filter_map(|n| n.as_str())
-                .map(|n| format!("ADS-B {n}")),
-        );
-    }
-    timings.insert("adsb_s".into(), json!(t.elapsed().as_secs_f64()));
-    let t = Instant::now();
-    let bp = track::BuildParams::default();
-    let tracks: Vec<track::TrackModel> = store
-        .legs
-        .par_iter()
-        .filter(|l| l.engine.tonal())
-        .flat_map_iter(|l| track::build(l, &bp))
-        .collect();
-    let n_jets = store.legs.iter().filter(|l| !l.engine.tonal()).count();
-    log.say(&format!(
-        "track models: {} (excluded {} jet legs)",
-        tracks.len(),
-        n_jets
-    ));
-    drop(store);
-    // ---- terrain ------------------------------------------------------------------------
-    let coarse = fdop_data::TerrariumDem::new(&a.cache, 10)
-        .with_offline(a.offline)
-        .with_fallback(0.0);
-    let fine = fdop_data::TerrariumDem::new(&a.cache, 13)
-        .with_offline(a.offline)
-        .with_fallback(0.0);
-    match coarse.prefetch_bbox(&region.bbox.padded_km(d_max / 1000.0 + 2.0), 4000) {
-        Ok(n) => log.say(&format!("terrain: {n} coarse tiles ready (z10)")),
-        Err(e) => warnings.push(format!(
-            "terrain prefetch: {e}; elevations fall back to 0 m where tiles are missing"
-        )),
-    }
-    timings.insert("tracks_terrain_s".into(), json!(t.elapsed().as_secs_f64()));
-    // ---- search -------------------------------------------------------------------------
-    let t = Instant::now();
-    let run_search = |lo: f64, hi: f64| -> SearchResult {
-        let mut sp = SearchParams::new(lo, hi, dur, region.bbox);
-        sp.c = c;
-        sp.tonal_only = true;
-        sp.max_events = a.max_events;
-        (sp.max_hyp_per_event, sp.max_hyp_total) = search::hyp_budget(search::physical_memory());
-        let inp = SearchInputs {
-            events: sevs.clone(),
-            tracks: &tracks,
-            heard_times: heard.clone(),
-            coarse_dem: &coarse,
-            fine_dem: &fine,
-            atmo: &*atmo,
-        };
-        let lg = log.clone();
-        search::run(&inp, &sp, &move |s: &str| lg.say(s))
-    };
-    let mut res = run_search(s_lo, s_hi);
-    let mut search_s = t.elapsed().as_secs_f64();
-    // ---- curve match --------------------------------------------------------------------
-    let t = Instant::now();
-    let run_curve = |clock| {
-        let Some(im) = curve_image.as_ref() else {
-            return Ok(None);
-        };
-        run_curve_match(
-            a,
-            &curve_params,
-            im,
-            region.bbox,
-            fetch_box,
-            clock,
-            dur,
-            adsb_end,
-            geoid_n,
-            &coarse,
-            &fine,
-            &*atmo,
-            log,
-        )
-    };
-    let mut curve = match run_curve(curve_clock) {
-        Ok(r) => r,
-        Err(e) => {
-            warnings.push(format!("curve match skipped: {e}"));
-            None
-        }
-    };
-    let mut curve_verdict = curve.as_ref().and_then(curvematch::verdict);
-    let mut curve_match_s = curve_image_s + t.elapsed().as_secs_f64();
-    let metadata_fallback = metadata_needs_fallback(
-        meta_window,
-        !res.candidates.is_empty(),
-        curve_verdict.as_ref(),
-    );
-    if metadata_fallback {
-        log.say("neither search located the recording inside the metadata window; widening to the full date window");
-        warnings.push(
-            "creation_time window gave no trace candidate or standing curve match; the full date window was searched. A curve match in the metadata window does not judge the wider search".into(),
-        );
-        let t = Instant::now();
-        res = run_search(full_window.0, full_window.1);
-        search_s += t.elapsed().as_secs_f64();
-        s_lo = full_window.0;
-        s_hi = full_window.1;
-        window_note = format!(
-            "recording start between {} and {} (full date window after neither search found an answer inside the creation_time window)",
-            iso_utc(s_lo),
-            iso_utc(s_hi)
-        );
-        // Usually the full date is too wide. Publication clipping can leave a shorter
-        // window, in which case the curve match must try it too, with its own decoys.
-        if curve_image.is_some()
-            && curve_match_skip_reason(&curve_params, region.bbox, full_window).is_none()
-        {
-            let t = Instant::now();
-            curve_clock = full_window;
-            curve = match run_curve(curve_clock) {
-                Ok(r) => r,
-                Err(e) => {
-                    warnings.push(format!("curve match in the full date window skipped: {e}"));
-                    None
-                }
-            };
-            curve_verdict = curve.as_ref().and_then(curvematch::verdict);
-            curve_match_s += t.elapsed().as_secs_f64();
-        }
-    }
-    drop(curve_image);
+    timings.insert("weather_wait_s".into(), json!(weather_wait_s));
+    timings.insert("weather_fetch_s".into(), json!(weather_fetch_s));
+    timings.insert("adsb_s".into(), json!(adsb_s));
+    timings.insert("tracks_terrain_s".into(), json!(tracks_terrain_s));
     timings.insert("search_s".into(), json!(search_s));
     timings.insert("curve_match_s".into(), json!(curve_match_s));
     warnings.extend(res.warnings.iter().cloned());
@@ -2055,8 +2150,10 @@ mod tests {
     fn weather_disconnect_keeps_a_received_profile() {
         let (tx, rx) = std::sync::mpsc::channel();
         assert!(
-            tx.send(WeatherUpdate::Fallback(test_weather("surface", -10.0, false)))
-                .is_ok()
+            tx.send(WeatherUpdate::Fallback(test_weather(
+                "surface", -10.0, false
+            )))
+            .is_ok()
         );
         drop(tx);
         let (weather, elapsed) = wait_for_weather(&rx, Duration::ZERO);
@@ -2068,6 +2165,292 @@ mod tests {
         assert!(!weather.winds_aloft);
         assert!(elapsed.is_nan());
         assert!(weather.warnings[1].contains("ended before a final result"));
+    }
+
+    fn offline_test_args(name: &str) -> LocateArgs {
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        LocateArgs {
+            media: dir.join("recording.mka"),
+            audio_selection: audio::AudioSelection::default(),
+            dates: "2026-09-07..2026-09-09".into(),
+            near: "40.8765,-73.5250,20".into(),
+            out: Some(dir.join("run")),
+            cache: dir.join("cache"),
+            offline: true,
+            start: None,
+            clock_tol_s: 60.0,
+            ignore_metadata_time: false,
+            max_events: 12,
+            curve_match: false,
+            sr: 4000,
+            quiet: true,
+        }
+    }
+
+    fn cache_test_day(
+        a: &LocateArgs,
+        bbox: BBox,
+        day: Ymd,
+        legs: Vec<fdop_types::store::FlightLeg>,
+    ) {
+        use fdop_types::store::{StoreMeta, TrackStore};
+        let (bbox, key) = fdop_data::fetch::bbox_key(&bbox);
+        let start = unix_from_utc(day.0, day.1, day.2, 0, 0, 0.0);
+        TrackStore {
+            meta: StoreMeta {
+                version: 1,
+                bbox,
+                t_start: start - 3600.0,
+                t_end: start + 86_400.0 + 3600.0,
+                geoid_n_m: fdop_data::geoid::DEFAULT_GEOID_M,
+                sources: vec!["synthetic".into()],
+                stats: json!({}),
+                created_unix: start,
+            },
+            legs,
+        }
+        .save(
+            &a.cache
+                .join("adsb")
+                .join(format!("{:04}-{:02}-{:02}", day.0, day.1, day.2))
+                .join(format!("prod+mlatonly_{key}.fdtrk")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn offline_metadata_locates_with_only_its_archive_day() {
+        use fdop_types::geo::{Enu, ecef_to_geodetic, haversine_m};
+        use fdop_types::store::{FlightLeg, TrackPoint, alt_src};
+        let a = offline_test_args("metadata-locate");
+        // Generate in exactly the atmosphere an uncached offline run will use. The selftest
+        // itself keeps its warm/windy atmosphere and otherwise uses this same synthesis.
+        let atmo = fdop_types::atmo::StandardAtmosphere::new(15.0, 0.0, 0.5);
+        let fixture =
+            crate::selftest::synthesize(a.media.parent().unwrap(), &atmo, &|_| {}).unwrap();
+        let mux = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(&fixture.wav)
+            .args(["-c:a", "copy", "-metadata"])
+            .arg(format!("creation_time={}", iso_utc(fixture.start)))
+            .arg(&a.media)
+            .output()
+            .expect("ffmpeg is required by locate and the selftest");
+        assert!(
+            mux.status.success(),
+            "{}",
+            String::from_utf8_lossy(&mux.stderr)
+        );
+        assert_eq!(
+            audio::probe(&a.media).unwrap().creation_unix,
+            Some(fixture.start)
+        );
+        let legs = fixture
+            .tracks
+            .iter()
+            .map(|tr| FlightLeg {
+                key: tr.key.clone(),
+                icao: tr.icao.clone(),
+                reg: tr.reg.clone(),
+                typ: tr.typ.clone(),
+                source: "synthetic".into(),
+                engine: tr.engine,
+                points: tr
+                    .t
+                    .iter()
+                    .zip(&tr.pos)
+                    .zip(&tr.vel)
+                    .map(|((&t, &p), &v)| {
+                        let (lat, lon, h) = ecef_to_geodetic(p);
+                        let vel = Enu::new(lat, lon, 0.0).vec_from_ecef(v);
+                        TrackPoint {
+                            t,
+                            lat,
+                            lon,
+                            alt_m: h as f32,
+                            gs_mps: vel[0].hypot(vel[1]) as f32,
+                            track_deg: vel[0].atan2(vel[1]).to_degrees().rem_euclid(360.0) as f32,
+                            vrate_mps: vel[2] as f32,
+                            alt_src: alt_src::GEOM,
+                            flags: 0,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        let region = parse_region(&a.near, &RegionContext::new(a.cache.clone(), false)).unwrap();
+        let bbox = region.bbox.padded_km(30.0);
+        cache_test_day(&a, bbox, (2026, 9, 8), legs);
+        let (d0, d1) = parse_dates(&a.dates).unwrap();
+        let full = PublishedWindow {
+            clock: start_window(d0, d1, region.utc_offset_h),
+            adsb_end: f64::INFINITY,
+            pending: Vec::new(),
+        };
+        // Prove that the old eager full-date request really cannot run from this cache.
+        let full_error = fdop_data::fetch_window(
+            &full.track_spec(bbox, fixture.duration, fdop_data::geoid::DEFAULT_GEOID_M),
+            &a.cache,
+            &fdop_data::FetchOptions {
+                offline: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            full_error
+                .to_string()
+                .contains("2026-09-07 (offline, not cached)")
+        );
+        let outcome = locate(&a, &Log::new(true)).unwrap();
+        assert!(outcome.found, "{}", outcome.report.answer.verdict);
+        let answer = &outcome.report.answer;
+        let error = haversine_m(
+            answer.lat,
+            answer.lon,
+            fixture.observer.0,
+            fixture.observer.1,
+        );
+        assert!(
+            error <= answer.radius_m.max(100.0),
+            "{error} m, radius {} m",
+            answer.radius_m
+        );
+        let best = &outcome.report.candidates[0];
+        let clock = parse_iso_utc(&best.recording_start_utc).unwrap();
+        assert!(
+            (clock - fixture.start).abs() < 2.0,
+            "clock offset {} s",
+            clock - fixture.start
+        );
+        for flight in ["A1DFEB", "ACE391"] {
+            assert!(
+                best.matches.iter().any(|m| m.flight == flight),
+                "missing {flight}"
+            );
+        }
+        assert!(
+            outcome.report.extra["window"]
+                .as_str()
+                .unwrap()
+                .contains("creation_time")
+        );
+        assert!(
+            !outcome
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.contains("full date window"))
+        );
+    }
+
+    #[test]
+    fn unavailable_metadata_tries_published_dates_but_explicit_clocks_do_not() {
+        let a = offline_test_args("metadata-pending");
+        let bbox = BBox::new(40.8, -73.6, 40.9, -73.5);
+        cache_test_day(&a, bbox, (2026, 9, 8), Vec::new());
+        let lo = parse_iso_utc("2026-09-08T12:00:00Z").unwrap();
+        let hint = parse_iso_utc("2026-09-10T12:00:00Z").unwrap();
+        let now = parse_iso_utc("2026-09-10T01:00:00Z").unwrap();
+        let mut warnings = Vec::new();
+        let (w, metadata) = first_published_window(
+            &a,
+            (lo, hint + 60.0),
+            Some((hint - 60.0, hint + 60.0)),
+            600.0,
+            now,
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(!metadata);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("creation_time window could not be searched"))
+        );
+        let opts = fdop_data::FetchOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let store =
+            fdop_data::fetch_window(&w.track_spec(bbox, 600.0, -30.0), &a.cache, &opts).unwrap();
+        assert_eq!(store.meta.stats["days"], json!(["2026-09-08"]));
+        assert!(
+            first_published_window(
+                &a,
+                (hint - 60.0, hint + 60.0),
+                None,
+                600.0,
+                now,
+                &mut Vec::new(),
+            )
+            .is_err(),
+            "an explicit clock cannot widen to the earlier cached day"
+        );
+        // Required midnight coverage remains strict even though the next day is not cached.
+        let late = parse_iso_utc("2026-09-08T23:50:00Z").unwrap();
+        let w = PublishedWindow {
+            clock: (late - 60.0, late + 60.0),
+            adsb_end: f64::INFINITY,
+            pending: Vec::new(),
+        };
+        let error = fdop_data::fetch_window(&w.track_spec(bbox, 3600.0, -30.0), &a.cache, &opts)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("2026-09-09 (offline, not cached)")
+        );
+    }
+
+    #[test]
+    fn empty_metadata_search_fetches_the_wider_dates() {
+        let a = offline_test_args("metadata-empty");
+        std::fs::create_dir_all(a.media.parent().unwrap()).unwrap();
+        let mux = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=4000:cl=mono",
+                "-t",
+                "12",
+                "-c:a",
+                "pcm_s16le",
+                "-metadata",
+                "creation_time=2026-09-08T19:16:40Z",
+            ])
+            .arg(&a.media)
+            .output()
+            .expect("ffmpeg is required by locate");
+        assert!(
+            mux.status.success(),
+            "{}",
+            String::from_utf8_lossy(&mux.stderr)
+        );
+        let region = parse_region(&a.near, &RegionContext::new(a.cache.clone(), false)).unwrap();
+        cache_test_day(&a, region.bbox.padded_km(30.0), (2026, 9, 8), Vec::new());
+        let log = Log::new(true);
+        let error = locate(&a, &log).unwrap_err();
+        assert!(
+            error.contains("2026-09-07 (offline, not cached)"),
+            "{error}"
+        );
+        assert!(
+            log.lines()
+                .iter()
+                .any(|s| s.contains("widening to the full date window"))
+        );
     }
 
     #[test]
@@ -2306,6 +2689,96 @@ mod tests {
                 .unwrap()
                 .contains("cells")
         );
+    }
+
+    #[test]
+    fn metadata_weather_brackets_curve_decoys_across_the_sounding_boundary() {
+        let day = unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let p = curvematch::MatchParams::default();
+        let bbox = BBox::new(40.8, -73.6, 40.9, -73.5);
+        let duration = 120.0;
+        // A 13:05 creation time gives [13:02, 13:06]. Its 48 decoys include 11:02,
+        // which needs the 00Z sounding as well as 12Z, not a clamp to the noon profile.
+        let clock = metadata_start_window(
+            (day, day + 86_400.0),
+            day + (13.0 * 60.0 + 5.0) * 60.0,
+            duration,
+            60.0,
+        )
+        .unwrap();
+        let w = PublishedWindow {
+            clock,
+            adsb_end: f64::INFINITY,
+            pending: Vec::new(),
+        };
+        let catalog = curve_catalog_span(&p, clock, duration, w.adsb_end);
+        assert_eq!(
+            catalog,
+            (
+                day + (10.0 * 60.0 + 42.0) * 60.0,
+                day + (15.0 * 60.0 + 28.0) * 60.0
+            )
+        );
+        let weather = w.weather_span(bbox, duration, Some(&p));
+        assert_eq!(weather, (catalog.0 - 3600.0, catalog.1 + 3600.0));
+        let trace_only = w.weather_span(bbox, duration, None);
+        assert_eq!(trace_only, (clock.0 - 3600.0, clock.1 + duration + 3600.0));
+        assert_eq!((trace_only.0 / 43_200.0).floor() * 43_200.0, day + 43_200.0);
+        assert_eq!((weather.0 / 43_200.0).floor() * 43_200.0, day);
+        assert!(
+            weather.0 > day && weather.1 < day + 86_400.0,
+            "not the whole requested date range"
+        );
+        // Neither disabling curve matching nor exceeding either eligibility limit should
+        // request decoy weather for a matcher that will not run.
+        let wide = PublishedWindow {
+            clock: (clock.0, clock.0 + 1801.0),
+            adsb_end: w.adsb_end,
+            pending: Vec::new(),
+        };
+        assert_eq!(
+            wide.weather_span(bbox, duration, Some(&p)),
+            wide.weather_span(bbox, duration, None)
+        );
+        let large = BBox::new(40.0, -74.0, 42.0, -72.0);
+        assert_eq!(w.weather_span(large, duration, Some(&p)), trace_only);
+    }
+
+    #[test]
+    fn curve_weather_covers_one_sided_decoys_at_archive_edges() {
+        let day = unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let p = curvematch::MatchParams::default();
+        let bbox = BBox::new(40.8, -73.6, 40.9, -73.5);
+        // Near midnight the missing earlier decoys move later; near publication's end,
+        // later decoys move earlier. Expected catalogues include the existing track padding.
+        for (clock, end, expected) in [
+            (
+                (day + 30.0 * 60.0, day + 34.0 * 60.0),
+                f64::INFINITY,
+                (day, day + (4.0 * 60.0 + 31.0) * 60.0),
+            ),
+            (
+                (
+                    day + (23.0 * 60.0 + 10.0) * 60.0,
+                    day + (23.0 * 60.0 + 14.0) * 60.0,
+                ),
+                day + 86_400.0 - 1.0,
+                (day + (19.0 * 60.0 + 30.0) * 60.0, day + 86_400.0 - 1.0),
+            ),
+        ] {
+            let w = PublishedWindow {
+                clock,
+                adsb_end: end,
+                pending: Vec::new(),
+            };
+            let catalog = curve_catalog_span(&p, clock, 120.0, end);
+            assert_eq!(catalog, expected);
+            assert_eq!(
+                w.weather_span(bbox, 120.0, Some(&p)),
+                (expected.0 - 3600.0, expected.1 + 3600.0)
+            );
+            assert!(catalog.1 <= end);
+        }
     }
 
     /// Every combination of the trace grade and where the curve match stands. km east of 40 N.

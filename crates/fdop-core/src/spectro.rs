@@ -677,16 +677,20 @@ mod tests {
                         + 0.1 * noise) as f32
                 })
                 .collect();
-            let actual =
-                stft_band_db(&x, sr, 0.25, 0.03125, fmin, fmax, df_max, offset).unwrap();
-            let nfft = nwin.max((sr as f64 / df_max).ceil() as usize).next_power_of_two();
+            let actual = stft_band_db(&x, sr, 0.25, 0.03125, fmin, fmax, df_max, offset).unwrap();
+            let nfft = nwin
+                .max((sr as f64 / df_max).ceil() as usize)
+                .next_power_of_two();
             let df = sr as f64 / nfft as f64;
             let b0 = (fmin / df).ceil() as usize;
             let b1 = ((fmax / df).floor() as usize).min(nfft / 2);
             assert_eq!(actual.nt(), nfr);
             assert_eq!(actual.nf(), b1 - b0 + 1);
             assert_eq!(actual.meta.nfft, nfft);
-            assert_eq!(actual.f, (b0..=b1).map(|k| k as f64 * df).collect::<Vec<_>>());
+            assert_eq!(
+                actual.f,
+                (b0..=b1).map(|k| k as f64 * df).collect::<Vec<_>>()
+            );
             let w = hann(nwin);
             let wsum: f64 = w.iter().sum();
             let norm = wsum * wsum;
@@ -699,8 +703,7 @@ mod tests {
                 let fft = fsci_fft::rfft(&buf, &opts).unwrap();
                 for (fi, k) in (b0..=b1).enumerate() {
                     let (re, im) = fft[k];
-                    let expected =
-                        (10.0 * ((re * re + im * im) / norm + 1e-20).log10()) as f32;
+                    let expected = (10.0 * ((re * re + im * im) / norm + 1e-20).log10()) as f32;
                     assert_eq!(
                         actual.at(fi, ti).to_bits(),
                         expected.to_bits(),
@@ -709,8 +712,7 @@ mod tests {
                 }
                 assert_eq!(
                     actual.t[ti],
-                    offset + (ti * hop) as f64 / sr as f64
-                        + nwin as f64 / (2.0 * sr as f64)
+                    offset + (ti * hop) as f64 / sr as f64 + nwin as f64 / (2.0 * sr as f64)
                 );
                 if ti % STFT_BLOCK_FRAMES == 0 {
                     drain_fft_traces();

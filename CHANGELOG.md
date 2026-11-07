@@ -19,6 +19,32 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Load the metadata attempt before requiring the full date range
+
+- Resolve the recording's metadata clock before archive availability and data loading. A timestamp
+  search now requests only its own tracks and weather, so an offline cache for the relevant day is
+  usable even when surrounding dates are uncached. If the hint is unavailable, its ADS-B load fails,
+  or neither the trace nor curve search finds an answer, load and search the full date window once.
+  Explicit `--start` remains binding, including publication clipping and midnight coverage.
+- Each attempt owns its publication bounds, tracks, atmosphere, wind gates and search result.
+  Reuse audio measurement and terrain, preserve independent-event caps, and report the final
+  attempt's data. Keep the existing rule preventing a narrow curve verdict from grading a wider
+  retry. Preserve upstream weather progress and usable-profile fallback handling.
+- Share the curve catalogue span between ADS-B and weather requests. Eligible curve decoys receive
+  the same weather coverage, including earlier/later radiosonde brackets and one-sided decoy
+  placement at archive edges; disabled or ineligible curve searches retain trace-only coverage.
+- Add a real 1300-second synthetic media-to-location regression with creation-time metadata and
+  one cached archive day, plus unavailable-hint, explicit-clock, empty-search fallback and weather
+  coverage regressions. Extract the existing selftest synthesizer without changing its warm/windy
+  run; the offline regression supplies the same standard atmosphere its real pipeline will use.
+- **Validation limit.** The pipeline and its new regressions have undergone source review and
+  formatting, but full application test compilation and workspace Clippy were killed by SIGKILL
+  inside upstream `asupersync` before reaching this crate. These pipeline tests remain unrun.
+  The actual `src/selftest.rs`, compiled unchanged through an external entry point against the
+  fresh core libraries, passed decode/detect/measure/search with both intended flights: 2.365 m
+  position error, 0.0249 s clock error and the existing 75 m radius. That validates the real core
+  chain and extracted synthesis, not the metadata pipeline or the full CLI release build.
+
 ### Detect faint aircraft beyond the original speed bank
 
 - Append faster subsonic templates after the existing primary, edge and contrast stages. Continue

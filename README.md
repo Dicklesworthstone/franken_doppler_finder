@@ -573,6 +573,14 @@ retries too if the wider window is still eligible. A curve test from the earlier
 that wider search. Its original `clock_window` and
 `judged_search_window` flag are recorded in `result.json` under `extra.curve_match` when it has a verdict.
 
+Archive availability, track loading and weather follow the window actually being tried. A metadata
+attempt can therefore run offline with just its required cached UTC day, even when `--dates` includes
+uncached surrounding days. If its archive cannot be loaded, or neither search finds an answer, the
+full-date attempt loads its own tracks and weather and rebuilds the wind-dependent speed gates. An
+eligible curve match still needs its wider decoy catalogue; weather covers those same decoy times,
+including the radiosonde brackets, before adding the normal padding. Dates spanning UTC midnight
+still require every day used by the attempted recording and track coverage.
+
 With `--start`, its clock window is intersected with the local dates before checking archive availability or
 fetching weather and tracks. Only the UTC days needed by that window, the recording duration and track padding
 are fetched; unrelated days in a broader `--dates` range are not required, including in `--offline` mode. A
@@ -1036,10 +1044,17 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 **Latest focused checks.** The executor recovered, and real RCH with the pinned nightly now runs
 the core tests. Six guided-ridge/background-restoration tests and the harmonic-family recovery PCM
 case pass together on the final frequency-restoration code. All three harmonic-family cases, the
-five local-approach/search regressions, the three coarse curve-stamping regressions and the STFT
-bitwise-reference test have also passed. These use one build job, two Rayon workers, optimization
-level 1 for workspace crates, unoptimized dependencies and no debug information. Full workspace
-tests, Clippy, release selftest and reference-recording replay are still pending.
+five local-approach/search regressions, the three coarse curve-stamping regressions, all four fast-bank
+tests and the STFT bitwise-reference test have also passed. Core/shared-type all-target Clippy passes
+with warnings denied, and workspace formatting passes. These use one build job, two Rayon workers,
+optimization level 1 for workspace crates, unoptimized dependencies and no debug information.
+
+The actual `src/selftest.rs`, compiled unchanged through an external entry point against fresh core
+libraries, passes the real decode/detect/measure/search chain: both intended flights, 2.365 m position
+error, 0.0249 s clock error and the existing 75 m radius. The complete application build and workspace
+Clippy were killed by SIGKILL in upstream `asupersync`, including a retry with one compiler frontend
+and backend job. The metadata/offline pipeline tests, full workspace gates, CLI release selftest and
+reference-recording replay therefore remain unconfirmed; the external selftest does not replace them.
 
 **Earlier recovery checks.**
 
