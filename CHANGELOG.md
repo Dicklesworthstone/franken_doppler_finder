@@ -19,6 +19,31 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Let the curve match judge a run with `--start` and the default clock tolerance
+
+- `--clock-tol` now defaults to 120 s (it was 180 s). The curve match ranks its answer against decoy clock
+  windows of the searched window's width, each the width plus 60 s apart within about ±2 h, and needs 40 of
+  them to judge. A start ±180 s is a 360 s window, which got 2 × ⌊7200 / 420⌋ = 34. So a run with `--start`
+  and no `--clock-tol` could never have a standing curve match: it could not raise a low answer, lower a
+  medium one, or exempt a medium from the measurement line. ±120 s gets 48, the configuration the curve match
+  was built and checked on. The widest window that gets 40 is 300 s (±150 s), and 120 s keeps clear of it.
+- The trace search's window narrows with it: a run with `--start` or a trusted `creation_time` and no
+  `--clock-tol` searches ±120 s instead of ±180 s, and nothing widens past it. Pass `--clock-tol 180` for the
+  old window; the curve match then cannot judge. The benchmark's R2 and R3 commands pass `--clock-tol 120`
+  explicitly, so they do not change, and runs with neither a start nor a `creation_time` do not use it.
+- A curve match that ran with fewer than 40 decoys now says why in a warning, and what would let it judge: a
+  window wider than 300 s (`curvematch::max_judged_window_s`), a `creation_time` window (the recording's
+  length plus the tolerance either side), or fetched days that end too close to the clock.
+- README: the option table, the curve match's decoy counts, and a Known issue for windows wider than 300 s,
+  which include every `creation_time` window of a clip longer than a minute at the default.
+- Tests: `the_widest_judged_window_is_where_the_decoys_run_out` (300 s gets 40, 301 s fewer, 240 s gets 48,
+  360 s gets 34), `the_default_clock_tolerance_lets_the_curve_match_judge`, and
+  `a_curve_match_short_of_decoys_says_why_and_what_would_judge`.
+- No recording was re-run. This changes which runs the curve match can judge, not how it scores, so it
+  claims no gain in accuracy. Where it now judges, its record applies: on sealed set E one wrong medium, from
+  one heard pass before the two-pass rule; outside development, its answers "from the curve match" have been
+  1 right and 3 wrong, all but that one on a synthetic injection bed (bench/PROTOCOL.md Addenda 14, 16, 17).
+
 ### Let the independent curve matcher score faster subsonic passes
 
 - Extend the default speed grid by two existing 20% steps, to about 250 m/s. Its unchanged 15%

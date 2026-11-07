@@ -484,6 +484,40 @@ fn metadata_needs_fallback(
     meta_window && !trace_has_candidate && !curve.is_some_and(|v| v.stands)
 }
 
+/// Why a curve match that ran cannot judge, and what would let it. It gets fewer than `MIN_DECOYS`
+/// decoy windows either because its clock window is wider than `max_judged_window_s`, or, for a
+/// narrower one, because the fetched days end too close to it. Without `--start` the curve match
+/// runs only on a `creation_time` window: a full date window is wider than `CURVE_MAX_CLOCK_S`.
+fn too_few_decoys_warning(
+    p: &curvematch::MatchParams,
+    clock: (f64, f64),
+    n_decoys: usize,
+    from_start: bool,
+    duration: f64,
+) -> Option<String> {
+    let need = curvematch::MIN_DECOYS;
+    if n_decoys >= need {
+        return None;
+    }
+    let (width, max) = (clock.1 - clock.0, curvematch::max_judged_window_s(p));
+    let cause = if width <= max {
+        "the fetched ADS-B days leave no room for more around this clock".to_string()
+    } else if from_start {
+        format!(
+            "a {width:.0} s clock window gets no more within about +-{:.0} h, and one of {max:.0} s or less gets {need} (--clock-tol {:.0} or less with --start)",
+            p.decoy_span_s / 3600.0,
+            0.5 * max
+        )
+    } else {
+        format!(
+            "the creation_time window is {width:.0} s wide, since it spans the recording's {duration:.0} s as well as the tolerance, and only one of {max:.0} s or less gets {need}"
+        )
+    };
+    Some(format!(
+        "the curve match ran with {n_decoys} decoy clocks, under the {need} it needs to judge: {cause}. It can neither stand nor overrule the trace search's grade"
+    ))
+}
+
 /// Decoys calibrate one searched clock window. A verdict retained from an earlier metadata
 /// attempt remains diagnostic after widening, until the matcher has searched that window too.
 fn curve_judges_window(curve_clock: (f64, f64), search_clock: (f64, f64), n_decoys: usize) -> bool {
@@ -1366,6 +1400,17 @@ fn locate_with_clock(
     let curve_judged = curve
         .as_ref()
         .is_some_and(|r| curve_judges_window(curve_clock, (s_lo, s_hi), r.decoys.len()));
+    if let Some(r) = &curve
+        && let Some(w) = too_few_decoys_warning(
+            &curve_params,
+            curve_clock,
+            r.decoys.len(),
+            a.start.is_some(),
+            dur,
+        )
+    {
+        warnings.push(w);
+    }
     if let Some(r) = &curve
         && let Err(e) = write_json(&run_dir.join("curvematch.json"), r)
     {
@@ -2778,6 +2823,25 @@ mod tests {
         assert!(!curve_judges_window(wider, wider, 0));
         assert!(!curve_judges_window(wider, wider, 39));
         assert!(!curve_judges_window(narrow, (1001.25, 1101.25), 48));
+    }
+
+    #[test]
+    fn a_curve_match_short_of_decoys_says_why_and_what_would_judge() {
+        let p = curvematch::MatchParams::default();
+        let need = curvematch::MIN_DECOYS;
+        assert!(too_few_decoys_warning(&p, (1000.0, 1240.0), need, true, 600.0).is_none());
+        // +-180 s around --start: the old default
+        let w = too_few_decoys_warning(&p, (1000.0, 1360.0), 34, true, 600.0).unwrap();
+        assert!(w.contains("34 decoy clocks"), "{w}");
+        assert!(w.contains("360 s clock window"), "{w}");
+        assert!(w.contains("--clock-tol 150 or less"), "{w}");
+        // a creation_time window holds the recording's length too
+        let w = too_few_decoys_warning(&p, (1000.0, 1840.0), 16, false, 600.0).unwrap();
+        assert!(w.contains("creation_time window is 840 s wide"), "{w}");
+        assert!(!w.contains("--clock-tol"), "{w}");
+        // a window narrow enough, short only because the fetched days end
+        let w = too_few_decoys_warning(&p, (1000.0, 1240.0), 30, true, 600.0).unwrap();
+        assert!(w.contains("leave no room"), "{w}");
     }
 
     #[test]

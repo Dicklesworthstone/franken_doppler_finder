@@ -5,6 +5,14 @@ use clap::{Args, Parser, Subcommand};
 use fdop_core::audio::{self, AudioSelection};
 use std::path::PathBuf;
 
+/// Default `--clock-tol` (s). With `--start` the clock window is twice this. The curve match ranks
+/// its answer against decoy windows of that width within about +-2 h, and needs
+/// `curvematch::MIN_DECOYS` (40) of them to judge, which a window of up to 300 s gets
+/// (`curvematch::max_judged_window_s`). The first default, 180 s, gave 34, so a run with a start
+/// and no `--clock-tol` could never judge. 120 s is the tolerance the curve match was built and
+/// checked on (48 decoys; the benchmark's R2 and R3 inputs), clear of the 150 s edge.
+pub const DEFAULT_CLOCK_TOL_S: f64 = 120.0;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "fdop",
@@ -99,8 +107,9 @@ pub struct LocateCli {
     /// Exact recording start if known (ISO 8601, e.g. 2026-09-08T19:17:30-04:00).
     #[arg(long)]
     pub start: Option<String>,
-    /// Finite, nonnegative clock tolerance around --start or the file's creation_time (s).
-    #[arg(long, default_value_t = 180.0)]
+    /// Finite, nonnegative clock tolerance around --start or the file's creation_time (s). The curve
+    /// match can judge a clock window of at most 300 s: with --start, a tolerance of 150 s or less.
+    #[arg(long, default_value_t = DEFAULT_CLOCK_TOL_S)]
     pub clock_tol: f64,
     /// Ignore the container's creation_time metadata.
     #[arg(long)]
@@ -566,6 +575,34 @@ mod tests {
         }
         assert!(
             Cli::try_parse_from(["fdop", "detect", "clip.mkv", "--audio-channel", "-1"]).is_err()
+        );
+    }
+
+    /// A run with `--start` and the default tolerance must get enough decoy clocks for the curve
+    /// match to judge it. The first default, 180 s, did not.
+    #[test]
+    fn the_default_clock_tolerance_lets_the_curve_match_judge() {
+        let args = [
+            "fdop",
+            "locate",
+            "clip.m4a",
+            "--dates",
+            "2026-09-08",
+            "--near",
+            "NY",
+            "--start",
+            "2026-09-08T15:17:30-04:00",
+        ];
+        let tol = match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Locate(l) => l.clock_tol,
+            _ => panic!("expected locate"),
+        };
+        assert_eq!(tol, DEFAULT_CLOCK_TOL_S);
+        let p = fdop_core::curvematch::MatchParams::default();
+        assert!(
+            2.0 * tol < fdop_core::curvematch::max_judged_window_s(&p),
+            "a +-{tol} s window is not clear of the {} s the decoys allow",
+            fdop_core::curvematch::max_judged_window_s(&p)
         );
     }
 }

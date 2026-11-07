@@ -1835,6 +1835,14 @@ fn decoy_counts(
     (lo as i64, hi as i64)
 }
 
+/// The widest recording-clock window (s) that can get `MIN_DECOYS` decoy windows, where the fetched
+/// days leave room: `decoy_counts` puts floor(`decoy_span_s` / (width + `decoy_guard_s`)) on each
+/// side. With the defaults that is 7200 / 20 - 60 = 300 s, a start known to +-150 s. A wider window
+/// is still searched, but its verdict can neither stand nor judge a trace answer.
+pub fn max_judged_window_s(p: &MatchParams) -> f64 {
+    p.decoy_span_s / MIN_DECOYS.div_ceil(2) as f64 - p.decoy_guard_s
+}
+
 /// The ADS-B span a caller must fetch so that every decoy window has flights, kept inside
 /// `limits` (the days already being fetched, and the end of the archive).
 pub fn catalog_span(
@@ -3912,6 +3920,26 @@ mod tests {
             "{:?}",
             b.decoy_margin
         );
+    }
+
+    /// `max_judged_window_s` is the edge: that window gets `MIN_DECOYS` decoys, one a second wider
+    /// does not.
+    #[test]
+    fn the_widest_judged_window_is_where_the_decoys_run_out() {
+        let p = MatchParams::default();
+        let w = max_judged_window_s(&p);
+        assert_eq!(w, 300.0);
+        let open = (f64::NEG_INFINITY, f64::INFINITY);
+        let total = |width: f64| {
+            let (lo, hi) = decoy_counts(&p, open, 1000.0, 1000.0 + width, 600.0);
+            (lo + hi) as usize
+        };
+        assert_eq!(total(w), MIN_DECOYS);
+        assert!(total(w + 1.0) < MIN_DECOYS, "{}", total(w + 1.0));
+        // +-120 s, the tolerance the curve match was built on, gets 48
+        assert_eq!(total(240.0), 48);
+        // +-180 s, the CLI default before it was lowered, got 34 and could never judge
+        assert_eq!(total(360.0), 34);
     }
 
     /// Near the end of a day the decoys come from the other side, and there are as many of them.
