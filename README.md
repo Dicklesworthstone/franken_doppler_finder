@@ -971,12 +971,12 @@ Design notes:
   narrowing the frequency tolerance does not count the signal as its own noise. Normalized spectra
   still select and qualify peaks. Only after qualification, local frequency interpolation restores
   the removed row background; its slope must not shift the measured tone. Preserve a valid concave
-  three-bin interpolation first, including a vertex between the selected bin and a neighbouring
-  basin boundary. If that correction is unavailable and normalization moved the peak by several FFT
-  bins, restoration climbs only within its original spectral lobe, stopping at a valley or flat noise
-  floor. Every restored vertex stays inside the original frequency tolerance. Restoration cannot
-  cross to another ridge or a removed hum, and the original
-  SNR/z thresholds stay in force. No extra full spectrogram is retained.
+  three-bin interpolation, including a vertex between the selected bin and a neighbouring basin
+  boundary; without one, the normalized vertex stands. A restored vertex stays inside the original
+  frequency tolerance, so restoration cannot cross to another ridge or a removed hum, and the original
+  SNR/z thresholds stay in force. There is no climb toward a raw maximum several bins away: tried,
+  it made Livermore distances worse and raised the evidence of wrong-date runs. No extra full
+  spectrogram is retained.
 - **Steep passes get a matched window.** A 0.5 s main window stops holding a chirp at 1/win² = 4 Hz/s. Frames
   steeper than that read a second spectrogram, with the window that matches the latest fit's chirp. There the
   peak integrates along the model's curve, the band is at least 0.25 s of chirp to allow for detection's error,

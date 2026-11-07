@@ -254,11 +254,12 @@ fn profile_peak(
         && k > 0
         && k + 1 < n_off
     {
-        // Normalisation selects the ridge above persistent hum, but a pass that dwells
-        // near an asymptote can put enough tone into its row background to move the
-        // normalised maximum by several FFT bins. Climb the restored local peak only
-        // inside this normalised peak's basin: crossing a valley could change ridges.
-        // Qualification and its SNR/z stay entirely on the normalised profile.
+        // Normalisation selects the ridge above persistent hum, but its frequency-dependent
+        // subtraction tilts the local peak. Restore only the three bins used for metrology,
+        // after every normalised qualification gate, whose SNR/z stay on the normalised
+        // profile. There is deliberately no climb to a raw maximum further out: on real
+        // recordings it moved distances away from the ADS-B truth and raised wrong-date
+        // evidence (CHANGELOG, "Restore only the three-bin correction").
         let raw = |o: usize| {
             let (mut sum, mut count) = (0.0, 0usize);
             for &(tk, shift) in &path {
@@ -275,9 +276,9 @@ fn profile_peak(
             }
             (count >= need).then_some(sum / count as f64)
         };
-        // Preserve the original three-bin correction before walking. A raw maximum
-        // on a basin-boundary bin can still have its interpolated vertex inside the
-        // basin; the whole [k - 1, k + 1] neighbourhood belongs to the selected peak.
+        // A raw maximum on a basin-boundary bin can still have its interpolated vertex
+        // inside the basin; the whole [k - 1, k + 1] neighbourhood belongs to the selected
+        // peak. A concave vertex within one bin and inside the band is a local correction.
         if let (Some(a), Some(b), Some(c)) = (raw(k - 1), raw(k), raw(k + 1)) {
             let curvature = a - 2.0 * b + c;
             let offset = 0.5 * (a - c) / curvature;
@@ -286,36 +287,8 @@ fn profile_peak(
                 && offset.abs() <= 1.0
                 && (offs[k] + offset * df).abs() <= band
             {
-                return Some((f_pred + offs[k] + offset * df, snr, snr / mad));
+                fhat = f_pred + offs[k] + offset * df;
             }
-        }
-        let (mut left, mut right) = (k - 1, k + 1);
-        while left > 0 && prof[left - 1].is_finite() && prof[left - 1] < prof[left] {
-            left -= 1;
-        }
-        while right + 1 < n_off && prof[right + 1].is_finite() && prof[right + 1] < prof[right] {
-            right += 1;
-        }
-        let mut peak = k;
-        while peak > left && peak < right {
-            let (Some(a), Some(b), Some(c)) = (raw(peak - 1), raw(peak), raw(peak + 1)) else {
-                break;
-            };
-            if b >= a && b >= c {
-                let curvature = a - 2.0 * b + c;
-                let offset = 0.5 * (a - c) / curvature;
-                if curvature < 0.0
-                    && offset.is_finite()
-                    && offset.abs() <= 1.0
-                    && (offs[peak] + offset * df).abs() <= band
-                {
-                    fhat = f_pred + offs[peak] + offset * df;
-                }
-                break;
-            }
-            // Each step must rise in raw level and remain in the same normalised basin.
-            // If the raw maximum is outside it, retain the qualified frequency instead.
-            peak = if a > c { peak - 1 } else { peak + 1 };
         }
     }
     Some((fhat, snr, snr / mad))
@@ -636,47 +609,6 @@ mod tests {
             assert!((normalized.0 - normalized_vertex).abs() < 2e-5, "{normalized:?}");
             assert!((restored.0 - expected).abs() < 2e-5, "{restored:?}");
             assert_eq!((restored.1, restored.2), (normalized.1, normalized.2));
-        }
-    }
-
-    #[test]
-    fn background_restoration_recovers_a_vertex_shifted_by_several_fft_bins() {
-        for center in [100.04, 100.13, 100.22] {
-            for slope in [-12.0, 12.0] {
-                for baseline in [-65.0, 35.0] {
-                    let height = |f: f64| (40.0 - 4.0 * (f - center).powi(2)).max(0.0);
-                    let mut spec = spec_from_profile(height);
-                    // A background concentrated around the tone models the part of a
-                    // long asymptote that contributes to a row median. Its subtraction
-                    // moves the selected peak by about 1 Hz, still in the same lobe.
-                    let background: Vec<f32> = spec
-                        .f
-                        .iter()
-                        .map(|&f| (baseline + slope * (f - center) * height(f) / 40.0) as f32)
-                        .collect();
-                    let nt = spec.nt();
-                    for (row, offset) in spec.db.chunks_mut(nt).zip(&background) {
-                        for value in row {
-                            *value -= offset;
-                        }
-                    }
-                    let peak = |offsets| {
-                        guided_ridge_peak(&spec, 1, 100.0, |_| 0.0, 5.0, 12.0, 1, 3.0, 4.0, offsets)
-                            .unwrap()
-                    };
-                    let normalized = peak(None);
-                    let restored = peak(Some(background.as_slice()));
-                    assert!(
-                        (normalized.0 - center).abs() > 2.0 * spec.df(),
-                        "{normalized:?}"
-                    );
-                    assert!(
-                        (restored.0 - center).abs() < 2e-5,
-                        "center={center}, slope={slope}, baseline={baseline}: {restored:?}"
-                    );
-                    assert_eq!((restored.1, restored.2), (normalized.1, normalized.2));
-                }
-            }
         }
     }
 

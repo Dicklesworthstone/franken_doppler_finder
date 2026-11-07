@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Restore only the three-bin correction: no climb to a raw peak several bins away
+
+- Remove the raw-peak climb added in 82f26a9. When the three-bin raw correction is unavailable, the
+  normalized vertex stands again, as before 82f26a9. 5300665's three-bin-first correction, its
+  frequency-band check and its basin-boundary test stay. The climb's own synthetic test goes with it.
+- Why: on the 40 real Livermore clips (set D, development), main `0abfbe9` with this change scores
+  34 right at 25 %/50 % and 37 at 30 %/60 %, against 33 and 36 without it (`sd_ncl1`, `sd_m0ab`). It
+  beats every rival at both tolerances (dopplertrack wide 30 and 36). N1387U_R44 is right again
+  (41 m/s, 476 m; truth 33 m/s, 421 m; 44 m/s, 544 m with the climb). Of the 31 clips whose distance
+  moved, 23 moved closer to the ADS-B truth. Median distance error is 164 m (11.5 %) against 170 m
+  (12.3 %).
+- Wrong-date runs had gained evidence from the climb and lose it: `c_ref_0909` 12.95 nats against
+  16.54, `c_sapsucker_1101` 5.10 against 6.16. Both stay low. `c_sapsucker_1101`'s search now finds no
+  distinct rival place, so its margin check no longer fails, as before 82f26a9; it still fails core
+  matches, an unheard close pass and its radius. Accepting only climbs of at least two bins, the shift
+  82f26a9 was written for, still left 36 at 30 %/60 % on set D and made one of `c_sapsucker_1101`'s
+  matches core, so the climb goes.
+- Validation (`ncl1` = `0abfbe9` with this change, `m0ab` = `0abfbe9`; built on the benchmark machine,
+  run locally): selftest passes, the six trace tests pass and clippy is clean. The workspace suite
+  has the same seven failures on `0abfbe9` with and without this change, with identical messages:
+  459079e's edge-pass test, two measure tests and four curve-match tests. On the seven development
+  recordings detection keeps every event; three fewer pass quality on the reference recording (14 to
+  11), one fewer on the osprey cam's 10-31 and on Duke Farms, and one more on the feeder. `locate`
+  with the benchmark's R2 inputs, offline on one cache (`ab_m0ab_ncl1`): all five wrong-date runs stay
+  low (`c_ref_0907`, `c_ref_0909`, `c_sapsucker_1101`, `c_osprey_1031`, `c_duke_1102`), and no
+  development answer loses a grade. The reference recording stays high (300 m), the osprey cam's 11-01
+  and 11-02 high (110 m, 220 m), Duke Farms medium (970 m), the feeder gives no location, and the
+  osprey cam's 10-31 rises from medium to high (80 m), its second match core again. The eagle cam
+  stays low (290 m off; core matches, radius).
+
 ### Preserve complete cross-day flights when an adjoining day supplies their type
 
 - Apply the data API's strict `keep_unknown = false` policy after cross-day merging. A flight
