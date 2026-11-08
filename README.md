@@ -1074,11 +1074,19 @@ Design notes:
   still select and qualify peaks. Only after qualification, local frequency interpolation restores
   the removed row background; its slope must not shift the measured tone. Preserve a valid concave
   three-bin interpolation, including a vertex between the selected bin and a neighbouring basin
-  boundary; without one, the normalized vertex stands. A restored vertex stays inside the original
+  boundary; without one, the normalized vertex stands during discovery. A restored vertex stays inside the original
   frequency tolerance, so restoration cannot cross to another ridge or a removed hum, and the original
   SNR/z thresholds stay in force. There is no climb toward a raw maximum several bins away: tried,
   it made Livermore distances worse and raised the evidence of wrong-date runs. No extra full
   spectrogram is retained.
+- **Accepted aircraft can improve their frequency and geometry without changing discovery.** After
+  the ordinary or free-trace path supplies a usable aircraft event, an optional refinement uses only
+  qualified peaks whose local three-bin raw profile supports the measured vertex. A displaced normalized
+  peak with no local raw vertex cannot bias this fit. The candidate must independently pass every
+  original quality gate and aircraft bound on its own retained observations; otherwise the original
+  accepted measurement stands. Refused events and fitted-ridge continuation keep their existing paths.
+  Final coverage, uncertainty and diagnostics use the selected trace and fit together. This adds at most
+  one ordinary budget of guided rounds to an accepted event; real-recording runtime has not been measured.
 - **Steep passes get a matched window.** A 0.5 s main window stops holding a chirp at 1/win² = 4 Hz/s. Frames
   steeper than that read a second spectrogram, with the window that matches the latest fit's maximum
   received chirp. That maximum occurs d/c before the heard closest approach and is larger than its CPA
@@ -1341,6 +1349,41 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Local raw vertices improve accepted-aircraft measurements (2026-11-08)
+
+Both documented PCM accuracy failures now pass their unchanged tolerances. Discovery retains its
+normalized-ridge fallback, while an optional fit of an already accepted aircraft uses only locally
+supported raw vertices. It neither restores the removed raw-peak climb nor changes detection,
+quality or aircraft-selection thresholds. Invalid or ineligible refinements retain the original
+accepted measurement.
+
+Absolute errors on the existing fixed synthetic fixtures, before → after:
+
+| Fixture | Tone (Hz) | Speed (m/s) | Closest distance (m) | Received CPA time (s) |
+|---|---:|---:|---:|---:|
+| Harmonic recovery: 118 Hz, 120 m/s, 1500 m, 110 s | 1.321376 → 0.000648 | 2.007916 → 0.000042 | 73.789775 → 0.062019 | 0.538345 → 0.000289 |
+| Fast pass: 83 Hz, 245 m/s, 3600 m, 85.61 s | 0.376272 → 0.002579 | 0.764535 → 0.004208 | 46.928168 → 0.536758 | 0.104248 → 0.001233 |
+
+All 36 ordinary measurement cases and all eight trace cases pass in native component execution.
+This includes accepted/refused short-pass controls, wrong-seed recovery, noise and reversal refusals,
+retained-support gates, and exact eager/deferred trace and full-fit comparisons. The interrupted-fit
+reference now explicitly fails the optional refinement and proves the original accepted trace/fit
+survives; its existing interruption comparisons remain exact.
+
+With the committed detector correction included, all four contrast-edge tests and the original
+747 Hz false-addition regression pass, including real PCM measurement and negative controls.
+The unchanged production engine selftest runs through real ffmpeg decoding, detection, measurement,
+association, search and refinement: both `ACE391` and `A1DFEB`, four measured events, 1.673779 m
+location error inside a 75 m radius, and 0.019586 s clock error.
+
+Execution used all actual core modules and pinned FFT/optimizer dependencies. To fit this executor,
+the F-distribution path was compiled from 46 verbatim upstream source items and the unchanged
+`bratio.rs`/`types.rs` numerical modules, without substitute numerics. Separately, the complete core
+test source passes type checking and native Clippy with `-D warnings` against the original complete
+dependency metadata. New code introduces no formatting differences; existing formatting discrepancies
+remain. These are component results: full Cargo workspace/CLI execution was blocked by filesystem
+exhaustion and dependency compiler kills. Reference, wrong-date and field recordings were not replayed.
 
 ### Short contrast-edge curves need continuous physical support (2026-11-08)
 

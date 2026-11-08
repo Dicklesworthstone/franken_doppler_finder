@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Refine accepted aircraft using locally supported raw spectral vertices
+
+- Preserve normalized-ridge discovery and recovery, then optionally refine an already accepted aircraft
+  using only qualified peaks with a valid local raw three-bin vertex. This removes biased normalized
+  frequency samples without climbing to a remote raw peak or changing SNR, quality or aircraft thresholds.
+- Adopt a replacement only when its own fitted observations pass every original gate and the same
+  aircraft bounds. Otherwise retain the original accepted trace/fit. Refusals and fitted-ridge continuation
+  retain their existing paths; final coverage, uncertainty and diagnostics use the selected observations.
+- Add a raw-vertex regression and extend eager-diagnostics/failure-fallback oracles while keeping exact
+  trace/full-fit comparisons. Existing harmonic and fast-pass accuracy assertions are unchanged.
+- Validation: all 36 ordinary measurement cases and all eight trace cases pass natively. Harmonic distance
+  error falls from 73.7898 m to 0.0620 m; the 245 m/s pass's tone error falls from 0.376272 Hz to 0.002579 Hz
+  and its distance error from 46.9282 m to 0.5368 m on the existing fixed PCM fixtures.
+- Combined with the detector repair, four contrast-edge physical recovery/control tests and the original
+  false-addition regression pass. The production engine selftest through real ffmpeg finds both flights,
+  with 1.673779 m position error inside 75 m and 0.019586 s clock error.
+- Native execution used actual core source and pinned dependencies, with the statistical path compiled
+  from 46 verbatim upstream items plus unchanged beta-kernel modules to fit the executor. Full core
+  test-source type checking and native Clippy (`-D warnings`) also pass against original complete
+  dependency metadata. Full workspace/CLI builds remain resource-blocked; reference/wrong-date/field
+  recordings were not replayed, and no real-recording accuracy or runtime improvement is claimed.
+
 ### Corroborate short contrast-edge candidates on a coherent native-frame curve
 
 - Reject short sparse aliases unless the intervening survey frames support one physical Doppler curve

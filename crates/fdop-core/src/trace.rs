@@ -90,6 +90,7 @@ pub(crate) fn ridge_peak(
         PeakChoice::Strongest,
         None,
     )
+    .map(|peak| peak.values)
 }
 
 /// A model-guided trace follows the nearest qualifying local peak, so a louder nearby
@@ -146,6 +147,47 @@ pub(crate) fn guided_ridge_peak_with_exclusion(
         PeakChoice::NearestQualified { min_snr, min_z },
         background,
     )
+    .map(|peak| peak.values)
+}
+
+/// Qualify the ridge on the normalised profile, but require a local raw spectral vertex
+/// for its measured frequency. A long tonal asymptote can contaminate the row median and
+/// leave a displaced normalised peak with no raw maximum in its three-bin neighbourhood.
+/// Such a peak is useful for tracing, but cannot supply an unbiased frequency to the fit.
+/// No search for another raw peak, or change to the normalised qualification, is allowed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn guided_raw_ridge_peak(
+    spec: &Spec,
+    j: usize,
+    f_pred: f64,
+    along: impl Fn(f64) -> f64,
+    band: f64,
+    noise_exclusion: f64,
+    noise_band: f64,
+    half: usize,
+    min_snr: f64,
+    min_z: f64,
+    background: &[f32],
+) -> Option<(f64, f64, f64)> {
+    profile_peak(
+        spec,
+        j,
+        f_pred,
+        along,
+        band,
+        noise_exclusion,
+        noise_band,
+        half,
+        PeakChoice::NearestQualified { min_snr, min_z },
+        Some(background),
+    )
+    .filter(|peak| peak.local_raw_vertex)
+    .map(|peak| peak.values)
+}
+
+struct ProfilePeak {
+    values: (f64, f64, f64),
+    local_raw_vertex: bool,
 }
 
 enum PeakChoice {
@@ -183,7 +225,7 @@ fn profile_peak(
     half: usize,
     choice: PeakChoice,
     background: Option<&[f32]>,
-) -> Option<(f64, f64, f64)> {
+) -> Option<ProfilePeak> {
     let df = spec.df();
     let n_off = ((2.0 * noise_band + 0.5 * df) / df).floor() as usize + 1;
     let nt = spec.nt();
@@ -277,6 +319,7 @@ fn profile_peak(
     };
     let snr = prof[k] - med;
     let mut fhat = peak_frequency(k);
+    let mut local_raw_vertex = false;
     if let Some(background) = background.filter(|offsets| offsets.len() == spec.nf())
         && k > 0
         && k + 1 < n_off
@@ -315,10 +358,14 @@ fn profile_peak(
                 && (offs[k] + offset * df).abs() <= band
             {
                 fhat = f_pred + offs[k] + offset * df;
+                local_raw_vertex = true;
             }
         }
     }
-    Some((fhat, snr, snr / mad))
+    Some(ProfilePeak {
+        values: (fhat, snr, snr / mad),
+        local_raw_vertex,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -724,6 +771,65 @@ mod tests {
         )
         .unwrap();
         assert!((peak.0 - 104.95).abs() < 2e-5, "{peak:?}");
+    }
+
+    #[test]
+    fn metrology_requires_a_raw_vertex_at_the_qualified_peak() {
+        let spec = spec_from_profile(|f| (40.0 - 4.0 * (f - 100.0).powi(2)).max(0.0));
+        let measured = |background: &[f32]| {
+            guided_raw_ridge_peak(
+                &spec,
+                1,
+                100.0,
+                |_| 0.0,
+                5.0,
+                5.0,
+                12.0,
+                1,
+                3.0,
+                4.0,
+                background,
+            )
+        };
+        for slope in [-0.4, 0.0, 0.4] {
+            let background: Vec<_> = spec
+                .f
+                .iter()
+                .map(|f| (slope * (f - 100.0)) as f32)
+                .collect();
+            let peak = measured(&background).unwrap();
+            // Adding a linear background to the known parabola moves its vertex by slope/8.
+            assert!((peak.0 - (100.0 + slope / 8.0)).abs() < 2e-5, "{peak:?}");
+        }
+        for background in [
+            spec.f
+                .iter()
+                .map(|f| (100.0 * (f - 100.0).powi(2)) as f32)
+                .collect::<Vec<_>>(),
+            spec.f.iter().map(|f| (8.0 * (f - 100.0)) as f32).collect(),
+            spec.f
+                .iter()
+                .map(|f| (1000.0 * (-0.5 * ((f - 106.0) / 3.0).powi(2)).exp()) as f32)
+                .collect(),
+        ] {
+            let normalized =
+                guided_ridge_peak(&spec, 1, 100.0, |_| 0.0, 5.0, 12.0, 1, 3.0, 4.0, None).unwrap();
+            let tracing = guided_ridge_peak(
+                &spec,
+                1,
+                100.0,
+                |_| 0.0,
+                5.0,
+                12.0,
+                1,
+                3.0,
+                4.0,
+                Some(&background),
+            )
+            .unwrap();
+            assert_eq!(tracing, normalized);
+            assert!(measured(&background).is_none());
+        }
     }
 
     #[test]

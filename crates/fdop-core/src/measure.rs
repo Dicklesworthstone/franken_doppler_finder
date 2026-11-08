@@ -27,7 +27,8 @@ use crate::fit::{Best, FitResult, PreparedFit, Side, prepare_constant_velocity};
 use crate::physics::{cv_curve, readouts, window_for_roc};
 use crate::spectro::{Spec, stft_band_db};
 use crate::trace::{
-    Trace, TraceParams, guided_ridge_peak, guided_ridge_peak_with_exclusion, ridge_trace,
+    Trace, TraceParams, guided_raw_ridge_peak, guided_ridge_peak, guided_ridge_peak_with_exclusion,
+    ridge_trace,
 };
 use serde::Serialize;
 
@@ -178,8 +179,12 @@ impl MeasuredEvent {
             && self
                 .fit
                 .as_ref()
-                .is_some_and(|f| f.best.v >= 28.0 && f.best.d >= 200.0)
+                .is_some_and(|f| aircraft_geometry(&f.best))
     }
+}
+
+fn aircraft_geometry(b: &Best) -> bool {
+    b.v >= 28.0 && b.d >= 200.0
 }
 
 fn model_fn(f0: f64, v: f64, d: f64, t0r: f64, c: f64) -> impl Fn(f64) -> f64 {
@@ -290,6 +295,7 @@ pub fn guided_trace(
         band,
         min_snr,
         min_z,
+        false,
     )
 }
 
@@ -304,6 +310,7 @@ fn guided_trace_with_background(
     band: f64,
     min_snr: f64,
     min_z: f64,
+    raw_only: bool,
 ) -> Trace {
     let nt = spec.nt();
     let hop = spec.dt();
@@ -340,19 +347,25 @@ fn guided_trace_with_background(
                         let reference = (4.0 * band).max(noise_band).max(4.0 * half_width);
                         let along = |tk: f64| model(tk) - fp;
                         let j = short.frame_index(t);
-                        let peak = guided_ridge_peak_with_exclusion(
-                            short,
-                            j,
-                            fp,
-                            along,
-                            band,
-                            peak_band,
-                            reference,
-                            half,
-                            min_snr,
-                            min_z,
-                            short_background,
-                        );
+                        let peak = match (short_background, raw_only) {
+                            (Some(background), true) => guided_raw_ridge_peak(
+                                short, j, fp, along, band, peak_band, reference, half, min_snr,
+                                min_z, background,
+                            ),
+                            _ => guided_ridge_peak_with_exclusion(
+                                short,
+                                j,
+                                fp,
+                                along,
+                                band,
+                                peak_band,
+                                reference,
+                                half,
+                                min_snr,
+                                min_z,
+                                short_background,
+                            ),
+                        };
                         (peak, band)
                     }
                     None => {
@@ -366,10 +379,16 @@ fn guided_trace_with_background(
                         let win = spec.meta.win_s;
                         let peak_band = band.max(2.0 / win + 0.5 * chirp * win);
                         let reference = noise_band.max(4.0 * peak_band);
-                        let peak = guided_ridge_peak(
-                            spec, j, fp, along, peak_band, reference, half, min_snr, min_z,
-                            background,
-                        );
+                        let peak = match (background, raw_only) {
+                            (Some(background), true) => guided_raw_ridge_peak(
+                                spec, j, fp, along, peak_band, peak_band, reference, half, min_snr,
+                                min_z, background,
+                            ),
+                            _ => guided_ridge_peak(
+                                spec, j, fp, along, peak_band, reference, half, min_snr, min_z,
+                                background,
+                            ),
+                        };
                         (peak, band)
                     }
                 };
@@ -468,6 +487,7 @@ struct Frames<'a> {
     fmax: f64,
     spec: &'a Spec,
     background: &'a [f32],
+    raw_only: bool,
     ta: f64,
     tb: f64,
 }
@@ -593,6 +613,7 @@ fn guided_rounds(
             band,
             p.min_snr,
             p.min_z,
+            fr.raw_only,
         );
         if tr.len() < MIN_GUIDED_POINTS {
             if round == 0 || continuation.is_some() {
@@ -829,6 +850,7 @@ fn continued_rounds(
     .ok()?;
     let background = spec.normalize_rows_with_offsets(None);
     let frames = Frames {
+        raw_only: false,
         fmin,
         fmax,
         spec: &spec,
@@ -912,6 +934,7 @@ fn measure_with_fit(
     };
     let background = spec.normalize_rows_with_offsets(None);
     let frames = Frames {
+        raw_only: false,
         x,
         sr,
         s0,
@@ -953,6 +976,36 @@ fn measure_with_fit(
     {
         chosen = second;
         quality.reseeded = true;
+    }
+    // Discovery can retain a normalised peak whose local raw frequency is unresolved.
+    // Once that path supplies an accepted aircraft curve, refine its metrology using only
+    // locally supported raw vertices. The replacement must pass every gate on its own
+    // retained observations and the existing aircraft bounds; a failed calibration keeps
+    // the accepted measurement.
+    if passes(&chosen, det.t0r, span, p)
+        && let Some(b) = chosen.prepared.as_ref().map(PreparedFit::best)
+        && aircraft_geometry(&b)
+    {
+        let calibrated = guided_rounds(
+            &Frames {
+                raw_only: true,
+                ..frames
+            },
+            (b.f0, b.v, b.d, b.t0r),
+            (3.0 * b.rmse).clamp(1.0, (0.04 * b.f0).clamp(3.0, 12.0)),
+            peak_received_chirp(b.f0, b.v, b.d, c),
+            p,
+            None,
+            &mut fit_trace,
+        );
+        if passes(&calibrated, det.t0r, span, p)
+            && calibrated
+                .prepared
+                .as_ref()
+                .is_some_and(|f| aircraft_geometry(&f.best()))
+        {
+            chosen = calibrated;
+        }
     }
     if refused
         && !quality.reseeded
@@ -1427,6 +1480,7 @@ mod tests {
                         1.0,
                         p.min_snr,
                         p.min_z,
+                        false,
                     );
                     let r = readouts(f0, v, d, c);
                     let ideal_drop = drop_traversed(&ideal.t, &ideal.f, r.f_pre, r.f_post, truth);
@@ -1787,28 +1841,35 @@ mod tests {
         let mut model: Box<dyn Fn(f64) -> f64 + Sync> = Box::new(tone);
         let mut band = (0.04 * det.f0).clamp(3.0, 12.0);
         let mut eager_trace = Trace::default();
-        let mut eager_fit = None;
-        // The previous measurement path completed full uncertainty diagnostics in each
-        // round. Use that public API as the oracle for all three model/band updates.
-        for _ in 0..p.rounds {
-            let trace = guided_trace_with_background(
-                spec,
-                Some(&background),
-                None,
-                &*model,
-                0.0,
-                120.0,
-                band,
-                p.min_snr,
-                p.min_z,
-            );
-            assert!(trace.len() >= 20);
-            let fit = fit_constant_velocity(&trace.t, &trace.f, c, Side::Both).unwrap();
-            let b = fit.best;
-            model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
-            band = (3.0 * b.rmse).clamp(1.0, band);
-            eager_trace = trace;
-            eager_fit = Some(fit);
+        let mut eager_fit: Option<FitResult> = None;
+        // Complete uncertainty diagnostics eagerly in every discovery and raw-metrology
+        // round. The deferred path must produce the same trace and full final fit.
+        for raw_only in [false, true] {
+            if raw_only {
+                let b = eager_fit.as_ref().unwrap().best;
+                band = (3.0 * b.rmse).clamp(1.0, (0.04 * b.f0).clamp(3.0, 12.0));
+            }
+            for _ in 0..p.rounds {
+                let trace = guided_trace_with_background(
+                    spec,
+                    Some(&background),
+                    None,
+                    &*model,
+                    0.0,
+                    120.0,
+                    band,
+                    p.min_snr,
+                    p.min_z,
+                    raw_only,
+                );
+                assert!(trace.len() >= 20);
+                let fit = fit_constant_velocity(&trace.t, &trace.f, c, Side::Both).unwrap();
+                let b = fit.best;
+                model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
+                band = (3.0 * b.rmse).clamp(1.0, band);
+                eager_trace = trace;
+                eager_fit = Some(fit);
+            }
         }
         assert_eq!(event.trace.t, eager_trace.t);
         assert_eq!(event.trace.f, eager_trace.f);
@@ -1924,6 +1985,7 @@ mod tests {
         let x = vec![0.0; 40 * 4000];
         let background = vec![0.0; spec.nf()];
         let frames = Frames {
+            raw_only: false,
             x: &x,
             sr: 4000,
             s0: 0,
@@ -2556,7 +2618,18 @@ mod tests {
             rounds: 1,
             ..Default::default()
         };
-        let first = measure(&x, sr, &det, "e1", &p);
+        // Keep the single discovery fit as the reference. The optional metrology fit
+        // deliberately fails: that must preserve the accepted trace and its quality.
+        let mut fits = 0;
+        let first = measure_with_fit(&x, sr, &det, "e1", &p, true, |t, f, c, side| {
+            fits += 1;
+            if fits == 1 {
+                prepare_constant_velocity(t, f, c, side)
+            } else {
+                Err("injected metrology failure".into())
+            }
+        });
+        assert_eq!(fits, 2);
         assert!(first.quality.ok, "{:?}", first.quality.reasons);
         p.rounds = 3;
         let mut rounds = 0;
