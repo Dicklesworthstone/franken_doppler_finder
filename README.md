@@ -1019,10 +1019,13 @@ Design notes:
   it made Livermore distances worse and raised the evidence of wrong-date runs. No extra full
   spectrogram is retained.
 - **Steep passes get a matched window.** A 0.5 s main window stops holding a chirp at 1/win² = 4 Hz/s. Frames
-  steeper than that read a second spectrogram, with the window that matches the latest fit's chirp. There the
+  steeper than that read a second spectrogram, with the window that matches the latest fit's maximum
+  received chirp. That maximum occurs d/c before the heard closest approach and is larger than its CPA
+  rate by (1 - (v/c)²)^(-3/2); the public CPA-rate readout keeps its existing meaning. There the
   peak integrates along the model's curve, the band is at least 0.25 s of chirp to allow for detection's error,
   and the noise reference spans four times the ridge's half-width (half a main lobe plus half the chirp's smear),
-  as the main window's does. A real tone's skirts are wider than a pure tone's; at twice, they filled the
+  as the main window's does. Both windows exclude that signal width from the noise estimate while retaining
+  the original final frequency tolerance. A real tone's skirts are wider than a pure tone's; at twice, they filled the
   reference once the band narrowed, and later rounds dropped steep frames whose ridge stood 8–14 dB up.
 - **A fit needs a ridge through its drop.** Two steady tones at different pitches fit a Doppler curve with nothing
   between them, at an excellent RMS. `drop_traversed` in `events.json` is the share of the central 10–90 % of the
@@ -1032,10 +1035,12 @@ Design notes:
 - **A one-sided refusal is traced once more, without the model.** A template of the wrong shape (at the edge
   of the bank, or with speed and distance wrong together) meets the ridge over one stretch and leaves the band
   elsewhere, so the guided trace holds one side of the pass and the gates refuse the fit. When a fit is refused
-  and its trace covers less than 8 s on either side, the ridge is followed by its own slope from that trace's
+  and its retained observations cover less than 8 s on either side, the ridge is followed by its own slope from that trace's
   first, strongest and last points, inside the event's analysis window. The free trace is fitted, and the guided
   rounds start again from that fit if it is plausible. The second attempt replaces the first only if every gate
-  accepts it; `reseeded` in `events.json` marks it. Accepted fits, and refusals whose trace held both sides, are
+  accepts it; `reseeded` in `events.json` marks it. Side coverage uses the fitter's existing retained timestamps;
+  discarded frequency outliers cannot create apparent approach/recede support or block this retry.
+  Raw trace points, SNR and central-drop accounting remain unchanged. Accepted fits, and refusals whose retained trace held both sides, are
   measured exactly as before. A wrong fit can pass this way too: a climbing pass in a clip that starts mid-drop
   trades speed against distance, and the retry accepts the wrong pair.
 - **A primary that lost its ridge can yield to a usable harmonic.** A bright harmonic may lose its ridge
@@ -1265,6 +1270,63 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Fast-pass measurement (2026-11-08): recovery and sensitivity limits
+
+The PCM oracle independently solves the light-time equation for emission phase and 1/r amplitude;
+it does not synthesize from the production frequency model. The two geometries have maximum
+received chirps of 7.24975 and 10.6545 Hz/s, although their heard-CPA rates are only 3.88727 and
+2.95627 Hz/s. The latter values had omitted the short spectrogram needed near the steepest drop.
+Selecting the correct window alone was insufficient: its noise estimate also needed to exclude
+the full signal lobe, as the ordinary window already does.
+
+Both final native regressions pass: `fast_passes_recover_physical_parameters_from_emission_phase`
+and `faint_fast_pass_from_emission_phase_preserves_ridge_refusal`. Every fixed PCM/noise/seed row
+retains the same 0.5% tone, 3% speed, 5% distance and 0.5 s arrival-time bounds:
+
+| Synthetic pass | True distance | Before | Matched windows | Acceptance |
+|---|---:|---:|---:|---|
+| 200 m/s, faint | 3,000 m | 3,171.26 m | 2,993.37 m | Accepted in both; now within the distance bound |
+| 200 m/s, strong | 3,000 m | 2,996.37 m | 2,991.20 m | Accepted in both |
+| 260 m/s, faint | 10,000 m | 10,445.33 m | 10,058.03 m | Refused in both for insufficient central-ridge support |
+| 260 m/s, strong | 10,000 m | 10,000.63 m | 9,996.76 m | Accepted in both |
+
+The initial exploratory requirement that all four rows be accepted failed. Even guidance by the
+exact physical curve follows only 13.6963% of the faint 260 m/s pass's central drop, below the
+unchanged 15% gate. Its final fitted parameters satisfy all four physical bounds, but the permanent
+control requires refusal for that specific missing-ridge reason. It also requires nontrivial exact-guide
+support on both sides, so an empty or wholly lost trace cannot satisfy the control. This is a real
+faint-signal sensitivity limit, not a claim of four accepted recoveries.
+
+The earlier clean 367 Hz/135 m/s/1,758 m wrong-seed case now recovers directly: 367.01306 Hz,
+135.01227 m/s, 1,758.32291 m and arrival 119.99774 s against 120 s. Its old expectation of a
+one-sided first refusal is therefore obsolete. The revised route check retains every original
+recording, seed, physical bound and negative control: a qualifying first result must be identical
+with retry enabled, while a refused first result must still be one-sided and recover through retry.
+
+The original receding-seed case exposed a separate support-accounting defect during validation:
+discarded frequency points made a fitted tail appear to have 30.6302 s of approach support when
+the robust fitter retained only 7.0302 s. Reusing those original inlier timestamps at all three
+quality decisions restores the unchanged 8 s gate and existing free retry. The unchanged PCM
+then recovers 249.99170 Hz, 109.95228 m/s, 898.55909 m and arrival 120.00093 s against the known
+250 Hz, 110 m/s, 900 m and 120 s. Neither the robust trim nor the retry condition was widened.
+An actual-solver regression verifies the rejected-point/retained-support contract on that same
+recording and preserves a clean, two-sided control. Short-window noise exclusion is also separate
+from peak-selection and raw-interpolation bounds; a dedicated profile regression protects both.
+
+The final native core checks pass for both new emission-phase tests, retained-fit support,
+noise-exclusion bounds, the complete original one-sided recovery/refusal matrix, the no-ridge
+and stepped-tone matrix, the actual slow-source refusal, nearby-ridge and steep-skirt controls,
+and all three short-clip contrast-edge regressions. Core Clippy passes for all targets with
+warnings denied. Running the unchanged production `selftest::run` module against the final real
+core/types libraries and FFmpeg recovers the correct two flights from four events, with 1.3121 m
+position error inside its 75 m radius and +0.01415 s clock error.
+
+That module run does not establish release-CLI, ledger, network or full-workspace integration.
+The serialized full application build still hits the 8 GiB memory limit in unchanged
+`asupersync` compilation; workspace formatting also retains pre-existing differences. No field,
+reference or wrong-date recording replay was available. These synthetic checks establish the
+specific recovery and refusal contracts above, not field accuracy or confidence calibration.
+
 ### Distinct tones survive overlapping-flight ownership
 
 A fixed 900-second PCM scene contains two simultaneous, similar Doppler paths at 90 and 114.5 Hz,
@@ -1344,8 +1406,10 @@ These controls must yield no aircraft-like event. They do not establish field ac
 confidence calibration; no reference or wrong-date recording replay is available in this checkout.
 
 All three new tests pass in the actual `fdop-core` test binary on the pinned nightly through
-genuine RCH. Across the four recovered clips, the largest absolute errors are 1.79 m in distance,
-0.114 m/s in speed and 0.0092 s in arrival time. The same recovery test failed before the
+genuine RCH. On `c7c1206`, the four recovered clips' largest absolute errors were 1.79 m in distance,
+0.114 m/s in speed and 0.0092 s in arrival time. The matched-window follow-up repeats all three
+tests with unchanged assertions; its largest errors are 3.74 m, 0.213 m/s and 0.0164 s respectively.
+The same recovery test failed before the
 production change. Staged bug-scan findings were reviewed; new warnings concern test assertions
 and fixture allocations. The changed lines meet formatting checks; three existing formatting
 differences in the separate fast-edge tests remain. This is a focused core result, not a full

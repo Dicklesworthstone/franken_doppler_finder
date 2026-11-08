@@ -21,7 +21,9 @@ use crate::detect::Detection;
 use crate::fit::{Best, FitResult, PreparedFit, Side, prepare_constant_velocity};
 use crate::physics::{cv_curve, readouts, window_for_roc};
 use crate::spectro::{Spec, stft_band_db};
-use crate::trace::{Trace, TraceParams, guided_ridge_peak, ridge_trace};
+use crate::trace::{
+    Trace, TraceParams, guided_ridge_peak, guided_ridge_peak_with_exclusion, ridge_trace,
+};
 use serde::Serialize;
 
 /// At most this many independent aircraft-like events enter the search, with primary detections
@@ -183,6 +185,13 @@ fn model_fn(f0: f64, v: f64, d: f64, t0r: f64, c: f64) -> impl Fn(f64) -> f64 {
 /// out of this window, so a steeper pass adds a spectrogram of its own for its steep frames.
 const MIN_MAIN_WIN_S: f64 = 0.5;
 
+/// The spectral window must hold the largest received chirp, which occurs at
+/// t0e, d/c before the heard CPA. Readouts deliberately reports the CPA rate;
+/// using that smaller rate can omit the short spectrogram of a fast pass.
+fn peak_received_chirp(f0: f64, v: f64, d: f64, c: f64) -> f64 {
+    readouts(f0, v, d, c).max_roc * (1.0 - (v / c).powi(2)).powf(-1.5)
+}
+
 /// Time error (s) the guided trace allows for in a steep frame. With it a steep pass is followed
 /// when its detection rates the chirp half as steep, about as far as real detections were seen to
 /// be off on passes traced well. A detection four times too gentle can lose the CPA frames and be
@@ -315,15 +324,20 @@ fn guided_trace_with_background(
                         // the reference, and a ridge 8-14 dB up read a robust z under 3.
                         let win = short.meta.win_s;
                         let half_width = 2.0 / win + 0.5 * chirp * win;
+                        // As in the main window, exclude the entire signal lobe
+                        // from the noise reference. The final position check
+                        // still uses the original timing/frequency tolerance.
+                        let peak_band = band.max(half_width);
                         let reference = (4.0 * band).max(noise_band).max(4.0 * half_width);
                         let along = |tk: f64| model(tk) - fp;
                         let j = short.frame_index(t);
-                        let peak = guided_ridge_peak(
+                        let peak = guided_ridge_peak_with_exclusion(
                             short,
                             j,
                             fp,
                             along,
                             band,
+                            peak_band,
                             reference,
                             half,
                             min_snr,
@@ -523,7 +537,7 @@ fn guided_rounds(
             Ok(prepared) => {
                 let b = prepared.best();
                 model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
-                fitted_roc = readouts(b.f0, b.v, b.d, c).max_roc;
+                fitted_roc = peak_received_chirp(b.f0, b.v, b.d, c);
                 band = (3.0 * b.rmse).clamp(1.0, band);
                 out.trace = tr;
                 out.prepared = Some(prepared);
@@ -550,10 +564,19 @@ struct Gated {
     reasons: Vec<String>,
 }
 
-fn gate(trace: &Trace, b: &Best, det_t0r: f64, span: f64, p: &MeasureParams) -> Gated {
+fn gate(
+    trace: &Trace,
+    inlier_times: &[f64],
+    b: &Best,
+    det_t0r: f64,
+    span: f64,
+    p: &MeasureParams,
+) -> Gated {
     let c = p.c;
     let (mut amin, mut rmax) = (b.t0r, b.t0r);
-    for &t in &trace.t {
+    // A ridge point rejected by the robust fit cannot establish that this
+    // fitted pass was observed on that side of its CPA.
+    for &t in inlier_times {
         amin = amin.min(t);
         rmax = rmax.max(t);
     }
@@ -610,7 +633,7 @@ fn gate(trace: &Trace, b: &Best, det_t0r: f64, span: f64, p: &MeasureParams) -> 
 fn passes(g: &Guided, det_t0r: f64, span: f64, p: &MeasureParams) -> bool {
     g.reasons.is_empty()
         && g.prepared.as_ref().is_some_and(|f| {
-            gate(&g.trace, &f.best(), det_t0r, span, p)
+            gate(&g.trace, f.inlier_times(), &f.best(), det_t0r, span, p)
                 .reasons
                 .is_empty()
         })
@@ -665,7 +688,7 @@ fn reseeded_rounds(
             fr,
             (b.f0, b.v, b.d, b.t0r),
             (0.04 * b.f0).clamp(3.0, 12.0),
-            readouts(b.f0, b.v, b.d, c).max_roc,
+            peak_received_chirp(b.f0, b.v, b.d, c),
             p,
             fit_trace,
         )
@@ -688,7 +711,7 @@ fn measure_with_fit(
     let v_hi = (det.v * 1.4).min(0.8 * c);
     let fmin = (det.f0 * c / (c + v_hi) * 0.93 - 3.0).max(15.0);
     let fmax = (det.f0 * c / (c - v_hi) * 1.07 + 3.0).min(sr as f64 * 0.45);
-    let roc = det.f0 * det.v * det.v / (c * det.d.max(50.0));
+    let roc = peak_received_chirp(det.f0, det.v, det.d.max(50.0), c);
     let win = window_for_roc(roc).clamp(MIN_MAIN_WIN_S, 2.0);
     let (ca, cb) = ((ta - p.context_s).max(0.0), (tb + p.context_s).min(dur));
     let mut quality = EventQuality {
@@ -747,7 +770,7 @@ fn measure_with_fit(
     // has nothing to follow; a two-sided trace that does not fit (a ridge that hops or bends) is not
     // helped by following it without the model.
     let one_sided = first.prepared.as_ref().is_some_and(|f| {
-        let g = gate(&first.trace, &f.best(), det.t0r, span, p);
+        let g = gate(&first.trace, f.inlier_times(), &f.best(), det.t0r, span, p);
         !g.reasons.is_empty()
             && (g.span_approach_s < p.min_side_s || g.span_recede_s < p.min_side_s)
     });
@@ -769,6 +792,9 @@ fn measure_with_fit(
         reasons,
     } = chosen;
     quality.reasons = reasons;
+    let gated = prepared
+        .as_ref()
+        .map(|f| gate(&trace, f.inlier_times(), &f.best(), det.t0r, span, p));
     // Only the final accepted trace needs uncertainty profiles and manoeuvre diagnostics.
     let fit = prepared.map(PreparedFit::complete);
     // Keep only the analysis window plus a scoring margin in memory.
@@ -776,13 +802,12 @@ fn measure_with_fit(
     let keep_b = (spec.frame_index((tb + 60.0).min(spec.t[spec.nt() - 1])) + 1).min(spec.nt());
     let spec = spec.crop(keep_a, keep_b, 0, spec.nf());
     quality.n_points = trace.len();
-    if let Some(fr) = &fit {
+    if let Some((fr, g)) = fit.as_ref().zip(gated) {
         let mut snr = trace.snr.clone();
         quality.median_snr_db = crate::spectro::median_f64(&mut snr);
         quality.rmse_hz = fr.best.rmse;
         let n_eff = fr.diagnostics.n_eff.max(1.0);
         quality.score = quality.median_snr_db.max(0.0) * n_eff.sqrt();
-        let g = gate(&trace, &fr.best, det.t0r, span, p);
         quality.span_approach_s = g.span_approach_s;
         quality.span_recede_s = g.span_recede_s;
         quality.drop_traversed = g.drop_traversed;
@@ -1125,6 +1150,139 @@ mod tests {
                 assert!(max_error < 0.01, "f0={f0} v={v} d={d}: {max_error} Hz");
             }
         }
+    }
+
+    fn check_emission_phase_passes(sensitivity_only: bool) {
+        let (sr, c, t0r, duration) = (4000u32, 343.0, 120.013, 240.0);
+        let mut failures = Vec::new();
+        // Both passes have a CPA chirp below 4 Hz/s, but their maximum received
+        // chirps occur earlier and exceed it. Include the existing faint-tone
+        // amplitude and a strong control without changing any measurement gate.
+        for (f0, v, d) in [(100.0, 200.0, 3000.0), (150.0, 260.0, 10_000.0)] {
+            for amplitude in [0.012, 0.05] {
+                let sensitivity_control = v == 260.0 && amplitude == 0.012;
+                if sensitivity_control != sensitivity_only {
+                    continue;
+                }
+                let t0e = t0r - d / c;
+                let mut seed = 90210u64;
+                let x: Vec<f32> = (0..(sr as f64 * duration) as usize)
+                    .map(|i| {
+                        let received = i as f64 / sr as f64;
+                        let u = received - t0e;
+                        // Independently solve t_r = t_e + range(t_e)/c. The
+                        // production Doppler/retarded-time functions are not used
+                        // to synthesize either the phase or its 1/r envelope.
+                        let mut emitted = u - d / c;
+                        for _ in 0..10 {
+                            let range = d.hypot(v * emitted);
+                            emitted -=
+                                (emitted + range / c - u) / (1.0 + v * v * emitted / (c * range));
+                        }
+                        let range = d.hypot(v * emitted);
+                        if i % 10_000 == 0 {
+                            assert!((emitted + range / c - u).abs() < 1e-10);
+                        }
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        let noise = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+                        (amplitude * d / range
+                            * (std::f64::consts::TAU * f0 * emitted + 0.13).sin()
+                            + noise) as f32
+                    })
+                    .collect();
+                let det = Detection {
+                    id: 0,
+                    t0r: t0r + 0.3,
+                    f0: f0 + 0.11,
+                    v: v * 1.03,
+                    d: d * 1.08,
+                    score: 10.0,
+                    score_approach: 10.0,
+                    score_recede: 10.0,
+                    half_s: 60.0,
+                    harmonic_of: None,
+                    harmonics: Vec::new(),
+                    from_contrast: false,
+                };
+                let event = measure(&x, sr, &det, "fast_phase", &MeasureParams::default());
+                let fit = event.fit.as_ref().map(|f| f.best);
+                if sensitivity_control {
+                    // Even exact physical guidance cannot observe enough of this
+                    // faint pass's central drop. An accurate extrapolated fit is
+                    // insufficient: preserve the existing missing-ridge refusal.
+                    let p = MeasureParams::default();
+                    let meta = &event.spec.as_ref().unwrap().meta;
+                    let mut main = stft_band_db(
+                        &x,
+                        sr,
+                        event.win_s,
+                        p.hop_s,
+                        meta.fmin,
+                        meta.fmax,
+                        p.df_max,
+                        0.0,
+                    )
+                    .unwrap();
+                    let main_background = main.normalize_rows_with_offsets(None);
+                    let mut short = stft_band_db(
+                        &x,
+                        sr,
+                        window_for_roc(peak_received_chirp(f0, v, d, c)),
+                        p.hop_s,
+                        meta.fmin,
+                        meta.fmax,
+                        p.df_max,
+                        0.0,
+                    )
+                    .unwrap();
+                    let short_background = short.normalize_rows_with_offsets(None);
+                    let truth = model_fn(f0, v, d, t0r, c);
+                    let ideal = guided_trace_with_background(
+                        &main,
+                        Some(&main_background),
+                        Some((&short, Some(&short_background))),
+                        &truth,
+                        0.0,
+                        duration,
+                        1.0,
+                        p.min_snr,
+                        p.min_z,
+                    );
+                    let r = readouts(f0, v, d, c);
+                    let ideal_drop = drop_traversed(&ideal.t, &ideal.f, r.f_pre, r.f_post, truth);
+                    assert!(ideal.len() >= p.min_points);
+                    assert!(ideal.t[0] <= t0r - p.min_side_s);
+                    assert!(ideal.t[ideal.len() - 1] >= t0r + p.min_side_s);
+                    assert!(ideal_drop < p.min_drop_traversed, "{ideal_drop}");
+                    assert!(!event.quality.ok && !event.quality.reseeded);
+                    assert!(event.quality.drop_traversed < p.min_drop_traversed);
+                    assert_eq!(event.quality.reasons.len(), 1, "{:?}", event.quality);
+                    assert!(event.quality.reasons[0].contains("frequency drop"));
+                }
+                let accurate = fit.is_some_and(|b| {
+                    (b.f0 - f0).abs() <= 0.005 * f0
+                        && (b.v - v).abs() <= 0.03 * v
+                        && (b.d - d).abs() <= 0.05 * d
+                        && (b.t0r - t0r).abs() <= 0.5
+                });
+                if !accurate || (!sensitivity_control && !event.is_aircraft_like()) {
+                    failures.push((f0, v, d, amplitude, fit, event.quality));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn fast_passes_recover_physical_parameters_from_emission_phase() {
+        check_emission_phase_passes(false);
+    }
+
+    #[test]
+    fn faint_fast_pass_from_emission_phase_preserves_ridge_refusal() {
+        check_emission_phase_passes(true);
     }
 
     #[test]
@@ -2449,8 +2607,9 @@ mod tests {
         // Set D's N394FX_R20: the bank's best template sat at its top speed, 175-181 m/s at about
         // 3650 m, for a pass of 135 m/s at 1758 m. That curve meets the ridge only on the recede side,
         // 31-46 Hz off it around the CPA where the band holds 12, so the guided trace holds only that
-        // side and its fit drifts to an implausible pass. Each case is a pass and a detection of that
-        // kind: (audio, pass f0 v d, detection f0 v d as multiples of the pass's, CPA offset s).
+        // side and its fit drifts to an implausible pass. Correct spectral resolution can also
+        // recover these seeds directly; an accepted first result must then remain unchanged.
+        // Each case is (audio, pass f0 v d, detection f0 v d as multiples, CPA offset s).
         let (dur, t0r) = (240.0, 120.0);
         let cases = [
             (
@@ -2501,8 +2660,35 @@ mod tests {
                 scintillating_pass(f0, v, d, t0r, dur, amp)
             }
         };
-        let json =
-            |e: &MeasuredEvent| serde_json::to_value((&e.fit, &e.trace, &e.quality)).unwrap();
+        let json = |e: &MeasuredEvent| serde_json::to_vec(&(&e.fit, &e.trace, &e.quality)).unwrap();
+        let check_route = |first: &MeasuredEvent, recovered: &MeasuredEvent, label: &str| {
+            let q = &first.quality;
+            assert!(!q.reseeded, "{label}: guided-only result {q:?}");
+            assert!(recovered.quality.ok, "{label}: {:?}", recovered.quality);
+            if q.ok {
+                assert!(
+                    !recovered.quality.reseeded,
+                    "{label}: {:?}",
+                    recovered.quality
+                );
+                assert_eq!(
+                    json(first),
+                    json(recovered),
+                    "{label}: accepted first result changed"
+                );
+            } else {
+                assert!(
+                    q.span_approach_s < off.min_side_s || q.span_recede_s < off.min_side_s,
+                    "{label}: first fit {:?}; quality {q:?}",
+                    first.fit.as_ref().map(|f| f.best)
+                );
+                assert!(
+                    recovered.quality.reseeded,
+                    "{label}: {:?}",
+                    recovered.quality
+                );
+            }
+        };
         for (kind, amp, (f0, v, d), (kf, kv, kd), dt) in cases {
             let label = format!(
                 "{kind} {amp}: pass {f0} Hz {v} m/s {d} m, detection x({kf}, {kv}, {kd}) {dt:+} s"
@@ -2510,18 +2696,8 @@ mod tests {
             let x = audio(kind, amp, (f0, v, d));
             let det = det_of((f0 * kf, v * kv, d * kd), t0r + dt);
             let first = measure(&x, 4000, &det, "e1", &off);
-            let q = &first.quality;
-            assert!(
-                !q.ok && (q.span_approach_s < off.min_side_s || q.span_recede_s < off.min_side_s),
-                "{label}: first attempt {:?}",
-                q.reasons
-            );
             let ev = measure(&x, 4000, &det, "e1", &on);
-            assert!(
-                ev.quality.ok && ev.quality.reseeded,
-                "{label}: {:?}",
-                ev.quality.reasons
-            );
+            check_route(&first, &ev, &label);
             let b = ev.fit.as_ref().unwrap().best;
             eprintln!(
                 "{label}: measured {:.2} Hz {:.2} m/s {:.1} m CPA {:.2} s",
@@ -2569,23 +2745,15 @@ mod tests {
             }
         }
         // This same PCM and wrong seed formerly gave a two-sided 6 m/s misfit.
-        // Restoring the raw peak leaves a one-sided first trace, so the free retry
-        // must now recover the physical pass within the same accuracy bounds.
+        // It must recover the physical pass within the same accuracy bounds,
+        // preserving an accepted first result or retrying a one-sided refusal.
         let x = wrong_shape_audio(Some((250.0, 110.0, 900.0)), None, t0r, dur, 0.15);
         let det = det_of((250.0 * 0.96, 110.0 * 1.25, 900.0 * 1.8), t0r + 14.0);
         let (a, b) = (
             measure(&x, 4000, &det, "e1", &on),
             measure(&x, 4000, &det, "e1", &off),
         );
-        let q = &b.quality;
-        assert!(
-            !q.ok
-                && !q.reseeded
-                && (q.span_approach_s < off.min_side_s || q.span_recede_s < off.min_side_s),
-            "first fit {:?}; quality {q:?}",
-            b.fit.as_ref().map(|f| f.best)
-        );
-        assert!(a.quality.ok && a.quality.reseeded, "{:?}", a.quality);
+        check_route(&b, &a, "receding seed");
         let fit = a.fit.as_ref().unwrap().best;
         eprintln!("recovered receding seed: {fit:?}");
         assert!((fit.f0 - 250.0).abs() <= 0.005 * 250.0, "{fit:?}");
@@ -2593,6 +2761,89 @@ mod tests {
         assert!((fit.d - 900.0).abs() <= 0.05 * 900.0, "{fit:?}");
         assert!((fit.t0r - t0r).abs() <= 0.5, "{fit:?}");
         assert_eq!(a.detection.v, det.v);
+    }
+
+    #[test]
+    fn quality_support_uses_only_times_retained_by_the_actual_solver() {
+        let p = MeasureParams::default();
+        let (f0, v, d, t0r) = (250.0, 110.0, 900.0, 120.0);
+        let truth = model_fn(f0, v, d, t0r, p.c);
+        let times: Vec<f64> = (0..=210).map(|i| 80.0 + 0.5 * i as f64).collect();
+        let frequencies = times
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| truth(t) + 0.01 * (1.731 * i as f64).sin())
+            .collect();
+        let trace = Trace {
+            snr: vec![10.0; times.len()],
+            t: times,
+            f: frequencies,
+        };
+        let prepared = prepare_constant_velocity(&trace.t, &trace.f, p.c, Side::Both).unwrap();
+        let best = prepared.best();
+        let quality = gate(&trace, prepared.inlier_times(), &best, t0r, 90.0, &p);
+        assert!((best.f0 - f0).abs() <= 0.005 * f0, "{best:?}");
+        assert!((best.v - v).abs() <= 0.03 * v, "{best:?}");
+        assert!((best.d - d).abs() <= 0.05 * d, "{best:?}");
+        assert!((best.t0r - t0r).abs() < 0.1, "{best:?}");
+        assert!(quality.reasons.is_empty(), "{:?}", quality.reasons);
+        assert_eq!(quality.span_approach_s, best.t0r - trace.t[0]);
+        assert_eq!(quality.span_recede_s, trace.t[trace.len() - 1] - best.t0r);
+
+        // Use the unchanged receding-seed recovery's real PCM and trace. Copy
+        // each actual PreparedFit's retained times before completion consumes
+        // them; do not reconstruct a mask from residuals or re-fit the trace.
+        let x = wrong_shape_audio(Some((f0, v, d)), None, t0r, 240.0, 0.15);
+        let det = Detection {
+            id: 0,
+            t0r: t0r + 14.0,
+            f0: f0 * 0.96,
+            v: v * 1.25,
+            d: d * 1.8,
+            score: 8.0,
+            score_approach: 8.0,
+            score_recede: 8.0,
+            half_s: 60.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+            from_contrast: false,
+        };
+        let mut retained = Vec::new();
+        let first = measure_with_fit(
+            &x,
+            4000,
+            &det,
+            "e1",
+            &MeasureParams {
+                free_reseed: false,
+                ..p.clone()
+            },
+            |t, f, c, side| {
+                let prepared = prepare_constant_velocity(t, f, c, side)?;
+                retained = prepared.inlier_times().to_vec();
+                Ok(prepared)
+            },
+        );
+        let best = first.fit.as_ref().unwrap().best;
+        let (lo, hi) = retained
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &t| {
+                (lo.min(t), hi.max(t))
+            });
+        assert!(retained.len() < first.trace.len());
+        assert!(best.t0r - first.trace.t[0] >= p.min_side_s);
+        assert!(first.trace.t[first.trace.len() - 1] - best.t0r >= p.min_side_s);
+        assert!(best.t0r - lo < p.min_side_s);
+        assert_eq!(first.quality.span_approach_s, (best.t0r - lo).max(0.0));
+        assert_eq!(first.quality.span_recede_s, (hi - best.t0r).max(0.0));
+        assert!(!first.quality.ok && !first.quality.reseeded);
+        assert!(
+            first
+                .quality
+                .reasons
+                .iter()
+                .any(|r| r.starts_with("one-sided trace"))
+        );
     }
 
     #[test]

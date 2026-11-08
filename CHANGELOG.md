@@ -19,6 +19,35 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover fast Doppler measurements with physically matched spectral windows
+
+- Size the initial, fitted-round and free-reseed spectrograms from the maximum received chirp,
+  which occurs before the heard closest approach. Preserve the public readout's CPA-rate
+  meaning and all existing window limits, model bounds and event acceptance gates.
+- Exclude the short window's complete Hann/chirp signal width from its noise estimate, as
+  the ordinary window already does. Keep the original final frequency tolerance. Correct
+  resolution alone had still counted a faint fast tone's own spectral skirts as noise.
+- Separate that noise-exclusion width from peak-selection and raw-interpolation bounds.
+  Existing callers retain their original behavior; widening a noise reference cannot move
+  the accepted peak or its local interpolation outside the original positional guard.
+- Measure approach/recede support from the robust fitter's existing retained timestamps.
+  Discarded points had inflated one original receding seed's approach span from 7.0302 s to
+  30.6302 s, blocking its existing retry. Reusing the stored mask restores that recovery
+  without changing the 8 s line, fit, point count, drop accounting, SNR or retry condition.
+- Keep four fixed independently synthesized emission-phase/1/r PCM cases and the same tone,
+  speed, distance and timing accuracy bounds. Three require accepted measurements. The faint
+  260 m/s case also requires accurate physical parameters, but exact physical guidance observes
+  only 13.6963% of its central drop, below the existing 15% line; a separate control requires
+  that specific refusal. The initial exploratory expectation that all four should be accepted
+  failed and was disproved by this exact-guidance check; it is not a four-case acceptance claim.
+- Final native core regressions pass, including the original recovery/refusal, no-ridge,
+  stepped-tone, slow-source, nearby-ridge, steep-skirt and short-clip contrast-edge controls.
+  Core all-target Clippy passes with warnings denied. The unchanged production selftest module,
+  linked to the final real libraries and using FFmpeg, recovers the correct flights with
+  1.3121 m position error inside its 75 m radius and +0.01415 s clock error. Full application
+  compilation remains memory-blocked in unchanged `asupersync`; this is not a release-CLI,
+  full-workspace or field/reference/wrong-date replay claim.
+
 ### Recover independent tones hidden by overlapping flight claims
 
 - Keep the original strongest-tone assignment, then recover distinct unclaimed peaks for

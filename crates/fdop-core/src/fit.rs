@@ -450,6 +450,11 @@ pub(crate) struct PreparedFit {
 }
 
 impl PreparedFit {
+    /// Reception times retained by the existing robust point fit.
+    pub(crate) fn inlier_times(&self) -> &[f64] {
+        &self.t_i
+    }
+
     pub(crate) fn best(&self) -> Best {
         Best {
             f0: self.p_best[0],

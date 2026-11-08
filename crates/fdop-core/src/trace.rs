@@ -84,6 +84,7 @@ pub(crate) fn ridge_peak(
         f_pred,
         |t| slope * (t - tj),
         band,
+        band,
         noise_band,
         half,
         PeakChoice::Strongest,
@@ -112,12 +113,34 @@ pub(crate) fn guided_ridge_peak(
     min_z: f64,
     background: Option<&[f32]>,
 ) -> Option<(f64, f64, f64)> {
+    guided_ridge_peak_with_exclusion(
+        spec, j, f_pred, along, band, band, noise_band, half, min_snr, min_z, background,
+    )
+}
+
+/// Exclude the signal's full spectral lobe from the noise reference without
+/// changing the positional bounds on peak selection or raw interpolation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn guided_ridge_peak_with_exclusion(
+    spec: &Spec,
+    j: usize,
+    f_pred: f64,
+    along: impl Fn(f64) -> f64,
+    band: f64,
+    noise_exclusion: f64,
+    noise_band: f64,
+    half: usize,
+    min_snr: f64,
+    min_z: f64,
+    background: Option<&[f32]>,
+) -> Option<(f64, f64, f64)> {
     profile_peak(
         spec,
         j,
         f_pred,
         along,
         band,
+        noise_exclusion,
         noise_band,
         half,
         PeakChoice::NearestQualified { min_snr, min_z },
@@ -155,6 +178,7 @@ fn profile_peak(
     f_pred: f64,
     along: impl Fn(f64) -> f64,
     band: f64,
+    noise_exclusion: f64,
     noise_band: f64,
     half: usize,
     choice: PeakChoice,
@@ -203,7 +227,8 @@ fn profile_peak(
             if kin.is_none_or(|k| prof[o] > prof[k]) {
                 kin = Some(o);
             }
-        } else {
+        }
+        if offs[o].abs() > noise_exclusion {
             noise.push(prof[o]);
         }
     }
@@ -658,6 +683,47 @@ mod tests {
             (restored.0 - expected.0).abs() < 2e-5,
             "{restored:?} vs {expected:?}"
         );
+    }
+
+    #[test]
+    fn noise_exclusion_keeps_the_original_peak_and_raw_position_bounds() {
+        let outside = profile_spec(&[(105.5, 16.0)]);
+        assert!(
+            guided_ridge_peak_with_exclusion(
+                &outside,
+                1,
+                100.0,
+                |_| 0.0,
+                5.0,
+                8.0,
+                12.0,
+                1,
+                3.0,
+                4.0,
+                None,
+            )
+            .is_none()
+        );
+        // The normalized vertex is inside the 5 Hz position band; restoring the
+        // row background would move it just outside. A wider noise exclusion
+        // must retain that vertex, as the original positional guard did.
+        let spec = spec_from_profile(|f| (40.0 - 4.0 * (f - 104.95).powi(2)).max(0.0));
+        let background: Vec<f32> = spec.f.iter().map(|f| (1.2 * (f - 100.0)) as f32).collect();
+        let peak = guided_ridge_peak_with_exclusion(
+            &spec,
+            1,
+            100.0,
+            |_| 0.0,
+            5.0,
+            8.0,
+            12.0,
+            1,
+            3.0,
+            4.0,
+            Some(&background),
+        )
+        .unwrap();
+        assert!((peak.0 - 104.95).abs() < 2e-5, "{peak:?}");
     }
 
     #[test]
