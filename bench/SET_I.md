@@ -280,3 +280,28 @@ as for sets E and F. Then `9087ec4` and `a0795de` ran.
   ended (`fdop`'s 1 means no location). A fault check at 06:40Z saw `dopplertrack`'s refine step exit 1 with a pandas
   IndexError on every row, as on sets A to F. Neither could change a row, since every build and command was fixed
   before the runs.
+
+### After the read: session bead `bb-m9r`'s statistic
+
+The statistic ran at 13:35Z, after the read, on the benchmark machine. It changes no row above. The statistic and its
+rule for a hit were frozen on 2026-11-07, before set I existed.
+
+- **Places.** The truth plus a 2 km grid over the case's R2 circle, 490 places per case.
+- **Passes.** Each place gets its closest approaches within 3 km slant, from ADS-B alone, at the true clock.
+- **Score.** Each pass is scored by the band-level rise at its predicted time (`bband`). The score is ranked against
+  the same pass at 16 chance offsets of 151 s to 941 s, and a place scores only with at least 4 passes.
+- **Null.** Each case's lines are also scored on the next case's audio, as a wrong-site null.
+- **Hit.** The truth must score above every place more than 3 km away and above its null's best place.
+
+| Case | Passes at the truth | Truth's score | Its rank among scored places | Best place more than 3 km off | Best place, wrong-site null |
+|---|---|---|---|---|---|
+| `i_monterey` | 6 | 0.45 | 44 of 127 | 1.97 | 1.76 |
+| `i_winterpark` | 15 | 1.00 | 68 of 384 | 3.09 | 2.67 |
+| `i_homosassa` | 7 | 1.75 | 14 of 301 | 2.58 | 2.64 |
+
+No case is a hit, so the bead's falsifier fires: it needs at least 2 hits. Deerfield Beach ranked first of 389 in
+set H, but that case was chosen because band power heard it, and the statistic was chosen after the result
+(`SET_H.md`, 2026-11-07). It does not repeat here, where no case was chosen on sound.
+
+The frozen `bband` and `cpa_multi` binaries are gone from the machine that built them. These were rebuilt from the
+same sources on `446a2bf`, so their hashes differ: `bband` `b7002191b568077c` and `cpa_multi` `2e31dc5b264d7c55`.
