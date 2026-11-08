@@ -354,12 +354,22 @@ must lead it by 3 nats, the medium margin line, or it becomes **low**. The margi
 compares explanations at one clock. The gate was added after a wrong date graded high on `c2c7578`
 ([Known issues](#known-issues)), so the development rows are not a test of it. On them it lowers that run and keeps
 every right answer: the five lead their decoys by 14.0 to 67.8 nats, the wrong date by 1.07 (`ab_c2c7578_dec1`,
-`n1_dec1`). The decoys run without the curve match, which the gate does not read. On the development rows the four
-added 4 to 9 minutes to an answer, with the same evidence as with the curve match on (`ab_dec1_dec2`, `n1_dec2`).
+`n1_dec1`). The decoys run without the curve match, which the gate does not read. Before sharing the audio
+analysis, the four added 4 to 9 minutes to an answer on the development rows, with the same evidence as with
+the curve match on (`ab_dec1_dec2`, `n1_dec2`).
 On copies of two development recordings given their start as `creation_time` instead of `--start`, both answers
 stay high, leading decoys at 2 h and 3 h steps by 13.96 and 7.54 nats, and all six runs at wrong places stay low
 (`ct_dec4`). A search of the full dates, with neither or after the `creation_time` window found nothing, runs no
 decoys: it already compares every clock in the dates.
+
+All four decoys now borrow the original recording's decoded duration, detections and measured events, including
+their traces and spectrograms. Probing, decoding, survey generation, detection and measurement run once; the
+large event spectra are shared without copying. Each decoy still checks its own archive availability and loads
+its own flight tracks and atmosphere, rebuilding wind-dependent speed gates before searching. Audio warnings,
+event IDs, measurement provenance and the independent-event limit are preserved. In each decoy's `result.json`,
+`extra.audio_analysis_reused` is `true`, and `decode_s`, `detect_s` and `measure_s` are zero; an ordinary run records
+`false` and its actual stage times. The search and confidence rules are unchanged. Overall time savings depend
+on how much of a run is spent analysing audio; the historical timings above are not measurements of this reuse.
 
 ### The curve match
 

@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Analyse a recording once for all decoy-clock searches
+
+- Share the original media information, decoded duration, detections, measured traces and spectra across the
+  four decoy clocks. Each clock still checks archive availability, loads its own tracks and atmosphere, and
+  rebuilds its wind-dependent speed gates. Detection, fitting, event ordering, provenance, caps and confidence
+  thresholds are unchanged. The shared observations are borrowed without cloning their spectral buffers;
+  survey images are released before the searches.
+- Keep the audio warnings and per-decoy detection/event artifacts. `result.json` adds
+  `extra.audio_analysis_reused`; reused decoys record zero for decode, detection and measurement time, while
+  ordinary runs retain their actual timings. Decoys still draw no figures or maps.
+- Extend the offline known-answer integration with exact fresh/shared comparisons for detections, events and
+  complete search results, covering both the real clock with its matching flights and an empty shifted clock.
+  The four decoys must share the original audio artifacts and retain their own atmosphere and search inputs.
+- Preserve the concurrent `creation_time` decoy change (`b759c6f`); both explicit-start and metadata-window
+  integration cases require four shared-audio decoys.
+- **Validation:** changed-file formatting and whitespace checks pass, and independent source review found
+  no equivalence or lifetime issue. Native test execution is blocked by SIGKILL while compiling unchanged
+  dependencies (`wide`, then `syn`, then `asupersync`) on this memory-constrained executor, including a
+  single-job, unoptimized, no-debug retry. The added integration assertions have not run here. No full CLI,
+  workspace-pass, field-replay or measured speedup claim is made; historical development timings predate reuse.
+
 ### Check creation_time answers against decoy clocks too
 
 - The decoy-clock gate below now also runs when a high or medium trace answer came from the file's

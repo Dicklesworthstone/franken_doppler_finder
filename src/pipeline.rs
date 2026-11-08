@@ -983,6 +983,158 @@ fn decoy_args(a: &LocateArgs, t0: f64, tol: f64, shift: f64, run_dir: &Path) -> 
     d
 }
 
+/// Audio measurements use the fixed reference sound speed, independent of the searched clock.
+/// Borrow the original observations for decoys; their tracks, atmosphere and speed gates still
+/// belong to each shifted clock. In particular, do not clone the per-event spectrograms.
+struct PreparedRecording<'a> {
+    info: &'a audio::MediaInfo,
+    duration_s: f64,
+    low_band_warning: Option<&'a str>,
+    measurements: &'a AudioMeasurements,
+}
+
+struct AudioMeasurements {
+    detections: Vec<Detection>,
+    events: Vec<MeasuredEvent>,
+    added: std::collections::HashSet<String>,
+    warnings: Vec<String>,
+    detect_s: f64,
+    measure_s: f64,
+}
+
+fn measure_recording(
+    x: &[f32],
+    sr: u32,
+    log: &Arc<Log>,
+    survey_path: Option<&Path>,
+) -> Result<AudioMeasurements, String> {
+    let mut warnings = Vec::new();
+    let t = Instant::now();
+    let dp = DetectParams::default();
+    let (ls, lin) = detect::survey(x, sr, &dp)?;
+    let (dets, det_cut) = detect::detect_counted(&ls, &dp);
+    let n_strong = dets
+        .iter()
+        .filter(|d| d.score >= dp.thr_db && d.harmonic_of.is_none())
+        .count();
+    log.say(&format!(
+        "detection: {} candidates, {} strong primaries; survey image spread {:.3}",
+        dets.len(),
+        n_strong,
+        ls.scale
+    ));
+    if ls.gain > 1.0 {
+        warnings.push(format!(
+            "the survey image's spread is {:.2}, under the {:.2} the detection lines were set at (a recording loud mostly while a pass goes over): its image was raised x{:.2} before detection",
+            ls.scale, dp.min_image_scale, ls.gain
+        ));
+    }
+    if det_cut > 0 {
+        warnings.push(format!(
+            "detection kept the {} strongest of {}{} candidate curves; the weaker ones cannot explain an event or mark a pass as heard",
+            dp.max_detections,
+            dp.max_detections + det_cut,
+            if det_cut >= 2 * dp.max_detections { "+" } else { "" },
+        ));
+    }
+    let detect_s = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let mp = MeasureParams::default();
+    // Every primary from the silence line up is measured strongest first. Refused, duplicate
+    // and non-aircraft fits leave room for later detections; a family contributes one event.
+    let max_measured = measure::MAX_MEASURED;
+    let prim: Vec<&Detection> = dets
+        .iter()
+        .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+        .collect();
+    let mut events: Vec<MeasuredEvent> = measure::measure_ranked_counted(
+        prim.len(),
+        max_measured,
+        |ranks| {
+            prim[ranks.clone()]
+                .par_iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    measure::measure_family(
+                        x,
+                        sr,
+                        &lin,
+                        d,
+                        &dets,
+                        &format!("e{}", ranks.start + i + 1),
+                        &mp,
+                    )
+                })
+                .collect()
+        },
+        |events| search::independent_measured_events(events, 0.0).len(),
+    );
+    if prim.len() > events.len() {
+        warnings.push(format!(
+            "measured the {} strongest of {} flyover detections, reaching the limit of {max_measured} independent aircraft events; the rest neither drive nor confirm the answer, though they still count as heard",
+            events.len(),
+            prim.len(),
+        ));
+    }
+    let added_ranks: std::collections::HashSet<String> = (0..events.len())
+        .filter(|&k| past_the_old_line(k, prim[k], &events[k].detection, max_measured, dp.thr_db))
+        .map(|k| format!("e{}", k + 1))
+        .collect();
+    events.sort_by(|p, q| q.quality.score.total_cmp(&p.quality.score));
+    let mut added = std::collections::HashSet::new();
+    for (k, e) in events.iter_mut().enumerate() {
+        let id = format!("e{}", k + 1);
+        if added_ranks.contains(&e.id) {
+            added.insert(id.clone());
+        }
+        e.id = id;
+    }
+    log.say(&format!(
+        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, found only on the contrast image, from the fast bank, or recovered from a harmonic)",
+        added.len(),
+        dp.thr_db
+    ));
+    let n_ok = events.iter().filter(|e| e.quality.ok).count();
+    let n_independent = search::independent_measured_events(&events, 0.0).len();
+    log.say(&format!(
+        "measured {} events, {} pass quality gates, {} independent aircraft events",
+        events.len(),
+        n_ok,
+        n_independent
+    ));
+    for e in &events {
+        if let Some(f) = &e.fit {
+            log.say(&format!(
+                "  {} t_rec={:.2}s f0={:.2} v={:.1} d={:.0} rms={:.2} q={:.0} {}",
+                e.id,
+                f.best.t0r,
+                f.best.f0,
+                f.best.v,
+                f.best.d,
+                f.best.rmse,
+                e.quality.score,
+                if e.quality.ok {
+                    "ok".to_string()
+                } else {
+                    e.quality.reasons.join("; ")
+                }
+            ));
+        }
+    }
+    let measure_s = t.elapsed().as_secs_f64();
+    if let Some(path) = survey_path {
+        let _ = survey_png(&ls, &lin, &dets, &events, path);
+    }
+    Ok(AudioMeasurements {
+        detections: dets,
+        events,
+        added,
+        warnings,
+        detect_s,
+        measure_s,
+    })
+}
+
 /// Run the same locate at decoy clocks for the clock window `t0 +- tol`, each into
 /// `run_dir/decoy_clock_<shift>h`, until [`DECOY_CLOCKS`] have run. A decoy that fails (an
 /// unpublished day, say) is logged and the next shift is tried.
@@ -993,6 +1145,7 @@ fn decoy_clock_runs(
     dates: (f64, f64),
     run_dir: &Path,
     log: &Arc<Log>,
+    recording: &PreparedRecording<'_>,
 ) -> Vec<(f64, Option<f64>)> {
     let mut runs = Vec::new();
     for s in decoy_shifts(t0, dates, tol) {
@@ -1000,7 +1153,7 @@ fn decoy_clock_runs(
             break;
         }
         let d = decoy_args(a, t0, tol, s, run_dir);
-        match locate_with_clock(&d, &Log::new(true), now, true) {
+        match locate_with_clock(&d, &Log::new(true), now, true, Some(recording)) {
             Ok(o) => {
                 log.say(&format!(
                     "decoy clock {:+.0} h: top evidence {}",
@@ -1021,7 +1174,7 @@ fn decoy_clock_runs(
 
 /// Run the whole pipeline.
 pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
-    locate_with_clock(a, log, &unix_now, false)
+    locate_with_clock(a, log, &unix_now, false, None)
 }
 
 /// `decoy` marks a run made by [`decoy_clock_runs`], which checks no decoys of its own.
@@ -1030,7 +1183,12 @@ fn locate_with_clock(
     log: &Arc<Log>,
     now: &dyn Fn() -> f64,
     decoy: bool,
+    recording: Option<&PreparedRecording<'_>>,
 ) -> Result<LocateOutcome, String> {
+    assert!(
+        recording.is_none() || (decoy && !a.curve_match),
+        "shared audio is only used for trace-only decoys"
+    );
     let t_all = Instant::now();
     let mut timings = serde_json::Map::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -1043,7 +1201,10 @@ fn locate_with_clock(
     if !a.media.is_file() {
         return Err(format!("{}: not a file", a.media.display()));
     }
-    let info = audio::probe_with_selection(&a.media, a.audio_selection)?;
+    let info = match recording {
+        Some(r) => r.info.clone(),
+        None => audio::probe_with_selection(&a.media, a.audio_selection)?,
+    };
     log.say(&format!(
         "media: {:.1} s, {} {} Hz x{}, audio stream {}, channel {}, creation_time {:?}",
         info.duration_s,
@@ -1089,11 +1250,24 @@ fn locate_with_clock(
     // missing/incorrect duration tag. Decode before publication clipping; weather still
     // overlaps detection and measurement. Metadata retains both start/end conventions.
     let t = Instant::now();
-    let x = audio::decode_with_selection(&a.media, 0.0, None, a.sr, a.audio_selection)?;
-    let dur = x.len() as f64 / a.sr as f64;
-    log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
-    warnings.extend(low_band_warning(&x, a.sr));
-    timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
+    let x = if recording.is_none() {
+        audio::decode_with_selection(&a.media, 0.0, None, a.sr, a.audio_selection)?
+    } else {
+        Vec::new()
+    };
+    let dur = recording.map_or_else(|| x.len() as f64 / a.sr as f64, |r| r.duration_s);
+    let low_band = match recording {
+        Some(r) => r.low_band_warning.map(str::to_owned),
+        None => low_band_warning(&x, a.sr),
+    };
+    warnings.extend(low_band.iter().cloned());
+    if recording.is_some() {
+        log.say("reusing the original recording's decoded duration, detections and measurements");
+        timings.insert("decode_s".into(), json!(0.0));
+    } else {
+        log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
+        timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
+    }
     let metadata_window = if given_start.is_none() && !a.ignore_metadata_time {
         media_metadata_start_window(full_window, &info, dur, a.clock_tol_s)
     } else {
@@ -1173,137 +1347,41 @@ fn locate_with_clock(
         None
     };
     let curve_image_s = t.elapsed().as_secs_f64();
-    // ---- detection ----------------------------------------------------------------------
-    let t = Instant::now();
-    let dp = DetectParams::default();
-    let (ls, lin) = detect::survey(&x, a.sr, &dp)?;
-    let (dets, det_cut) = detect::detect_counted(&ls, &dp);
-    let n_strong = dets
-        .iter()
-        .filter(|d| d.score >= dp.thr_db && d.harmonic_of.is_none())
-        .count();
-    log.say(&format!(
-        "detection: {} candidates, {} strong primaries; survey image spread {:.3}",
-        dets.len(),
-        n_strong,
-        ls.scale
-    ));
-    if ls.gain > 1.0 {
-        warnings.push(format!(
-            "the survey image's spread is {:.2}, under the {:.2} the detection lines were set at (a recording loud mostly while a pass goes over): its image was raised x{:.2} before detection",
-            ls.scale, dp.min_image_scale, ls.gain
-        ));
-    }
-    if det_cut > 0 {
-        warnings.push(format!(
-            "detection kept the {} strongest of {}{} candidate curves; the weaker ones cannot explain an event or mark a pass as heard",
-            dp.max_detections,
-            dp.max_detections + det_cut,
-            if det_cut >= 2 * dp.max_detections { "+" } else { "" },
-        ));
-    }
-    timings.insert("detect_s".into(), json!(t.elapsed().as_secs_f64()));
-    // ---- measurement --------------------------------------------------------------------
-    let t = Instant::now();
-    let mp = MeasureParams {
-        c,
-        ..Default::default()
+    // ---- detection and measurement: one immutable observation set for every clock ---------
+    let measured;
+    let measurements = match recording {
+        Some(r) => r.measurements,
+        None => {
+            let survey_path = run_dir.join("survey.png");
+            measured = measure_recording(&x, a.sr, log, extras.then_some(survey_path.as_path()))?;
+            &measured
+        }
     };
-    // Every primary detection from the silence line up is a candidate, strongest first: the
-    // detection score does not separate flyovers from tones (pure noise peaks near 3), the
-    // measurement gates do. An unusable primary gets one chance from each detected harmonic,
-    // keeping at most one event for its family. Duplicate or non-aircraft fits do not use up
-    // the allowance: continue until MAX_MEASURED independent aircraft events survive.
-    let max_measured = measure::MAX_MEASURED;
-    let prim: Vec<&Detection> = dets
-        .iter()
-        .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
-        .collect();
-    let mut events: Vec<MeasuredEvent> = measure::measure_ranked_counted(
-        prim.len(),
-        max_measured,
-        |ranks| {
-            prim[ranks.clone()]
-                .par_iter()
-                .enumerate()
-                .map(|(i, d)| {
-                    measure::measure_family(
-                        &x,
-                        a.sr,
-                        &lin,
-                        d,
-                        &dets,
-                        &format!("e{}", ranks.start + i + 1),
-                        &mp,
-                    )
-                })
-                .collect()
-        },
-        |events| search::independent_measured_events(events, 0.0).len(),
-    );
-    if prim.len() > events.len() {
-        warnings.push(format!(
-            "measured the {} strongest of {} flyover detections, reaching the limit of {max_measured} independent aircraft events; the rest neither drive nor confirm the answer, though they still count as heard",
-            events.len(),
-            prim.len(),
-        ));
-    }
-    // Events the old measurement line would not have measured (`past_the_old_line`). Without a
-    // curve match to judge it, an answer that rests on one of them cannot be medium
-    // (`leans_on_added`).
-    let added_ranks: std::collections::HashSet<String> = (0..events.len())
-        .filter(|&k| past_the_old_line(k, prim[k], &events[k].detection, max_measured, dp.thr_db))
-        .map(|k| format!("e{}", k + 1))
-        .collect();
     drop(x);
-    events.sort_by(|p, q| q.quality.score.total_cmp(&p.quality.score));
-    let mut added = std::collections::HashSet::new();
-    for (k, e) in events.iter_mut().enumerate() {
-        let id = format!("e{}", k + 1);
-        if added_ranks.contains(&e.id) {
-            added.insert(id.clone());
-        }
-        e.id = id;
-    }
-    log.say(&format!(
-        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, found only on the contrast image, from the fast bank, or recovered from a harmonic)",
-        added.len(),
-        dp.thr_db
-    ));
-    let n_ok = events.iter().filter(|e| e.quality.ok).count();
-    let n_independent = search::independent_measured_events(&events, 0.0).len();
-    log.say(&format!(
-        "measured {} events, {} pass quality gates, {} independent aircraft events",
-        events.len(),
-        n_ok,
-        n_independent
-    ));
-    for e in &events {
-        if let Some(f) = &e.fit {
-            log.say(&format!(
-                "  {} t_rec={:.2}s f0={:.2} v={:.1} d={:.0} rms={:.2} q={:.0} {}",
-                e.id,
-                f.best.t0r,
-                f.best.f0,
-                f.best.v,
-                f.best.d,
-                f.best.rmse,
-                e.quality.score,
-                if e.quality.ok {
-                    "ok".to_string()
-                } else {
-                    e.quality.reasons.join("; ")
-                }
-            ));
-        }
-    }
-    timings.insert("measure_s".into(), json!(t.elapsed().as_secs_f64()));
-    if extras {
-        let _ = survey_png(&ls, &lin, &dets, &events, &run_dir.join("survey.png"));
-    }
-    write_json(&run_dir.join("detections.json"), &dets)?;
-    write_json(&run_dir.join("events.json"), &events)?;
-    for e in &events {
+    warnings.extend(measurements.warnings.iter().cloned());
+    timings.insert(
+        "detect_s".into(),
+        json!(if recording.is_some() {
+            0.0
+        } else {
+            measurements.detect_s
+        }),
+    );
+    timings.insert(
+        "measure_s".into(),
+        json!(if recording.is_some() {
+            0.0
+        } else {
+            measurements.measure_s
+        }),
+    );
+    let dets = &measurements.detections;
+    let events = &measurements.events;
+    let added = &measurements.added;
+    let max_measured = measure::MAX_MEASURED;
+    write_json(&run_dir.join("detections.json"), dets)?;
+    write_json(&run_dir.join("events.json"), events)?;
+    for e in events {
         if e.fit.is_some() {
             if extras {
                 let _ = event_png(e, c, &run_dir.join(format!("{}.png", e.id)), None, "");
@@ -1315,7 +1393,7 @@ fn locate_with_clock(
     }
     // Wind changes speed gates, not event eligibility, order, distance gates or grouping.
     // Select the capped event IDs once; rebuild their speed gates for each attempted atmosphere.
-    let mut base_events = search::independent_measured_events(&events, 0.0);
+    let mut base_events = search::independent_measured_events(events, 0.0);
     let excluded_by_event_limit: std::collections::HashSet<String> = base_events
         .iter()
         .skip(max_measured)
@@ -1457,7 +1535,7 @@ fn locate_with_clock(
         }
         warnings.extend(wwarn);
         let wind = if has_wind { 3.0 } else { 10.0 };
-        let mut sevs = search::independent_measured_events(&events, wind);
+        let mut sevs = search::independent_measured_events(events, wind);
         sevs.truncate(max_measured);
         // ---- search ---------------------------------------------------------------------
         let t = Instant::now();
@@ -1901,7 +1979,7 @@ fn locate_with_clock(
             .filter(|m| m.core)
             .map(|m| m.event.as_str())
             .collect();
-        let unchecked = leans_on_added(trace_confidence, call, curve_judged, &core_ids, &added);
+        let unchecked = leans_on_added(trace_confidence, call, curve_judged, &core_ids, added);
         if unchecked {
             let on: Vec<&str> = core_ids
                 .iter()
@@ -1976,6 +2054,12 @@ fn locate_with_clock(
                     start_window(d0, d1, region.utc_offset_h),
                     &run_dir,
                     log,
+                    &PreparedRecording {
+                        info: &info,
+                        duration_s: dur,
+                        low_band_warning: low_band.as_deref(),
+                        measurements,
+                    },
                 );
                 timings.insert("decoy_clocks_s".into(), json!(t.elapsed().as_secs_f64()));
                 let (passes, why) = decoy_gate(evidence, &runs);
@@ -2239,7 +2323,7 @@ fn locate_with_clock(
                 "survey.png".into(),
             ),
         );
-        for e in &events {
+        for e in events {
             if e.fit.is_some() {
                 report.figures.push((
                     format!("{} spectrogram, trace and fit", e.id),
@@ -2287,6 +2371,7 @@ fn locate_with_clock(
         "region_bbox": region.bbox.as_array(),
         "atmosphere": {"source": atmo.describe(), "c_0_1500m": m1.c, "c_0_5000m": m5.c, "wind_0_5000m": [m5.wind_e, m5.wind_n]},
         "search_events": sevs,
+        "audio_analysis_reused": recording.is_some(),
         "curve_match": curve_verdict.as_ref().map(|v| json!({
             "call": format!("{curve_used:?}"),
             "clock_window": [curve_clock.0, curve_clock.1],
@@ -2801,7 +2886,7 @@ mod tests {
                 .err()
                 .expect("the longer container reaches an unpublished day");
             assert!(error.contains("no published day covers"), "{error}");
-            locate_with_clock(&a, &Log::new(true), &|| now, false).unwrap()
+            locate_with_clock(&a, &Log::new(true), &|| now, false, None).unwrap()
         } else {
             locate(&a, &Log::new(true)).unwrap()
         };
@@ -2813,6 +2898,7 @@ mod tests {
             outcome.report.extra["media"]["duration_s"],
             json!(info.duration_s)
         );
+        assert_eq!(outcome.report.extra["audio_analysis_reused"], json!(false));
         assert!(outcome.found, "{}", outcome.report.answer.verdict);
         let answer = &outcome.report.answer;
         // Metamorphic: moved by hours, the clock lines up no true pass, so the known answer must
@@ -2837,6 +2923,19 @@ mod tests {
                 continue;
             }
             results += usize::from(dir.join("result.json").is_file());
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("result.json")).unwrap()).unwrap();
+            assert_eq!(report["extra"]["audio_analysis_reused"], json!(true));
+            for stage in ["decode_s", "detect_s", "measure_s"] {
+                assert_eq!(report["timings"][stage], json!(0.0), "{stage}");
+            }
+            for file in ["detections.json", "events.json"] {
+                assert_eq!(
+                    std::fs::read(dir.join(file)).unwrap(),
+                    std::fs::read(outcome.run_dir.join(file)).unwrap(),
+                    "a shifted clock must retain the same {file}"
+                );
+            }
             let images: Vec<_> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|f| f.unwrap().path())
@@ -2846,6 +2945,63 @@ mod tests {
         }
         assert_eq!(results, DECOY_CLOCKS);
         assert!(outcome.run_dir.join("survey.png").is_file());
+
+        if long_video {
+            // A borrowed recording must also reproduce a nonempty, correct search. The four
+            // shifted clocks above have no true flights, so they alone cannot prove this.
+            let pcm =
+                audio::decode_with_selection(&a.media, 0.0, None, a.sr, a.audio_selection).unwrap();
+            let measurements = measure_recording(&pcm, a.sr, &Log::new(true), None).unwrap();
+            let low_band = low_band_warning(&pcm, a.sr);
+            let recording = PreparedRecording {
+                info: &info,
+                duration_s: pcm.len() as f64 / a.sr as f64,
+                low_band_warning: low_band.as_deref(),
+                measurements: &measurements,
+            };
+            drop(pcm);
+            let mut replay = a.clone();
+            replay.out = Some(a.media.parent().unwrap().join("reused-audio-control"));
+            let reused =
+                locate_with_clock(&replay, &Log::new(true), &unix_now, true, Some(&recording))
+                    .unwrap();
+            assert!(reused.found, "{}", reused.report.answer.verdict);
+            assert_eq!(reused.trace_evidence, outcome.trace_evidence);
+            for file in ["detections.json", "events.json", "search.json"] {
+                assert_eq!(
+                    std::fs::read(reused.run_dir.join(file)).unwrap(),
+                    std::fs::read(outcome.run_dir.join(file)).unwrap(),
+                    "fresh and reused audio must produce identical {file}"
+                );
+            }
+            assert_eq!(
+                reused.report.extra["search_events"],
+                outcome.report.extra["search_events"]
+            );
+            assert_eq!(reused.report.atmosphere, outcome.report.atmosphere);
+
+            // Conversely, a fresh shifted run must equal the shared decoy, including its
+            // clock-specific catalogue, atmosphere and empty search result.
+            let mut fresh_decoy =
+                decoy_args(&a, fixture.start, a.clock_tol_s, -7_200.0, &outcome.run_dir);
+            let shared_dir = fresh_decoy.out.clone().unwrap();
+            fresh_decoy.out = Some(a.media.parent().unwrap().join("fresh-decoy-control"));
+            let fresh =
+                locate_with_clock(&fresh_decoy, &Log::new(true), &unix_now, true, None).unwrap();
+            assert_eq!(
+                std::fs::read(fresh.run_dir.join("search.json")).unwrap(),
+                std::fs::read(shared_dir.join("search.json")).unwrap()
+            );
+            let shared: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(shared_dir.join("result.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                fresh.report.extra["search_events"],
+                shared["extra"]["search_events"]
+            );
+            assert_eq!(json!(fresh.report.atmosphere), shared["atmosphere"]);
+            assert_eq!(json!(fresh.report.warnings), shared["warnings"]);
+        }
         let error = haversine_m(
             answer.lat,
             answer.lon,
