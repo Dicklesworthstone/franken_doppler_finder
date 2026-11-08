@@ -19,6 +19,35 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Check creation_time answers against decoy clocks too
+
+- The decoy-clock gate below now also runs when a high or medium trace answer came from the file's
+  `creation_time` window, the narrow window a recording without `--start` gets from its metadata, as a phone
+  recording usually does. Before, only `--start` runs met the gate, so these answers could be as fragile as the
+  wrong date `c2c7578` graded high. No development, null or benchmark row tested this path: every one passes
+  `--start`, and none of the six development recordings carries `creation_time`.
+- The whole window is moved. Each decoy gets the moved window's centre as `--start` and its half-width as
+  `--clock-tol`, so it reads no metadata. Steps are whole hours, at least the window's width plus 10 minutes, so no
+  decoy window reaches the true start. `--start` with a `--clock-tol` up to 1,500 s keeps 1 h steps, so `--start`
+  runs are unchanged. A one-hour recording's 3,840 s `creation_time` window gets 2 h steps. A full-date search,
+  with neither or after the `creation_time` window found nothing, still runs no decoys: it compares every clock.
+- Development rows (Mac, `ct_dec4`): copies of the reference recording and the osprey cam's 11-02 recording, with
+  the same audio packets and `creation_time` set to their start, run without `--start`.
+  - The reference recording: high, 0.26 km from its `--start` answer. Its decoys at −4, −2, +2 and +4 h reach 19.32
+    nats at best, against 33.28, so it leads by 13.96.
+  - The osprey cam on 11-02: high, 0.04 km from its `--start` answer. Its window is 2.8 h wide, so the decoys step
+    by 3 h. The −6 h decoy found nothing, and the best, +3 h, reaches 22.68 against 30.22, a lead of 7.54.
+  - At the null battery's three wrong places, all six runs stay low, so none reaches the gate. These rows show no
+    wrong answer the old code would have asserted: the change closes a path that no row tested.
+  - The reference recording with `--start` (`ab_dec3_dec4`) is unchanged, to the same decoy evidence.
+- Tests:
+  - `decoy_windows_stay_clear_of_the_searched_window`: the step for windows of several widths, and, for
+    half-widths from 0 to 20,000 s, no decoy window within 10 minutes of the searched one.
+  - `decoy_runs_move_only_the_start_and_skip_the_curve_match` now also builds a `creation_time` window's decoy.
+  - `decoy_shifts_keep_each_clock_window_inside_the_dates` adds the 2 h steps.
+  - The `creation_time` known-answer test now requires its answer to pass four decoy clocks, whose directories
+    hold no image. It required that none ran.
+
 ### Check high and medium answers against decoy clocks
 
 - A high or medium answer from the trace search, on a run given `--start`, now meets a new gate, `decoy clocks`.
@@ -26,7 +55,8 @@ at that commit, not per-change commits.
   the next of ±3 and ±4 hours stands in, and a decoy that fails is skipped. The answer's top evidence must lead the
   best decoy's by 3 nats, the medium margin line, or the answer becomes low. Fewer than four decoys also mean low.
   Each decoy writes its own run directory, `decoy_clock_<shift>h/`, inside the answer's, with no figures or map,
-  and looks up no place name online. Curve-only answers and runs without `--start` are unchanged.
+  and looks up no place name online. Curve-only answers are unchanged; runs without `--start` were too, until
+  the entry above.
 - Why: on `c2c7578` the osprey cam's 11-02 recording, searched on 10-31, graded high 34 km off with a 6.34-nat
   margin (`n33_c2c7578`). `8be452d`'s peak-chirp factor tipped it, but the factor is correct physics. Without it,
   the same recording at a wrong place grades high instead (`n33_gnochirp`). The margin compares explanations at one

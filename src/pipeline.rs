@@ -898,23 +898,32 @@ pub(crate) fn event_png(
     )
 }
 
-/// Starts of the decoy clocks relative to `--start`, in the order tried; the first
-/// [`DECOY_CLOCKS`] whose whole `--clock-tol` window lies inside the dates are used. Hours apart,
-/// no true pass lines up at a decoy, and the traffic is that of the same place and day.
-const DECOY_SHIFTS_S: [f64; 8] = [
-    -7_200.0, -3_600.0, 3_600.0, 7_200.0, -10_800.0, 10_800.0, -14_400.0, 14_400.0,
-];
+/// Decoy clocks, in [`decoy_unit_s`] steps from the searched clock window's centre, in the order
+/// tried; the first [`DECOY_CLOCKS`] whose whole window lies inside the dates are used. Hours
+/// apart, no true pass lines up at a decoy, and the traffic is that of the same place and day.
+const DECOY_STEPS: [f64; 8] = [-2.0, -1.0, 1.0, 2.0, -3.0, 3.0, -4.0, 4.0];
+/// The least gap between a decoy's clock window and the searched one.
+const DECOY_GAP_S: f64 = 600.0;
 /// Decoy clocks a high or medium trace answer is checked against.
 const DECOY_CLOCKS: usize = 4;
 /// Nats a high or medium trace answer must lead its best decoy clock by: the medium margin line.
 const DECOY_LEAD_NATS: f64 = 3.0;
 
-/// Decoy shifts for a recording that starts at `t0`, in the order tried: those whose clock window
+/// The decoy step for a clock window `centre +- half`: whole hours, at least the window's width
+/// plus [`DECOY_GAP_S`], so no decoy window reaches the true start. A `--start` window
+/// (`--clock-tol` up to 1500 s) gets 1 h; a creation_time window, which spans the recording, gets
+/// more (a one-hour recording's 3840 s window gets 2 h).
+fn decoy_unit_s(half: f64) -> f64 {
+    3600.0 * ((2.0 * half + DECOY_GAP_S) / 3600.0).ceil().max(1.0)
+}
+
+/// Decoy shifts for a clock window `t0 +- tol`, in the order tried: those whose window
 /// `t0 + shift +- tol` fits inside the date window.
 fn decoy_shifts(t0: f64, dates: (f64, f64), tol: f64) -> Vec<f64> {
-    DECOY_SHIFTS_S
+    let unit = decoy_unit_s(tol);
+    DECOY_STEPS
         .iter()
-        .copied()
+        .map(|k| k * unit)
         .filter(|s| t0 + s - tol >= dates.0 && t0 + s + tol <= dates.1)
         .collect()
 }
@@ -952,42 +961,45 @@ fn decoy_gate(evidence: f64, runs: &[(f64, Option<f64>)]) -> (bool, String) {
     (
         lead >= DECOY_LEAD_NATS,
         format!(
-            "evidence {evidence:.2} nats vs {best:.2} at the best of {DECOY_CLOCKS} decoy clocks, the same search with --start moved ({list}): {lead:+.2} nats, needs {DECOY_LEAD_NATS:.1}"
+            "evidence {evidence:.2} nats vs {best:.2} at the best of {DECOY_CLOCKS} decoy clocks, the same search with its clock window moved ({list}): {lead:+.2} nats, needs {DECOY_LEAD_NATS:.1}"
         ),
     )
 }
 
-/// Arguments for one decoy-clock run: `a` with the start moved by `shift`, its own run directory,
-/// quiet, and no curve match. The gate reads only the trace search's evidence, which with an
-/// explicit start is computed before the curve match and does not read it. Without the curve match
-/// that evidence came out identical on four decoys from both development harnesses, at a fifth to a
-/// tenth of the time (LOG 2026-11-08T17:51Z).
-fn decoy_args(a: &LocateArgs, t0: f64, shift: f64, run_dir: &Path) -> LocateArgs {
+/// Arguments for one decoy-clock run: `a` with the clock window `t0 +- tol` moved by `shift` and
+/// given as `--start` and `--clock-tol` (a creation_time window becomes the same window as a start,
+/// so the decoy reads no metadata), its own run directory, quiet, and no curve match. The gate
+/// reads only the trace search's evidence, which with an explicit start is computed before the
+/// curve match and does not read it. Without the curve match that evidence came out identical on
+/// four decoys from both development harnesses, at a fifth to a tenth of the time (LOG
+/// 2026-11-08T17:51Z).
+fn decoy_args(a: &LocateArgs, t0: f64, tol: f64, shift: f64, run_dir: &Path) -> LocateArgs {
     let mut d = a.clone();
     d.start = Some(format!("{:.3}", t0 + shift));
+    d.clock_tol_s = tol;
     d.out = Some(run_dir.join(format!("decoy_clock_{:+.0}h", shift / 3600.0)));
     d.quiet = true;
     d.curve_match = false;
     d
 }
 
-/// Run the same locate at decoy clocks, each into `run_dir/decoy_clock_<shift>h`, until
-/// [`DECOY_CLOCKS`] have run. A decoy that fails (an unpublished day, say) is logged and the next
-/// shift is tried.
+/// Run the same locate at decoy clocks for the clock window `t0 +- tol`, each into
+/// `run_dir/decoy_clock_<shift>h`, until [`DECOY_CLOCKS`] have run. A decoy that fails (an
+/// unpublished day, say) is logged and the next shift is tried.
 fn decoy_clock_runs(
     a: &LocateArgs,
     now: &dyn Fn() -> f64,
-    t0: f64,
+    (t0, tol): (f64, f64),
     dates: (f64, f64),
     run_dir: &Path,
     log: &Arc<Log>,
 ) -> Vec<(f64, Option<f64>)> {
     let mut runs = Vec::new();
-    for s in decoy_shifts(t0, dates, a.clock_tol_s) {
+    for s in decoy_shifts(t0, dates, tol) {
         if runs.len() == DECOY_CLOCKS {
             break;
         }
-        let d = decoy_args(a, t0, s, run_dir);
+        let d = decoy_args(a, t0, tol, s, run_dir);
         match locate_with_clock(&d, &Log::new(true), now, true) {
             Ok(o) => {
                 log.say(&format!(
@@ -1944,13 +1956,23 @@ fn locate_with_clock(
         // Its margin compares explanations inside one clock window; a wrong date or place can
         // still find two chance fits to a recording's strong passes there (nd_o02_1031 on
         // c2c7578, np_o02_p3 without 8be452d's chirp factor), and the decoys measure that level.
-        let confidence = match given_start {
-            Some(t0) if !decoy && on_trace && matches!(confidence, "high" | "medium") => {
+        // The window moved is `--start +- --clock-tol`, or the creation_time window the answer
+        // came from; the full date window, after a fallback or with neither, compares every clock.
+        let decoy_window = match given_start {
+            Some(t0) => Some((t0, a.clock_tol_s)),
+            None if meta_window => Some((
+                0.5 * (archive.clock.0 + archive.clock.1),
+                0.5 * (archive.clock.1 - archive.clock.0),
+            )),
+            None => None,
+        };
+        let confidence = match decoy_window {
+            Some(window) if !decoy && on_trace && matches!(confidence, "high" | "medium") => {
                 let t = Instant::now();
                 let runs = decoy_clock_runs(
                     a,
                     now,
-                    t0,
+                    window,
                     start_window(d0, d1, region.utc_offset_h),
                     &run_dir,
                     log,
@@ -2484,7 +2506,7 @@ mod tests {
         a.quiet = false;
         a.start = Some("2026-09-08T20:17:00Z".into());
         let t0 = parse_iso_utc("2026-09-08T20:17:00Z").unwrap();
-        let d = decoy_args(&a, t0, -7_200.0, Path::new("/runs/x"));
+        let d = decoy_args(&a, t0, a.clock_tol_s, -7_200.0, Path::new("/runs/x"));
         assert_eq!(
             parse_iso_utc(d.start.as_deref().unwrap()).unwrap(),
             parse_iso_utc("2026-09-08T18:17:00Z").unwrap()
@@ -2513,15 +2535,32 @@ mod tests {
                 a.sr
             )
         );
-        let d = decoy_args(&a, t0, 3_600.0, Path::new("/runs/x"));
+        let d = decoy_args(&a, t0, a.clock_tol_s, 3_600.0, Path::new("/runs/x"));
         assert_eq!(d.out.as_deref(), Some(Path::new("/runs/x/decoy_clock_+1h")));
+        // A creation_time window (no --start) becomes the same window as a start: its centre
+        // moved, and its half-width as the tolerance.
+        a.start = None;
+        let (lo, hi) = (t0 - 3_720.0, t0 + 120.0);
+        let d = decoy_args(
+            &a,
+            0.5 * (lo + hi),
+            0.5 * (hi - lo),
+            7_200.0,
+            Path::new("/runs/x"),
+        );
+        let start = parse_iso_utc(d.start.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            (start - d.clock_tol_s, start + d.clock_tol_s),
+            (lo + 7_200.0, hi + 7_200.0)
+        );
+        assert_eq!(d.out.as_deref(), Some(Path::new("/runs/x/decoy_clock_+2h")));
     }
 
     #[test]
     fn decoy_shifts_keep_each_clock_window_inside_the_dates() {
         let day = (0.0, 86_400.0);
         let midday = decoy_shifts(43_200.0, day, 120.0);
-        assert_eq!(midday.len(), DECOY_SHIFTS_S.len());
+        assert_eq!(midday.len(), DECOY_STEPS.len());
         assert_eq!(
             midday[..DECOY_CLOCKS],
             [-7_200.0, -3_600.0, 3_600.0, 7_200.0]
@@ -2539,6 +2578,39 @@ mod tests {
         // the tolerance counts: at 01:01 an hour earlier leaves 60 s, under 120 s
         assert!(!decoy_shifts(3_660.0, day, 120.0).contains(&-3_600.0));
         assert!(decoy_shifts(3_660.0, day, 60.0).contains(&-3_600.0));
+        // a one-hour recording's creation_time window (3840 s) steps by 2 h
+        assert_eq!(
+            decoy_shifts(43_200.0, day, 1_920.0)[..DECOY_CLOCKS],
+            [-14_400.0, -7_200.0, 7_200.0, 14_400.0]
+        );
+    }
+
+    #[test]
+    fn decoy_windows_stay_clear_of_the_searched_window() {
+        // whole hours, 1 h for any --start window up to 1500 s each side
+        assert_eq!(decoy_unit_s(0.0), 3_600.0);
+        assert_eq!(decoy_unit_s(120.0), 3_600.0);
+        assert_eq!(decoy_unit_s(1_500.0), 3_600.0);
+        assert_eq!(decoy_unit_s(1_501.0), 7_200.0);
+        assert_eq!(decoy_unit_s(1_920.0), 7_200.0);
+        // Metamorphic: whatever the window, every decoy window keeps DECOY_GAP_S from the
+        // searched one, so none can hold the true start; and no step is wider than it needs to be.
+        let mut half = 0.0;
+        while half <= 20_000.0 {
+            let unit = decoy_unit_s(half);
+            assert!(unit - 2.0 * half >= DECOY_GAP_S, "half {half}: unit {unit}");
+            assert!(
+                unit == 3_600.0 || unit - 3_600.0 < 2.0 * half + DECOY_GAP_S,
+                "half {half}: unit {unit}"
+            );
+            for s in decoy_shifts(5.0 * 86_400.0, (0.0, 10.0 * 86_400.0), half) {
+                assert!(
+                    s.abs() - 2.0 * half >= DECOY_GAP_S,
+                    "half {half}: shift {s}"
+                );
+            }
+            half += 37.5;
+        }
     }
 
     fn offline_test_args(name: &str) -> LocateArgs {
@@ -2744,40 +2816,36 @@ mod tests {
         assert!(outcome.found, "{}", outcome.report.answer.verdict);
         let answer = &outcome.report.answer;
         // Metamorphic: moved by hours, the clock lines up no true pass, so the known answer must
-        // lead its decoy clocks. Only an explicit --start (the long video) is moved; a
-        // creation_time window runs no decoys.
+        // lead its decoy clocks, whether its clock window came from --start (the long video) or
+        // from the file's creation_time (1300 s of audio +- 60 s, so 1 h steps).
         let decoys = answer.gates.iter().find(|g| g.0 == "decoy clocks");
-        if long_video {
-            assert!(
-                decoys.is_some_and(|g| g.1),
-                "{} {:?}: {}",
-                answer.confidence,
-                decoys,
-                answer.verdict
-            );
-            // Each decoy writes its result but no figure or map; the answer keeps its figures.
-            let mut results = 0;
-            for dir in std::fs::read_dir(&outcome.run_dir).unwrap() {
-                let dir = dir.unwrap().path();
-                if !dir
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("decoy_clock_"))
-                {
-                    continue;
-                }
-                results += usize::from(dir.join("result.json").is_file());
-                let images: Vec<_> = std::fs::read_dir(&dir)
-                    .unwrap()
-                    .map(|f| f.unwrap().path())
-                    .filter(|p| p.extension().is_some_and(|x| x == "png" || x == "svg"))
-                    .collect();
-                assert!(images.is_empty(), "{}: {images:?}", dir.display());
+        assert!(
+            decoys.is_some_and(|g| g.1),
+            "{} {:?}: {}",
+            answer.confidence,
+            decoys,
+            answer.verdict
+        );
+        // Each decoy writes its result but no figure or map; the answer keeps its figures.
+        let mut results = 0;
+        for dir in std::fs::read_dir(&outcome.run_dir).unwrap() {
+            let dir = dir.unwrap().path();
+            if !dir
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("decoy_clock_"))
+            {
+                continue;
             }
-            assert_eq!(results, DECOY_CLOCKS);
-            assert!(outcome.run_dir.join("survey.png").is_file());
-        } else {
-            assert!(decoys.is_none(), "{decoys:?}");
+            results += usize::from(dir.join("result.json").is_file());
+            let images: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|f| f.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|x| x == "png" || x == "svg"))
+                .collect();
+            assert!(images.is_empty(), "{}: {images:?}", dir.display());
         }
+        assert_eq!(results, DECOY_CLOCKS);
+        assert!(outcome.run_dir.join("survey.png").is_file());
         let error = haversine_m(
             answer.lat,
             answer.lon,

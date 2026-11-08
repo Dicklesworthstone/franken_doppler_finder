@@ -244,8 +244,9 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
               decoy clocks; the answer stands only if it beats every one
       │
       ▼
- decoy clocks  a high or medium trace answer given --start: the same locate again at starts moved by
-               −2, −1, +1 and +2 h; the answer must lead the best of them by 3 nats, or it becomes low
+ decoy clocks  a high or medium trace answer from a --start or creation_time window: the same locate
+               again with that window moved by −2, −1, +1 and +2 steps (1 h for --start); the answer
+               must lead the best of them by 3 nats, or it becomes low
       │
       ▼
  gates ─► confidence ─► reverse geocode ─► map.png / report.html / report.md / result.json ─► run ledger
@@ -262,7 +263,7 @@ layers. Coarse gates retain the existing first-order wind rescaling of the fitte
 | radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
 | curve match | listed when the [curve match](#the-curve-match) stands: the answer is within 3 km of where it stands. Also listed, failed, on a medium answer when the curve match ran with enough decoy clocks to judge (40) and stands nowhere |
 | measurement line | listed, failed, only on a medium answer that rests on a core match measured past the old line (a detection score under 4.5, past the strongest 24, found only on the contrast image, from a faster supplemental seed, or recovered from a harmonic after its primary failed) when no curve match ran with enough decoy clocks to judge it |
-| decoy clocks | listed on a high or medium answer from the trace search when `--start` is given: `locate` runs again with the start moved by −2, −1, +1 and +2 hours (the next of ±3 and ±4 h when a window would leave `--dates`), and the answer's evidence must lead the best decoy's by ≥ 3 nats. Fewer than four decoys that run fail it |
+| decoy clocks | listed on a high or medium answer from the trace search when `--start` is given or the answer came from the file's `creation_time` window: `locate` runs again with that clock window moved by −2, −1, +1 and +2 steps (the next of ±3 and ±4 steps when a window would leave `--dates`), and the answer's evidence must lead the best decoy's by ≥ 3 nats. A step is whole hours, at least the window's width plus 10 minutes: 1 h for `--start`. Fewer than four decoys that run fail it |
 
 Refinement uses the grid to find a basin, then improves the observer position with a bounded continuous
 search that evaluates the same physical trace model at every proposed point. The grid spacing controls
@@ -342,19 +343,23 @@ test. A high answer keeps its grade. Where the curve match does not run or has t
 is the trace search's, except that a medium answer resting on a core match measured past the old line (below)
 becomes **low**: nothing calibrated then checks that the extra events did not just give chance more to work with.
 
-A high or medium answer from the trace search, on a run given `--start`, then meets its **decoy clocks**. `locate`
-runs again four times with the start moved by −2, −1, +1 and +2 hours, each into `decoy_clock_<shift>h/` inside
-the run directory. A decoy draws no figures or map and looks up no place name online. Hours off, no true pass lines
-up, but the recording, the place and the day's traffic are the same, so the best decoy shows how much evidence
-chance fits to this recording's sounds reach there. The answer must
-lead it by 3 nats, the medium margin line, or it becomes **low**. The margin gate cannot see this, because it
+A high or medium answer from the trace search then meets its **decoy clocks** when its clock window was narrow:
+given by `--start`, or by the file's `creation_time`. `locate` runs again four times with that window moved by −2,
+−1, +1 and +2 steps, each into `decoy_clock_<shift>h/` inside the run directory. A step is whole hours, at least
+the window's width plus 10 minutes, so no decoy window reaches the true start: 1 h for `--start`, and 2 h for a
+one-hour recording's `creation_time` window, which spans the recording. A decoy draws no figures or map and looks
+up no place name online. Hours off, no true pass lines up, but the recording, the place and the day's traffic are
+the same, so the best decoy shows how much evidence chance fits to this recording's sounds reach there. The answer
+must lead it by 3 nats, the medium margin line, or it becomes **low**. The margin gate cannot see this, because it
 compares explanations at one clock. The gate was added after a wrong date graded high on `c2c7578`
 ([Known issues](#known-issues)), so the development rows are not a test of it. On them it lowers that run and keeps
 every right answer: the five lead their decoys by 14.0 to 67.8 nats, the wrong date by 1.07 (`ab_c2c7578_dec1`,
 `n1_dec1`). The decoys run without the curve match, which the gate does not read. On the development rows the four
 added 4 to 9 minutes to an answer, with the same evidence as with the curve match on (`ab_dec1_dec2`, `n1_dec2`).
-Without `--start` the gate does not run: there is no given clock to move, and the search already compares every
-clock in the dates.
+On copies of two development recordings given their start as `creation_time` instead of `--start`, both answers
+stay high, leading decoys at 2 h and 3 h steps by 13.96 and 7.54 nats, and all six runs at wrong places stay low
+(`ct_dec4`). A search of the full dates, with neither or after the `creation_time` window found nothing, runs no
+decoys: it already compares every clock in the dates.
 
 ### The curve match
 
@@ -639,7 +644,8 @@ fdop locate clip.mov --dates 2026-09-08 --near NY --audio-stream 1 --audio-chann
 **The time window.** Without `--start`, recording starts are searched from local midnight on the first date to
 local midnight after the last, using every UTC offset the region spans, DST included. If the file's
 `creation_time` falls inside that window, the search first narrows to it, allowing for both start and end
-conventions. Both the trace search and, when eligible, the independent curve match try that window. A standing
+conventions, and a high or medium trace answer found there meets the [decoy clocks](#the-gates). Both the trace
+search and, when eligible, the independent curve match try that window. A standing
 curve match can locate the recording even when no trace candidate survives. Only when there is neither a trace
 candidate nor a standing curve match does the search widen to the full window, with a warning. The curve match
 retries too if the wider window is still eligible. A curve test from the earlier narrow window does not grade
@@ -787,7 +793,7 @@ Each `locate` run writes a directory:
 | `survey.png` | Whole-file log-frequency spectrogram with detections and traces marked |
 | `e<N>.png`, `e<N>_trace.csv` | Per-event spectrogram with the fitted curve, and the traced points |
 | `e<N>_match.png` | Each winning event's trace against the ADS-B prediction |
-| `decoy_clock_<shift>h/` | On a high or medium trace answer given `--start`: one run directory per [decoy clock](#the-gates), with its JSON, CSV and report files but no figures or map |
+| `decoy_clock_<shift>h/` | On a high or medium trace answer from a `--start` or `creation_time` window: one run directory per [decoy clock](#the-gates), with its JSON, CSV and report files but no figures or map |
 | `curvematch.json` | The curve match, when it ran: its places with every pass's evidence, the best place's twins along the heard flights' tracks (`aliases`), each decoy window's best place and score, the margin over the best decoy and its rank p |
 | `detections.json`, `events.json`, `search.json` | Intermediate results. `search.json` keeps the best 10,000 candidates, and `candidates_total` counts them all |
 
