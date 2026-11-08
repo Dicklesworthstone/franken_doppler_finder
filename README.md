@@ -1053,6 +1053,17 @@ Design notes:
   Raw trace points, SNR and central-drop accounting remain unchanged. Accepted fits, and refusals whose retained trace held both sides, are
   measured exactly as before. A wrong fit can pass this way too: a climbing pass in a clip that starts mid-drop
   trades speed against distance, and the retry accepts the wrong pair.
+- **A fast fitted ridge can regain missing side coverage.** If the free trace also fails, the fitted speed is
+  already beyond the primary bank's 175 m/s limit, and the steep fitted ridge meets every gate except the
+  required approach/recede span, measurement renews its spectral band and window from that fitted geometry.
+  It continues the same ridge for at most twice the ordinary fitting budget, capped at six rounds. After
+  completing the ordinary rounds, it stops when all gates pass or coverage stops growing on the missing
+  side. Both eight-second sides must belong to the retained ridge through the fitted CPA: a gap longer
+  than the existing three-second continuity limit ends that ridge. Isolated retained points cannot stand
+  in for a missing approach. The original recording interval, normalization context, detection identity
+  and CPA-drift limit remain in force. An accepted continuation retains its actual spectrum and is marked
+  `reseeded`; a failed one preserves the original refusal. Existing accepted measurements keep their
+  complete output. The short-fast-pass regressions below check recovered geometry and this preservation.
 - **A primary that lost its ridge can yield to a usable harmonic.** A bright harmonic may lose its ridge
   through the drop while another tone from the same pass remains measurable. Both `locate` and `detect`
   try the primary first, then its detected siblings in score order only if the primary has no fit, fewer
@@ -1315,6 +1326,64 @@ The existing empirical calibration, hearing threshold, confidence gates and radi
 unchanged. These are synthetic curve-matching results; field/reference/wrong-date replays and a
 complete CLI/workspace result are not established. The separate grazing-pass hearing failure remains.
 
+### Short fast passes: fitted-ridge recovery
+
+`short_fast_passes_recover_the_same_detected_ridge_after_refusal` runs fixed 30-second PCM
+through survey, detection, refinement, family measurement and independent-event selection.
+For a 118 Hz, 215 m/s pass at 900 m, the 0, 6, 9 and 12 dB attenuation cases previously supplied
+no usable event: the ordinary seed masked the supplemental fast seed, then measurement retained
+only about two seconds of approach. A bounded continuation now recovers one independent event
+from that original detection in each case, with 8.39–9.89 seconds of retained approach and at
+least 19.41 seconds of recede support. Across the four, maximum absolute errors are 0.145 Hz,
+0.206 m/s, 3.44 m and 0.0108 s for emitted tone, speed, distance and arrival time. The 0 dB case requires trace
+points above the old spectrum's upper frequency limit, proving that the cropped approach returned.
+
+All four new end-to-end measurement regressions pass through genuine RCH on the pinned nightly.
+`fitted_continuation_preserves_accepted_short_events` compares complete event output and spectra
+for the already successful early 3 dB case and the previously accepted late 3 and 6 dB cases.
+`fitted_continuation_preserves_refused_late_fast_passes` retains the late 0, 9 and 12 dB refusals,
+including their complete output and spectra. Together with the four recoveries, these checks cover
+all ten fixed early/late attenuation scenes.
+`fitted_continuation_refuses_noise_tones_and_reversed_passes` checks noise/hum, a steady tone,
+and both reversed edge passes through the actual measurement path. The late accepted fits still
+have incorrect geometry; preserving them establishes the scope of this recovery, not their accuracy.
+The detector and its ownership masks remain unchanged. These synthetic results do not establish
+real-recording accuracy or confidence calibration.
+
+The complete early/late attenuation diagnostic caught a new wrong acceptance when continuation
+was initially allowed on ordinary-speed fitted curves: a late 245 m/s source was mismeasured at
+159 m/s. Recovery is therefore scoped to fits already beyond the existing primary-bank speed
+limit, with that late refusal retained as a permanent regression. The four accurate new early
+recoveries already satisfy this domain requirement; no accuracy assertion or quality gate is loosened.
+
+Continuing the same fixed scenes also caught a premature acceptance at 9 dB: one isolated retained
+point made a fit appear to cover both sides while its continuous ridge began too late. Completing
+the ordinary fitting rounds and requiring continuous retained support restores the correct geometry
+at both 9 and 12 dB. The continuity and side-span limits remain the existing three and eight seconds;
+no fixture-specific threshold or relaxed physical-accuracy bound was introduced.
+
+If a continuation loses its ridge before those rounds finish, it refuses rather than accepting
+the preceding fit. `continuation_refuses_a_lost_trace_before_ordinary_rounds_complete` isolates
+that exit with injected loss of replacement-window observations after an actual successful fit;
+the original non-continuation behavior remains unchanged. This is a failure-path unit check,
+separate from the four PCM pipeline tests above.
+
+All five focused checks pass on the final native core, as does core all-target Clippy with
+warnings denied. The unchanged production selftest module, freshly linked to the actual
+core/types libraries and using FFmpeg, recovers the correct two flights from four events:
+1.312094 m position error within a 75 m radius and +0.014154 s recording-clock error.
+These results do not establish release-CLI or full-workspace integration. Full application
+compilation remains memory-blocked in unchanged `asupersync`; the workspace formatting check
+also reports remaining differences. Reference, wrong-date and field recordings were not replayed.
+
+Two existing measurement accuracy failures remain. The harmonic-family fixture still returns
+119.32138 Hz and arrival 109.46166 s against 118 Hz and 110 s. In the longer 245 m/s fixture,
+independent-event selection still chooses 83.37627 Hz against 83 Hz, outside its unchanged
+0.3 Hz bound. Direct continuation-off/on comparisons reproduce both selected results; the
+selected events and spectra compare exactly. The longer-pass continuation also recovers an
+accurate alternative at 83.03463 Hz, but that alternative does not displace the existing winner.
+These are unresolved measurement/selection defects, not passing accuracy checks.
+
 ### Fast-pass measurement (2026-11-08): recovery and sensitivity limits
 
 The PCM oracle independently solves the light-time equation for emission phase and 1/r amplitude;
@@ -1461,14 +1530,16 @@ and fixture allocations. The changed lines meet formatting checks; three existin
 differences in the separate fast-edge tests remain. This is a focused core result, not a full
 workspace or CLI selftest pass.
 
-The separate fast-edge regression remains unresolved. A subsequent native diagnostic measured all
+The separate detector fast-edge regression remains unresolved. Before fitted-ridge continuation,
+a native diagnostic measured all
 ten fixed early/late fast-pass scenes, including the original seeds that the old regression skipped.
 Legacy measurement correctly recovers one scene. Two further early 215 m/s scenes recover only
 when the fast bank is run without earlier ownership: all five receding-side samples of their useful
 seed are already masked by an ordinary candidate whose measurement fails. The late 245 m/s scenes
 remain unrecovered by that diagnostic; some ordinary fits pass quality gates with incorrect geometry.
-This calls for measurement-aware retry, not a claim that extra accepted seeds are correct recoveries.
-No ownership threshold, stage priority or existing assertion was changed for that separate issue.
+The fitted-ridge continuation described above now recovers four additional early scenes from the
+ordinary detections, preserving the already successful one. Its regression checks physical parameters
+as well as acceptance. No ownership threshold, stage priority or existing assertion was changed.
 
 ### Midnight flight coverage: native data validation
 

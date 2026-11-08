@@ -16,8 +16,13 @@
 //! 5. A fit the gates refuse because its trace held one side of the pass is followed afresh once:
 //!    from its own trace, the ridge is traced without the model, fitted, and the guided rounds
 //!    start again from that fit. The second attempt replaces the first only if every gate accepts it.
+//!    If that still fails on a steep ridge fitted beyond the primary detector's speed bank, and
+//!    its only missing gate is side coverage, the original fit gets one bounded continuation with
+//!    a fresh band and spectrogram. It completes the ordinary fitting rounds, then continues only
+//!    while the retained ridge through the CPA gains side coverage. Every gate and both sides of
+//!    that continuous ridge must pass; a failed continuation leaves the original refusal unchanged.
 
-use crate::detect::Detection;
+use crate::detect::{Detection, PRIMARY_MAX_SPEED_MPS};
 use crate::fit::{Best, FitResult, PreparedFit, Side, prepare_constant_velocity};
 use crate::physics::{cv_curve, readouts, window_for_roc};
 use crate::spectro::{Spec, stft_band_db};
@@ -104,7 +109,8 @@ pub struct MeasureParams {
     pub max_rmse_hz: f64,
     pub rounds: usize,
     /// Follow the ridge of a fit the gates refuse without the model, and measure again from
-    /// what that finds ([`reseeded_rounds`]).
+    /// what that finds ([`reseeded_rounds`]). If that fails, a steep fit beyond the primary speed
+    /// bank whose sole refusal is side coverage can continue from its fitted spectral geometry.
     pub free_reseed: bool,
 }
 
@@ -140,8 +146,9 @@ pub struct EventQuality {
     /// Ranking value: median SNR (dB) x sqrt(effective independent points).
     pub score: f64,
     pub ok: bool,
-    /// The detection's curve was refused and this event was measured from a free trace of the
-    /// ridge its guided trace had found ([`MeasureParams::free_reseed`]).
+    /// The detection's curve was refused and this event was recovered from its observed ridge:
+    /// by free tracing, or a bounded guided continuation of a fast fitted ridge with renewed
+    /// spectral support ([`MeasureParams::free_reseed`]). This remains the same detected event.
     pub reseeded: bool,
     pub reasons: Vec<String>,
 }
@@ -198,6 +205,10 @@ fn peak_received_chirp(f0: f64, v: f64, d: f64, c: f64) -> f64 {
 /// refused, and at eight times most are.
 const STEEP_TIME_ERROR_S: f64 = 0.25;
 
+/// A longer silence ends a continuous observed ridge. Use the same gap for the frequency-drop
+/// gate and for the retained ridge through the CPA in a bounded continuation.
+const MAX_RIDGE_GAP_S: f64 = 3.0;
+
 /// Share of a fit's frequency drop that the trace travels through. A pass's ridge moves from the
 /// approach tone to the recede tone and is loudest on the way. Two steady tones joined by a fit do
 /// not: the trace sits flat on each, and the fit crosses the empty space between them with points
@@ -213,8 +224,6 @@ fn drop_traversed(
     f_post: f64,
     model: impl Fn(f64) -> f64,
 ) -> f64 {
-    /// A longer silence ends a stretch: the fall across it was not observed.
-    const MAX_GAP_S: f64 = 3.0;
     /// A step this far from the model's own step is a move to another ridge, and ends a stretch.
     /// The trace takes the peak nearest the model in each frame with no limit on continuity, so
     /// neighbouring peaks can differ from the model's step by up to twice the band. That is this
@@ -244,7 +253,7 @@ fn drop_traversed(
             continue;
         }
         let off = fi - fitted;
-        if ti - last_t > MAX_GAP_S || (off - last_off).abs() > MAX_STEP_OFF_MODEL_HZ {
+        if ti - last_t > MAX_RIDGE_GAP_S || (off - last_off).abs() > MAX_STEP_OFF_MODEL_HZ {
             fell += net_fall(&stretch);
             stretch.clear();
         }
@@ -382,7 +391,7 @@ fn guided_trace_with_background(
 
 /// Measure one detection. `x` is the whole recording at `sr`; times are recording seconds.
 pub fn measure(x: &[f32], sr: u32, det: &Detection, id: &str, p: &MeasureParams) -> MeasuredEvent {
-    measure_with_fit(x, sr, det, id, p, prepare_constant_velocity)
+    measure_with_fit(x, sr, det, id, p, true, prepare_constant_velocity)
 }
 
 /// Refine and measure a detection family's primary, then try its detected harmonics only if
@@ -471,6 +480,58 @@ struct Guided {
     reasons: Vec<String>,
 }
 
+/// One continuation of an already fitted ridge. Only missing side coverage can initiate it;
+/// progress measures the retained continuous stretch through the fitted CPA.
+struct SideContinuation {
+    det_t0r: f64,
+    span: f64,
+    covered_s: f64,
+}
+
+/// A coarse curve can need more than three fits to reach a fast pass's approach. Complete the
+/// ordinary fitting budget before stopping on support: early parameter corrections can shorten
+/// a side temporarily, and an isolated point can make an early fit look two-sided. Extra rounds
+/// must then gain continuous retained support. The total is at most twice the ordinary budget,
+/// with this absolute ceiling; no additional detection or independent starting curve is searched.
+const MAX_CONTINUATION_ROUNDS: usize = 6;
+
+#[derive(Default)]
+struct SideSupport {
+    approach_s: f64,
+    recede_s: f64,
+}
+
+impl SideSupport {
+    /// More receding audio cannot stand in for the missing approach, or vice versa.
+    fn covered_s(&self, min_side_s: f64) -> f64 {
+        self.approach_s.min(min_side_s) + self.recede_s.min(min_side_s)
+    }
+
+    fn complete(&self, min_side_s: f64) -> bool {
+        self.approach_s >= min_side_s && self.recede_s >= min_side_s
+    }
+}
+
+/// Retained points outside the continuous stretch containing the fitted CPA cannot establish
+/// that this ridge was followed to the approach or recede side. A single distant point may be
+/// retained by a fit even though the gap between it and the pass contains no observed ridge.
+fn contiguous_side_support(inlier_times: &[f64], t0r: f64) -> SideSupport {
+    let mut begin = 0;
+    for i in 1..=inlier_times.len() {
+        if i == inlier_times.len() || inlier_times[i] - inlier_times[i - 1] > MAX_RIDGE_GAP_S {
+            let (first, last) = (inlier_times[begin], inlier_times[i - 1]);
+            if first <= t0r && t0r <= last {
+                return SideSupport {
+                    approach_s: t0r - first,
+                    recede_s: last - t0r,
+                };
+            }
+            begin = i;
+        }
+    }
+    SideSupport::default()
+}
+
 /// Guided rounds from the curve `start` = (f0, v, d, t0r) and the band `band`: trace within the
 /// band, fit, make the fit the next curve and narrow the band to a few fit-RMS.
 fn guided_rounds(
@@ -479,6 +540,7 @@ fn guided_rounds(
     mut band: f64,
     roc: f64,
     p: &MeasureParams,
+    mut continuation: Option<SideContinuation>,
     fit_trace: &mut impl FnMut(&[f64], &[f64], f64, Side) -> Result<PreparedFit, String>,
 ) -> Guided {
     let c = p.c;
@@ -492,7 +554,13 @@ fn guided_rounds(
     };
     // From the latest fit, since a detection can rate a steep pass far too gently.
     let mut fitted_roc = roc;
-    for round in 0..p.rounds {
+    let rounds = if continuation.is_some() {
+        p.rounds.saturating_mul(2).min(MAX_CONTINUATION_ROUNDS)
+    } else {
+        p.rounds
+    };
+    let ordinary_rounds = p.rounds.min(rounds);
+    for round in 0..rounds {
         let steep_win = window_for_roc(fitted_roc);
         let steep = (steep_win < MIN_MAIN_WIN_S)
             .then(|| {
@@ -527,7 +595,7 @@ fn guided_rounds(
             p.min_z,
         );
         if tr.len() < MIN_GUIDED_POINTS {
-            if round == 0 {
+            if round == 0 || continuation.is_some() {
                 out.reasons
                     .push(format!("guided trace found only {} ridge points", tr.len()));
             }
@@ -539,8 +607,27 @@ fn guided_rounds(
                 model = Box::new(model_fn(b.f0, b.v, b.d, b.t0r, c));
                 fitted_roc = peak_received_chirp(b.f0, b.v, b.d, c);
                 band = (3.0 * b.rmse).clamp(1.0, band);
+                let stop = continuation.as_mut().is_some_and(|progress| {
+                    let g = gate(
+                        &tr,
+                        prepared.inlier_times(),
+                        &b,
+                        progress.det_t0r,
+                        progress.span,
+                        p,
+                    );
+                    let support = contiguous_side_support(prepared.inlier_times(), b.t0r);
+                    let covered = support.covered_s(p.min_side_s);
+                    let gained = covered > progress.covered_s + 0.5 * fr.spec.dt();
+                    progress.covered_s = covered;
+                    round + 1 >= ordinary_rounds
+                        && ((g.reasons.is_empty() && support.complete(p.min_side_s)) || !gained)
+                });
                 out.trace = tr;
                 out.prepared = Some(prepared);
+                if stop {
+                    break;
+                }
             }
             Err(e) => {
                 out.reasons.push(format!("fit: {e}"));
@@ -690,9 +777,90 @@ fn reseeded_rounds(
             (0.04 * b.f0).clamp(3.0, 12.0),
             peak_received_chirp(b.f0, b.v, b.d, c),
             p,
+            None,
             fit_trace,
         )
     })
+}
+
+/// Restore spectral support once for a steep fast fit whose only refusal is side coverage.
+/// Its initial detection can make the analysis band too narrow for the approach and leave the
+/// first few fits converging on the receding side. Continuing from that observed fit uses the
+/// ordinary frequency/window rules, original time/context bounds, and every original gate.
+/// A new spectrogram belongs to the event only if the continuation succeeds.
+fn continued_rounds(
+    fr: &Frames,
+    first: &Guided,
+    det_t0r: f64,
+    span: f64,
+    p: &MeasureParams,
+    fit_trace: &mut impl FnMut(&[f64], &[f64], f64, Side) -> Result<PreparedFit, String>,
+) -> Option<(Guided, Spec)> {
+    let fitted = first.prepared.as_ref()?;
+    let b = fitted.best();
+    let g = gate(&first.trace, fitted.inlier_times(), &b, det_t0r, span, p);
+    let roc = peak_received_chirp(b.f0, b.v, b.d, p.c);
+    let lacks_side = g.span_approach_s < p.min_side_s || g.span_recede_s < p.min_side_s;
+    if !first.reasons.is_empty()
+        || g.reasons.len() != 1
+        || !lacks_side
+        || !b.f0.is_finite()
+        // This repairs a fitted pass already beyond the primary bank's speed domain. A slower
+        // one-sided fit does not establish that gap; continuing it accepted wrong geometry in
+        // the late-pass control. Keep that separate measurement failure outside this recovery.
+        || b.v <= PRIMARY_MAX_SPEED_MPS
+        || window_for_roc(roc) >= MIN_MAIN_WIN_S
+    {
+        return None;
+    }
+    let (fmin, fmax) = measurement_band(b.f0, b.v, fr.sr, p.c);
+    let (fmin, fmax) = (fmin.min(fr.fmin), fmax.max(fr.fmax));
+    let win = window_for_roc(roc).clamp(MIN_MAIN_WIN_S, 2.0);
+    let mut spec = stft_band_db(
+        &fr.x[fr.s0..fr.s1],
+        fr.sr,
+        win,
+        p.hop_s,
+        fmin,
+        fmax,
+        p.df_max,
+        fr.ca,
+    )
+    .ok()?;
+    let background = spec.normalize_rows_with_offsets(None);
+    let frames = Frames {
+        fmin,
+        fmax,
+        spec: &spec,
+        background: &background,
+        ..*fr
+    };
+    let continued = guided_rounds(
+        &frames,
+        (b.f0, b.v, b.d, b.t0r),
+        (0.04 * b.f0).clamp(3.0, 12.0),
+        roc,
+        p,
+        Some(SideContinuation {
+            det_t0r,
+            span,
+            covered_s: contiguous_side_support(fitted.inlier_times(), b.t0r)
+                .covered_s(p.min_side_s),
+        }),
+        fit_trace,
+    );
+    let supported = continued.prepared.as_ref().is_some_and(|f| {
+        contiguous_side_support(f.inlier_times(), f.best().t0r).complete(p.min_side_s)
+    });
+    (passes(&continued, det_t0r, span, p) && supported).then_some((continued, spec))
+}
+
+fn measurement_band(f0: f64, v: f64, sr: u32, c: f64) -> (f64, f64) {
+    let v_hi = (v * 1.4).min(0.8 * c);
+    (
+        (f0 * c / (c + v_hi) * 0.93 - 3.0).max(15.0),
+        (f0 * c / (c - v_hi) * 1.07 + 3.0).min(sr as f64 * 0.45),
+    )
 }
 
 fn measure_with_fit(
@@ -701,6 +869,7 @@ fn measure_with_fit(
     det: &Detection,
     id: &str,
     p: &MeasureParams,
+    allow_continuation: bool,
     mut fit_trace: impl FnMut(&[f64], &[f64], f64, Side) -> Result<PreparedFit, String>,
 ) -> MeasuredEvent {
     let c = p.c;
@@ -708,9 +877,7 @@ fn measure_with_fit(
     let tau = det.d / det.v.max(10.0);
     let span = (4.0 * tau).clamp(45.0, 300.0);
     let (ta, tb) = ((det.t0r - span).max(0.0), (det.t0r + span).min(dur));
-    let v_hi = (det.v * 1.4).min(0.8 * c);
-    let fmin = (det.f0 * c / (c + v_hi) * 0.93 - 3.0).max(15.0);
-    let fmax = (det.f0 * c / (c - v_hi) * 1.07 + 3.0).min(sr as f64 * 0.45);
+    let (fmin, fmax) = measurement_band(det.f0, det.v, sr, c);
     let roc = peak_received_chirp(det.f0, det.v, det.d.max(50.0), c);
     let win = window_for_roc(roc).clamp(MIN_MAIN_WIN_S, 2.0);
     let (ca, cb) = ((ta - p.context_s).max(0.0), (tb + p.context_s).min(dur));
@@ -763,6 +930,7 @@ fn measure_with_fit(
         (0.04 * det.f0).clamp(3.0, 12.0),
         roc,
         p,
+        None,
         &mut fit_trace,
     );
     // Only a fit the gates refused because its trace held one side of the pass is followed afresh:
@@ -784,6 +952,16 @@ fn measure_with_fit(
         && passes(&second, det.t0r, span, p)
     {
         chosen = second;
+        quality.reseeded = true;
+    }
+    if refused
+        && !quality.reseeded
+        && allow_continuation
+        && let Some((continued, wide)) =
+            continued_rounds(&frames, &chosen, det.t0r, span, p, &mut fit_trace)
+    {
+        chosen = continued;
+        spec = wide;
         quality.reseeded = true;
     }
     let Guided {
@@ -822,7 +1000,7 @@ fn measure_with_fit(
         fit,
         trace,
         quality,
-        win_s: win,
+        win_s: spec.meta.win_s,
         spec: Some(spec),
     }
 }
@@ -1710,6 +1888,369 @@ mod tests {
     }
 
     #[test]
+    fn continuation_refuses_a_lost_trace_before_ordinary_rounds_complete() {
+        // Inject loss of the replacement short-window observations after a successful main
+        // trace. The main spectrum carries a physical ridge; replacement audio is silent.
+        // This isolates the short-trace exit without changing fit/gate thresholds.
+        let p = MeasureParams::default();
+        let start = (200.0, 200.0, 3000.0, 20.0);
+        let model = model_fn(start.0, start.1, start.2, start.3, p.c);
+        let t: Vec<_> = (0..396).map(|i| 0.25 + 0.1 * f64::from(i)).collect();
+        let f: Vec<_> = (128..=2048)
+            .map(|i| f64::from(i) * 4000.0 / 16_384.0)
+            .collect();
+        let mut db = Vec::with_capacity(t.len() * f.len());
+        for (row, &frequency) in f.iter().enumerate() {
+            for (col, &time) in t.iter().enumerate() {
+                let ridge = 18.0 * (-0.5 * ((frequency - model(time)) / 0.7).powi(2)).exp();
+                db.push((ridge + 0.08 * ((row * 37 + col * 13) as f64).sin()) as f32);
+            }
+        }
+        let spec = Spec {
+            t,
+            f,
+            db,
+            meta: crate::spectro::SpecMeta {
+                sr: 4000,
+                win_s: 2.0,
+                hop_s: 0.1,
+                nfft: 16_384,
+                df: 4000.0 / 16_384.0,
+                fmin: 31.25,
+                fmax: 500.0,
+                norm: "injected normalized physical ridge".into(),
+            },
+        };
+        let x = vec![0.0; 40 * 4000];
+        let background = vec![0.0; spec.nf()];
+        let frames = Frames {
+            x: &x,
+            sr: 4000,
+            s0: 0,
+            s1: x.len(),
+            ca: 0.0,
+            fmin: spec.meta.fmin,
+            fmax: spec.meta.fmax,
+            spec: &spec,
+            background: &background,
+            ta: 0.0,
+            tb: 40.0,
+        };
+        let one = MeasureParams {
+            rounds: 1,
+            ..p.clone()
+        };
+        // The initial chirp estimate keeps the main spectrum for round one; the measured
+        // fast fit then requests a shorter spectrum, whose injected observations are absent.
+        let first = guided_rounds(
+            &frames,
+            start,
+            4.0,
+            1.0,
+            &one,
+            None,
+            &mut prepare_constant_velocity,
+        );
+        assert!(passes(&first, start.3, 60.0, &p));
+        let fitted = first.prepared.as_ref().unwrap();
+        assert!(
+            contiguous_side_support(fitted.inlier_times(), fitted.best().t0r)
+                .complete(p.min_side_s)
+        );
+        assert!(
+            window_for_roc(peak_received_chirp(
+                fitted.best().f0,
+                fitted.best().v,
+                fitted.best().d,
+                p.c
+            )) < MIN_MAIN_WIN_S
+        );
+        let legacy = guided_rounds(
+            &frames,
+            start,
+            4.0,
+            1.0,
+            &p,
+            None,
+            &mut prepare_constant_velocity,
+        );
+        assert!(
+            passes(&legacy, start.3, 60.0, &p),
+            "legacy behavior changed"
+        );
+        let failed = guided_rounds(
+            &frames,
+            start,
+            4.0,
+            1.0,
+            &p,
+            Some(SideContinuation {
+                det_t0r: start.3,
+                span: 60.0,
+                covered_s: 0.0,
+            }),
+            &mut prepare_constant_velocity,
+        );
+        assert!(!passes(&failed, start.3, 60.0, &p));
+        assert_eq!(failed.reasons, ["guided trace found only 0 ridge points"]);
+        assert_eq!(
+            serde_json::to_value(&failed.trace).unwrap(),
+            serde_json::to_value(&first.trace).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(failed.prepared.as_ref().unwrap().best()).unwrap(),
+            serde_json::to_value(fitted.best()).unwrap()
+        );
+    }
+
+    #[test]
+    fn short_fast_passes_recover_the_same_detected_ridge_after_refusal() {
+        let pass = (118.0, 215.0, 900.0, 10.13);
+        let dp = DetectParams::default();
+        let p = MeasureParams::default();
+        for attenuation in [0, 6, 9, 12] {
+            let mut x = crate::detect::fast_pass_scene(
+                pass,
+                0.32 * 10.0f64.powf(-f64::from(attenuation) / 20.0),
+            );
+            x.truncate(30 * 4000);
+            let (ls, lin) = survey(&x, 4000, &dp).unwrap();
+            let detections = detect(&ls, &dp);
+            let primary = detections
+                .iter()
+                .find(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+                .unwrap();
+            let refined = refine(&lin, primary, p.c);
+            let legacy = measure_with_fit(
+                &x,
+                4000,
+                &refined,
+                "e0",
+                &p,
+                false,
+                prepare_constant_velocity,
+            );
+            assert!(
+                !legacy.is_aircraft_like(),
+                "{attenuation} dB: {:?}",
+                legacy.quality
+            );
+            assert_eq!(
+                legacy.quality.reasons.len(),
+                1,
+                "{attenuation} dB: {:?}",
+                legacy.quality
+            );
+            assert!(legacy.quality.span_approach_s < p.min_side_s);
+
+            let (_, events) = survey_measure_families(&x, &dp);
+            let independent = crate::search::independent_measured_events(&events, 0.0);
+            let diagnostic: Vec<_> = events
+                .iter()
+                .map(|e| (&e.quality, e.fit.as_ref().map(|f| f.best)))
+                .collect();
+            assert_eq!(independent.len(), 1, "{attenuation} dB: {diagnostic:?}");
+            let event = events.iter().find(|e| e.id == independent[0].id).unwrap();
+            let b = event.fit.as_ref().unwrap().best;
+            eprintln!(
+                "continued fast edge {attenuation} dB: {b:?}; {:?}",
+                event.quality
+            );
+            assert!(event.quality.reseeded);
+            assert_eq!(
+                serde_json::to_value(&event.detection).unwrap(),
+                serde_json::to_value(&refined).unwrap(),
+                "same detected event, {attenuation} dB"
+            );
+            assert!((b.f0 - pass.0).abs() < 0.3, "{attenuation} dB: {b:?}");
+            assert!((b.v - pass.1).abs() < 4.0, "{attenuation} dB: {b:?}");
+            assert!((b.d / pass.2 - 1.0).abs() < 0.08, "{attenuation} dB: {b:?}");
+            assert!((b.t0r - pass.3).abs() < 0.3, "{attenuation} dB: {b:?}");
+            let spec = event.spec.as_ref().unwrap();
+            assert!(
+                event
+                    .trace
+                    .f
+                    .iter()
+                    .all(|f| *f >= spec.f[0] && *f <= spec.f[spec.nf() - 1])
+            );
+            if attenuation == 0 {
+                let old_top = *legacy.spec.as_ref().unwrap().f.last().unwrap();
+                assert!(
+                    event.trace.f.iter().any(|f| *f > old_top),
+                    "the previously cropped approach was not restored"
+                );
+            }
+        }
+    }
+
+    fn assert_same_measurement(a: &MeasuredEvent, b: &MeasuredEvent) {
+        assert_eq!(
+            serde_json::to_value(a).unwrap(),
+            serde_json::to_value(b).unwrap()
+        );
+        match (&a.spec, &b.spec) {
+            (Some(a), Some(b)) => {
+                assert_eq!(a.t, b.t);
+                assert_eq!(a.f, b.f);
+                assert_eq!(a.db, b.db);
+                assert_eq!(
+                    serde_json::to_value(&a.meta).unwrap(),
+                    serde_json::to_value(&b.meta).unwrap()
+                );
+            }
+            (None, None) => {}
+            _ => panic!("spectrogram presence changed"),
+        }
+    }
+
+    #[test]
+    fn fitted_continuation_preserves_accepted_short_events() {
+        let dp = DetectParams::default();
+        let p = MeasureParams::default();
+        // The early 3 dB pass already succeeds through free tracing. Some accepted late-pass
+        // fits still have the wrong geometry: this recovery cannot replace accepted results,
+        // and must not claim to fix those distinct failures.
+        for (pass, attenuation) in [
+            ((118.0, 215.0, 900.0, 10.13), 3),
+            ((83.0, 245.0, 700.0, 19.37), 3),
+            ((83.0, 245.0, 700.0, 19.37), 6),
+        ] {
+            let mut x = crate::detect::fast_pass_scene(
+                pass,
+                0.32 * 10.0f64.powf(-f64::from(attenuation) / 20.0),
+            );
+            x.truncate(30 * 4000);
+            let (_, events) = survey_measure_families(&x, &dp);
+            assert_eq!(
+                crate::search::independent_measured_events(&events, 0.0).len(),
+                1
+            );
+            let mut preserved = 0;
+            for new in events {
+                let old = measure_with_fit(
+                    &x,
+                    4000,
+                    &new.detection,
+                    &new.id,
+                    &p,
+                    false,
+                    prepare_constant_velocity,
+                );
+                assert_same_measurement(&old, &new);
+                if old.is_aircraft_like() {
+                    preserved += 1;
+                    eprintln!(
+                        "unchanged accepted short pass v={} {attenuation} dB: {:?}",
+                        pass.1,
+                        new.fit.as_ref().unwrap().best
+                    );
+                }
+            }
+            assert!(
+                preserved > 0,
+                "v={} {attenuation} dB: no accepted control",
+                pass.1
+            );
+        }
+    }
+
+    #[test]
+    fn fitted_continuation_preserves_refused_late_fast_passes() {
+        let pass = (83.0, 245.0, 700.0, 19.37);
+        let dp = DetectParams::default();
+        let p = MeasureParams::default();
+        // A generic steep-ridge continuation promoted the 9 dB refusal to a wrong 159 m/s fit.
+        // Its original fit was inside the primary bank's domain, so it did not establish the
+        // missing-fast-bank failure this continuation repairs. The incoming retained-support
+        // gates also refuse the 12 dB row. Keep all three outputs unchanged; the already
+        // accepted late rows are checked separately above.
+        for attenuation in [0, 9, 12] {
+            let mut x = crate::detect::fast_pass_scene(
+                pass,
+                0.32 * 10.0f64.powf(-f64::from(attenuation) / 20.0),
+            );
+            x.truncate(30 * 4000);
+            let (_, events) = survey_measure_families(&x, &dp);
+            assert!(!events.is_empty(), "{attenuation} dB: no refused control");
+            assert!(crate::search::independent_measured_events(&events, 0.0).is_empty());
+            for event in events {
+                let old = measure_with_fit(
+                    &x,
+                    4000,
+                    &event.detection,
+                    &event.id,
+                    &p,
+                    false,
+                    prepare_constant_velocity,
+                );
+                assert!(
+                    !old.is_aircraft_like(),
+                    "{attenuation} dB: {:?}",
+                    old.quality
+                );
+                assert!(
+                    !event.is_aircraft_like(),
+                    "{attenuation} dB: {:?}",
+                    event.quality
+                );
+                assert_same_measurement(&old, &event);
+                eprintln!(
+                    "unchanged refused late pass {attenuation} dB: {:?}; {:?}",
+                    event.fit.as_ref().map(|f| f.best),
+                    event.quality.reasons
+                );
+                if attenuation == 9 {
+                    assert!(old.fit.as_ref().unwrap().best.v <= PRIMARY_MAX_SPEED_MPS);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_continuation_refuses_noise_tones_and_reversed_passes() {
+        let early = (118.0, 215.0, 900.0, 10.13);
+        let mut noise = crate::detect::fast_pass_scene(early, 0.0);
+        noise.truncate(30 * 4000);
+        let mut steady = noise.clone();
+        for (i, sample) in steady.iter_mut().enumerate() {
+            *sample += (0.32 * (std::f64::consts::TAU * 118.0 * i as f64 / 4000.0).sin()) as f32;
+        }
+        let mut cases = vec![("noise and hum", noise), ("steady tone", steady)];
+        for (label, pass) in [
+            ("reversed early", early),
+            ("reversed late", (83.0, 245.0, 700.0, 19.37)),
+        ] {
+            let mut reversed = crate::detect::fast_pass_scene(pass, 0.32);
+            reversed.truncate(30 * 4000);
+            reversed.reverse();
+            cases.push((label, reversed));
+        }
+        let dp = DetectParams::default();
+        let p = MeasureParams::default();
+        for (label, x) in cases {
+            let (_, events) = survey_measure_families(&x, &dp);
+            assert!(
+                crate::search::independent_measured_events(&events, 0.0).is_empty(),
+                "{label}"
+            );
+            for event in events {
+                assert!(!event.is_aircraft_like(), "{label}: {:?}", event.quality);
+                let old = measure_with_fit(
+                    &x,
+                    4000,
+                    &event.detection,
+                    &event.id,
+                    &p,
+                    false,
+                    prepare_constant_velocity,
+                );
+                assert_same_measurement(&old, &event);
+            }
+        }
+    }
+
+    #[test]
     fn fast_passes_survive_detection_refinement_and_measurement() {
         use crate::detect::{FAST_PASSES, PRIMARY_MAX_SPEED_MPS, fast_pass_scene};
         let dp = DetectParams::default();
@@ -2019,7 +2560,7 @@ mod tests {
         assert!(first.quality.ok, "{:?}", first.quality.reasons);
         p.rounds = 3;
         let mut rounds = 0;
-        let interrupted = measure_with_fit(&x, sr, &det, "e1", &p, |t, f, c, side| {
+        let interrupted = measure_with_fit(&x, sr, &det, "e1", &p, true, |t, f, c, side| {
             rounds += 1;
             if rounds == 1 {
                 prepare_constant_velocity(t, f, c, side)
@@ -2042,7 +2583,7 @@ mod tests {
         assert_eq!(interrupted.quality.reasons, ["fit: injected fit failure"]);
 
         // If the first fit fails, keep that trace for inspection and report no fit.
-        let failed = measure_with_fit(&x, sr, &det, "e1", &p, |_, _, _, _| {
+        let failed = measure_with_fit(&x, sr, &det, "e1", &p, true, |_, _, _, _| {
             Err("injected fit failure".into())
         });
         assert!(failed.fit.is_none());
@@ -2818,6 +3359,7 @@ mod tests {
                 free_reseed: false,
                 ..p.clone()
             },
+            true,
             |t, f, c, side| {
                 let prepared = prepare_constant_velocity(t, f, c, side)?;
                 retained = prepared.inlier_times().to_vec();

@@ -43,6 +43,52 @@ at that commit, not per-change commits.
 - **Limits:** the separate grazing-pass hearing failure remains below the existing threshold.
   No field-accuracy, reference/wrong-date replay or complete CLI/workspace claim is made.
 
+### Continue fast fitted ridges that still lack approach or recede coverage
+
+- After the original guided and free-trace attempts fail, renew spectral support from the
+  original fitted geometry when its speed already exceeds the primary bank's 175 m/s limit,
+  the ridge is steep, and side coverage is its only failed gate. Continue that same
+  observed ridge for at most twice the configured fitting rounds, capped at six. Complete
+  the ordinary rounds first, then stop on acceptance or when missing-side coverage stops growing.
+- Require both eight-second sides on the retained continuous ridge through the fitted CPA.
+  Reuse the existing three-second gap limit; isolated retained points cannot supply a missing
+  approach. This corrects a premature 9 dB acceptance and allows the fixed 12 dB case to
+  finish converging, without changing a physical-accuracy bound or introducing a tuned cutoff.
+- A continuation that loses its ridge records a failure even after a successful fitting round,
+  preventing premature acceptance of the preceding fit. A focused failure-injection unit
+  regression covers this exit and preserves the original non-continuation behavior.
+- Retain the original detection, analysis interval, normalization context and CPA-drift
+  limit. Every existing physical and trace-quality gate still applies. Successful recovery
+  retains its actual spectrum and uses the existing `reseeded` marker; failed recovery
+  preserves the original refusal. Existing accepted measurements retain their full output.
+- Add full survey/detection/measurement/independent-event recovery checks for short fast
+  passes, exact accepted-output comparisons including spectra, and noise, steady-tone and
+  reversed-pass controls. The detector, masks, candidate caps and confidence thresholds
+  remain unchanged.
+- **Validation:** all four new PCM pipeline regressions and the failed-retrace unit control pass
+  on the pinned nightly through genuine RCH. The four previously refused 30-second 215 m/s scenes each recover one
+  independent event, with maximum errors of 0.145 Hz, 0.206 m/s, 3.44 m and 0.0108 s in tone,
+  speed, distance and arrival time. Existing accepted outputs and spectra compare exactly;
+  the late 0, 9 and 12 dB refusals also compare exactly. These tests cover all ten fixed
+  early/late attenuation scenes, and the four interference controls supply no aircraft-like
+  event. The unchanged accuracy assertions first failed on the original production path.
+- Core all-target Clippy passes with warnings denied. The unchanged production selftest module,
+  freshly linked to the final real core/types libraries and using FFmpeg, recovers the correct
+  two flights with 1.312094 m position error inside its 75 m radius and +0.014154 s clock error.
+- The complete early/late attenuation check caught a wrong 159 m/s acceptance from a late
+  245 m/s source in the initial broader retry. Restricting continuation to the existing
+  fast-fit domain preserves that refusal; a permanent regression covers the counterexample.
+- **Limits:** accepted late fast-pass misfits remain unchanged and unresolved. This recovery
+  supplies more usable audio measurements; it does not establish field accuracy or repair
+  the detector's earlier-ownership masking by itself. Full application compilation remains
+  memory-blocked in unchanged `asupersync`, and the workspace formatting check still reports
+  differences. Release-CLI, full-workspace and reference/wrong-date/field replays are not claimed.
+- The existing harmonic-family and longer 245 m/s accuracy tests still fail. Continuation-off/on
+  diagnostics reproduce the same selected events and spectra. In the longer case, continuation
+  adds an accurate alternative, but selection keeps the existing 83.37627 Hz fit against 83 Hz;
+  its unchanged 0.3 Hz assertion still fails. The diagnostic's broader all-event-equality
+  assertion also failed at that newly recovered alternative; it is not a passing regression.
+
 ### Recover fast Doppler measurements with physically matched spectral windows
 
 - Size the initial, fitted-round and free-reseed spectrograms from the maximum received chirp,
