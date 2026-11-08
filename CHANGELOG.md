@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover faint Doppler passes in short, swelled recordings
+
+- Add a final contrast-first edge-template scan after every existing detector stage. Short clips
+  can now supply a measurable pass even when the ordinary image is compressed by a broadband
+  swell and neither half can cover a full-length contrast template.
+- Reuse the existing edge coverage guard, accepted-curve mask, suppression, strong threshold,
+  candidate budget and detection cap. Original detections retain their order and priority;
+  new seeds carry `from_contrast` through the existing expanded-detection confidence guard.
+- Add four known-answer 30-second PCM recoveries, an exact original-output prefix comparison
+  across 16 scenes at both 1- and 60-detection caps, and 14 reversed/steady/noise controls through
+  physical measurement and independent-event selection. The new recovery regression first
+  failed on the unchanged detector because it produced no seed.
+- **Validation:** all three new native core tests pass on the pinned nightly through genuine
+  RCH. The four recovered passes' largest absolute errors are 1.79 m, 0.114 m/s and 0.0092 s
+  for distance, speed and arrival time. Focused formatting, whitespace and staged bug-scan
+  review found no new production issue.
+- **Limits:** the separate existing fast-edge recovery assertion still fails on the native
+  baseline; this change does not loosen it. No new field-accuracy or confidence-calibration
+  claim is made, and reference/wrong-date recording replays remain unavailable.
+
 ### Preserve separate flight visits when cropping cached tracks
 
 - Keep disjoint retained sections as separate flight legs. Filtering can no longer invent

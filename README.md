@@ -949,7 +949,7 @@ Design notes:
   suppression, residual and marking rules, so every detection the passes accept is the same with or
   without it. `refine` keeps the 10 s half. The stage runs only on the frames near each end, and not at
   all when the passes stop at three times the detection cap.
-- **A compressed image is scored once more, contrast first.** The swell that compresses an image also
+- **Compressed images also use contrast-first recovery.** The swell that compresses an image also
   shrinks the ridges of the pass that made it. It raises every row together, which inflates each row's MAD
   before the frame contrast can take the swell out. On Livermore's N1387U_R44, a 157 Hz tone 33 dB over its
   neighbours at the CPA had a row z of 1 to 1.5, and nothing in its image scored over 2.88. An image under the 0.5
@@ -960,7 +960,13 @@ Design notes:
   recording is under the floor, so no null run tests them, and an answer resting on one counts as measured
   past the old line. On swells of noise alone the stage adds nothing up to 30 dB. From 35 dB it adds strong
   curves of its own, and the measurement gates refuse them.
-- **A final bank covers faster subsonic passes.** After the primary, edge and contrast stages, templates
+  After every existing stage, including the fast banks, a final contrast-first edge scan can recover
+  a pass whose short clip cannot cover a full template. It uses the ordinary edge bank's coverage guard,
+  the same residual ownership mask and strong line, and only the remaining candidate budget and
+  detection slots. Earlier detections retain priority; recovered seeds carry `from_contrast`, preserving
+  the existing guard on answers that depend on expanded detection. Four fixed 30-second synthetic
+  clips now reach physical measurement where the original stage sequence found no detection (Testing).
+- **A supplemental bank covers faster subsonic passes.** After the primary, edge and contrast stages, templates
   continue the original speed spacing above 175 m/s, up to the existing measurement bound of 0.8 times
   sound speed (about 194, 215, 238 and 263 m/s at 343 m/s). Full-length fast templates run first, followed
   by their short edge templates near the recording's ends. The fast edge scan uses the ordinary edge
@@ -972,7 +978,8 @@ Design notes:
   A faster coarse seed counts as measured past the old line even if refinement lowers its speed.
   A fixed 14-scene synthetic signal-strength sweep establishes one new faint 215 m/s full-length
   recovery with no baseline event; it does not establish recovery of a real field miss. The new
-  fast-edge PCM recovery assertions remain unrun (Testing).
+  fast-edge PCM recovery assertion still fails in the native baseline: its early 215 m/s case adds
+  no fast-edge seed. The contrast-edge change does not repair or weaken that separate assertion (Testing).
 - **STFT working storage stays bounded as recordings grow.** Frames transform into a reusable block of
   at most 256 columns and 4 MiB of frequency values, then copy into the final row-major spectrogram.
   A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
@@ -1241,6 +1248,30 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Contrast-first recovery for short recordings
+
+The final contrast-edge stage is checked against the complete previous detector stage sequence,
+with recovery disabled only in the test oracle. Four fixed 30-second PCM clips combine a faint
+300 Hz, 90 m/s pass at 900 m with 20 or 25 dB broadband swells, near either recording edge.
+The previous detector finds no seed; the new path must produce one independent aircraft-like
+measurement and recover tone, speed, distance and arrival time within fixed physical tolerances.
+The regression failed on the old production path before adding the stage.
+
+Additional regressions compare every original detection field and harmonic prefix across 16
+physical scenes at caps of 1 and 60, require new seeds to clear the strong threshold, and preserve
+the cap and original ordering. Fourteen controls exercise reversed passes, steady tones and
+noise swells through survey, detection, refinement, measurement and independent-event selection.
+These controls must yield no aircraft-like event. They do not establish field accuracy or
+confidence calibration; no reference or wrong-date recording replay is available in this checkout.
+
+All three new tests pass in the actual `fdop-core` test binary on the pinned nightly through
+genuine RCH. Across the four recovered clips, the largest absolute errors are 1.79 m in distance,
+0.114 m/s in speed and 0.0092 s in arrival time. The same recovery test failed before the
+production change. Staged bug-scan findings were reviewed; new warnings concern test assertions
+and fixture allocations. The changed lines meet formatting checks; three existing formatting
+differences in the separate fast-edge tests remain. This is a focused core result, not a full
+workspace or CLI selftest pass.
 
 ### Midnight flight coverage: native data validation
 

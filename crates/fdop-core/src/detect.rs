@@ -118,6 +118,7 @@ pub struct LogSpec {
     /// row's MAD before the frame contrast can remove the swell, which shrinks its own ridge;
     /// taking the frame contrast first keeps the swell out of the row statistics.
     /// [`detect_counted`] scores it after the primary and edge banks, on what `data` left unexplained.
+    /// A final edge scan recovers short-clip coverage after every existing stage has had its turn.
     pub contrast: Option<Vec<f32>>,
 }
 
@@ -561,9 +562,9 @@ pub struct Detection {
 }
 
 /// Run the template banks. Primary/edge detections come first, then the contrast stage's, then
-/// the fast full-length and fast edge stages'; each group is strongest first. All clear
-/// `thr_silence_db`, and the supplemental groups also clear `thr_db`. Family primaries are
-/// the measurement candidates.
+/// the fast full-length and fast edge stages', then contrast edge recovery. Each group is
+/// strongest first. All clear `thr_silence_db`; supplemental groups also clear `thr_db`.
+/// Family primaries are the measurement candidates.
 pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
     detect_counted(ls, p).0
 }
@@ -571,6 +572,15 @@ pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
 /// [`detect`], plus how many accepted candidates the cap `p.max_detections` cut. The count is a
 /// lower bound when the scan stopped at three times the cap.
 pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize) {
+    detect_counted_impl(ls, p, true)
+}
+
+// Keep the complete original stage sequence available for output-equivalence tests.
+fn detect_counted_impl(
+    ls: &LogSpec,
+    p: &DetectParams,
+    recover_contrast_edges: bool,
+) -> (Vec<Detection>, usize) {
     let (nt, nr) = (ls.nt(), ls.nr());
     if nt < 8 || nr < 8 {
         return (Vec::new(), 0);
@@ -754,6 +764,57 @@ pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize)
             added.truncate(room);
             out.extend(added);
         }
+    }
+    // Contrast-first evidence can reveal a pass in a clip too short for any full template.
+    // Run its edge templates last, so no original stage loses its candidates or their order.
+    if recover_contrast_edges
+        && !edge.is_empty()
+        && out.len() < p.max_detections
+        && remaining_candidates > 0
+        && let Some(contrast) = ls.contrast.as_deref()
+    {
+        let view = LogSpec {
+            t: ls.t.clone(),
+            freqs: ls.freqs.clone(),
+            data: contrast.to_vec(),
+            bins_per_octave: ls.bins_per_octave,
+            hop_s: ls.hop_s,
+            scale: ls.scale,
+            gain: ls.gain,
+            contrast: None,
+        };
+        // The primary residual is no longer needed; reuse its allocation for this image.
+        lp.copy_from_slice(contrast);
+        zero_known(&mut lp, &known);
+        let windows = edge_windows(&view, p.min_half_s);
+        let (bs, bi) = score_bank(&view, &edge, &lp, &windows);
+        let threshold = p.thr_db.max(p.thr_silence_db);
+        let mut cand: Vec<usize> = (0..nr * nt)
+            .filter(|&k| bs[k] as f64 >= threshold)
+            .collect();
+        cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
+        // This last stage can consume only what the shared candidate budget left.
+        cand.truncate(remaining_candidates);
+        let before = out.len();
+        let room = p.max_detections - before;
+        accept_candidates(
+            &view,
+            p,
+            &edge,
+            (&bs, &bi),
+            &cand,
+            threshold,
+            &mut known,
+            &mut out,
+        );
+        let mut added = out.split_off(before);
+        for d in added.iter_mut() {
+            d.from_contrast = true;
+        }
+        added.sort_by(|a, b| b.score.total_cmp(&a.score));
+        cut += added.len().saturating_sub(room);
+        added.truncate(room);
+        out.extend(added);
     }
     for (i, d) in out.iter_mut().enumerate() {
         d.id = i;
@@ -1183,6 +1244,145 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn contrast_edge_passes_recover_after_every_existing_stage() {
+        let p = DetectParams::default();
+        let (f0, v, d, t0r) = SWELL_PASS;
+        // These 30 s crops have no cell with the full bank's required coverage on both
+        // sides. The faint pass is visible only after contrast-first normalization.
+        for start in [3, 13] {
+            for swell in [20.0, 25.0] {
+                let source = swell_scene(0.08, swell);
+                let x = &source[start * 4000..(start + 30) * 4000];
+                let (ls, lin) = survey(x, 4000, &p).unwrap();
+                assert!(ls.contrast.is_some());
+                let (old, old_cut) = detect_counted_impl(&ls, &p, false);
+                assert!(old.is_empty(), "{start}/{swell}: {old:?}");
+                let (new, cut) = detect_counted(&ls, &p);
+                assert_eq!(old_cut, 0);
+                assert_eq!(cut, 0);
+                let events = measure_edge_families(x, &lin, &new);
+                let independent = crate::search::independent_measured_events(&events, 0.0);
+                assert_eq!(independent.len(), 1, "{start}/{swell}: {new:?}");
+                for event in events.iter().filter(|e| e.is_aircraft_like()) {
+                    assert!(event.detection.from_contrast);
+                    assert_eq!(event.detection.half_s, p.edge_half_s);
+                    assert!(new[event.detection.id].score >= p.thr_db);
+                    let best = event.fit.as_ref().unwrap().best;
+                    assert!((best.f0 - f0).abs() < 0.3, "{start}/{swell}: {best:?}");
+                    assert!((best.v - v).abs() < 4.0, "{start}/{swell}: {best:?}");
+                    assert!((best.d / d - 1.0).abs() < 0.08, "{start}/{swell}: {best:?}");
+                    assert!(
+                        (best.t0r - (t0r - start as f64)).abs() < 0.3,
+                        "{start}/{swell}: {best:?}"
+                    );
+                    eprintln!("contrast edge start={start} swell={swell}: {best:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_edge_recovery_preserves_existing_stages_and_shared_cap() {
+        let p = DetectParams::default();
+        let mut scenes = vec![
+            fast_pass_scene((118.0, 120.0, 2400.0, 90.0), 0.16),
+            fast_pass_scene(FAST_PASSES[2], 0.16),
+            edge_clip(30.0, EDGE_PASS, 0.3, (0.0, 0.0, 0.0)),
+            swell_scene(0.08, 25.0),
+        ];
+        for start in [3, 13] {
+            for swell in [20.0, 25.0] {
+                for amplitude in [0.04, 0.08, 0.16] {
+                    let source = swell_scene(amplitude, swell);
+                    scenes.push(source[start * 4000..(start + 30) * 4000].to_vec());
+                }
+            }
+        }
+        for (scene, x) in scenes.iter().enumerate() {
+            let (ls, _) = survey(x, 4000, &p).unwrap();
+            for cap in [1, p.max_detections] {
+                let params = DetectParams {
+                    max_detections: cap,
+                    ..p.clone()
+                };
+                let (old, old_cut) = detect_counted_impl(&ls, &params, false);
+                let (new, cut) = detect_counted(&ls, &params);
+                assert!(new.len() >= old.len() && new.len() <= cap, "scene {scene}");
+                assert!(cut >= old_cut, "scene {scene}");
+                for (before, after) in old.iter().zip(&new) {
+                    // A later harmonic may extend a family's members; every existing field
+                    // and every pre-existing harmonic remains in its original order.
+                    assert!(after.harmonics.starts_with(&before.harmonics));
+                    let mut prefix = after.clone();
+                    prefix.harmonics.clone_from(&before.harmonics);
+                    assert_eq!(
+                        serde_json::to_vec(before).unwrap(),
+                        serde_json::to_vec(&prefix).unwrap(),
+                        "scene {scene}"
+                    );
+                }
+                let added = &new[old.len()..];
+                assert!(
+                    added.iter().all(|d| d.from_contrast
+                        && d.half_s == p.edge_half_s
+                        && d.score >= p.thr_db)
+                );
+                assert!(added.windows(2).all(|w| w[0].score >= w[1].score));
+                if old.len() == cap || ls.contrast.is_none() {
+                    assert!(added.is_empty(), "scene {scene}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_edges_keep_swell_noise_flat_tones_and_reversed_passes_out() {
+        let p = DetectParams::default();
+        for start in [3, 13] {
+            let mut cases = Vec::new();
+            for swell in [20.0, 25.0] {
+                let source = swell_scene(0.08, swell);
+                let mut reversed = source[start * 4000..(start + 30) * 4000].to_vec();
+                reversed.reverse();
+                cases.push((format!("reversed {swell}"), reversed));
+            }
+            for swell in [20.0, 25.0, 35.0, 40.0] {
+                let source = swell_scene(0.0, swell);
+                cases.push((
+                    format!("noise {swell}"),
+                    source[start * 4000..(start + 30) * 4000].to_vec(),
+                ));
+            }
+            let source = swell_scene(0.0, 25.0);
+            let tone = source[start * 4000..(start + 30) * 4000]
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| {
+                    x + (0.4 * (std::f64::consts::TAU * 300.0 * i as f64 / 4000.0).sin()) as f32
+                })
+                .collect();
+            cases.push(("steady tone".into(), tone));
+            for (name, x) in cases {
+                let (ls, lin) = survey(&x, 4000, &p).unwrap();
+                let detections = detect(&ls, &p);
+                let events = measure_edge_families(&x, &lin, &detections);
+                let diagnostics: Vec<_> = events
+                    .iter()
+                    .map(|e| (&e.quality, e.fit.as_ref().map(|f| f.best)))
+                    .collect();
+                assert!(
+                    events.iter().all(|e| !e.is_aircraft_like()),
+                    "start {start}, {name}: {diagnostics:?}"
+                );
+                assert!(
+                    crate::search::independent_measured_events(&events, 0.0).is_empty(),
+                    "start {start}, {name}"
+                );
+            }
+        }
     }
 
     #[test]
