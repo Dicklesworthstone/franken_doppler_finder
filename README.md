@@ -1123,15 +1123,18 @@ bit-for-bit; the size of the end-to-end speedup has not yet been measured on a r
 Pair joining now discards duplicate flight/place/clock seeds as they are generated, using bounded
 batches of 4,096 input hypotheses and ordered worker chunks. Previously it held every compatible
 raw pair before deduplicating: a dense bucket could exhaust memory before the quick-check budget
-was considered. The hash index and distinct surviving seeds still consume memory; this is not a
-fixed total-memory bound. The same first representative, candidate order, spatial and clock cells,
-and complete comparison are retained. No detection cap, search budget or confidence line changes.
+was considered. The hash index, deduplication keys, active worker chunks and quick survivors still
+consume memory; this is not a fixed total-memory bound. The same first representative, candidate
+order, spatial and clock cells, and complete comparison are retained. No detection cap, search
+budget or confidence line changes.
 
-Each event pair now reaches the quick trace check before the next pair is joined, so rejected
-seeds do not accumulate across the entire search. The joined-seed budget still counts rejected
-seeds and stops at the same complete-pair boundary. Hypothesis clouds are released before fine
-scoring, and fine-grid input seeds before confirmation and refinement. These later stages retain
-their surviving candidates; the changes do not impose an additional search cut.
+Complete representatives now reach the quick trace check in groups of at most 4,096 seeds while
+their event pair is still being joined. Rejected seeds therefore do not accumulate until the end
+of even one large pair. This bounds the completed-output buffer, rather than the complete search:
+the join's deduplication keys and active worker chunks still grow with the data. The joined-seed
+budget counts rejected seeds and stops at the same complete-pair boundary. Hypothesis clouds are
+released before fine scoring, and fine-grid input seeds before confirmation and refinement.
+Later stages retain their surviving candidates; the changes impose no additional search cut.
 
 **Pair-join component measurement, 2026-11-07.** The
 `dense_pair_join_with_one_million_raw_matches` workload has 1,024 hypotheses on each side,
@@ -1150,7 +1153,9 @@ was shared, and these are not whole-recording timings or total `fdop` memory mea
 The updated `dense_pair_join_keeps_one_seed_without_raw_pair_storage` regression also passed
 with 16,777,216 compatible pairs and 9,344 KiB peak RSS; its original-version counterpart was
 not run under the shared 8 GiB memory limit. No end-to-end memory reduction is claimed from
-the additional per-pair quick-scoring and early-release changes.
+the additional per-pair quick-scoring and early-release changes. These measurements also predate
+streaming completed outputs into the quick check; that follow-up has native ordered-output,
+bounded-delivery, budget and positive-localization regressions, but no new recording measurement.
 
 The exact-curve scorer now builds one conservative ECEF box per shortlisted trajectory and reuses it
 across candidate locations, clock alternatives, refinement and decoy windows. The box encloses the full

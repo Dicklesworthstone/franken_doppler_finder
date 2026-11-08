@@ -691,9 +691,12 @@ struct Joined {
 // Indexed chunks keep the original input/bucket order, including the first representative.
 const JOIN_BATCH_HYPOTHESES: usize = 4096;
 const JOIN_CHUNK_HYPOTHESES: usize = 64;
+// Score complete representatives promptly; one dense event pair must not retain all
+// of its rejected seeds until the join ends. This is a buffer size, not a search cut.
+const JOIN_OUTPUT_SEEDS: usize = 4096;
 
 #[allow(clippy::too_many_arguments)]
-fn join(
+fn join_batches(
     hi: &[Hyp],
     hj: &[Hyp],
     ei: usize,
@@ -702,9 +705,10 @@ fn join(
     tt: f64,
     same_flight_min_dt: f64,
     t_base: f64,
-) -> Vec<Joined> {
+    mut consume: impl FnMut(&[Joined]),
+) -> usize {
     if hi.is_empty() || hj.is_empty() {
-        return Vec::new();
+        return 0;
     }
     let key = |e: f32, n: f32, ts: f32| {
         (
@@ -729,7 +733,8 @@ fn join(
     };
     let r2 = r * r;
     let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
+    let mut ready = Vec::with_capacity(JOIN_OUTPUT_SEEDS);
+    let mut joined = 0usize;
     for batch in hj.chunks(JOIN_BATCH_HYPOTHESES) {
         let parts: Vec<Vec<Joined>> = batch
             .par_chunks(JOIN_CHUNK_HYPOTHESES)
@@ -791,12 +796,21 @@ fn join(
                 if let Some(k) = cell(&j)
                     && seen.insert(k)
                 {
-                    out.push(j);
+                    ready.push(j);
+                    if ready.len() == JOIN_OUTPUT_SEEDS {
+                        joined += ready.len();
+                        consume(&ready);
+                        ready.clear();
+                    }
                 }
             }
         }
     }
-    out
+    if !ready.is_empty() {
+        joined += ready.len();
+        consume(&ready);
+    }
+    joined
 }
 
 /// Merge duplicate place/clock seeds and rank every flight pair's best cell before its next.
@@ -2125,41 +2139,49 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             (j, i, hj, hi)
         };
         let tt = evs[i].t_tol + evs[j].t_tol + slop;
-        let joined = join(ha, hb, a, b, r_join, tt, SAME_FLIGHT_MIN_DT_S, t_base);
-        progress(&format!(
-            "join {}x{}: {}",
-            evs[a].id,
-            evs[b].id,
-            joined.len()
-        ));
-        funnel.joined += joined.len();
-        // Quick-score this pair before joining the next. Rejected seeds then leave the
-        // working set immediately; surviving seeds retain the same pair/input order.
-        let checked: Vec<(Joined, f64)> = joined
-            .par_iter()
-            .filter_map(|j| {
-                let k = done.fetch_add(1, Ordering::Relaxed);
-                if k.is_multiple_of(500_000) && k > 0 {
-                    progress(&format!("quick check {k}/{} joined so far", funnel.joined));
-                }
-                let (la, lo) = frame.latlon(j.e, j.n);
-                if !p.region.contains(la, lo) {
-                    return None;
-                }
-                let o = observer(la, lo, inp.coarse_dem);
-                let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
-                let pe = eval_point(&o, &assign, &evs, tracks, p, atmo, true, true, true)?;
-                let worst = pe.chis.iter().map(|c| c.chi).fold(0.0, f64::max);
-                let qs: f64 = pe
-                    .chis
-                    .iter()
-                    .zip(&assign)
-                    .map(|(c, a)| ev_weight(&evs[a.0]) * (1.0 - c.chi / p.quick_chi).max(0.0))
-                    .sum();
-                (worst <= p.quick_chi).then_some((*j, qs))
-            })
-            .collect();
-        quick.extend(checked);
+        let joined = join_batches(
+            ha,
+            hb,
+            a,
+            b,
+            r_join,
+            tt,
+            SAME_FLIGHT_MIN_DT_S,
+            t_base,
+            |batch| {
+                funnel.joined += batch.len();
+                // Only quick survivors outlive this output batch. The join still visits
+                // the complete event pair, and emits the original representative order.
+                let checked: Vec<(Joined, f64)> = batch
+                    .par_iter()
+                    .filter_map(|j| {
+                        let k = done.fetch_add(1, Ordering::Relaxed);
+                        if k.is_multiple_of(500_000) && k > 0 {
+                            progress(&format!("quick check {k}/{} joined so far", funnel.joined));
+                        }
+                        let (la, lo) = frame.latlon(j.e, j.n);
+                        if !p.region.contains(la, lo) {
+                            return None;
+                        }
+                        let o = observer(la, lo, inp.coarse_dem);
+                        let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
+                        let pe = eval_point(&o, &assign, &evs, tracks, p, atmo, true, true, true)?;
+                        let worst = pe.chis.iter().map(|c| c.chi).fold(0.0, f64::max);
+                        let qs: f64 = pe
+                            .chis
+                            .iter()
+                            .zip(&assign)
+                            .map(|(c, a)| {
+                                ev_weight(&evs[a.0]) * (1.0 - c.chi / p.quick_chi).max(0.0)
+                            })
+                            .sum();
+                        (worst <= p.quick_chi).then_some((*j, qs))
+                    })
+                    .collect();
+                quick.extend(checked);
+            },
+        );
+        progress(&format!("join {}x{}: {}", evs[a].id, evs[b].id, joined));
         pairs_done += 1;
         // The budget counts every joined seed, including rejected ones, and still stops
         // only after a complete event pair. Streaming must not grant extra comparisons.
@@ -3345,6 +3367,27 @@ mod tests {
     use crate::track::straight_track;
     use fdop_types::FlatElevation;
 
+    // Collect only in tests, so the exhaustive oracle still checks the complete ordered
+    // output. The production caller scores and releases each bounded output batch.
+    #[allow(clippy::too_many_arguments)]
+    fn join(
+        hi: &[Hyp],
+        hj: &[Hyp],
+        ei: usize,
+        ej: usize,
+        r: f64,
+        tt: f64,
+        same_flight_min_dt: f64,
+        t_base: f64,
+    ) -> Vec<Joined> {
+        let mut out = Vec::new();
+        let count = join_batches(hi, hj, ei, ej, r, tt, same_flight_min_dt, t_base, |batch| {
+            out.extend_from_slice(batch);
+        });
+        assert_eq!(count, out.len());
+        out
+    }
+
     // Exhaustive reference: visit every input pair in the original bucket/insertion order.
     // No hash join, parallel chunks or intermediate candidate collection is used here.
     fn exhaustive_join(hi: &[Hyp], hj: &[Hyp], r: f64, tt: f64, t_base: f64) -> Vec<Joined> {
@@ -3450,6 +3493,59 @@ mod tests {
         }
         assert!(join(&[], &hj, 2, 5, 600.0, 20.0, 30.0, 0.0).is_empty());
         assert!(join(&hi, &[], 2, 5, 600.0, 20.0, 30.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn pair_join_streams_complete_pair_in_bounded_batches() {
+        let h = Hyp {
+            trk: 0,
+            t_e: 100.0,
+            e: 100.0,
+            n: 100.0,
+            t_s: 200.0,
+        };
+        let hi: Vec<_> = (0..4).map(|trk| Hyp { trk, ..h }).collect();
+        let hj: Vec<_> = (100..8305).map(|trk| Hyp { trk, ..h }).collect();
+        // All 32,820 flight pairs are distinct. Verify every ordered output without
+        // retaining them, across both output boundaries and three input batches.
+        for workers in [1, 4] {
+            let mut visited = 0usize;
+            let mut batches = 0usize;
+            let mut largest = 0usize;
+            let count = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(|| {
+                    join_batches(&hi, &hj, 2, 5, 600.0, 20.0, 30.0, 0.0, |batch| {
+                        assert!(!batch.is_empty());
+                        assert!(batch.len() <= JOIN_OUTPUT_SEEDS);
+                        batches += 1;
+                        largest = largest.max(batch.len());
+                        for j in batch {
+                            assert_eq!(
+                                *j,
+                                Joined {
+                                    ei: 2,
+                                    ej: 5,
+                                    ti: (visited % hi.len()) as u32,
+                                    tj: 100 + (visited / hi.len()) as u32,
+                                    te_i: 100.0,
+                                    te_j: 100.0,
+                                    e: 100.0,
+                                    n: 100.0,
+                                    t_s: 200.0,
+                                }
+                            );
+                            visited += 1;
+                        }
+                    })
+                });
+            assert_eq!(visited, hi.len() * hj.len());
+            assert_eq!(count, visited);
+            assert!(batches > 1);
+            assert!(largest < count);
+        }
     }
 
     fn check_dense_pair_join(size: usize) {

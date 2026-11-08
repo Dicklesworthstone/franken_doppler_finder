@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Score joined seeds before one complete event pair fills memory
+
+- Deliver completed representatives directly to the quick trace check in groups of at most
+  4,096. A large pair no longer retains a complete output vector of seeds that the quick check
+  will reject; only its survivors carry forward. The deduplication keys, active worker chunks
+  and hypothesis clouds still consume memory, so this is not a total-memory cap.
+- Preserve every representative, output order and existing scoring arithmetic. The joined
+  budget still counts rejected seeds and stops after the complete pair, with the same warnings
+  and margin-gate consequence. No candidate cap or confidence threshold changes.
+- Add a native regression that consumes all 32,820 distinct flight pairs without collecting
+  their outputs, across three input batches and multiple output groups, under one and four
+  workers. The existing exhaustive ordered-output regression also passes in the full core binary.
+- **Validation:** the pinned-nightly core binary also passes the rejected-seed budget and
+  two-flyover localization/refinement regressions. The latter retains correct A/B identities,
+  0.2 m observer error and a 75 m reported radius on its synthetic scene. This follow-up has
+  no new whole-recording memory or runtime measurement.
+
 ### Restore only the three-bin correction: no climb to a raw peak several bins away
 
 - Remove the raw-peak climb added in 82f26a9. When the three-bin raw correction is unavailable, the
