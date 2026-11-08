@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Match curve-bank weights to retarded flight geometry
+
+- Compute the bank's inverse-range weights at emission time, consistently with its Doppler
+  frequencies and exact trajectory scoring. Using the reception-time offset as the aircraft's
+  emission offset had calibrated the bank to different amplitude weights, including for a
+  straight constant-speed flight.
+- Preserve the existing sample times, frequency rows, path durations, score formulas, coverage
+  requirements and confidence thresholds. Real windows and decoy windows share the correction.
+- Add actual `TrackModel` comparisons at four speeds and three ranges, with time and position
+  translations, plus harmonic PCM requiring the same recovered emitted tone and raw score
+  from the bank and physical trajectory.
+- **Validation:** both new native regressions fail on the original production path and pass
+  with the correction. The fast PCM previously scored 94.35496 in the bank versus 81.89703
+  on the physical path; they now agree within 0.001 at the same emitted-tone row. The existing
+  two-fast-flight location/clock/verdict test and its reversed/steady-tone controls also pass.
+  The pre-existing grazing audibility failure remains below its unchanged 6.9-nat line, and
+  the short-circuit fixture retains the same 340.027 m displacement and 2.5 s clock error.
+  These synthetic checks do not establish complete-suite or real-recording accuracy.
+
 ### Recover faint Doppler passes in short, swelled recordings
 
 - Add a final contrast-first edge-template scan after every existing detector stage. Short clips

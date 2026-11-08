@@ -25,7 +25,7 @@
 //! - **Both halves of the pass must light up** (`Stat::Min`, as in `detect`): a flat tone only
 //!   lights one.
 
-use crate::physics::cv_ratio_rel_t0r;
+use crate::physics::{cv_radial, cv_ratio_rel_t0r, retarded_tau};
 use crate::spectro::{median_f32, stft_band_db};
 use crate::track::{Prop, TrackBounds, TrackModel};
 use fdop_types::atmo::Atmosphere;
@@ -589,7 +589,11 @@ fn path(p: &MatchParams, v: f64, d: f64, dt: f64, bpo: f64) -> Vec<Sample> {
     (-n..=n)
         .map(|j| {
             let u = j as f64 * dt;
-            let r = (d * d + v * v * u * u).sqrt();
+            // u is reception time relative to the delayed CPA. Range, like the
+            // Doppler ratio, must come from emission time so the bank null and
+            // exact trajectory score use the same physical amplitude weights.
+            let emitted = retarded_tau(u + d / BASE_C, 0.0, v, d, BASE_C);
+            let (r, _) = cv_radial(emitted, v, d);
             Sample {
                 dt: j,
                 dr: (bpo * cv_ratio_rel_t0r(u, v, d, BASE_C).log2()).round() as i32,
@@ -2706,6 +2710,141 @@ mod tests {
             atmo: &atmo,
         };
         run(&inp, p, say)
+    }
+
+    /// Independent trajectory oracle: use the same physical solver as exact scoring,
+    /// without the constant-velocity bank's analytic range or frequency functions.
+    fn track_path(
+        template: &[Sample],
+        tr: &TrackModel,
+        observer: V3,
+        arrival: f64,
+        dt: f64,
+        p: &MatchParams,
+    ) -> Vec<Sample> {
+        template
+            .iter()
+            .map(|s| {
+                let (_, range, ratio) = tr
+                    .solve_emission_p(
+                        arrival + f64::from(s.dt) * dt,
+                        observer,
+                        &Prop::still(BASE_C),
+                        None,
+                    )
+                    .expect("the complete straight track covers the bank path");
+                Sample {
+                    dt: s.dt,
+                    dr: (p.bins_per_octave * ratio.log2()).round() as i32,
+                    w: (p.r_ref_m / range).min(1.0) as f32,
+                    approach: s.dt < 0,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bank_path_weights_match_retarded_track_geometry() {
+        let p = MatchParams::default();
+        let enu = Enu::new(SCENE_AT.0, SCENE_AT.1, 0.0);
+        for speed in [28.0, 80.0, 215.0, 263.0] {
+            for distance in [400.0, 1500.0, 7999.5] {
+                let template = path(&p, speed, distance, p.hop_s, p.bins_per_octave);
+                for (shift_s, shift_m) in [(0.0, [0.0; 3]), (17.25, [12_000.0, -2300.0, 500.0])] {
+                    let cpa = SCENE_AT.2 + shift_s;
+                    let mut tr = straight_track(
+                        &enu,
+                        [0.0, distance, MIC_HEIGHT_M],
+                        [speed, 0.0, 0.0],
+                        cpa,
+                        cpa - 600.0,
+                        cpa + 600.0,
+                        4.0,
+                    );
+                    let mut observer = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+                    for axis in 0..3 {
+                        observer[axis] += shift_m[axis];
+                        for position in &mut tr.pos {
+                            position[axis] += shift_m[axis];
+                        }
+                    }
+                    let exact = track_path(
+                        &template,
+                        &tr,
+                        observer,
+                        cpa + distance / BASE_C,
+                        p.hop_s,
+                        &p,
+                    );
+                    for (bank, trajectory) in template.iter().zip(&exact) {
+                        assert_eq!(bank.dr, trajectory.dr);
+                        assert_eq!(bank.approach, trajectory.approach);
+                        assert!(
+                            (bank.w - trajectory.w).abs() < 2e-6,
+                            "v={speed}, d={distance}, shift={shift_s}, frame={}: bank {}, exact {}",
+                            bank.dt,
+                            bank.w,
+                            trajectory.w
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bank_path_scores_match_the_exact_fast_pcm_curve() {
+        let speed = 263.0;
+        let distance = 1000.0;
+        let cpa = 100.0;
+        let tr = scene_track(
+            [0.0, distance, MIC_HEIGHT_M],
+            [speed, 0.0, 0.0],
+            cpa,
+            -300.0,
+            700.0,
+        );
+        let c = scene_with_visible_harmonics(vec![tr], &[115.0], 200.0, 240.0);
+        let p = MatchParams::default();
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let template = path(&p, speed, distance, im.dt, im.bpo);
+        let observer = geodetic_to_ecef(c.lat, c.lon, MIC_HEIGHT_M);
+        let arrival = c.clock + cpa + distance / BASE_C;
+        let exact = track_path(&template, &c.tracks[0], observer, arrival, im.dt, &p);
+        let tau = ((arrival - c.clock - im.t0) / im.dt).round() as i64;
+        let r0 = im.row_of(p.f0_lo).round() as usize;
+        let nf0 = im.row_of(p.f0_hi).round() as usize + 1 - r0;
+        let score = |samples: &[Sample]| {
+            let full = samples.iter().fold((0.0, 0.0), |(a, b), s| {
+                if s.approach {
+                    (a + s.w * s.w, b)
+                } else {
+                    (a, b + s.w * s.w)
+                }
+            });
+            sweep_tau(
+                &im,
+                samples,
+                tau,
+                r0,
+                nf0,
+                p.stat,
+                &mut SweepBuffers::new(nf0),
+                full,
+                None,
+            )
+            .expect("both halves of the audible pass are covered")
+        };
+        let bank_score = score(&template);
+        let exact_score = score(&exact);
+        let tone = im.f_lo * ((r0 + exact_score.1) as f64 / im.bpo).exp2();
+        assert!((tone / 115.0).ln().abs() < std::f64::consts::LN_2 / im.bpo);
+        assert!(exact_score.0 > 0.0);
+        assert_eq!(bank_score.1, exact_score.1);
+        assert!(
+            (bank_score.0 - exact_score.0).abs() < 0.001,
+            "bank {bank_score:?}, exact physical curve {exact_score:?}"
+        );
     }
 
     #[test]

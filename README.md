@@ -361,6 +361,9 @@ in `crates/fdop-core/src/curvematch.rs`:
   needs at least 25% of the full squared weight on each half within the time/frequency image;
   an out-of-band neighbouring tone cannot discard its usable pixels. Reused range-difference
   buffers accumulate clipped coverage, while fully covered paths keep scalar normalization.
+  The bank's inverse-range weights use the aircraft's position at retarded emission time,
+  matching the physical amplitude convention of exact trajectory scoring. The received
+  frequency and the distance weight therefore describe the same emitted sound.
   Real windows, null calibration and decoy windows all use this same scorer.
 - **Tone by type.** For common propeller types a tone the propeller can make (blades × rpm / 60, from typical
   published figures) earns more and other tones less. The weights are divided by where this recording's best
@@ -1248,6 +1251,27 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Retarded curve-bank weights (2026-11-08): physical scoring agreement
+
+The actual pinned-nightly core crate passes both new regressions through genuine RCH:
+`bank_path_weights_match_retarded_track_geometry` compares every frequency row and range weight
+against the trajectory solver in 24 speed/range/time/position cases, and
+`bank_path_scores_match_the_exact_fast_pcm_curve` recovers the same emitted tone and raw score
+from a 263 m/s harmonic PCM pass. These are straight trajectories in still air at 343 m/s.
+
+Both tests fail before the repair. The first geometry mismatch is already present at 28 m/s;
+the fast PCM gives a bank score of 94.35496 against the physical trajectory's 81.89703 at the
+same emitted-tone row. After the repair, the raw scores agree within the unchanged 0.001
+tolerance. The existing fast-crossing test also passes: both correct flights, observer within
+200 m, clock within 2 s, a standing decoy verdict, and refusal of reversed/steady-tone controls.
+
+This corrects amplitude weighting in the bank's empirical calibration, not the remaining
+spatial-evidence bias. The grazing test still fails its unchanged 6.9-nat hearing requirement:
+6.2908 nats after the repair versus 6.3341 before. The short-circuit/crossing-flight regression
+still selects the same point 340.027 m away and clock 2.5 s early while hearing all four passes.
+No complete core/workspace suite, release
+CLI selftest, reference/wrong-date replay or field-accuracy improvement is established here.
 
 ### Contrast-first recovery for short recordings
 
