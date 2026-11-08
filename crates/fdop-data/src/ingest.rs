@@ -479,6 +479,21 @@ impl<'de> Deserialize<'de> for Row {
                 drain_map(a)?;
                 Ok(Row::default())
             }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<Row, E> {
+                Ok(Row::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Row, E> {
+                Ok(Row::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Row, E> {
+                Ok(Row::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Row, E> {
+                Ok(Row::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Row, E> {
+                Ok(Row::default())
+            }
             fn visit_unit<E: de::Error>(self) -> Result<Row, E> {
                 Ok(Row::default())
             }
@@ -1180,6 +1195,77 @@ pub(crate) mod tests {
         assert!(
             old.points[0].alt_geom_msl.is_nan() && (old.points[0].alt_baro_m - 1219.2).abs() < 0.01
         );
+    }
+
+    #[test]
+    fn malformed_scalar_rows_preserve_usable_trace() {
+        let sp = IngestSpec {
+            bbox: BBox::new(0.0, 0.0, 0.1, 0.1),
+            t_start: T0,
+            t_end: T0 + 300.0,
+            ..spec()
+        };
+        let point = |t, lon| {
+            serde_json::json!([
+                t,
+                0.05,
+                lon,
+                4000,
+                100,
+                90,
+                0,
+                0,
+                null,
+                "adsb_icao",
+                4100,
+                0
+            ])
+        };
+        let rows = vec![
+            point(0, 0.02),
+            point(10, 0.03),
+            serde_json::json!([30, null, null, "ground"]),
+            point(60, 0.04),
+            point(70, 0.05),
+        ];
+        let read = |rows: &[serde_json::Value]| {
+            let json =
+                serde_json::json!({"icao":"000001", "t":"PC12", "timestamp":T0, "trace":rows});
+            let tar = tar_of(&[("trace_full_000001.json", gz(&json.to_string()))]);
+            ingest_reader(tar.as_slice(), "prod", &sp, &|_| {}).unwrap()
+        };
+        let expected = read(&rows);
+        assert_eq!(expected.0[0].points.len(), 4);
+        let expected_store = crate::build::build_store(vec![expected.clone()], &sp, vec![]);
+        assert_eq!(expected_store.legs.len(), 2);
+        for malformed in [
+            serde_json::json!(true),
+            serde_json::json!(-1),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(1.5),
+            serde_json::json!("bad row"),
+            serde_json::Value::Null,
+            serde_json::json!({"bad": [true, null]}),
+        ] {
+            let mut mixed = vec![malformed.clone()];
+            for row in &rows {
+                mixed.push(row.clone());
+                mixed.push(malformed.clone());
+            }
+            let actual = read(&mixed);
+            assert_eq!(actual.1.parse_errors, 0, "row={malformed}");
+            assert_eq!(actual.1.kept_aircraft, 1, "row={malformed}");
+            assert_eq!(actual.0[0].points, expected.0[0].points);
+            let store = crate::build::build_store(vec![actual], &sp, vec![]);
+            assert_eq!(
+                store.legs.len(),
+                2,
+                "ground boundary lost for row={malformed}"
+            );
+            for (leg, expected_leg) in store.legs.iter().zip(&expected_store.legs) {
+                assert_eq!(leg.points, expected_leg.points);
+            }
+        }
     }
 
     #[test]

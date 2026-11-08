@@ -911,6 +911,17 @@ one; the first recognized type still takes precedence over a later conflicting k
 Only flight segments that actually join share this metadata. Separate flights of the same
 aircraft and flights whose type remains unknown are still excluded by the strict policy.
 
+Within a day's feed merge, the first recognized aircraft type in feed-preference order takes
+precedence over an unrecognized designator from another feed. If no feed recognizes the type,
+the first nonempty designator is retained and the usual unknown-type policy applies. This does
+not change which feed supplies duplicate positions; boundary-only records cannot supply identity.
+
+Malformed scalar entries inside an otherwise valid aircraft trace are skipped individually,
+like the existing null and object entries. Valid surrounding reports and ground/new-leg markers
+are retained, rather than losing the entire aircraft. Invalid JSON still fails parsing. These
+recoveries apply during fresh ingestion; existing day stores are not automatically rebuilt to
+restore previously discarded aircraft or improve their cached type metadata.
+
 When neighboring track stores overlap, reports within the existing 0.05 s duplicate interval
 prefer non-MLAT positions even if an MLAT report arrived slightly earlier. The merge preserves
 the previous flight-leg joins and same-quality choices, including interleaved overlaps from

@@ -333,11 +333,14 @@ fn build_store_inner(
             merges += 1;
         }
         group.sort_by_key(|a| feed_of(&a.feed).rank());
+        // Recover a recognized designator from another airborne source when the
+        // preferred feed's type is unknown, retaining feed order among known types.
         let typ = group
             .iter()
             .filter(|a| !a.points.is_empty())
             .map(|a| a.typ.as_str())
-            .find(|t| !t.is_empty())
+            .filter(|t| !t.is_empty())
+            .min_by_key(|t| engine_class(t) == EngineClass::Unknown)
             .unwrap_or("")
             .to_string();
         let reg = group
@@ -1344,6 +1347,99 @@ mod tests {
         assert_eq!(bb.points[0].alt_src, alt_src::BARO_CORRECTED);
         assert!((bb.points[0].alt_m - (2000.0 * 0.3048 + off) as f32).abs() < 0.05);
         assert_eq!(store.meta.stats["baro_raw"], 0);
+    }
+
+    #[test]
+    fn same_day_type_recovery_keeps_first_recognized_feed() {
+        let prod = seam_part(T0, T0, "prod", &[seam_row(0.0, 0.02), seam_row(10.0, 0.03)]);
+        let mlat = seam_part(
+            T0,
+            T0,
+            "mlat",
+            &[seam_row(10.0, 0.08), seam_row(20.0, 0.04)],
+        );
+        let reference = build_store(vec![prod.clone(), mlat.clone()], &seam_spec(T0), vec![]);
+        assert_eq!(reference.legs.len(), 1);
+        assert_eq!(reference.n_points(), 3);
+        for (prod_type, mlat_type, expected_type) in [
+            ("ZZZZ9", "PC12", "PC12"),
+            ("", "PC12", "PC12"),
+            ("PC12", "C172", "PC12"),
+            ("C172", "PC12", "C172"),
+            ("ZZZZ9", "ZZZZ8", "ZZZZ9"),
+            ("", "ZZZZ8", "ZZZZ8"),
+            ("", "", ""),
+        ] {
+            let mut parts = vec![prod.clone(), mlat.clone()];
+            for ((aircraft, _), typ) in parts.iter_mut().zip([prod_type, mlat_type]) {
+                aircraft[0].typ = typ.into();
+                aircraft[0].engine = engine_class(typ);
+            }
+            for reverse in [false, true] {
+                let mut inputs = parts.clone();
+                if reverse {
+                    inputs.reverse();
+                }
+                for keep_unknown in [false, true] {
+                    let sp = IngestSpec {
+                        keep_unknown,
+                        ..seam_spec(T0)
+                    };
+                    let store = build_store(inputs.clone(), &sp, vec![]);
+                    let engine = engine_class(expected_type);
+                    if engine == EngineClass::Unknown && !keep_unknown {
+                        assert!(store.legs.is_empty());
+                        continue;
+                    }
+                    assert_eq!(store.legs.len(), 1, "prod={prod_type}, mlat={mlat_type}");
+                    let leg = &store.legs[0];
+                    assert_eq!(leg.typ, expected_type);
+                    assert_eq!(leg.engine, engine);
+                    assert_eq!(leg.source, "prod+mlat");
+                    assert_eq!(leg.points, reference.legs[0].points);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_day_type_recovery_ignores_boundary_only_sources() {
+        let mut boundary = seam_part(
+            T0,
+            T0,
+            "prod",
+            &[serde_json::json!([-10, null, null, "ground"])],
+        );
+        assert!(boundary.0[0].points.is_empty());
+        boundary.0[0].typ = "C172".into();
+        boundary.0[0].engine = EngineClass::Piston;
+        boundary.0[0].reg = "BOUNDARY_ONLY".into();
+        let mut airborne = seam_part(
+            T0,
+            T0,
+            "mlat",
+            &[seam_row(20.0, 0.04), seam_row(30.0, 0.05)],
+        );
+        airborne.0[0].typ = "ZZZZ9".into();
+        airborne.0[0].engine = EngineClass::Unknown;
+        for keep_unknown in [false, true] {
+            let sp = IngestSpec {
+                keep_unknown,
+                ..seam_spec(T0)
+            };
+            let store = build_store(vec![boundary.clone(), airborne.clone()], &sp, vec![]);
+            if keep_unknown {
+                assert_eq!(store.legs.len(), 1);
+                let leg = &store.legs[0];
+                assert_eq!(leg.typ, "ZZZZ9");
+                assert_eq!(leg.engine, EngineClass::Unknown);
+                assert!(leg.reg.is_empty());
+                assert_eq!(leg.points.len(), 2);
+                assert_ne!(leg.points[0].flags & pt_flags::NEW_LEG, 0);
+            } else {
+                assert!(store.legs.is_empty());
+            }
+        }
     }
 
     #[test]

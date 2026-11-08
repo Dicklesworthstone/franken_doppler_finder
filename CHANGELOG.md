@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve usable aircraft through malformed rows and incomplete feed metadata
+
+- Skip non-array scalar trace entries consistently with existing null/object handling. A boolean, number or
+  string in an otherwise valid trace no longer discards every good report for that aircraft. Pending ground
+  and new-leg boundaries survive the skipped row; malformed JSON remains a parse failure.
+- Prefer the first recognized type in the established same-day feed order. An unknown nonempty designator
+  from production no longer hides a recognized secondary-feed type or causes strict ingestion to drop its
+  flight. Preserve preferred duplicate positions, recognized-feed priority, unknown fallback and boundary-only
+  metadata exclusion. Existing caches are not silently rebuilt.
+- Add real archive/build regressions for all JSON scalar categories, exact retained geometry across a ground
+  boundary, both input orders, strict/permissive unknown policies and boundary-only sources.
+- Validation: all 30 native ingestion/build component tests pass (27 existing, 3 new, none ignored). The
+  scalar and recognized-type regressions both fail against the original production snippets and pass with
+  these fixes; the boundary-only control passes in both. The temporary driver imports the actual source
+  modules and exact shared support definitions with workspace-pinned dependency artifacts; it does not
+  exercise the HTTP runtime or full crate. Full-crate tests and workspace Clippy remain blocked before
+  application checks by SIGKILL while compiling unchanged runtime dependencies. Changed-file formatting
+  and whitespace checks pass; no end-to-end or field-accuracy claim is made from component tests.
+
 ### Analyse a recording once for all decoy-clock searches
 
 - Share the original media information, decoded duration, detections, measured traces and spectra across the
