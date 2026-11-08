@@ -393,6 +393,16 @@ in `crates/fdop-core/src/curvematch.rs`:
   for collisions and cached within the exact score; their unmasked maxima bound which profiles can
   improve it. A new claim invalidates pending residual scores before they can be accepted. Real and
   decoy windows use this same recovery.
+  Each retained mode with at least two independently heard visits then fits its location and
+  shared clock on a fixed set of observed frames. The frames, range weights, approach/recede
+  partition and per-flight timestamp offsets stay fixed during this fit, so moving farther from
+  a circling aircraft cannot win merely by adding audio to its window. Fractional frequency rows
+  fit within the original emitted tone's one-row neighbourhood. Every retained real and decoy
+  mode receives the same procedure, including modes outside the expensive evidence-refinement
+  budget; disabling refinement still disables it. The ordinary calibrated scorer then evaluates
+  the fitted point at that shared clock with its original per-flight timing slack. The point is
+  adopted only if each fitted source visit remains independently heard, matched one-to-one by
+  track, observed arrival support and tone neighbourhood. Otherwise the original mode remains.
   Flights are screened for exact scoring using their interpolated paths over the catalogue span, at the
   closest-approach sampling interval. This retains sparse passes that enter the search area between logged
   ADS-B positions.
@@ -1270,6 +1280,41 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Curve localization on fixed observations
+
+The original circuit-and-crossing fixture contains three visits by a circling aircraft and a
+separate crossing flight. All four were heard, but the score preferred a displaced observer even
+when given the true point. Moving farther from the circuit increased the amount of audio scored;
+the crossing flight also gained calibrated evidence despite a poorer raw match.
+
+The new local geometry fit compares each candidate mode's locations on the same observations,
+then recomputes the existing evidence at the fitted point. The unchanged known-answer regression
+`coarse_stamps_feed_a_short_circuit_and_crossing_flight_into_the_match` now passes:
+
+| Synthetic result | Before physical fitting | Final guarded fit |
+|---|---:|---:|
+| Observer error | 340.026957 m | 35.336527 m |
+| Recording-clock error | -2.500 s | -0.500 s |
+| Independently heard visits | 4 | 4 |
+
+The original requirements remain under 150 m position error, under 2 s clock error, the crossing
+flight and at least two distinct circuit visits. A separate multiple-mode test covers a limited
+evidence-refinement budget; it passed before the placement change and is coverage, not a red/green claim.
+
+Extending the existing overlapping-flight PCM fixture through physical fitting caught a source
+reassignment: final rescoring swapped two tones. The final implementation preserves the original
+mode if its fitted source visits cannot all retain their independent identities and original tone
+neighbourhoods. The distinct-tone, absent-source and same-tone variants now pass, alongside all
+their original acoustic-assignment assertions.
+
+All ten focused native checks pass on the integrated core through genuine RCH: those three tests,
+real/decoy symmetry, alternative clocks, fast crossings and their refusal controls, duplicate-event
+protection, per-flight timestamp errors, simultaneous distinct tones, and noise versus decoys.
+Core all-target Clippy also passes with warnings denied on the integrated source.
+The existing empirical calibration, hearing threshold, confidence gates and radius rules remain
+unchanged. These are synthetic curve-matching results; field/reference/wrong-date replays and a
+complete CLI/workspace result are not established. The separate grazing-pass hearing failure remains.
+
 ### Fast-pass measurement (2026-11-08): recovery and sensitivity limits
 
 The PCM oracle independently solves the light-time equation for emission phase and 1/r amplitude;
@@ -1382,10 +1427,11 @@ same emitted-tone row. After the repair, the raw scores agree within the unchang
 tolerance. The existing fast-crossing test also passes: both correct flights, observer within
 200 m, clock within 2 s, a standing decoy verdict, and refusal of reversed/steady-tone controls.
 
-This corrects amplitude weighting in the bank's empirical calibration, not the remaining
-spatial-evidence bias. The grazing test still fails its unchanged 6.9-nat hearing requirement:
+That bank-weight correction did not resolve the spatial-evidence bias. The grazing test still
+fails its unchanged 6.9-nat hearing requirement:
 6.2908 nats after the repair versus 6.3341 before. The short-circuit/crossing-flight regression
-still selects the same point 340.027 m away and clock 2.5 s early while hearing all four passes.
+selected a point 340.027 m away and clock 2.5 s early while hearing all four passes on that build;
+the fixed-observation geometry fit described above now repairs this separate regression.
 No complete core/workspace suite, release
 CLI selftest, reference/wrong-date replay or field-accuracy improvement is established here.
 

@@ -19,6 +19,30 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Refine curve locations on fixed observations
+
+- Separate local geometry fitting from template-dependent evidence support. After the existing
+  evidence search, fit each mode's physical Doppler paths on fixed observed frames, weights,
+  approach/recede partitions and per-flight timestamp offsets. Fractional frequency rows fit
+  within each original emitted tone's one-row neighbourhood.
+- Apply the procedure to every eligible retained real and decoy mode, including modes outside
+  the expensive evidence-refinement budget. Preserve the existing refinement-disable controls,
+  candidate limits, calibrated scorer, per-flight slack, hearing threshold and radius rules.
+- Recompute evidence at the fitted point and shared clock. Require a one-to-one match to every
+  fitted independent source visit, with the same track, observed arrival support and tone
+  neighbourhood; otherwise retain the original mode. An actual overlap regression caught
+  swapped tone identities before this guard, and all original assignment assertions remain.
+- **Validation:** ten focused native core checks pass through genuine RCH on integrated main.
+  The existing circuit-plus-crossing regression improves from 340.026957 m / -2.500 s error
+  to 35.336527 m / -0.500 s, retaining all four heard visits and the original accuracy bounds.
+  Controls cover overlap/absence/same-tone assignment, retained modes, real/decoy symmetry,
+  alternative clocks, fast crossings, duplicate events, per-flight timing, simultaneous tones
+  and noise. The multiple-mode case is coverage-only; the original localization failure and
+  the intermediate source swap both have genuine native red/green evidence.
+  Core all-target Clippy passes with warnings denied on the integrated source.
+- **Limits:** the separate grazing-pass hearing failure remains below the existing threshold.
+  No field-accuracy, reference/wrong-date replay or complete CLI/workspace claim is made.
+
 ### Recover fast Doppler measurements with physically matched spectral windows
 
 - Size the initial, fitted-round and free-reseed spectrograms from the maximum received chirp,

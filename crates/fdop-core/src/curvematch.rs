@@ -1939,6 +1939,236 @@ fn refine_point(
     Some(cur)
 }
 
+/// Fit the already heard curves on common data. Evidence finds a plausible collection of
+/// passes, but its template-dependent null and d/v support are not a location likelihood:
+/// moving farther from a circling aircraft can win simply by summing a longer recording.
+/// Freeze the independent passes' frames, weights, half partitions and timestamp offsets,
+/// then fit their physical Doppler paths with fractional frequency rows. This score never
+/// becomes evidence; the unchanged scorer must justify the resulting point and clock.
+fn polish_point(
+    inp: &MatchInputs<'_>,
+    p: &MatchParams,
+    bank: &Bank,
+    idx: &[ExactTrack],
+    lat: f64,
+    lon: f64,
+    seed: Exact,
+) -> (f64, f64, Exact) {
+    let original = (lat, lon, seed);
+    if original.2.n_heard < 2 || p.refine_modes == 0 || p.refine_steps_m.is_empty() {
+        return original;
+    }
+    struct FitPass<'a> {
+        tr: &'a TrackModel,
+        row: f64,
+        offset_s: f64,
+        centre_s: f64,
+        t_e: f64,
+        height_m: f64,
+        frames: Vec<(usize, bool, f32)>,
+        gains: (f32, f32),
+    }
+    let im = inp.image;
+    let z = inp.fine_dem.elev_m(lat, lon) + MIC_HEIGHT_M;
+    let x = geodetic_to_ecef(lat, lon, z);
+    let enu = Enu::new(lat, lon, z);
+    let mut passes = Vec::new();
+    for ps in &original.2.passes {
+        if !counts_as_heard(ps.value, ps.nats, ps.shared) {
+            continue;
+        }
+        let Some(tr) = idx
+            .iter()
+            .map(|t| &inp.tracks[t.index])
+            .find(|tr| tr.key == ps.key)
+        else {
+            continue;
+        };
+        let t_guess = original.2.clock + ps.t_audio - ps.slant_m / BASE_C;
+        let Some(cpa) = tr.cpa_near(x, t_guess, 2.0 * p.sample_s) else {
+            continue;
+        };
+        let (_, _, height_m) = ecef_to_geodetic(tr.pos_at(cpa.t_e));
+        let medium = inp.atmo.medium(lat, lon, cpa.t_e, z, height_m);
+        let prop = Prop::from_medium(&medium, &enu);
+        let half = (p.half_k * ps.slant_m / ps.speed_mps).clamp(p.half_min_s, p.half_max_s);
+        let centre = ps.t_audio - ps.clock_offset_s;
+        let first = (((centre - half - im.t0) / im.dt).ceil() as i64).max(0);
+        let last = (((centre + half - im.t0) / im.dt).floor() as i64).min(im.nt as i64 - 1);
+        let mut frames = Vec::new();
+        let (mut wa, mut wb) = (0f32, 0f32);
+        let (mut warm, mut hint) = (None, 0);
+        for frame in first..=last {
+            let time = im.t0 + frame as f64 * im.dt;
+            if let Some((t_e, r, _)) = tr.solve_emission_sweep(
+                original.2.clock + ps.clock_offset_s + time,
+                x,
+                &prop,
+                warm,
+                &mut hint,
+                1e-4,
+            ) {
+                warm = Some(t_e);
+                let w = (p.r_ref_m / r).min(1.0) as f32;
+                let approach = time < centre;
+                if approach {
+                    wa += w * w;
+                } else {
+                    wb += w * w;
+                }
+                frames.push((frame as usize, approach, w));
+            } else {
+                warm = None;
+            }
+        }
+        if wa > 0.0 && wb > 0.0 {
+            passes.push(FitPass {
+                tr,
+                row: im.row_of(ps.f0_hz),
+                offset_s: ps.clock_offset_s,
+                centre_s: centre,
+                t_e: cpa.t_e,
+                height_m,
+                frames,
+                gains: (1.0 / wa.sqrt(), 1.0 / wb.sqrt()),
+            });
+        }
+    }
+    if passes.len() < 2 {
+        return original;
+    }
+    let score = |la: f64, lo: f64, clock: f64| -> Option<f32> {
+        let z = inp.fine_dem.elev_m(la, lo) + MIC_HEIGHT_M;
+        let x = geodetic_to_ecef(la, lo, z);
+        let enu = Enu::new(la, lo, z);
+        let mut total = 0.0;
+        for pass in &passes {
+            let medium = inp.atmo.medium(la, lo, pass.t_e, z, pass.height_m);
+            let prop = Prop::from_medium(&medium, &enu);
+            let (mut warm, mut hint) = (None, 0);
+            let mut rows = Vec::with_capacity(pass.frames.len());
+            for &(frame, _, _) in &pass.frames {
+                let t_r = clock + pass.offset_s + im.t0 + frame as f64 * im.dt;
+                let (t_e, _, ratio) = pass
+                    .tr
+                    .solve_emission_sweep(t_r, x, &prop, warm, &mut hint, 1e-4)?;
+                warm = Some(t_e);
+                rows.push(pass.row + im.bpo * ratio.log2());
+            }
+            let mut best = f32::NEG_INFINITY;
+            // The emitted row and Doppler offset each rounded by at most half a row.
+            // Fit their combined quantization error locally, without jumping harmonics.
+            for shift in -8..=8 {
+                let offset = f64::from(shift) / 8.0;
+                let (mut a, mut b) = (0f32, 0f32);
+                let mut visible = true;
+                for (&row, &(frame, approach, w)) in rows.iter().zip(&pass.frames) {
+                    let u = row + offset;
+                    if !(0.0..(im.nu - 1) as f64).contains(&u) {
+                        visible = false;
+                        break;
+                    }
+                    let r = u.floor() as usize;
+                    let mix = (u - r as f64) as f32;
+                    let left = im.comb[frame * im.nu + r];
+                    let right = im.comb[frame * im.nu + r + 1];
+                    let v = w * (left + mix * (right - left));
+                    if approach {
+                        a += v;
+                    } else {
+                        b += v;
+                    }
+                }
+                if visible {
+                    best = best.max(stat_of(p.stat, a * pass.gains.0, b * pass.gains.1));
+                }
+            }
+            if !best.is_finite() {
+                return None;
+            }
+            total += best;
+        }
+        Some(total)
+    };
+    let Some(initial) = score(lat, lon, original.2.clock) else {
+        return original;
+    };
+    let mut cur = (lat, lon, original.2.clock, initial);
+    for &step in &p.refine_steps_m {
+        for _ in 0..refine_moves(p.nms_m, step) {
+            let (mlat, mlon) = m_per_deg(cur.0);
+            let centre = cur;
+            let best = (-2i32..=2)
+                .flat_map(|i| (-2i32..=2).map(move |j| (i, j)))
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .filter_map(|(i, j)| {
+                    let la = centre.0 + f64::from(i) * step / mlat;
+                    let lo = centre.1 + f64::from(j) * step / mlon;
+                    if !inp.region.contains(la, lo) {
+                        return None;
+                    }
+                    std::iter::once(0)
+                        .chain((-p.clock_sweep_frames..=p.clock_sweep_frames).filter(|&k| k != 0))
+                        .filter_map(|k| {
+                            let clock = centre.2 + k as f64 * im.dt;
+                            if clock < inp.start_lo || clock > inp.start_hi {
+                                return None;
+                            }
+                            score(la, lo, clock).map(|s| (la, lo, clock, s))
+                        })
+                        .max_by(|a, b| {
+                            a.3.total_cmp(&b.3).then_with(|| {
+                                (b.2 - centre.2).abs().total_cmp(&(a.2 - centre.2).abs())
+                            })
+                        })
+                })
+                .max_by(|a, b| a.3.total_cmp(&b.3));
+            match best {
+                Some(next) if next.3 > cur.3 => cur = next,
+                _ => break,
+            }
+        }
+    }
+    if cur.3 <= initial {
+        return original;
+    }
+    // Do not let the significance sweep undo the fitted shared clock. Per-flight timing
+    // slack, ownership, empirical nulls and the independent-hearing threshold stay intact.
+    let fixed_clock = MatchParams {
+        clock_sweep_frames: 0,
+        ..p.clone()
+    };
+    let Some(e) = score_exact(inp, &fixed_clock, bank, idx, cur.0, cur.1, cur.2) else {
+        return original;
+    };
+    // This fit conditioned on particular source visits and emitted tones. A different
+    // strongest-tone assignment cannot justify it, even if the total heard count holds.
+    // Claim each final visit once, so repeated trips by one aircraft remain distinct.
+    let mut claimed = vec![false; e.passes.len()];
+    for pass in &passes {
+        let first = im.t0 + pass.frames[0].0 as f64 * im.dt;
+        let last = im.t0 + pass.frames[pass.frames.len() - 1].0 as f64 * im.dt;
+        let choice = e.passes.iter().enumerate()
+            .filter(|&(i, after)| {
+                let arrive = after.t_audio - after.clock_offset_s;
+                !claimed[i] && after.key == pass.tr.key
+                    && counts_as_heard(after.value, after.nats, after.shared)
+                    && (im.row_of(after.f0_hz).round() - pass.row.round()).abs() <= 1.0
+                    && (first..=last).contains(&arrive)
+            })
+            .min_by(|(_, a), (_, b)| {
+                (a.t_audio - a.clock_offset_s - pass.centre_s).abs()
+                    .total_cmp(&(b.t_audio - b.clock_offset_s - pass.centre_s).abs())
+            });
+        let Some((i, _)) = choice else {
+            return original;
+        };
+        claimed[i] = true;
+    }
+    (cur.0, cur.1, e)
+}
+
 /// Widest disc scanned before climbing, in steps: about 1,260 points.
 const DISC_MAX_STEPS: i32 = 20;
 
@@ -2512,6 +2742,10 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                 } else {
                     (m.1, m.2, e)
                 };
+                // Physical fitting can lower evidence, so every retained mode gets it
+                // before ranking, including those outside the costlier refinement budget.
+                // polish_point preserves the explicit refine_modes == 0 disable.
+                let (la, lo, e) = polish_point(&window, p, &bank, &keep, la, lo, e);
                 Some(MatchMode {
                     lat: la,
                     lon: lo,
@@ -3706,6 +3940,10 @@ mod tests {
             .first()
             .expect("the heard passes seed an exact match");
         let error = haversine_m(top.lat, top.lon, c.lat, c.lon);
+        eprintln!(
+            "short-circuit observer error {error:.6} m, clock offset {:.3} s, {} heard",
+            top.clock_unix - c.clock, top.n_heard
+        );
         assert!(error < 150.0, "{error} m: {top:?}");
         assert!((top.clock_unix - c.clock).abs() < 2.0, "{top:?}");
         assert!(top.n_heard >= 3, "{top:?}");
@@ -3723,6 +3961,31 @@ mod tests {
                 >= 2,
             "the returning aircraft must supply distinct heard visits: {top:?}"
         );
+    }
+
+    #[test]
+    fn physical_polish_compares_every_retained_mode_on_the_same_data_basis() {
+        let circuit = short_circuit(60.0);
+        let mut crossing =
+            scene_track([0.0, -600.0, 500.0], [80.0, 0.0, 0.0], 240.0, -120.0, 960.0);
+        crossing.key = "crossing".into();
+        crossing.icao = crossing.key.clone();
+        let c = scene_for(vec![circuit, crossing], 400.0, 360.0);
+        // Several retained starts lie on the same acoustic peak. Physical refinement can
+        // lower calibrated evidence, so a start outside the evidence-refinement budget
+        // must receive the same fit before it competes with a refined answer.
+        let p = MatchParams {
+            nms_m: 200.0,
+            refine_modes: 1,
+            decoy_span_s: 360.0,
+            ..MatchParams::default()
+        };
+        let r = run_case(&c, &p, c.clock - 10.0, c.clock + 10.0);
+        let top = r.modes.first().expect("the independent heard passes survive");
+        let error = haversine_m(top.lat, top.lon, c.lat, c.lon);
+        assert!(error < 150.0, "{error} m: {top:?}");
+        assert!((top.clock_unix - c.clock).abs() < 2.0, "{top:?}");
+        assert!(top.n_heard >= 3, "{top:?}");
     }
 
     #[test]
@@ -5021,7 +5284,23 @@ mod tests {
                 fine_dem: &dem,
                 atmo: &atmo,
             };
-            score_exact(&inp, &p, &bank, &idx, lat, lon, clock).unwrap()
+            let exact = score_exact(&inp, &p, &bank, &idx, lat, lon, clock).unwrap();
+            let seed = score_exact(&inp, &p, &bank, &idx, lat, lon, clock).unwrap();
+            let (_, _, polished) = polish_point(&inp, &p, &bank, &idx, lat, lon, seed);
+            assert_eq!(polished.n_heard, exact.n_heard, "{:?}", polished.passes);
+            for before in exact.passes.iter().filter(|pass| {
+                counts_as_heard(pass.value, pass.nats, pass.shared)
+            }) {
+                let after = polished.passes.iter().find(|pass| {
+                    pass.key == before.key && counts_as_heard(pass.value, pass.nats, pass.shared)
+                }).expect("physical fitting preserves each independent source");
+                assert!(
+                    (after.f0_hz - before.f0_hz).abs() < 3.0,
+                    "physical fitting changed {} from {} to {} Hz",
+                    before.key, before.f0_hz, after.f0_hz
+                );
+            }
+            exact
         };
         // 114.5/90 is separated from every ratio of harmonics through order six. The
         // paths have the same Doppler shape here, but their independent tones are real.
