@@ -213,6 +213,10 @@ pub struct CombImage {
     pub nt: usize,
     pub nu: usize,
     pub comb: Vec<f32>,
+    /// Whitened, neighbour-expanded samples before harmonic summation, `[row][frame]`.
+    /// Retaining the existing allocation costs one additional `nt * nu` f32 image. Manual
+    /// images may omit it; without these samples, collided tones cannot gain independent credit.
+    pub whitened: Option<Vec<f32>>,
 }
 
 impl CombImage {
@@ -361,6 +365,7 @@ pub fn build_image(x: &[f32], sr: u32, p: &MatchParams) -> Result<CombImage, Str
         nt,
         nu,
         comb,
+        whitened: Some(rows),
     })
 }
 
@@ -619,6 +624,8 @@ struct SweepBuffers {
     recede: Vec<f32>,
     approach_w2_diff: Vec<f32>,
     recede_w2_diff: Vec<f32>,
+    /// Empty on the ordinary path; allocated only when an owned peak needs another tone.
+    profile: Vec<f32>,
 }
 
 impl SweepBuffers {
@@ -628,6 +635,7 @@ impl SweepBuffers {
             recede: vec![0.0; nf0],
             approach_w2_diff: vec![0.0; nf0 + 1],
             recede_w2_diff: vec![0.0; nf0 + 1],
+            profile: Vec::new(),
         }
     }
 
@@ -636,6 +644,7 @@ impl SweepBuffers {
         self.recede.fill(0.0);
         self.approach_w2_diff.fill(0.0);
         self.recede_w2_diff.fill(0.0);
+        self.profile.fill(f32::NEG_INFINITY);
     }
 }
 
@@ -718,6 +727,9 @@ fn sweep_tau(
         let mut s = stat_of(stat, a * ra, b * rb);
         if let Some((q, beta)) = tone {
             s += beta * q[row];
+        }
+        if !scratch.profile.is_empty() {
+            scratch.profile[row] = s;
         }
         if s > best {
             best = s;
@@ -1245,6 +1257,21 @@ fn score_exact(
     lon: f64,
     clock0: f64,
 ) -> Option<Exact> {
+    score_exact_with_recovery(inp, p, bank, idx, lat, lon, clock0, true)
+}
+
+/// The disabled recovery path preserves the original strongest-tone assignment as a test oracle.
+#[allow(clippy::too_many_arguments)]
+fn score_exact_with_recovery(
+    inp: &MatchInputs<'_>,
+    p: &MatchParams,
+    bank: &Bank,
+    idx: &[ExactTrack],
+    lat: f64,
+    lon: f64,
+    clock0: f64,
+    recover_tones: bool,
+) -> Option<Exact> {
     let im = inp.image;
     // Coarse votes are quantized to image frames, even for an exact fractional-second start.
     // Clamp the seed before predicting curves, then constrain the sweep too: repeated spatial
@@ -1260,6 +1287,8 @@ fn score_exact(
     struct One {
         tr: usize,
         table: Vec<(f32, u16)>,
+        path: Vec<Sample>,
+        full: (f32, f32),
         d: f64,
         v: f64,
         arrive: f64,
@@ -1378,6 +1407,8 @@ fn score_exact(
             ones.push(One {
                 tr: ti,
                 table,
+                path: pth,
+                full,
                 d: cpa.d,
                 v: cpa.speed,
                 arrive,
@@ -1434,55 +1465,266 @@ fn score_exact(
         }
         best
     };
-    // Total value at clock k, one audio event to one flight: each pass credited, best first, claims
-    // its pixels, and a later pass whose curve lies mostly on claimed pixels earns nothing for them.
-    // Weak passes claim too, or ten faint copies of one sound would each be credited. An unheard close
-    // pass keeps its cost, because it was not heard whoever else is claiming the audio.
-    let assign = |k: i64, r50: f64| -> (f64, Vec<(f64, i64, bool)>) {
-        let mut vals: Vec<(f64, i64, bool)> = ones
+    #[derive(Clone, Copy)]
+    struct Choice {
+        value: f64,
+        at: i64,
+        shared: bool,
+        score: f32,
+        row: u16,
+    }
+    // A cached profile is needed only for a collided pass/clock. Ordinary lookups still retain
+    // just their strongest row. Every profile uses the same coverage, prior and null as that row.
+    let mut profiles: Vec<Vec<Option<Vec<f32>>>> = ones.iter().map(|_| Vec::new()).collect();
+    let shares_pixels = |o: &One, at: i64, row: u16, claims: &[(i64, i64, usize)]| {
+        let nc = (o.core.len() as i64 - 1) / 2;
+        let first = o.f_arr + at - nc;
+        let (mut shared, mut total) = (0usize, 0usize);
+        for (q, &dr) in o.core.iter().enumerate() {
+            if dr == i32::MIN {
+                continue;
+            }
+            total += 1;
+            let frame = first + q as i64;
+            let here = i64::from(row) + i64::from(dr);
+            let hit = claims.iter().any(|&(f2, r2, c)| {
+                let q2 = frame - f2;
+                let other = &ones[c].core;
+                if q2 < 0 || q2 >= other.len() as i64 || other[q2 as usize] == i32::MIN {
+                    return false;
+                }
+                let d = here - (r2 + i64::from(other[q2 as usize]));
+                d.abs() <= dmax as i64 && same_pixels[(d + dmax as i64) as usize]
+            });
+            shared += usize::from(hit);
+        }
+        total > 0 && shared as f64 >= p.same_event_share * total as f64
+    };
+    let claim = |i: usize, choice: Choice| {
+        let o = &ones[i];
+        (
+            o.f_arr + choice.at - (o.core.len() as i64 - 1) / 2,
+            i64::from(choice.row),
+            i,
+        )
+    };
+    // A different-shaped path can touch a claimed curve for fewer central frames than the
+    // shared-event cutoff, yet borrow enough of its energy to sound independently heard.
+    // Only alternatives need this residual check: remove positive harmonic contributions on
+    // claimed full paths. Other partials, every visible weight and the prior/null stay intact.
+    let residual_score =
+        |o: &One, at: i64, row: u16, upper: f32, claims: &[(i64, i64, usize)]| -> f32 {
+            let Some(whitened) = &im.whitened else {
+                return f32::NEG_INFINITY;
+            };
+            let (mut a, mut b, mut wa, mut wb) = (0f32, 0f32, 0f32, 0f32);
+            for s in &o.path {
+                let frame = o.f_arr + at + i64::from(s.dt);
+                let here = i64::from(row) + i64::from(s.dr);
+                let received = bank.r0 as i64 + here;
+                if frame < 0 || frame >= im.nt as i64 || received < 0 || received >= im.nu as i64 {
+                    continue;
+                }
+                let mut v = im.comb[frame as usize * im.nu + received as usize];
+                let (mut removed, mut w2) = (0f32, 0f32);
+                for (&shift, &(_, weight)) in shifts.iter().zip(&p.harmonics) {
+                    let pixel = received + i64::from(shift);
+                    if pixel < 0 || pixel >= im.nu as i64 {
+                        continue;
+                    }
+                    w2 += weight * weight;
+                    let contribution = weight * whitened[pixel as usize * im.nt + frame as usize];
+                    if contribution > 0.0
+                        && claims.iter().any(|&(first, tone, i)| {
+                            let other = &ones[i];
+                            let centre = first + (other.core.len() as i64 - 1) / 2;
+                            let dt = frame - centre;
+                            let Ok(q) = other.path.binary_search_by_key(&dt, |s| i64::from(s.dt))
+                            else {
+                                return false;
+                            };
+                            let base = bank.r0 as i64 + tone + i64::from(other.path[q].dr);
+                            if base < 0 || base >= im.nu as i64 {
+                                return false;
+                            }
+                            shifts.iter().any(|&sh| {
+                                let owned = base + i64::from(sh);
+                                owned >= 0 && owned < im.nu as i64 && (pixel - owned).abs() <= 1
+                            })
+                        })
+                    {
+                        removed += contribution;
+                    }
+                }
+                if w2 > 0.0 {
+                    v -= removed / w2.sqrt();
+                }
+                if s.approach {
+                    a += s.w * v;
+                    wa += s.w * s.w;
+                } else {
+                    b += s.w * v;
+                    wb += s.w * s.w;
+                }
+            }
+            if wa < 0.25 * o.full.0 || wb < 0.25 * o.full.1 {
+                return f32::NEG_INFINITY;
+            }
+            let mut score = stat_of(p.stat, a * (1.0 / wa.sqrt()), b * (1.0 / wb.sqrt()));
+            if let Some(q) = bank.tone_of(&inp.tracks[o.tr].typ) {
+                score += o.null.beta * q[row as usize];
+            }
+            // The scalar weight sum can round differently from the bank's clipped-row
+            // prefix sums. Suppressing support must never improve its original score.
+            score.min(upper)
+        };
+    // First finish the original strongest-tone assignment unchanged. Recovery must not steal
+    // an independent curve from a later original winner. Weak original passes still claim pixels;
+    // unheard close passes still pay their original cost.
+    let mut assign = |k: i64, r50: f64| -> (f64, Vec<Choice>) {
+        let mut vals: Vec<Choice> = ones
             .iter()
             .map(|o| {
                 let (v, at) = value_at(o, k, r50);
-                (v, at, false)
+                let (score, row) = o.table[(at + span) as usize];
+                Choice {
+                    value: v,
+                    at,
+                    shared: false,
+                    score,
+                    row,
+                }
             })
             .collect();
-        let mut order: Vec<usize> = (0..ones.len()).filter(|&i| vals[i].0 > 0.0).collect();
-        order.sort_by(|&x, &y| vals[y].0.total_cmp(&vals[x].0));
+        let mut order: Vec<usize> = (0..ones.len()).filter(|&i| vals[i].value > 0.0).collect();
+        order.sort_by(|&x, &y| vals[y].value.total_cmp(&vals[x].value));
         // (first frame, row of tone, index into ones) of each pass that has claimed pixels
         let mut claims: Vec<(i64, i64, usize)> = Vec::new();
+        let mut collided = Vec::new();
         for &i in &order {
             let o = &ones[i];
-            let at = vals[i].1;
-            let nc = (o.core.len() as i64 - 1) / 2;
-            let first = o.f_arr + at - nc;
-            let row = o.table[(at + span) as usize].1 as i64;
-            let (mut shared, mut total) = (0usize, 0usize);
-            for (q, &dr) in o.core.iter().enumerate() {
-                if dr == i32::MIN {
-                    continue;
-                }
-                total += 1;
-                let frame = first + q as i64;
-                let here = row + dr as i64;
-                let hit = claims.iter().any(|&(f2, r2, c)| {
-                    let q2 = frame - f2;
-                    let other = &ones[c].core;
-                    if q2 < 0 || q2 >= other.len() as i64 || other[q2 as usize] == i32::MIN {
-                        return false;
-                    }
-                    let d = here - (r2 + other[q2 as usize] as i64);
-                    d.abs() <= dmax as i64 && same_pixels[(d + dmax as i64) as usize]
-                });
-                shared += usize::from(hit);
-            }
-            if total > 0 && shared as f64 >= p.same_event_share * total as f64 {
-                vals[i].0 = 0.0;
-                vals[i].2 = true;
+            if shares_pixels(o, vals[i].at, vals[i].row, &claims) {
+                vals[i].value = 0.0;
+                vals[i].shared = true;
+                collided.push(i);
             } else {
-                claims.push((first, row, i));
+                claims.push(claim(i, vals[i]));
             }
         }
-        (vals.iter().map(|v| v.0).sum(), vals)
+        if !recover_tones || collided.is_empty() || im.whitened.is_none() {
+            return (vals.iter().map(|v| v.value).sum(), vals);
+        }
+        let mut alternative = |i: usize, claims: &[(i64, i64, usize)]| -> Option<Choice> {
+            let o = &ones[i];
+            let cache = &mut profiles[i];
+            if cache.is_empty() {
+                cache.resize_with(o.table.len(), || None);
+            }
+            let mut best: Option<Choice> = None;
+            for (jj, j) in (-slack..=slack).enumerate() {
+                let at = k + j;
+                let strongest = o.table[(at + span) as usize].0;
+                if !strongest.is_finite() {
+                    continue;
+                }
+                let max_nats = o.null.nats(strongest) as f64;
+                if max_nats < HEARD_NATS {
+                    continue;
+                }
+                // Under the calibrator's defined 0 < kappa < 1 domain, evidence is monotone
+                // in this already-known maximum. A weaker row cannot improve its bound.
+                if (0.0..1.0).contains(&p.kappa) {
+                    let upper = pass_value(p, r50, max_nats, o.d) - pens[jj];
+                    if upper <= 0.0 || best.as_ref().is_some_and(|b| upper <= b.value) {
+                        continue;
+                    }
+                }
+                let scores = cache[(at + span) as usize].get_or_insert_with(|| {
+                    scratch.profile.resize(bank.nf0, f32::NEG_INFINITY);
+                    let tone = bank
+                        .tone_of(&inp.tracks[o.tr].typ)
+                        .map(|q| (q, o.null.beta));
+                    sweep_tau(
+                        im,
+                        &o.path,
+                        o.f_arr + at,
+                        bank.r0,
+                        bank.nf0,
+                        p.stat,
+                        &mut scratch,
+                        o.full,
+                        tone,
+                    );
+                    scratch.profile.clone()
+                });
+                for (row, &s) in scores.iter().enumerate() {
+                    if !s.is_finite() {
+                        continue;
+                    }
+                    // Judge peaks on the complete profile, including claimed neighbours.
+                    // An unclaimed shoulder of a bright ridge is not a second emitted tone.
+                    if (row > 0 && scores[row - 1] >= s)
+                        || (row + 1 < scores.len() && scores[row + 1] > s)
+                    {
+                        continue;
+                    }
+                    let nats = o.null.nats(s) as f64;
+                    if nats < HEARD_NATS {
+                        continue;
+                    }
+                    let upper = pass_value(p, r50, nats, o.d) - pens[jj];
+                    if ((0.0..1.0).contains(&p.kappa)
+                        && (upper <= 0.0 || best.as_ref().is_some_and(|b| upper <= b.value)))
+                        || shares_pixels(o, at, row as u16, claims)
+                    {
+                        continue;
+                    }
+                    let s = residual_score(o, at, row as u16, s, claims);
+                    if !s.is_finite() {
+                        continue;
+                    }
+                    let nats = o.null.nats(s) as f64;
+                    if nats < HEARD_NATS {
+                        continue;
+                    }
+                    let value = pass_value(p, r50, nats, o.d) - pens[jj];
+                    if value > 0.0 && best.as_ref().is_none_or(|b| value > b.value) {
+                        best = Some(Choice {
+                            value,
+                            at,
+                            shared: false,
+                            score: s,
+                            row: row as u16,
+                        });
+                    }
+                }
+            }
+            best
+        };
+        let mut pending: Vec<_> = collided
+            .into_iter()
+            .filter_map(|i| alternative(i, &claims).map(|choice| (i, choice, claims.len())))
+            .collect();
+        // A new claim can lower any residual score, even below the shared-event cutoff.
+        // Stale values are upper bounds: rescore and reinsert before accepting the next best.
+        while let Some(q) = (0..pending.len()).max_by(|&a, &b| {
+            pending[a]
+                .1
+                .value
+                .total_cmp(&pending[b].1.value)
+                .then_with(|| pending[b].0.cmp(&pending[a].0))
+        }) {
+            let (i, choice, version) = pending.swap_remove(q);
+            if version != claims.len() {
+                if let Some(next) = alternative(i, &claims) {
+                    pending.push((i, next, claims.len()));
+                }
+            } else {
+                vals[i] = choice;
+                claims.push(claim(i, choice));
+            }
+        }
+        (vals.iter().map(|v| v.value).sum(), vals)
     };
     // best over the clock and the heard range together; a tie keeps the range listed first (the
     // shorter, in the default order)
@@ -1504,8 +1746,14 @@ fn score_exact(
     let mut passes = Vec::with_capacity(ones.len());
     let (mut n_heard, mut n_close) = (0, 0);
     let (_, assigned) = assign(k, r50);
-    for (o, &(value, at, shared)) in ones.iter().zip(&assigned) {
-        let (s, r) = o.table[(at + span) as usize];
+    for (o, &choice) in ones.iter().zip(&assigned) {
+        let Choice {
+            value,
+            at,
+            shared,
+            score: s,
+            row: r,
+        } = choice;
         let usable = s.is_finite();
         let nats = if usable { o.null.nats(s) as f64 } else { 0.0 };
         if counts_as_heard(value, nats, shared) {
@@ -3722,7 +3970,13 @@ mod tests {
                     "the unchanged PCM must contain independent heard passes"
                 );
             }
-            assert_eq!(signature(bounded), signature(original));
+            let actual = signature(bounded);
+            assert_eq!(actual, signature(original));
+            let legacy =
+                score_exact_with_recovery(&inp, &p, &bank, &idx, lat, lon, c.clock + dt, false)
+                    .unwrap();
+            assert!(legacy.passes.iter().all(|pass| !pass.shared));
+            assert_eq!(actual, signature(legacy), "noncolliding results changed");
         }
         println!(
             "three exact scores, {nearby} nearby and 1024 distant tracks: original {old_time:?}, bounded {bounded_time:?}"
@@ -4702,6 +4956,191 @@ mod tests {
         );
     }
 
+    /// When similar paths overlap, both flights initially prefer the same louder curve. A
+    /// second distinct fundamental is still audible and must survive that first pixel claim.
+    #[test]
+    fn overlapping_flights_recover_distinct_tones_after_pixel_claims() {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let observer = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let mut tracks = vec![
+            scene_track([900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 450.0, -120.0, 1100.0),
+            scene_track(
+                [-900.0, 0.0, 700.0],
+                [0.0, 70.0, 0.0],
+                450.0,
+                -120.0,
+                1100.0,
+            ),
+            scene_track(
+                [0.0, -1500.0, 900.0],
+                [65.0, 0.0, 0.0],
+                150.0,
+                -120.0,
+                1100.0,
+            ),
+        ];
+        for (tr, key) in tracks.iter_mut().zip(["east", "west", "crossing"]) {
+            tr.key = key.into();
+            tr.icao = key.into();
+        }
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let prop = Prop::still(BASE_C);
+        let p = params();
+        let score = |second_tone: Option<f64>| {
+            let mut pcm = noise(2800 * 900, 42, 0.05);
+            add_flight(
+                &mut pcm, 2800.0, clock, &tracks[0], observer, &prop, 90.0, 0.5,
+            );
+            add_flight(
+                &mut pcm, 2800.0, clock, &tracks[2], observer, &prop, 150.0, 0.5,
+            );
+            if let Some(f0) = second_tone {
+                add_flight(
+                    &mut pcm, 2800.0, clock, &tracks[1], observer, &prop, f0, 0.35,
+                );
+            }
+            let pcm: Vec<f32> = pcm.into_iter().map(|v| v as f32).collect();
+            let im = build_image(&pcm, 2800, &p).unwrap();
+            let bank = build_bank(&im, &p);
+            let idx: Vec<_> = tracks
+                .iter()
+                .enumerate()
+                .map(|(i, tr)| ExactTrack::new(i, tr))
+                .collect();
+            let inp = MatchInputs {
+                image: &im,
+                tracks: &tracks,
+                region: BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01),
+                start_lo: clock,
+                start_hi: clock,
+                duration_s: 900.0,
+                catalog: (f64::NEG_INFINITY, f64::INFINITY),
+                dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            score_exact(&inp, &p, &bank, &idx, lat, lon, clock).unwrap()
+        };
+        // 114.5/90 is separated from every ratio of harmonics through order six. The
+        // paths have the same Doppler shape here, but their independent tones are real.
+        let distinct = score(Some(114.5));
+        assert_eq!(distinct.n_heard, 3, "{:?}", distinct.passes);
+        let mut tones: Vec<_> = distinct
+            .passes
+            .iter()
+            .filter(|pass| {
+                pass.key != "crossing" && counts_as_heard(pass.value, pass.nats, pass.shared)
+            })
+            .map(|pass| pass.f0_hz)
+            .collect();
+        tones.sort_by(f64::total_cmp);
+        assert!(
+            (tones[0] - 90.0).abs() < 3.0 && (tones[1] - 114.5).abs() < 3.0,
+            "{tones:?}"
+        );
+        // A second catalogue trajectory, or a second source on the same tone, does not
+        // supply independent acoustic evidence. Harmonics of the first stay claimed too.
+        for second in [None, Some(90.0)] {
+            let single = score(second);
+            assert_eq!(single.n_heard, 2, "{second:?}: {:?}", single.passes);
+            assert!(single.passes.iter().any(|pass| pass.shared));
+        }
+    }
+
+    /// A rejected duplicate can also fit a weaker true flight. Recovering it immediately would
+    /// steal that flight's curve before the original strongest-tone assignment reaches it.
+    #[test]
+    fn recovered_tones_cannot_displace_original_independent_matches() {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let observer = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let mut tracks = vec![
+            scene_track([900.0, 0.0, 700.0], [0.0, 70.0, 0.0], 450.0, -120.0, 1100.0),
+            scene_track(
+                [-900.0, 0.0, 700.0],
+                [0.0, 70.0, 0.0],
+                450.0,
+                -120.0,
+                1100.0,
+            ),
+            scene_track(
+                [-1100.0, 0.0, 800.0],
+                [0.0, -65.0, 0.0],
+                450.0,
+                -120.0,
+                1100.0,
+            ),
+        ];
+        for (tr, key) in tracks.iter_mut().zip(["bright", "duplicate", "owner"]) {
+            tr.key = key.into();
+            tr.icao = key.into();
+        }
+        let prop = Prop::still(BASE_C);
+        let mut pcm = noise(2800 * 900, 42, 0.05);
+        for (i, f0) in [(0, 90.0), (2, 128.0)] {
+            add_flight(
+                &mut pcm, 2800.0, clock, &tracks[i], observer, &prop, f0, 0.5,
+            );
+        }
+        let pcm: Vec<f32> = pcm.into_iter().map(|v| v as f32).collect();
+        let p = MatchParams {
+            pass_slack_frames: 0,
+            r50_m: vec![2000.0],
+            tone_prior: false,
+            ..params()
+        };
+        let im = build_image(&pcm, 2800, &p).unwrap();
+        let bank = build_bank(&im, &p);
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &tracks,
+            region: BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01),
+            start_lo: clock,
+            start_hi: clock,
+            duration_s: 900.0,
+            catalog: (f64::NEG_INFINITY, f64::INFINITY),
+            dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let idx: Vec<_> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
+        let old = score_exact_with_recovery(&inp, &p, &bank, &idx, lat, lon, clock, false).unwrap();
+        assert_eq!(old.n_heard, 2, "{:?}", old.passes);
+        assert!(old.passes.iter().any(|pass| {
+            pass.key == "owner" && counts_as_heard(pass.value, pass.nats, pass.shared)
+        }));
+        // Without the true owner, the rejected duplicate really can recover that tone. This
+        // establishes the competing claim rather than merely testing an empty recovery queue.
+        let competing = score_exact(&inp, &p, &bank, &idx[..2], lat, lon, clock).unwrap();
+        assert_eq!(competing.n_heard, 2, "{:?}", competing.passes);
+        assert!(
+            competing
+                .passes
+                .iter()
+                .any(|pass| { pass.key == "duplicate" && (pass.f0_hz - 128.0).abs() < 4.0 })
+        );
+        let actual = score_exact(&inp, &p, &bank, &idx, lat, lon, clock).unwrap();
+        assert_eq!(
+            actual.n_heard, old.n_heard,
+            "original: {:?}; recovered: {:?}",
+            old.passes, actual.passes
+        );
+        assert_eq!(actual.evidence.to_bits(), old.evidence.to_bits());
+        assert_eq!(actual.clock.to_bits(), old.clock.to_bits());
+        assert_eq!(
+            serde_json::to_vec(&actual.passes).unwrap(),
+            serde_json::to_vec(&old.passes).unwrap()
+        );
+    }
+
     /// Real flights sit up to about 3 s off the shared clock at a known site. Two seconds either way
     /// must not cost the answer. The allowance can only help, by construction; this test does not show
     /// it is needed (here it changes nothing), so whether to keep it is a question for real recordings.
@@ -4870,6 +5309,7 @@ mod tests {
             nt: 3,
             nu: 12,
             comb: vec![0.0; 36],
+            whitened: None,
         };
         let pth = [
             Sample { dt: -1, dr: 5, w: 1.0, approach: true },
@@ -4906,6 +5346,7 @@ mod tests {
             nt: 13,
             nu: 19,
             comb: (0..13 * 19).map(|i| ((i * 13 % 37) as f32 - 18.0) * 0.25).collect(),
+            whitened: None,
         };
         let pth = [
             Sample { dt: -4, dr: 8, w: 0.25, approach: true },

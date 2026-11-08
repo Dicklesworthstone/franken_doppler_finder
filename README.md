@@ -380,6 +380,19 @@ in `crates/fdop-core/src/curvematch.rs`:
   on a 100 m grid before it is climbed to 25 m. A close pass with no energy costs evidence, as in the trace
   search, and one audio event can credit only one flight. This recovers clock alternatives at selected
   places; the existing spatial shortlist still limits which places reach exact scoring.
+  If two trajectories initially prefer the same bright tone, the original strongest-tone assignment
+  finishes before recovery looks for a distinct, unclaimed peak for the rejected trajectory. A recovered
+  peak must clear the existing 6.9-nat heard threshold and timing penalty, with the same coverage, type
+  prior and null. Peak qualification includes claimed neighbours, so the shoulder of an owned ridge
+  cannot become a new tone simply because the ridge itself is excluded. Harmonic pixel ownership still
+  applies, and an original independent match keeps priority over every recovered alternative. Recovery
+  subtracts only positive harmonic contributions on already claimed full paths, retaining independent
+  partials, all original coverage weights and the original comb normalization. Its remaining evidence
+  must still clear the heard threshold. The normalized frequency rows are retained for this check,
+  adding one `f32` image the size of the comb without another STFT. Tone profiles are computed only
+  for collisions and cached within the exact score; their unmasked maxima bound which profiles can
+  improve it. A new claim invalidates pending residual scores before they can be accepted. Real and
+  decoy windows use this same recovery.
   Flights are screened for exact scoring using their interpolated paths over the catalogue span, at the
   closest-approach sampling interval. This retains sparse passes that enter the search area between logged
   ADS-B positions.
@@ -1252,6 +1265,47 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Distinct tones survive overlapping-flight ownership
+
+A fixed 900-second PCM scene contains two simultaneous, similar Doppler paths at 90 and 114.5 Hz,
+plus a separate crossing flight at 150 Hz. The original exact scorer credits only two aircraft:
+both simultaneous paths select the brighter 90 Hz tone before pixel ownership rejects one.
+Recovery finds the other real peak and credits all three, using the same 6.9-nat threshold.
+The regression failed with two heard passes before the production change. Controls with the
+second source absent or on the same tone still require exactly two heard passes, including
+harmonic ownership. An initial implementation exposed a false extra tone on the bright peak's
+shoulder; requiring a peak in the complete tone profile fixes that case without changing its test.
+
+A separate physical PCM control checks that a rejected duplicate cannot take a weaker original
+flight's evidence. It establishes that the competing tone is recoverable when its real owner is
+omitted, then requires the complete previous pass output and evidence to remain identical when
+that owner is present. The existing noncolliding-output oracle also compares every reported
+floating-point bit and metadata field with recovery disabled. These checks concern acoustic
+assignment; they do not resolve parallel-flight position/clock ambiguity or establish field
+confidence calibration.
+
+All three focused native core regressions pass together on the pinned nightly through genuine
+RCH: independent-tone recovery with absent/same-tone controls, exact original-owner protection,
+and the complete noncolliding-output oracle. The ownership check uses individual retained
+frequency rows: deleting a whole comb sample also deleted valid independent partials and failed
+the unchanged positive test. Per-harmonic subtraction preserves that recovery while refusing
+the duplicate. Manual `CombImage` values without `whitened` rows keep the original assignment
+and cannot receive additional tone credit.
+
+After integrating the concurrent retarded-time bank-weight correction, the same three recovery
+regressions and both physical bank-weight tests pass together in the native core binary (five
+tests). This checks the weaker recovered tone against the corrected empirical calibration.
+Integrated core all-target Clippy also passes with warnings denied through genuine RCH.
+Independent source review, focused formatting, whitespace checks and staged bug-scan review
+found no new production issue; existing whole-file formatting differences remain outside this change.
+
+The unchanged `src/selftest.rs` also passed in a native component linked to the actual core,
+types and Rayon libraries on the pinned nightly through genuine RCH. Its 1,300-second synthetic
+recording went through WAV generation, FFmpeg decode, detection, measurement, search and refinement.
+It selected `ACE391` and `A1DFEB`, with 2.365 m position error inside a 75 m radius and 0.0249 s
+clock error. This validates the selftest component and the committed detector path; it does not
+exercise curve matching or replace a full CLI/workspace build or real-recording replay.
+
 ### Retarded curve-bank weights (2026-11-08): physical scoring agreement
 
 The actual pinned-nightly core crate passes both new regressions through genuine RCH:
@@ -1296,6 +1350,15 @@ production change. Staged bug-scan findings were reviewed; new warnings concern 
 and fixture allocations. The changed lines meet formatting checks; three existing formatting
 differences in the separate fast-edge tests remain. This is a focused core result, not a full
 workspace or CLI selftest pass.
+
+The separate fast-edge regression remains unresolved. A subsequent native diagnostic measured all
+ten fixed early/late fast-pass scenes, including the original seeds that the old regression skipped.
+Legacy measurement correctly recovers one scene. Two further early 215 m/s scenes recover only
+when the fast bank is run without earlier ownership: all five receding-side samples of their useful
+seed are already masked by an ordinary candidate whose measurement fails. The late 245 m/s scenes
+remain unrecovered by that diagnostic; some ordinary fits pass quality gates with incorrect geometry.
+This calls for measurement-aware retry, not a claim that extra accepted seeds are correct recoveries.
+No ownership threshold, stage priority or existing assertion was changed for that separate issue.
 
 ### Midnight flight coverage: native data validation
 

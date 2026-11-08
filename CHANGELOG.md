@@ -19,6 +19,41 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover independent tones hidden by overlapping flight claims
+
+- Keep the original strongest-tone assignment, then recover distinct unclaimed peaks for
+  trajectories rejected because another flight owns their first-choice pixels. A quieter real
+  tone can now credit an overlapping pass instead of being discarded before ownership is known.
+- Finish every original claim before recovery, preserving independent original matches. Check
+  peaks against the full tone profile, including claimed neighbours, so an owned ridge's shoulder
+  is not promoted into a second tone. Keep harmonic ownership, coverage, type priors, nulls,
+  timing penalties and the existing 6.9-nat heard threshold. Real and decoy scores share the path.
+- Require recovered evidence to survive removal of positive harmonic contributions already
+  claimed along full accepted paths. Keep unrelated partials and original normalization; a new
+  claim invalidates pending residual scores. Retain the normalized frequency rows for exact
+  harmonic ownership, adding one `f32` image the size of the comb without recomputing the STFT.
+- Compute and cache alternate profiles only for actual collisions; existing maximum scores
+  bound which clock slots can improve the recovery. No wider candidate bank or raised cap.
+- Add a synthetic three-flight PCM recovery that fails with two heard passes on the old scorer,
+  absent-source and same-tone controls, a competing-owner preservation regression, and an
+  exact original-output comparison for noncolliding matches. The single-source control caught
+  a false shoulder peak during development and passes with full-profile peak qualification.
+- **Validation:** all three focused native core regressions pass together on the pinned nightly
+  through genuine RCH: positive recovery and absent/same-tone controls, exact original-owner
+  protection, and complete noncolliding-output equivalence. Assertions and thresholds remain
+  unchanged. Manual comb images without retained frequency rows keep the original assignment.
+  All three also pass after integration with the concurrent retarded-time bank-weight correction,
+  alongside its two physical-scoring regressions (five native tests on the integrated source).
+  Integrated core all-target Clippy passes with warnings denied; independent source review,
+  focused formatting, whitespace checks and staged bug-scan review found no new production issue.
+- The unchanged end-to-end selftest component passes through actual FFmpeg decode, detection,
+  measurement, search and refinement: correct flights, 2.365 m position error within a 75 m
+  radius, and 0.0249 s clock error. This is native component evidence for the committed detector
+  path, not curve-matching, full-CLI or whole-workspace validation.
+- **Limits:** these are acoustic-assignment improvements. Parallel-flight location/clock
+  ambiguity and field confidence calibration remain separate limitations; no real-recording
+  accuracy claim is made.
+
 ### Match curve-bank weights to retarded flight geometry
 
 - Compute the bank's inverse-range weights at emission time, consistently with its Doppler
