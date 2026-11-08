@@ -36,6 +36,20 @@ at that commit, not per-change commits.
   0.2 m observer error and a 75 m reported radius on its synthetic scene. This follow-up has
   no new whole-recording memory or runtime measurement.
 
+### Reuse time interpolation throughout each ridge profile
+
+- Prepare the fixed time coordinate of each integration frame once instead of recomputing it
+  for every frequency offset. Reuse it for normalized peak selection and the existing three-bin
+  raw-background correction; retain fractional weights, endpoint duplication, frequency arithmetic,
+  summation order, peak rules and measurement thresholds.
+- Add two bit-for-bit scalar interpolation regressions spanning fractional/large-origin grids,
+  boundaries, invalid coordinates and nonfinite values. Both pass in the actual native core crate,
+  alongside all six existing trace tests and both existing spectrogram tests.
+- The optimized native `ridge_profile_validation` component compared 384 complete original/current
+  profiles exactly and recorded seven alternating 2,400-call trials: median paired speedup 1.69x,
+  range 1.56-1.79x. README records hardware and build/workload details. This is a synthetic component
+  result, not a recording runtime or accuracy result; CLI selftest and field replays remain unrun.
+
 ### Restore only the three-bin correction: no climb to a raw peak several bins away
 
 - Remove the raw-peak climb added in 82f26a9. When the three-bin raw correction is unavailable, the
@@ -139,9 +153,10 @@ at that commit, not per-change commits.
 - Preserve scoring arithmetic, pass order, hearing/silence evidence, reach limits, detection caps
   and confidence thresholds. Add grazing/invalid-input regressions and an exact-output comparison
   using the original three-flight PCM plus 1,024 distant tracks at three observers/clocks.
-- **Validation limit:** independent source review and auxiliary JavaScript geometry checks only
-  (38,514 translated/grazing cases). Native Rust equivalence, workspace checks, selftest and
-  recording replays remain unrun after the executor outage. No measured speedup is claimed.
+- **Validation:** the geometry/fail-open regressions and the complete exact-score equivalence test
+  now pass in the actual native core crate with the pinned nightly and locked dependencies.
+  Independent source review and 38,514 auxiliary JavaScript geometry cases also passed. Workspace
+  checks, CLI selftest and recording replays remain unverified; no measured speedup is claimed here.
 
 ### Recover damaged auxiliary caches without colliding with concurrent runs
 

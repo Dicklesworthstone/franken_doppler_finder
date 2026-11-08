@@ -163,10 +163,12 @@ fn profile_peak(
     let df = spec.df();
     let n_off = ((2.0 * noise_band + 0.5 * df) / df).floor() as usize + 1;
     let nt = spec.nt();
-    let path: Vec<(f64, f64)> = (0..=2 * half)
+    // Every frequency offset uses the same integration times. Prepare their grid
+    // coordinates once, retaining the original fractional weights and edge duplication.
+    let path: Vec<_> = (0..=2 * half)
         .map(|k| {
             let k = (j as i64 + k as i64 - half as i64).clamp(0, nt as i64 - 1) as usize;
-            (spec.t[k], along(spec.t[k]))
+            (spec.time_sampler(spec.t[k]), along(spec.t[k]))
         })
         .collect();
     let need = 3usize.max(path.len() / 3);
@@ -176,8 +178,8 @@ fn profile_peak(
         let off = -noise_band + o as f64 * df;
         *ov = off;
         let (mut sum, mut cnt) = (0.0f64, 0usize);
-        for &(tk, shift) in &path {
-            if let Some(v) = spec.bilinear(tk, f_pred + off + shift) {
+        for &(sampler, shift) in &path {
+            if let Some(v) = sampler.and_then(|s| s.sample(f_pred + off + shift)) {
                 sum += v as f64;
                 cnt += 1;
             }
@@ -262,9 +264,9 @@ fn profile_peak(
         // evidence (CHANGELOG, "Restore only the three-bin correction").
         let raw = |o: usize| {
             let (mut sum, mut count) = (0.0, 0usize);
-            for &(tk, shift) in &path {
+            for &(sampler, shift) in &path {
                 let fq = f_pred + offs[o] + shift;
-                if let Some(value) = spec.bilinear(tk, fq) {
+                if let Some(value) = sampler.and_then(|s| s.sample(fq)) {
                     let fi = ((fq - spec.f[0]) / df).min(spec.nf() as f64 - 1.000_001);
                     let row = fi as usize;
                     let weight = fi - row as f64;

@@ -1162,8 +1162,18 @@ across candidate locations, clock alternatives, refinement and decoy windows. Th
 Hermite curves, including turns outside the reported points. A trajectory proven farther away than the
 existing reach limit skips the repeated closest-approach scan; uncertain geometry keeps the original
 path. This does not change the reach limit, score formulas, candidate order or confidence thresholds.
-The new shortcut has source review and regression coverage, but native equivalence and runtime
-measurements remain pending; no end-to-end speedup is claimed.
+The geometry and complete exact-score equivalence regressions now pass in a native core build.
+Whole-recording runtime measurements remain pending; no end-to-end speedup is claimed.
+
+Ridge tracing prepares each integration frame's time interpolation once and reuses it across the
+frequency profile. Frequency interpolation, summation order, peak qualification and the three-bin
+raw-background correction remain unchanged. In the native `ridge_profile_validation` component run,
+384 original/current full-profile cases returned identical frequency, SNR and z-score bits, including
+fractional timestamps, clipped edges and restored backgrounds. Seven alternating-order trials of
+2,400 calls each gave a median paired speedup of **1.69x** (range 1.56-1.79x): original 204-292 ms,
+prepared-time 117-164 ms. This used the pinned nightly with optimization level 3, one codegen unit,
+real dependencies and the complete original/current trace modules on a shared AMD EPYC 9V74 Linux
+host. It measures synthetic ridge-profile calls, not an end-to-end recording or its accuracy.
 
 **Component measurements, 2026-11-04.** Optimized Rust builds on a shared AMD EPYC 9V74 host, with
 alternating old/new execution order. The detector uses four Rayon workers; other probes are serial.
@@ -1215,6 +1225,17 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Ridge-profile interpolation: native equivalence and component timing
+
+Both `spectro::tests::prepared_time_*` regressions pass against the unchanged scalar bilinear sampler,
+covering non-dyadic grids, large timestamp origins, boundaries, invalid coordinates and nonfinite
+samples. All six existing trace tests and both existing spectrogram tests also pass. The native
+`ridge_profile_validation` run compares full original/current profile outputs bit for bit in 384
+cases and in each timed trial; the measured workload and limits are in [Performance](#performance).
+The actual core crate compiled with the pinned nightly and locked dependencies through RCH, using
+one build job, no debug information and dependency optimization disabled to fit shared memory.
+These focused checks do not establish a workspace, CLI selftest or real-recording replay pass.
+
 ### Search working set (2026-11-07): focused native integration passes
 
 The pinned `nightly-2026-08-31` full-core test binary passes these three checks through the actual
@@ -1256,7 +1277,7 @@ recognized-type precedence across joined days. It does not include the fetch or 
 modules: their offline-cache, sidecar, contiguous-part, unfinished-upload and listing-refresh tests
 remain blocked by the full data-crate build. This is not an end-to-end archive replay or workspace pass.
 
-### Conservative trajectory bounds (2026-11-07): native validation pending
+### Conservative trajectory bounds (2026-11-07): native regressions verified
 
 Added geometry regressions for between-knot Hermite excursions, signed ECEF coordinates, grazing
 faces/edges/corners and malformed input. The exact-score regression adds 1,024 distant tracks to the
@@ -1266,8 +1287,9 @@ unchanged silence and chance-calibration handling; it does not assert a speedup.
 
 Independent JavaScript double-precision arithmetic checks covered 38,514 translated/grazing cases and
 confirmed the fixture's distant tracks lie outside every tested observer's reach. These are auxiliary
-geometry checks, not execution of the Rust tests. Native scoring equivalence, formatting, Clippy,
-selftest and real-recording replays remain unrun because the executor became unavailable.
+geometry checks. The geometry/fail-open tests and the complete exact-score equivalence regression
+now pass in the actual native core test binary with the pinned nightly and locked dependencies.
+Workspace checks, CLI selftest and real-recording replays are not established by these focused tests.
 
 ### Shared cache recovery (2026-11-07): native validation pending
 

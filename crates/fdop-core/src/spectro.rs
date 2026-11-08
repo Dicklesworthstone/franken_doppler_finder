@@ -29,6 +29,35 @@ pub struct Spec {
     pub meta: SpecMeta,
 }
 
+/// The time half of bilinear interpolation, reused while sampling many frequencies
+/// along one integration frame. Keep the scalar sampler's f32 arithmetic and edge clamp.
+#[derive(Clone, Copy)]
+pub(crate) struct TimeSampler<'a> {
+    spec: &'a Spec,
+    t0: usize,
+    wt: f32,
+    df: f64,
+}
+
+impl TimeSampler<'_> {
+    #[inline]
+    pub(crate) fn sample(self, fq: f64) -> Option<f32> {
+        let (nt, nf) = (self.spec.t.len(), self.spec.f.len());
+        let fi = (fq - self.spec.f[0]) / self.df;
+        if !(fi >= 0.0 && fi <= (nf - 1) as f64) {
+            return None;
+        }
+        let fi = fi.min(nf as f64 - 1.000_001);
+        let f0 = fi as usize;
+        let (wt, wf) = (self.wt, (fi - f0 as f64) as f32);
+        let a = self.spec.db[f0 * nt + self.t0];
+        let b = self.spec.db[f0 * nt + self.t0 + 1];
+        let c = self.spec.db[(f0 + 1) * nt + self.t0];
+        let d = self.spec.db[(f0 + 1) * nt + self.t0 + 1];
+        Some(a * (1.0 - wt) * (1.0 - wf) + b * wt * (1.0 - wf) + c * (1.0 - wt) * wf + d * wt * wf)
+    }
+}
+
 impl Spec {
     pub fn nt(&self) -> usize {
         self.t.len()
@@ -80,6 +109,28 @@ impl Spec {
         let c = self.db[(f0 + 1) * nt + t0];
         let d = self.db[(f0 + 1) * nt + t0 + 1];
         Some(a * (1.0 - wt) * (1.0 - wf) + b * wt * (1.0 - wf) + c * (1.0 - wt) * wf + d * wt * wf)
+    }
+
+    /// Prepare a fixed time for repeated frequency queries. The time coordinate is
+    /// still computed from the grid, even for a frame centre: rounding it to an integer
+    /// would change the original interpolation at non-dyadic timestamps and the last frame.
+    pub(crate) fn time_sampler(&self, tq: f64) -> Option<TimeSampler<'_>> {
+        let (nt, nf) = (self.t.len(), self.f.len());
+        if nt < 2 || nf < 2 {
+            return None;
+        }
+        let ti = (tq - self.t[0]) / self.dt();
+        if !(ti >= 0.0 && ti <= (nt - 1) as f64) {
+            return None;
+        }
+        let ti = ti.min(nt as f64 - 1.000_001);
+        let t0 = ti as usize;
+        Some(TimeSampler {
+            spec: self,
+            t0,
+            wt: (ti - t0 as f64) as f32,
+            df: self.df(),
+        })
     }
 
     /// Subtract each row's median over frames `[a, b)` (whole row when `None`): stationary hum
@@ -652,6 +703,115 @@ pub fn write_png_rgb(path: &Path, w: usize, h: usize, rgb: &[u8]) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_time_samples_match_scalar_interpolation_bit_for_bit() {
+        for (nt, nf) in [(2, 2), (3, 41), (67, 161)] {
+            for origin in [0.0, 1234.125, 1_000_000_000.0] {
+                for (dt, df) in [(0.1, 0.25), (0.25, 0.1)] {
+                    let spec = Spec {
+                        t: (0..nt).map(|i| origin + i as f64 * dt).collect(),
+                        f: (0..nf).map(|i| 80.0 + i as f64 * df).collect(),
+                        db: (0..nt * nf)
+                            .map(|i| (17.0 * (i as f64 * 0.731).sin()) as f32)
+                            .collect(),
+                        meta: SpecMeta {
+                            sr: 4000,
+                            win_s: 0.5,
+                            hop_s: dt,
+                            nfft: 16_384,
+                            df,
+                            fmin: 80.0,
+                            fmax: 80.0 + (nf - 1) as f64 * df,
+                            norm: "sampling oracle".into(),
+                        },
+                    };
+                    let mut times: Vec<_> = (0..=3 * (nt - 1))
+                        .map(|i| origin + i as f64 / 3.0 * dt)
+                        .collect();
+                    times.extend_from_slice(&spec.t);
+                    times.extend([
+                        spec.t[0].next_down(),
+                        spec.t[nt - 1].next_up(),
+                        f64::NAN,
+                        f64::NEG_INFINITY,
+                        f64::INFINITY,
+                    ]);
+                    let mut frequencies: Vec<_> = (0..=3 * (nf - 1))
+                        .map(|i| 80.0 + i as f64 / 3.0 * df)
+                        .collect();
+                    frequencies.extend_from_slice(&spec.f);
+                    frequencies.extend([
+                        spec.f[0].next_down(),
+                        spec.f[nf - 1].next_up(),
+                        f64::NAN,
+                        f64::NEG_INFINITY,
+                        f64::INFINITY,
+                    ]);
+                    for tq in times {
+                        let sampler = spec.time_sampler(tq);
+                        for &fq in &frequencies {
+                            assert_eq!(
+                                sampler.and_then(|s| s.sample(fq)).map(f32::to_bits),
+                                spec.bilinear(tq, fq).map(f32::to_bits),
+                                "grid {nt}x{nf}, origin {origin}, steps {dt}/{df}, query {tq}/{fq}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_time_sampling_keeps_nonfinite_values_and_degenerate_grids() {
+        let mut spec = Spec {
+            t: vec![0.0, 0.1, 0.2],
+            f: vec![80.0, 80.25, 80.5],
+            db: vec![
+                0.0,
+                -0.0,
+                2.0,
+                f32::NAN,
+                f32::INFINITY,
+                1.0,
+                -1.0,
+                7.0,
+                -5.0,
+            ],
+            meta: SpecMeta {
+                sr: 4000,
+                win_s: 0.5,
+                hop_s: 0.1,
+                nfft: 16_384,
+                df: 0.25,
+                fmin: 80.0,
+                fmax: 80.5,
+                norm: String::new(),
+            },
+        };
+        for t in [0.0, 0.05, 0.1, 0.2] {
+            for f in [80.0, 80.125, 80.25, 80.5] {
+                assert_eq!(
+                    spec.time_sampler(t)
+                        .and_then(|s| s.sample(f))
+                        .map(f32::to_bits),
+                    spec.bilinear(t, f).map(f32::to_bits)
+                );
+            }
+        }
+        for n in [1, 0] {
+            spec.t.truncate(n);
+            assert!(spec.time_sampler(0.0).is_none());
+            assert!(spec.bilinear(0.0, 80.0).is_none());
+        }
+        spec.t = vec![0.0, 0.1, 0.2];
+        for n in [1, 0] {
+            spec.f.truncate(n);
+            assert!(spec.time_sampler(0.0).is_none());
+            assert!(spec.bilinear(0.0, 80.0).is_none());
+        }
+    }
 
     #[test]
     fn blocked_stft_matches_direct_frames_bit_for_bit() {
