@@ -36,6 +36,15 @@ pub mod pt_flags {
     pub const TISB: u8 = 2;
     /// readsb marked the position stale / estimated.
     pub const STALE: u8 = 4;
+    /// A readsb new-leg marker or preceding ground report. Store merging applies
+    /// the same minimum-gap rule as the raw builder before joining across it.
+    pub const NEW_LEG: u8 = 8;
+    /// A new-leg/ground marker follows this report, including at archive EOF.
+    pub const NEW_LEG_AFTER: u8 = 16;
+    /// Original airborne reports were removed before this retained leg.
+    pub const CLIPPED_BEFORE: u8 = 32;
+    /// Original airborne reports were removed after this retained leg.
+    pub const CLIPPED_AFTER: u8 = 64;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -283,6 +292,8 @@ impl TrackStore {
     /// Existing leg boundaries are never crossed. Legs left with < 2 points go.
     pub fn filtered(&self, bbox: &BBox, t0: f64, t1: f64) -> TrackStore {
         let mut legs = Vec::new();
+        let mut used_keys: std::collections::HashSet<String> =
+            self.legs.iter().map(|leg| leg.key.clone()).collect();
         for leg in &self.legs {
             let inside: Vec<bool> = leg
                 .points
@@ -315,24 +326,57 @@ impl TrackStore {
                     *g = true;
                 }
             }
-            let pts: Vec<TrackPoint> = leg
-                .points
-                .iter()
-                .zip(&grown)
-                .filter(|(_, g)| **g)
-                .map(|(p, _)| *p)
-                .collect();
-            if pts.len() >= 2 {
-                legs.push(FlightLeg {
-                    points: pts,
-                    ..leg.clone()
-                });
+            // Joining two retained islands would invent an interpolated chord across
+            // reports removed by this filter. Keep each contiguous run separately.
+            let mut start = 0;
+            let mut fragment = 0;
+            while start < n {
+                if !grown[start] {
+                    start += 1;
+                    continue;
+                }
+                let end = (start + 1..n).find(|&i| !grown[i]).unwrap_or(n);
+                if end - start >= 2 {
+                    let key = if fragment == 0 {
+                        leg.key.clone()
+                    } else {
+                        loop {
+                            let candidate = format!("{}#filter{fragment}", leg.key);
+                            if used_keys.insert(candidate.clone()) {
+                                break candidate;
+                            }
+                            fragment += 1;
+                        }
+                    };
+                    let mut points = leg.points[start..end].to_vec();
+                    if start > 0 {
+                        points[0].flags |= pt_flags::CLIPPED_BEFORE;
+                    }
+                    if end < n {
+                        points.last_mut().unwrap().flags |= pt_flags::CLIPPED_AFTER;
+                    }
+                    legs.push(FlightLeg {
+                        key,
+                        icao: leg.icao.clone(),
+                        reg: leg.reg.clone(),
+                        typ: leg.typ.clone(),
+                        source: leg.source.clone(),
+                        engine: leg.engine,
+                        points,
+                    });
+                    fragment += 1;
+                }
+                start = end;
             }
         }
         let mut meta = self.meta.clone();
         meta.bbox = *bbox;
         meta.t_start = t0;
         meta.t_end = t1;
+        // A cropped store cannot certify that every report around midnight remains.
+        if let Some(stats) = meta.stats.as_object_mut() {
+            stats.remove("midnight_context");
+        }
         TrackStore { meta, legs }
     }
 }
@@ -397,17 +441,22 @@ mod tests {
         );
         let got = store.filtered(&bbox, 145.0, 155.0);
         assert_eq!(got.legs.len(), 1, "the 120 s crossing segment was dropped");
-        assert_eq!(got.legs[0].points, store.legs[0].points[1..7]);
+        let mut bracket = store.legs[0].points[1..7].to_vec();
+        bracket[0].flags |= pt_flags::CLIPPED_BEFORE;
+        bracket.last_mut().unwrap().flags |= pt_flags::CLIPPED_AFTER;
+        assert_eq!(got.legs[0].points, bracket);
         assert_eq!(got.meta.bbox, bbox);
         assert_eq!((got.meta.t_start, got.meta.t_end), (145.0, 155.0));
         // Time and space must overlap on the same portion of the segment.
         assert!(store.filtered(&bbox, 100.0, 110.0).legs.is_empty());
         // A time-only crop between knots also needs both interpolation anchors.
         let timed = store.filtered(&store.meta.bbox, 145.0, 155.0);
-        assert_eq!(timed.legs[0].points, store.legs[0].points[1..7]);
+        assert_eq!(timed.legs[0].points, bracket);
         // Existing two-neighbour behavior for a crop containing a knot stays unchanged.
         let existing = store.filtered(&store.meta.bbox, 55.0, 65.0);
-        assert_eq!(existing.legs[0].points, store.legs[0].points[..5]);
+        let mut around_knot = store.legs[0].points[..5].to_vec();
+        around_knot.last_mut().unwrap().flags |= pt_flags::CLIPPED_AFTER;
+        assert_eq!(existing.legs[0].points, around_knot);
         let split = TrackStore {
             legs: vec![
                 FlightLeg {
@@ -466,6 +515,150 @@ mod tests {
             .as_nanos();
         let name = format!("fdop-store-{label}-{}-{nonce}", std::process::id());
         std::env::temp_dir().join(name).join("t.fdtrk")
+    }
+
+    fn looping_store() -> TrackStore {
+        let mut store = sample_store();
+        store.meta.bbox = BBox::new(-0.1, -0.1, 0.1, 0.1);
+        store.meta.t_end = 400.0;
+        store.meta.stats = serde_json::json!({"midnight_context": {
+            "version": 1, "day_start": 0.0, "join_gap_s": 300.0, "archive_pad_s": 3600.0
+        }});
+        store.legs[0].key = "synthetic_0".into();
+        store.legs[0].icao = "000001".into();
+        store.legs[0].points = [
+            (0.0, -0.002),
+            (0.0, -0.001),
+            (0.0, 0.0),
+            (0.0, -0.001),
+            (0.0, -0.002),
+            (0.0, -0.003),
+            (0.001, -0.004),
+            (0.003, -0.004),
+            (0.005, -0.004),
+            (0.005, 0.0),
+            (0.005, 0.004),
+            (0.003, 0.004),
+            (0.001, 0.004),
+            (0.0, 0.003),
+            (0.0, 0.002),
+            (0.0, 0.001),
+            (0.0, 0.0),
+            (0.0, -0.001),
+            (0.0, -0.002),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (lat, lon))| TrackPoint {
+            t: i as f64 * 10.0,
+            lat,
+            lon,
+            alt_m: 1000.0,
+            gs_mps: 70.0,
+            track_deg: 0.0,
+            vrate_mps: 0.0,
+            alt_src: alt_src::GEOM,
+            flags: 0,
+        })
+        .collect();
+        store
+    }
+
+    #[test]
+    fn filtering_disjoint_visits_does_not_invent_a_crossing_between_them() {
+        let store = looping_store();
+        let bbox = BBox::new(-0.001, -0.001, 0.001, 0.001);
+        let cropped = store.filtered(&bbox, 0.0, 180.0);
+        assert_eq!(cropped.legs.len(), 2);
+        assert_eq!(cropped.n_points(), 12);
+        assert_eq!(cropped.legs[0].key, store.legs[0].key);
+        assert_ne!(cropped.legs[0].key, cropped.legs[1].key);
+        assert_eq!(cropped.legs[0].t1(), 50.0);
+        assert_eq!(cropped.legs[1].t0(), 130.0);
+        assert!(cropped.meta.stats.get("midnight_context").is_none());
+        assert_ne!(
+            cropped.legs[0].points.last().unwrap().flags & pt_flags::CLIPPED_AFTER,
+            0
+        );
+        assert_ne!(
+            cropped.legs[1].points[0].flags & pt_flags::CLIPPED_BEFORE,
+            0
+        );
+        // The real flight travels north of this box at t=90. Concatenating the two
+        // retained islands would instead draw a false west-to-east crossing through it.
+        assert!(store.filtered(&bbox, 80.0, 100.0).legs.is_empty());
+        assert!(cropped.filtered(&bbox, 80.0, 100.0).legs.is_empty());
+        let path = test_path("filtered-islands");
+        cropped.save(&path).unwrap();
+        let loaded = TrackStore::load(&path).unwrap();
+        assert!(loaded.filtered(&bbox, 80.0, 100.0).legs.is_empty());
+        for (got, want) in loaded.legs.iter().zip(&cropped.legs) {
+            assert_eq!(got.key, want.key);
+            assert_eq!(got.points, want.points);
+        }
+    }
+
+    #[test]
+    fn repeated_filtering_preserves_unique_stable_fragment_keys() {
+        let mut store = looping_store();
+        // A second, wider excursion separates a third visit only in the first crop.
+        // The narrower crop must then split its first leg without reusing the second
+        // leg's existing fragment key.
+        let first_new = store.legs[0].points.len();
+        let template = store.legs[0].points[0];
+        store.legs[0].points.extend(
+            [
+                (0.0, -0.004),
+                (0.0, -0.008),
+                (0.0, -0.012),
+                (0.0, -0.016),
+                (0.01, -0.02),
+                (0.03, -0.02),
+                (0.05, -0.02),
+                (0.05, 0.0),
+                (0.05, 0.02),
+                (0.03, 0.02),
+                (0.01, 0.02),
+                (0.0, 0.016),
+                (0.0, 0.012),
+                (0.0, 0.008),
+                (0.0, 0.004),
+                (0.0, 0.002),
+                (0.0, 0.001),
+                (0.0, 0.0),
+                (0.0, -0.001),
+                (0.0, -0.002),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (lat, lon))| TrackPoint {
+                t: (first_new + i) as f64 * 10.0,
+                lat,
+                lon,
+                ..template
+            }),
+        );
+        let wide = store.filtered(&BBox::new(-0.01, -0.01, 0.01, 0.01), 0.0, 400.0);
+        assert_eq!(wide.legs.len(), 2);
+        let existing_keys: Vec<_> = wide.legs.iter().map(|l| l.key.clone()).collect();
+        let narrow = BBox::new(-0.001, -0.001, 0.001, 0.001);
+        let cropped = wide.filtered(&narrow, 0.0, 400.0);
+        assert_eq!(cropped.legs.len(), 3);
+        let keys: std::collections::HashSet<_> =
+            cropped.legs.iter().map(|l| l.key.as_str()).collect();
+        assert_eq!(keys.len(), cropped.legs.len());
+        assert_eq!(cropped.legs[0].key, existing_keys[0]);
+        assert_eq!(cropped.legs[2].key, existing_keys[1]);
+        let path = test_path("refilter-keys");
+        cropped.save(&path).unwrap();
+        let loaded = TrackStore::load(&path).unwrap();
+        let repeated = loaded.filtered(&narrow, 0.0, 400.0);
+        assert_eq!(repeated.legs.len(), cropped.legs.len());
+        for (got, want) in repeated.legs.iter().zip(&cropped.legs) {
+            assert_eq!(got.key, want.key);
+            assert_eq!(got.icao, want.icao);
+            assert_eq!(got.points, want.points);
+        }
     }
 
     #[test]

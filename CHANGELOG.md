@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve separate flight visits when cropping cached tracks
+
+- Keep disjoint retained sections as separate flight legs. Filtering can no longer invent
+  a straight path through the reports removed between two real visits to the requested region.
+- Preserve the original key for the first surviving section and reserve existing keys before
+  naming additional sections. Nested crops keep distinct identities instead of colliding with
+  a fragment already present in the input store. Retained endpoint flags preserve the cut
+  through serialization; the binary store layout remains unchanged.
+- Add a real looping-track regression that rules out a fabricated crossing during the discarded
+  excursion, including after save/load, and a three-visit nested-crop regression for unique,
+  stable keys and complete point payloads. Existing bracketing tests retain their exact points
+  and explicitly require the new endpoint flags.
+- **Validation:** all 27 native `fdop-types` library tests pass on the pinned nightly through
+  genuine RCH, as does all-target `fdop-types` Clippy with warnings denied. Independent source
+  review, focused formatting and whitespace checks pass. These are data-geometry and cache
+  tests; no new recording accuracy or whole-workspace result is claimed.
+
 ### Skip unreachable flights during confirmation and silent-pass checks
 
 - Cache complete Hermite trajectory bounds once with the trace search's immutable time index.

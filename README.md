@@ -787,7 +787,7 @@ UTC days; keeping the whole aircraft also preserves merge keys, feed preference 
 anchors. Original day metadata and altitude references remain available even when no aircraft from a
 day is selected. This reduces retained track data for selective requests. A cached file containing
 selected aircraft is decompressed twice, so broad requests may save little memory and pay for the extra
-scan. The store format and final spatial/time filter are unchanged.
+scan. The binary store format is unchanged.
 
 Concurrent searches publish track stores through separate, exclusively created staging files, so one
 writer cannot truncate another writer's cache. A load also rejects bytes after its compressed member,
@@ -841,9 +841,10 @@ three or more files. Unjoined legs retain their original point allocation.
 Archive ingestion and cached-window slicing retain the original samples bracketing a sparse segment that
 crosses the requested region and time window, even when neither sample is inside. The segment must enter
 both at the same time. Ingestion does not infer a crossing across a ground report or restart marker;
-cached-window slicing does not cross stored flight-leg boundaries. Two neighbouring samples on each side
-still anchor interpolation, and the track model's existing gap and geometry checks still apply. No positions
-are invented. Older narrow caches that already discarded an aircraft need fresh ingestion to recover it;
+cached-window slicing does not cross stored flight-leg boundaries. Separate retained sections remain
+separate legs, so filtering cannot invent a straight chord through discarded reports. Two neighbouring
+samples on each side still anchor interpolation, and the track model's existing gap and geometry checks
+still apply. No positions are invented. Older narrow caches that already discarded an aircraft need fresh ingestion to recover it;
 the fix can use bracketing
 samples in an existing wider cache, but cannot restore samples absent from the stored data.
 
