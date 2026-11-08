@@ -40,11 +40,15 @@ at that commit, not per-change commits.
 - Before the gate was coded, the rule was written down and run offline. It was run on these rows' decoy clocks
   (`dclock_c2c7578`) and against 17 fresh wrong dates (`f17_c2c7578`), none of which asserted. It was chosen after
   seeing one wrong answer, so these rows do not test it.
-- Cost: a high or medium answer takes about five times as long.
+- Cost: the decoys run without the curve match, which the gate does not read. On the development rows the four
+  added 229 to 543 s to an answer, and every decoy's evidence was the same to 0.01 nats as with the curve match
+  on, which took 1,121 to 3,618 s (`ab_dec1_dec2`, `n1_dec2`).
 - Tests:
   - `decoy_gate_reads_rows_from_real_runs`: the gate on these rows' numbers, the inclusive 3-nat line, a decoy
     with no answer, and three decoys.
   - `decoy_shifts_keep_each_clock_window_inside_the_dates`.
+  - `decoy_runs_move_only_the_start_and_skip_the_curve_match`: a decoy's arguments differ from the answer's only
+    in the start, the run directory, `quiet` and the curve match.
   - The long-video known-answer test now requires its answer to pass its decoy clocks, and the `creation_time` test
     requires that it runs none.
   - `fdop-core`'s seven red tests are the same as on `c2c7578`.

@@ -957,6 +957,20 @@ fn decoy_gate(evidence: f64, runs: &[(f64, Option<f64>)]) -> (bool, String) {
     )
 }
 
+/// Arguments for one decoy-clock run: `a` with the start moved by `shift`, its own run directory,
+/// quiet, and no curve match. The gate reads only the trace search's evidence, which with an
+/// explicit start is computed before the curve match and does not read it. Without the curve match
+/// that evidence came out identical on four decoys from both development harnesses, at a fifth to a
+/// tenth of the time (LOG 2026-11-08T17:51Z).
+fn decoy_args(a: &LocateArgs, t0: f64, shift: f64, run_dir: &Path) -> LocateArgs {
+    let mut d = a.clone();
+    d.start = Some(format!("{:.3}", t0 + shift));
+    d.out = Some(run_dir.join(format!("decoy_clock_{:+.0}h", shift / 3600.0)));
+    d.quiet = true;
+    d.curve_match = false;
+    d
+}
+
 /// Run the same locate at decoy clocks, each into `run_dir/decoy_clock_<shift>h`, until
 /// [`DECOY_CLOCKS`] have run. A decoy that fails (an unpublished day, say) is logged and the next
 /// shift is tried.
@@ -973,10 +987,7 @@ fn decoy_clock_runs(
         if runs.len() == DECOY_CLOCKS {
             break;
         }
-        let mut d = a.clone();
-        d.start = Some(format!("{:.3}", t0 + s));
-        d.out = Some(run_dir.join(format!("decoy_clock_{:+.0}h", s / 3600.0)));
-        d.quiet = true;
+        let d = decoy_args(a, t0, s, run_dir);
         match locate_with_clock(&d, &Log::new(true), now, true) {
             Ok(o) => {
                 log.say(&format!(
@@ -2435,6 +2446,28 @@ mod tests {
             &runs([Some(14.88), Some(14.64), Some(14.91), Some(16.88)])[..3],
         );
         assert!(!pass && why.contains("only 3 of 4"), "{why}");
+    }
+
+    #[test]
+    fn decoy_runs_move_only_the_start_and_skip_the_curve_match() {
+        let mut a = offline_test_args("decoy-args");
+        a.curve_match = true;
+        a.quiet = false;
+        a.start = Some("2026-09-08T20:17:00Z".into());
+        let t0 = parse_iso_utc("2026-09-08T20:17:00Z").unwrap();
+        let d = decoy_args(&a, t0, -7_200.0, Path::new("/runs/x"));
+        assert_eq!(
+            parse_iso_utc(d.start.as_deref().unwrap()).unwrap(),
+            parse_iso_utc("2026-09-08T18:17:00Z").unwrap()
+        );
+        assert_eq!(d.out.as_deref(), Some(Path::new("/runs/x/decoy_clock_-2h")));
+        assert!(d.quiet && !d.curve_match);
+        assert_eq!(
+            (&d.media, &d.dates, &d.near, &d.cache, d.offline, d.clock_tol_s, d.max_events, d.sr),
+            (&a.media, &a.dates, &a.near, &a.cache, a.offline, a.clock_tol_s, a.max_events, a.sr)
+        );
+        let d = decoy_args(&a, t0, 3_600.0, Path::new("/runs/x"));
+        assert_eq!(d.out.as_deref(), Some(Path::new("/runs/x/decoy_clock_+1h")));
     }
 
     #[test]
