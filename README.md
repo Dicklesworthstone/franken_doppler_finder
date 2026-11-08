@@ -1225,6 +1225,40 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Recover supported motion when another report component is unusable
+
+Track construction now recovers independently supported horizontal or vertical motion after the
+existing full-vector report check fails or horizontal metadata is absent. A corrupt climb rate
+can no longer automatically discard a valid turn tangent; a missing speed or heading can no
+longer automatically discard a supported climb rate. Unsupported components retain the existing
+position-derived finite differences. Recovery still requires position support at the same
+25 m/s tolerance, including across samples at least 30 s apart, and retains the close-neighbour
+requirements for turn support. When both components individually pass but the original joint
+check fails, the original fallback remains. Previously accepted full vectors and their
+`reported_vel_frac` credit are unchanged; partial recovery adds no credit.
+
+The actual pinned-nightly core crate ran the same 34 track tests before and after the production
+change through RCH: **30 passed / 4 failed before; 34 passed / 0 failed after**. The analytic
+oracles exercise raw `FlightLeg` construction, Hermite interpolation, emission-time solving and
+received Doppler against independently calculated circle and cubic-climb trajectories:
+
+- `sparse_turns_recover_horizontal_motion_despite_bad_climb_rates` covers both turn directions
+  and uneven samples. Maximum position error stays below 30 m, versus more than 100 m for the
+  old finite-difference fallback. Maximum 200 Hz Doppler error is below one quarter of the old
+  error. The first failing original-code case measured 288.23 m and 27.75 Hz.
+- `climbing_tracks_keep_vertical_reports_without_horizontal_metadata` covers missing speed,
+  missing heading and both, in climbs and descents. Maximum error stays below 0.1 m and 0.01 Hz,
+  versus more than 20 m and 0.2 Hz for the old fallback.
+- `partial_velocity_recovery_requires_position_support_and_keeps_joint_limit` and
+  `accepted_velocity_reports_remain_bitwise_unchanged` protect the joint tolerance, sparse-sample
+  support, report credit and previously accepted vectors. Existing corrupt-speed/heading/rate
+  tests still reject the corrupt component while requiring preservation of the supported one.
+
+These are synthetic trajectory results, not measured recording accuracy. Independent source
+review passed. The CLI selftest and reference/wrong-date/field replays were not run, and no
+matching recording/cache was available in this workspace. The selftest also constructs models
+directly, so it would not replace the raw-report recovery oracles above.
+
 ### Ridge-profile interpolation: native equivalence and component timing
 
 Both `spectro::tests::prepared_time_*` regressions pass against the unchanged scalar bilinear sampler,

@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover independently supported flight-motion components
+
+- Keep valid horizontal turn motion when a corrupt vertical-rate report rejects the full vector,
+  and keep a position-supported vertical rate when speed or heading is missing or rejected.
+  Unsupported components retain the existing finite-difference fallback.
+- Preserve the original full-vector acceptance path and its exact arithmetic/report credit.
+  Partial recovery requires actual position support at the existing 25 m/s tolerance, keeps
+  the turn-neighbour requirements, and adds no report credit. It cannot combine two individually
+  acceptable residuals into a newly accepted vector that exceeded the original joint limit.
+- Add analytic circle/cubic-climb regressions through raw track construction, interpolation and
+  emission/Doppler prediction, plus unchanged-vector and joint-limit controls. Strengthen the
+  existing corruption tests to require both rejection of the bad component and retention of the
+  supported one. No cleaning, gap, physical, confidence or comparison-budget threshold changes.
+- **Validation:** the same native 34-test track selection changes from 30 passes / 4 failures on
+  the original production code to 34 passes / 0 failures. Sparse-turn maximum position error is
+  below 30 m (old fallback above 100 m), with less than one quarter of its maximum Doppler error;
+  cubic-climb errors are below 0.1 m and 0.01 Hz. README names the oracles and their limits.
+  Independent review passed. CLI selftest and recording replays remain unrun; no new
+  real-recording accuracy is claimed.
+
 ### Score joined seeds before one complete event pair fills memory
 
 - Deliver completed representatives directly to the quick trace check in groups of at most

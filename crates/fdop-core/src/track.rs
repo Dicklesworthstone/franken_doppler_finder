@@ -1,8 +1,10 @@
 //! ADS-B track model: cubic Hermite interpolation of ECEF position using per-sample velocity
 //! vectors (velocity-Hermite). Reported ground speed / track / vertical rate are used when
 //! present and consistent with the positions; otherwise velocity comes from second-order
-//! finite differences. Tracks are split at gaps longer than `max_gap_s` so interpolation never
-//! invents geometry across a coverage hole. The longest physically consistent chain anchors each
+//! finite differences. If one motion component fails, an independently supported horizontal
+//! or vertical component can still replace its finite difference. Tracks are split at gaps
+//! longer than `max_gap_s` so interpolation never invents geometry across a coverage hole.
+//! The longest physically consistent chain anchors each
 //! raw piece: archived legs can interleave junk positions (MLAT mis-solutions, another aircraft's
 //! position under the same address) that interpolation would otherwise fly through. Supported
 //! chains outside the winner's time coverage can survive as separate models when the same
@@ -25,7 +27,8 @@ pub struct TrackModel {
     pub t: Vec<f64>,
     pub pos: Vec<V3>,
     pub vel: Vec<V3>,
-    /// Share of samples whose velocity came from reported gs/track (vs finite differences).
+    /// Share of samples accepted by the full reported gs/track check (with reported vertical
+    /// rate when available). Partial component recovery does not add report credit.
     pub reported_vel_frac: f64,
     pub mlat_frac: f64,
 }
@@ -260,12 +263,13 @@ fn fd_velocity(t: &[f64], p: &[V3]) -> Vec<V3> {
 /// constant-rate assumption on that side only, so requiring both would discard correct reports
 /// wherever an aircraft rolls in or out. In steady flight and steady turns both chords predict
 /// the same tangent, so a wrong report fails either way.
+/// With `vu = None`, test horizontal motion alone; no vertical report contributes to the residual.
 fn turn_consistent(
     pts: &[fdop_types::store::TrackPoint],
     pos: &[V3],
     k: usize,
     enu: &Enu,
-    vu: f64,
+    vu: Option<f64>,
     tolerance: f64,
 ) -> bool {
     let p = &pts[k];
@@ -273,7 +277,7 @@ fn turn_consistent(
         return false;
     }
     let (gs, heading) = (p.gs_mps as f64, (p.track_deg as f64).to_radians());
-    let reported = [gs * heading.sin(), gs * heading.cos(), vu];
+    let reported = [gs * heading.sin(), gs * heading.cos(), vu.unwrap_or(0.0)];
     [k.checked_sub(1), (k + 1 < pts.len()).then_some(k + 1)]
         .into_iter()
         .flatten()
@@ -304,10 +308,43 @@ fn turn_consistent(
             let expected = [
                 speed * tangent_heading.sin(),
                 speed * tangent_heading.cos(),
-                chord[2],
+                vu.map_or(0.0, |_| chord[2]),
             ];
             norm(sub(reported, expected)) <= tolerance
         })
+}
+
+/// Recover one supported component after the original full-vector check has failed, or when
+/// horizontal reports are missing. Every new component needs position support; the original
+/// sparse-sample exemption is not enough.
+/// If both components fit separately, keep the old fallback: accepting both here could bypass
+/// a failed joint residual and enlarge its tolerance by sqrt(2).
+fn recover_velocity_component(
+    pts: &[fdop_types::store::TrackPoint],
+    pos: &[V3],
+    k: usize,
+    fd: V3,
+    tolerance: f64,
+) -> V3 {
+    let p = &pts[k];
+    let enu = Enu::new(p.lat, p.lon, 0.0);
+    let fallback = enu.vec_from_ecef(fd);
+    let vertical = p.vrate_mps as f64;
+    let vertical_ok = vertical.is_finite() && (vertical - fallback[2]).abs() <= tolerance;
+    let horizontal = if p.gs_mps.is_finite() && p.gs_mps >= 0.0 && p.track_deg.is_finite() {
+        let (gs, heading) = (p.gs_mps as f64, (p.track_deg as f64).to_radians());
+        let reported = [gs * heading.sin(), gs * heading.cos()];
+        ((reported[0] - fallback[0]).hypot(reported[1] - fallback[1]) <= tolerance
+            || turn_consistent(pts, pos, k, &enu, None, tolerance))
+        .then_some(reported)
+    } else {
+        None
+    };
+    match (horizontal, vertical_ok) {
+        (Some([ve, vn]), false) => enu.vec_to_ecef([ve, vn, fallback[2]]),
+        (None, true) => add(fd, enu.vec_to_ecef([0.0, 0.0, vertical - fallback[2]])),
+        _ => fd,
+    }
 }
 
 /// Build track models from one stored leg (possibly several, split at gaps).
@@ -364,12 +401,22 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
                                 || (k + 1 < t.len() && t[k + 1] - t[k] < 30.0);
                             if !near
                                 || norm(sub(rep, fd[k])) <= bp.vel_consistency_mps
-                                || turn_consistent(seg, &pos, k, &enu, vu, bp.vel_consistency_mps)
+                                || turn_consistent(
+                                    seg,
+                                    &pos,
+                                    k,
+                                    &enu,
+                                    Some(vu),
+                                    bp.vel_consistency_mps,
+                                )
                             {
                                 vel[k] = rep;
                                 n_rep += 1;
+                                continue;
                             }
                         }
+                        vel[k] =
+                            recover_velocity_component(seg, &pos, k, fd[k], bp.vel_consistency_mps);
                     }
                     let key = if recovered == 0 {
                         base_key.clone()
@@ -1170,7 +1217,26 @@ mod tests {
             assert_eq!(models.len(), 1);
             let model = &models[0];
             let fd = fd_velocity(&model.t, &model.pos);
-            assert_eq!(model.vel[2], fd[2], "corrupt field {field} was accepted");
+            let p = &corrupt.points[2];
+            let local = Enu::new(p.lat, p.lon, 0.0);
+            let got = local.vec_from_ecef(model.vel[2]);
+            let fallback = local.vec_from_ecef(fd[2]);
+            if field < 2 {
+                assert!(
+                    (got[0] - fallback[0]).hypot(got[1] - fallback[1]) < 1e-9,
+                    "corrupt horizontal field {field} was accepted"
+                );
+                assert!((got[2] - p.vrate_mps as f64).abs() < 1e-9);
+            } else {
+                let heading = (p.track_deg as f64).to_radians();
+                assert!((got[0] - p.gs_mps as f64 * heading.sin()).abs() < 1e-9);
+                assert!((got[1] - p.gs_mps as f64 * heading.cos()).abs() < 1e-9);
+                assert!(
+                    (got[2] - fallback[2]).abs() < 1e-9,
+                    "corrupt vertical rate was accepted"
+                );
+            }
+            assert_eq!(model.reported_vel_frac, 0.8);
         }
         let mut missing_headings = leg.clone();
         missing_headings.points[1].track_deg = f32::NAN;
@@ -1178,7 +1244,15 @@ mod tests {
         let models = build(&missing_headings, &BuildParams::default());
         let model = &models[0];
         let fd = fd_velocity(&model.t, &model.pos);
-        assert_eq!(model.vel[2], fd[2], "an unobserved turn was assumed");
+        let p = &missing_headings.points[2];
+        let local = Enu::new(p.lat, p.lon, 0.0);
+        let got = local.vec_from_ecef(model.vel[2]);
+        let fallback = local.vec_from_ecef(fd[2]);
+        assert!(
+            (got[0] - fallback[0]).hypot(got[1] - fallback[1]) < 1e-9,
+            "an unobserved turn was assumed"
+        );
+        assert!((got[2] - p.vrate_mps as f64).abs() < 1e-9);
     }
 
     #[test]
@@ -1198,10 +1272,199 @@ mod tests {
                 assert_eq!(models.len(), 1);
                 let model = &models[0];
                 let fd = fd_velocity(&model.t, &model.pos);
-                assert_eq!(
-                    model.vel[2], fd[2],
+                let p = &corrupt.points[2];
+                let local = Enu::new(p.lat, p.lon, 0.0);
+                let got = local.vec_from_ecef(model.vel[2]);
+                let fallback = local.vec_from_ecef(fd[2]);
+                assert!(
+                    (got[0] - fallback[0]).hypot(got[1] - fallback[1]) < 1e-9,
                     "{error} degree heading error was accepted"
                 );
+                assert!((got[2] - p.vrate_mps as f64).abs() < 1e-9);
+            }
+        }
+    }
+
+    // Independent position and received-frequency oracle from the analytic source states.
+    // Reception times use the exact source's range; only the tested model solves emission time.
+    fn analytic_flight_errors(
+        model: &TrackModel,
+        observer: V3,
+        state: impl Fn(f64) -> (V3, V3),
+    ) -> (f64, f64) {
+        let (mut position, mut frequency) = (0.0_f64, 0.0_f64);
+        for interval in model.t.windows(2) {
+            for j in 1..10 {
+                let te = interval[0] + (interval[1] - interval[0]) * j as f64 / 10.0;
+                let (p, v) = state(te - 1000.0);
+                position = position.max(norm(sub(model.pos_at(te), p)));
+                let rv = sub(p, observer);
+                let range = norm(rv);
+                let received = te + range / 343.0;
+                let truth_hz = 200.0 / (1.0 + dot(rv, v) / (range * 343.0));
+                let (_, _, ratio) = model
+                    .solve_emission_p(received, observer, &Prop::still(343.0), None)
+                    .expect("analytic reception stays inside the model");
+                frequency = frequency.max((200.0 * ratio - truth_hz).abs());
+            }
+        }
+        (position, frequency)
+    }
+
+    #[test]
+    fn sparse_turns_recover_horizontal_motion_despite_bad_climb_rates() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let observer = enu.to_ecef([0.0, 0.0, 0.0]);
+        for degrees_per_second in [-3.0_f64, 3.0] {
+            let omega = degrees_per_second.to_radians();
+            for times in [
+                vec![0.0, 25.0, 50.0, 75.0, 100.0],
+                vec![0.0, 25.0, 53.0, 77.0, 106.0],
+            ] {
+                for error in [-60.0, 60.0] {
+                    let mut leg = turning_leg(&enu, &times, omega);
+                    for p in &mut leg.points {
+                        p.vrate_mps += error;
+                    }
+                    let models = build(&leg, &BuildParams::default());
+                    assert_eq!(models.len(), 1);
+                    let model = &models[0];
+                    assert_eq!(model.t.len(), times.len());
+                    assert_eq!(model.reported_vel_frac, 0.0);
+                    let mut old_fallback = model.clone();
+                    old_fallback.vel = fd_velocity(&model.t, &model.pos);
+                    let state = |t| turn_state(&enu, t, omega);
+                    let recovered = analytic_flight_errors(model, observer, state);
+                    let old = analytic_flight_errors(&old_fallback, observer, state);
+                    assert!(recovered.0 < 30.0, "recovered position: {recovered:?}");
+                    assert!(old.0 > 100.0, "old position: {old:?}");
+                    assert!(
+                        recovered.1 < old.1 * 0.25,
+                        "Doppler: {recovered:?} vs {old:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn climbing_tracks_keep_vertical_reports_without_horizontal_metadata() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let observer = enu.to_ecef([0.0, 0.0, 0.0]);
+        for sign in [-1.0, 1.0] {
+            // A cubic height curve is exactly reconstructible from its true endpoint rates.
+            // Finite differences alone lose those rates at every knot, especially the ends.
+            let state = |t: f64| {
+                let q = t - 50.0;
+                (
+                    enu.to_ecef([100.0 * q, 800.0, 1200.0 + sign * 0.003 * q.powi(3)]),
+                    enu.vec_to_ecef([100.0, 0.0, sign * 0.009 * q.powi(2)]),
+                )
+            };
+            for times in [
+                vec![0.0, 25.0, 50.0, 75.0, 100.0],
+                vec![0.0, 19.0, 43.0, 72.0, 100.0],
+            ] {
+                for missing in 1..=3 {
+                    let mut leg = leg_from_states(&times, state);
+                    for p in &mut leg.points {
+                        if missing & 1 != 0 {
+                            p.gs_mps = f32::NAN;
+                        }
+                        if missing & 2 != 0 {
+                            p.track_deg = f32::NAN;
+                        }
+                    }
+                    let models = build(&leg, &BuildParams::default());
+                    assert_eq!(models.len(), 1);
+                    let model = &models[0];
+                    assert_eq!(model.t.len(), times.len());
+                    assert_eq!(model.reported_vel_frac, 0.0);
+                    let mut old_fallback = model.clone();
+                    old_fallback.vel = fd_velocity(&model.t, &model.pos);
+                    for (k, p) in leg.points.iter().enumerate() {
+                        let local = Enu::new(p.lat, p.lon, 0.0);
+                        let got = local.vec_from_ecef(model.vel[k]);
+                        let fallback = local.vec_from_ecef(old_fallback.vel[k]);
+                        assert!((got[2] - p.vrate_mps as f64).abs() < 1e-9);
+                        assert!((got[0] - fallback[0]).hypot(got[1] - fallback[1]) < 1e-9);
+                    }
+                    let recovered = analytic_flight_errors(model, observer, state);
+                    let old = analytic_flight_errors(&old_fallback, observer, state);
+                    assert!(recovered.0 < 0.1, "recovered position: {recovered:?}");
+                    assert!(old.0 > 20.0, "old position: {old:?}");
+                    assert!(recovered.1 < 0.01, "recovered Doppler: {recovered:?}");
+                    assert!(old.1 > 0.2, "old Doppler: {old:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_velocity_recovery_requires_position_support_and_keeps_joint_limit() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        for times in [[0.0, 25.0, 50.0], [0.0, 60.0, 120.0]] {
+            for error in [-60.0, 60.0] {
+                let mut leg = straight_leg(&enu, &times);
+                for p in &mut leg.points {
+                    p.gs_mps = f32::NAN;
+                    p.vrate_mps += error;
+                }
+                let models = build(&leg, &BuildParams::default());
+                assert_eq!(models.len(), 1);
+                let model = &models[0];
+                assert_eq!(model.vel, fd_velocity(&model.t, &model.pos));
+                assert_eq!(model.reported_vel_frac, 0.0);
+            }
+        }
+        let mut leg = straight_leg(&enu, &[0.0, 10.0, 20.0]);
+        leg.points[1].gs_mps += 20.0;
+        leg.points[1].vrate_mps += 20.0;
+        let models = build(&leg, &BuildParams::default());
+        let model = &models[0];
+        let fd = fd_velocity(&model.t, &model.pos);
+        // Each component fits the 25 m/s limit, but their joint residual does not.
+        // Partial recovery must not reinstate the complete previously rejected vector.
+        assert_eq!(model.vel[1], fd[1]);
+        assert_eq!(model.reported_vel_frac, 2.0 / 3.0);
+    }
+
+    #[test]
+    fn accepted_velocity_reports_remain_bitwise_unchanged() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let mut sparse = straight_leg(&enu, &[0.0, 60.0, 120.0]);
+        for p in &mut sparse.points {
+            p.vrate_mps += 60.0;
+        }
+        let mut missing_vertical = straight_leg(&enu, &[0.0, 10.0, 20.0]);
+        for p in &mut missing_vertical.points {
+            p.vrate_mps = f32::NAN;
+        }
+        for leg in [
+            straight_leg(&enu, &[0.0, 10.0, 20.0]),
+            turning_leg(&enu, &[0.0, 25.0, 53.0, 77.0, 106.0], 3.0_f64.to_radians()),
+            missing_vertical,
+            sparse, // Preserve the original !near full-report path as well.
+        ] {
+            let models = build(&leg, &BuildParams::default());
+            assert_eq!(models.len(), 1);
+            let model = &models[0];
+            assert_eq!(model.reported_vel_frac, 1.0);
+            let fd = fd_velocity(&model.t, &model.pos);
+            for (k, p) in leg.points.iter().enumerate() {
+                let local = Enu::new(p.lat, p.lon, 0.0);
+                let vertical = if p.vrate_mps.is_finite() {
+                    p.vrate_mps as f64
+                } else {
+                    local.vec_from_ecef(fd[k])[2]
+                };
+                let heading = (p.track_deg as f64).to_radians();
+                let expected = local.vec_to_ecef([
+                    p.gs_mps as f64 * heading.sin(),
+                    p.gs_mps as f64 * heading.cos(),
+                    vertical,
+                ]);
+                assert_eq!(model.vel[k].map(f64::to_bits), expected.map(f64::to_bits));
             }
         }
     }
