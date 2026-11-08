@@ -1291,6 +1291,68 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Full workspace suite at `c2c7578` (2026-11-08): seven red core tests and their causes
+
+Every test target of the workspace at `c2c7578` was built with the pinned nightly on x86-64 Linux
+(`cargo build --locked --workspace --tests`, through RCH), and each test executable was run from its
+crate's directory. Doc tests were not run. `fdop-core`: 231 passed, 7 failed, 7 ignored. Every other
+target passed: `fdop-data` 75, `fdop-types` 27, `fdop-geo` 26, `fdop-http` 16 and the application
+library 32 (the binary target has no tests). On `8be452d` the same run had eight core failures;
+`79414aa` fixed `coarse_stamps_feed_a_short_circuit_and_crossing_flight_into_the_match`. `fdop-core`
+does not depend on `asupersync`, so `cargo test -p fdop-core --lib` needs no application build; it
+took 145 s on four threads.
+
+The curve-match and measurement causes were measured: the earlier behaviour was put back behind a
+test-only switch in a scratch tree outside this repository, and the unchanged test was run again.
+The contrast row's cause follows from the failing detection, which only `c7c1206`'s stage can
+produce. The grazing and fast-edge tests were added with their code unrun and fail on every commit
+run here (`0abfbe9`, `a0795de`, `8be452d`, `c2c7578`).
+
+| Red test | Fails on | Cause |
+|---|---|---|
+| `curvematch::three_flights_locate_the_observer_and_beat_every_decoy` | decoy margin 4.961 nats; needs more than 5 | `83e8796`, then `79414aa` (below) |
+| `curvematch::refinement_climbs_from_a_start_beyond_one_move_per_scale` | its control: one move per scale now ends 106 m off with 11.242 nats, above the observer's 11.208 | `83e8796` |
+| `curvematch::grazing_passes_are_heard_across_exact_clock_seeds` | the grazing pass has 6.29 nats; needs 6.9 | added by `7bc5b48`; never seen passing |
+| `detect::fast_edge_passes_reach_measurement_at_both_recording_ends` | no pass found at 215 m/s, 10.13 s | added by `459079e`; never seen passing |
+| `detect::contrast_stage_keeps_every_detection_of_the_survey_image` | an added detection with a 10 s half path | `c7c1206`; passed on `a0795de` (below) |
+| `measure::harmonic_sibling_recovers_a_refused_primary_as_one_aircraft_event` | 119.32 Hz and 1,426 m, against 118 Hz and 1,500 m | `c0204f6` (below) |
+| `measure::fast_passes_survive_detection_refinement_and_measurement` | the 245 m/s pass at 83.376 Hz; bound 83 ± 0.3 Hz | `c0204f6` (below) |
+
+**The interpolated null (`83e8796`).** With the nearest-node null put back on `162e248`,
+`three_flights_locate_the_observer_and_beat_every_decoy`,
+`refinement_climbs_from_a_start_beyond_one_move_per_scale` and
+`coarse_stamps_feed_a_short_circuit_and_crossing_flight_into_the_match` pass, and only
+`alternative_clock_peaks_recover_the_three_flight_recording` fails: the 213 m case `83e8796` was
+written for. The interpolated null changes with the observer's place, and that change can outweigh
+the data. In the three-flight scene the best point of a 50 m grid is 206 m from the observer. Between
+the two, flight AAA's raw score falls from 211.5 to 205.1, but its null's median and tail scale fall
+from 14.26 and 22.26 to 13.22 and 20.28, so its nats rise from 9.55 to 10.15. A scratch variant on
+`162e248` compared nearby places under one calibration and recalibrated at each accepted point. It
+put the three-flight answer 78 m off, the circuit and crossing 141 m off and the clock-alias case 56 m
+off. But the three-flight margin fell from 5.13 to 4.967: the best decoy kept its 6.278 nats while the
+real window's best place lost the 0.16 nats the null's pull had given it. Its 600 m climb also ended
+at 11.193 nats, under the observer's 11.208. `79414aa`, a different fix of the same effect, gives a
+4.961 margin here. A place counts as right within 1 km (5 km on some sets) and the margin is one of
+the grade gates, so a more exact place that lowers margins can cost asserted answers. The scratch
+variant is not proposed.
+
+**The contrast edge stage (`c7c1206`).** The 48 s scene with a 35 dB swell has one tone, a 300 Hz pass
+at 22 s. The new stage adds an edge seed there at 35.5 s and 747.5 Hz, with score 4.88 against the
+4.5 line: a false detection. The test requires every contrast-stage addition to come from the full
+bank. Running the stage only on clips with no frame a full half path from both ends would not exclude
+this scene: its frames span less than 48 s, two 24 s half paths.
+
+**The removed climb (`c0204f6`).** With `82f26a9`'s climb put back on `c2c7578`, both measure tests
+pass, and four tests added since by `8be452d` and `c2c7578` fail:
+`fitted_continuation_preserves_accepted_short_events`,
+`fitted_continuation_preserves_refused_late_fast_passes`,
+`quality_support_uses_only_times_retained_by_the_actual_solver` and
+`short_fast_passes_recover_the_same_detected_ridge_after_refusal`. On `162e248` the climb gives
+118.0001 Hz and 1,500.07 m for the sibling, and 82.999 Hz for the 245 m/s pass. `c0204f6` removed it
+on set D's evidence (34 of 40 right at 25/50 %, against 33). Its record says both tests fail on
+`0abfbe9` with and without the climb. On x86-64 both pass on `0abfbe9`, so that record holds only on
+the machine it was measured on. These are synthetic checks on one platform, not field results.
+
 ### Curve localization on fixed observations
 
 The original circuit-and-crossing fixture contains three visits by a circling aircraft and a
