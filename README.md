@@ -1036,7 +1036,11 @@ Design notes:
   After every existing stage, including the fast banks, a final contrast-first edge scan can recover
   a pass whose short clip cannot cover a full template. It uses the ordinary edge bank's coverage guard,
   the same residual ownership mask and strong line, and only the remaining candidate budget and
-  detection slots. Earlier detections retain priority; recovered seeds carry `from_contrast`, preserving
+  detection slots. Before acceptance, native survey frames must support one coherent Doppler curve
+  inside the seed's original frequency/time cell. The check uses the original sparse sample count, so
+  denser sampling cannot raise the score merely by adding correlated observations. It searches exact
+  frequency-rounding intervals and bounded subframe clock phases, retaining owned samples as zero.
+  Earlier detections retain priority; recovered seeds carry `from_contrast`, preserving
   the existing guard on answers that depend on expanded detection. Four fixed 30-second synthetic
   clips now reach physical measurement where the original stage sequence found no detection (Testing).
 - **A supplemental bank covers faster subsonic passes.** After the primary, edge and contrast stages, templates
@@ -1337,6 +1341,30 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Short contrast-edge curves need continuous physical support (2026-11-08)
+
+The final contrast-edge stage now corroborates each sparse candidate on native survey frames.
+One frequency offset inside the original half-row cell and one CPA offset inside the original
+half-hop cell must explain both halves. Each half's mean residual evidence is scaled by the
+square root of its original sparse sample count; the strong line remains 4.5. This prevents an
+increased sampling rate from supplying extra score by itself. Frequency intervals are swept
+exactly, with 17 bounded clock phases and O(N log N) work per phase. Candidate ranking, reported
+scores, earlier-stage priority, ownership masks and shared caps retain their original rules.
+
+Eight native detector component checks pass with the pinned compiler and actual production
+FFT/spectrogram/detector code. The unchanged
+`contrast_stage_keeps_every_detection_of_the_survey_image` fails before this repair at 35.5 s,
+747.510 Hz and score 4.87718; that false short curve is now refused. The new regression at both
+0.5 s and 1 s survey hops retains continuous and fractional-cell ridges while rejecting support
+only at sparse sample times and alternating neighbouring peaks that no single curve can follow.
+
+The four existing 30-second cropped PCM fixtures retain byte-identical coarse and refined
+detection catalogues. Existing short-edge recovery, hidden-pass recovery, earlier-stage ordering,
+negative controls and cap checks also pass. These component checks do not execute measurement
+or search, and do not replace the full workspace/CLI checks or real reference/wrong-date replays.
+Full core test-source type checking and native Clippy with `-D warnings` also pass against the
+original complete dependency metadata. The separate early 215 m/s fast-edge miss remains unresolved.
 
 ### Full workspace suite at `c2c7578` (2026-11-08): seven red core tests and their causes
 

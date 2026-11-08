@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Corroborate short contrast-edge candidates on a coherent native-frame curve
+
+- Reject short sparse aliases unless the intervening survey frames support one physical Doppler curve
+  inside the same frequency/time cell. Hold speed, distance and observed-frame coverage fixed; sweep
+  frequency-rounding intervals exactly and check bounded subframe CPA phases.
+- Keep the original sparse effective sample counts and existing strong line. Denser sampling earns no
+  extra score by itself; owned and out-of-band samples contribute zero with their denominators intact.
+  Existing candidate order, budget, reported scores, earlier detections and cap accounting are preserved.
+- Add a production detector regression at two survey hops covering continuous support, subcell offsets,
+  sparse-only aliases and alternating neighbouring peaks.
+- Validation: eight native detector component checks pass. The original 35 dB swell regression fails on
+  the baseline's false 747.510 Hz / 35.5 s short curve and passes after the repair. All four cropped PCM
+  coarse/refined catalogues are byte-identical to baseline; earlier-stage/cap and negative controls pass.
+  Full core test-source type checking and native Clippy (`-D warnings`) pass against the original
+  complete dependency metadata. Full workspace/CLI execution remains blocked by dependency-build resource failures. These checks do not
+  exercise measurement/search or establish field accuracy; reference and wrong-date recordings were not
+  replayed. The separate fast-edge recovery failure is unchanged.
+
 ### Preserve usable aircraft through malformed rows and incomplete feed metadata
 
 - Skip non-array scalar trace entries consistently with existing null/object handling. A boolean, number or

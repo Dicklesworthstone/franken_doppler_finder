@@ -797,16 +797,44 @@ fn detect_counted_impl(
         cand.truncate(remaining_candidates);
         let before = out.len();
         let room = p.max_detections - before;
-        accept_candidates(
-            &view,
-            p,
-            &edge,
-            (&bs, &bi),
-            &cand,
-            threshold,
-            &mut known,
-            &mut out,
+        // A short sparse path can join unrelated peaks while the intervening frames hold
+        // no coherent ridge. Check native frames inside the seed's survey cell, at the same
+        // effective sample count and strong line. Companion templates retain the bank indices.
+        let dense = build_edge_templates(
+            &DetectParams {
+                path_dt: ls.hop_s,
+                ..p.clone()
+            },
+            ls.hop_s,
         );
+        for &k in &cand {
+            if out.len() >= p.max_detections * 3 {
+                break;
+            }
+            // Recheck the live mask after each acceptance: explained intermediate frames
+            // count as zero, with their coverage and denominator intact, just like the bank.
+            let ti = bi[k] as usize;
+            if !corroborate_contrast_edge(
+                &view,
+                p,
+                (k / nt, k % nt),
+                (&edge[ti], &dense[ti]),
+                &known,
+                threshold,
+            ) {
+                continue;
+            }
+            accept_candidates(
+                &view,
+                p,
+                &edge,
+                (&bs, &bi),
+                &[k],
+                threshold,
+                &mut known,
+                &mut out,
+            );
+        }
         let mut added = out.split_off(before);
         for d in added.iter_mut() {
             d.from_contrast = true;
@@ -821,6 +849,105 @@ fn detect_counted_impl(
     }
     group_harmonics(&mut out, p);
     (out, cut)
+}
+
+/// Require one coherent curve between a short contrast seed's sparse samples. Keep its
+/// speed/range and observed-frame coverage fixed; only the half-row tone cell and half-hop
+/// clock cell are searched. Native-frame means use the original sparse sample counts so a
+/// finer cadence cannot increase the score merely by adding correlated observations.
+fn corroborate_contrast_edge(
+    ls: &LogSpec,
+    p: &DetectParams,
+    (r, i): (usize, usize),
+    (sparse, dense): (&Template, &Template),
+    known: &[bool],
+    threshold: f64,
+) -> bool {
+    if p.path_dt <= ls.hop_s {
+        return true;
+    }
+    let (nt, nr) = (ls.nt() as i64, ls.nr() as i64);
+    let index = |dt: i32, dr: i32| {
+        let (t, row) = (i as i64 + dt as i64, r as i64 + dr as i64);
+        (t >= 0 && t < nt && row >= 0 && row < nr).then_some(t as usize)
+    };
+    let mut counts = [0usize; 2];
+    for &(dt, dr, approach) in &sparse.path {
+        if index(dt, dr).is_some() {
+            counts[usize::from(!approach)] += 1;
+        }
+    }
+    let frames: Vec<_> = dense
+        .path
+        .iter()
+        .filter_map(|&(dt, dr, approach)| index(dt, dr).map(|t| (t, usize::from(!approach))))
+        .collect();
+    let mut native_counts = [0usize; 2];
+    for &(_, side) in &frames {
+        native_counts[side] += 1;
+    }
+    if counts.contains(&0)
+        || native_counts.contains(&0)
+        || (native_counts[0] as f64) < 0.6 * dense.n_a as f64
+        || (native_counts[1] as f64) < 0.6 * dense.n_r as f64
+    {
+        return false;
+    }
+    let scale = [
+        (counts[0] as f64).sqrt() / native_counts[0] as f64,
+        (counts[1] as f64).sqrt() / native_counts[1] as f64,
+    ];
+    let clears = |sums: [f64; 2]| (sums[0] * scale[0]).min(sums[1] * scale[1]) >= threshold;
+    let sample = |t: usize, row: i64| {
+        if row < 0 || row >= nr {
+            return 0.0;
+        }
+        let k = row as usize * nt as usize + t;
+        if known[k] { 0.0 } else { ls.data[k] as f64 }
+    };
+    let mut crossings = Vec::with_capacity(frames.len());
+    // As in refine, four binary scales resolve the clock cell. The score line is unchanged.
+    for phase in -8..=8 {
+        let clock = phase as f64 * ls.hop_s / 16.0;
+        let mut sums = [0.0; 2];
+        crossings.clear();
+        for &(t, side) in &frames {
+            let u = ls.t[t] - ls.t[i] - clock;
+            let row = r as f64
+                + cv_ratio_rel_t0r(u, sparse.v, sparse.d, p.c).log2() * p.bins_per_octave as f64;
+            if !row.is_finite() {
+                return false;
+            }
+            // Inside a one-row-wide f0 cell each frame crosses at most one rounding
+            // boundary. Start just inside its lower edge, then sweep every open interval.
+            let lower = row.floor() as i64;
+            let old = sample(t, lower);
+            sums[side] += old;
+            let shift = lower as f64 + 0.5 - row;
+            if shift < 0.5 {
+                crossings.push((shift, side, sample(t, lower + 1) - old));
+            }
+        }
+        if clears(sums) {
+            return true;
+        }
+        crossings.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut j = 0;
+        while j < crossings.len() {
+            let boundary = crossings[j].0;
+            // Equal boundaries move together: mixing their old/new rows would not describe
+            // any single physical frequency. Masked or out-of-band rows contribute zero.
+            while j < crossings.len() && crossings[j].0 == boundary {
+                let (_, side, delta) = crossings[j];
+                sums[side] += delta;
+                j += 1;
+            }
+            if clears(sums) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Known samples contribute zero to a later bank scan.
@@ -1244,6 +1371,109 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn contrast_edges_require_support_between_the_bank_samples() {
+        let (v, d) = (90.0, 900.0);
+        for hop_s in [0.5, 1.0] {
+            let p = DetectParams {
+                v_grid: vec![v],
+                d_grid: vec![d],
+                fast_templates: false,
+                hop_s,
+                ..Default::default()
+            };
+            // Twenty seconds between the first and last frame covers the entire short
+            // template, but cannot give a full template 60 % coverage on both sides.
+            let nt = (20.0 / hop_s) as usize + 1;
+            let nr = 240;
+            let t: Vec<_> = (0..nt).map(|i| 0.5 + i as f64 * hop_s).collect();
+            let freqs: Vec<_> = (0..nr)
+                .map(|r| p.fmin * 2.0f64.powf(r as f64 / p.bins_per_octave as f64))
+                .collect();
+            let row = 150;
+            let (f0, t0r) = (freqs[row], t[nt / 2]);
+            let stride = (p.path_dt / hop_s).round() as usize;
+            let scene = |only_bank_samples| {
+                let mut contrast = vec![0.0; nr * nt];
+                for (i, &time) in t.iter().enumerate() {
+                    if only_bank_samples && !i.abs_diff(nt / 2).is_multiple_of(stride) {
+                        continue;
+                    }
+                    let f = cv_curve(time, f0, v, d, t0r - d / p.c, p.c);
+                    let r = ((f / freqs[0]).log2() * p.bins_per_octave as f64).round() as usize;
+                    contrast[r * nt + i] = 2.1;
+                }
+                LogSpec {
+                    t: t.clone(),
+                    freqs: freqs.clone(),
+                    data: vec![0.0; nr * nt],
+                    bins_per_octave: p.bins_per_octave,
+                    hop_s,
+                    scale: 0.25,
+                    gain: 2.0,
+                    contrast: Some(contrast),
+                }
+            };
+            let continuous = detect(&scene(false), &p);
+            assert_eq!(continuous.len(), 1, "hop {hop_s}: {continuous:?}");
+            assert!(continuous[0].from_contrast);
+            assert_eq!(continuous[0].half_s, p.edge_half_s);
+
+            // The two images agree at every sample of the winning sparse template. Its
+            // score still clears the strong line, but the second image has no ridge between
+            // those samples and must not become a short contrast detection.
+            let sparse = scene(true);
+            let (coarse, _) = score_bank(
+                &sparse,
+                &build_edge_templates(&p, hop_s),
+                sparse.contrast.as_ref().unwrap(),
+                &[(0, nt)],
+            );
+            assert!(coarse[row * nt + nt / 2] as f64 >= p.thr_db);
+            let detections = detect(&sparse, &p);
+            assert!(detections.is_empty(), "hop {hop_s}: {detections:?}");
+
+            // A real curve inside the anchor's tone/clock cell must survive quantization.
+            // Independent neighbouring peaks that alternate around the curve must not.
+            let mut shifted = scene(true);
+            let mut alternating = scene(true);
+            for (i, &time) in t.iter().enumerate() {
+                let f = cv_curve(
+                    time,
+                    f0 * 2.0f64.powf(0.25 / p.bins_per_octave as f64),
+                    v,
+                    d,
+                    t0r + 0.25 * hop_s - d / p.c,
+                    p.c,
+                );
+                let r = ((f / freqs[0]).log2() * p.bins_per_octave as f64).round() as usize;
+                shifted.contrast.as_mut().unwrap()[r * nt + i] = 2.1;
+                if !i.abs_diff(nt / 2).is_multiple_of(stride) {
+                    let f = cv_curve(time, f0, v, d, t0r - d / p.c, p.c);
+                    let r = ((f / freqs[0]).log2() * p.bins_per_octave as f64).round() as usize;
+                    let r = if (i / stride).is_multiple_of(2) {
+                        r + 1
+                    } else {
+                        r - 1
+                    };
+                    alternating.contrast.as_mut().unwrap()[r * nt + i] = 2.1;
+                }
+            }
+            let recovered = detect(&shifted, &p);
+            assert!(
+                !recovered.is_empty(),
+                "hop {hop_s}: lost the coherent shift"
+            );
+            assert!(
+                recovered
+                    .iter()
+                    .all(|d| d.from_contrast && d.half_s == p.edge_half_s)
+            );
+            let spurious = detect(&alternating, &p);
+            assert!(spurious.is_empty(), "hop {hop_s}: {spurious:?}");
+        }
     }
 
     #[test]
