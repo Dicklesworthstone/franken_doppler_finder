@@ -8,8 +8,10 @@
 
 use crate::DataError;
 use crate::adsblol::{DayRelease, Feed, find_day_releases_cached};
-use crate::build::{build_store, merge_stores};
-use crate::ingest::{IngestProgress, IngestSpec, IngestStats, RawAircraft, ingest_reader};
+use crate::build::{build_day_store, merge_stores};
+use crate::ingest::{
+    DayContext, IngestProgress, IngestSpec, IngestStats, RawAircraft, ingest_day_reader,
+};
 use fdop_types::BBox;
 use fdop_types::engine::EngineClass;
 use fdop_types::store::{FlightLeg, StoreMeta, TrackStore, alt_src};
@@ -22,6 +24,15 @@ use std::sync::{Arc, Mutex};
 
 /// Legs of one aircraft in consecutive day stores closer than this are joined (s).
 pub const DAY_JOIN_GAP_S: f64 = 300.0;
+const DAY_CACHE_PAD_S: f64 = 3600.0;
+
+fn day_context(day: (i64, u32, u32)) -> DayContext {
+    DayContext::new(
+        days_from_civil(day.0, day.1, day.2) as f64 * 86_400.0,
+        DAY_JOIN_GAP_S,
+        DAY_CACHE_PAD_S,
+    )
+}
 
 pub type ProgressFn = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -287,6 +298,7 @@ fn find_cached(
     want: &IngestSpec,
     label: &str,
     opts: &FetchOptions,
+    required_context: Option<DayContext>,
 ) -> Option<(PathBuf, CachedDay)> {
     let rd = std::fs::read_dir(dir).ok()?;
     let mut candidates = Vec::new();
@@ -300,6 +312,7 @@ fn find_cached(
         }
     }
     candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut legacy = None;
     for (_, p) in candidates {
         match CachedDay::scan(&p) {
             Ok(s)
@@ -307,6 +320,18 @@ fn find_cached(
                     && s.meta.t_start <= want.t_start
                     && s.meta.t_end >= want.t_end =>
             {
+                if required_context.is_some_and(|required|
+                    !DayContext::from_stats(&s.meta.stats).is_some_and(|context| context.includes(required)))
+                {
+                    if opts.offline {
+                        if legacy.is_none() {
+                            legacy = Some((p, s));
+                        }
+                    } else {
+                        opts.say(&format!("[adsb] {label}: cache {} lacks verified midnight coverage; rebuilding for this multi-day window", p.display()));
+                    }
+                    continue;
+                }
                 return Some((p, s));
             }
             Ok(_) => opts.say(&format!(
@@ -319,7 +344,17 @@ fn find_cached(
             )),
         }
     }
-    None
+    legacy
+}
+
+fn cache_context_note(
+    label: &str,
+    store: &CachedDay,
+    required: Option<DayContext>,
+) -> Option<String> {
+    required.filter(|required| !DayContext::from_stats(&store.meta.stats)
+        .is_some_and(|context| context.includes(*required)))
+        .map(|_| format!("{label}: legacy day cache lacks verified midnight coverage; cross-midnight flights may be missing or discontinuous; rerun online to rebuild this day"))
 }
 
 /// Cache feedset name of a day store built from `main` (prod or staging) plus optional mlatonly.
@@ -542,12 +577,14 @@ pub fn fetch_window(
             t_end: spec.t_end.min(day_start + 86_400.0),
             ..*spec
         };
-        if let Some((p, s)) = find_cached(&dir, feedset, &want, &label, opts) {
+        let required_context = (days.len() > 1).then(|| day_context(day));
+        if let Some((p, s)) = find_cached(&dir, feedset, &want, &label, opts, required_context) {
             opts.say(&format!(
                 "[adsb] {label}: cached {} ({} legs)",
                 p.display(),
                 s.leg_count
             ));
+            notes.extend(cache_context_note(&label, &s, required_context));
             day_stores[i] = Some(s);
             cache_hits += 1;
             continue;
@@ -561,7 +598,7 @@ pub fn fetch_window(
         let available = feedset_available(&rels, opts.include_mlat);
         for fs in partial_feedsets(feedset) {
             if (opts.offline || available.as_ref().is_none_or(|a| a.as_str() == *fs))
-                && let Some((p, s)) = find_cached(&dir, fs, &want, &label, opts)
+                && let Some((p, s)) = find_cached(&dir, fs, &want, &label, opts, required_context)
             {
                 opts.say(&format!(
                     "[adsb] {label}: cached {} ({} legs; {fs} only, nothing better is published)",
@@ -569,6 +606,7 @@ pub fn fetch_window(
                     s.leg_count
                 ));
                 notes.extend(feedset_gaps(&label, fs, opts.include_mlat));
+                notes.extend(cache_context_note(&label, &s, required_context));
                 day_stores[i] = Some(s);
                 cache_hits += 1;
                 break;
@@ -630,8 +668,8 @@ pub fn fetch_window(
     // ---- stream the uncached releases ----
     let day_spec = |day: (i64, u32, u32)| IngestSpec {
         bbox: rbox,
-        t_start: days_from_civil(day.0, day.1, day.2) as f64 * 86_400.0 - 3600.0,
-        t_end: days_from_civil(day.0, day.1, day.2) as f64 * 86_400.0 + 86_400.0 + 3600.0,
+        t_start: days_from_civil(day.0, day.1, day.2) as f64 * 86_400.0 - DAY_CACHE_PAD_S,
+        t_end: days_from_civil(day.0, day.1, day.2) as f64 * 86_400.0 + 86_400.0 + DAY_CACHE_PAD_S,
         geoid_n_m: spec.geoid_n_m,
         keep_unknown: true,
     };
@@ -682,7 +720,7 @@ pub fn fetch_window(
                                 p.elapsed_s
                             ));
                         };
-                        let res = ingest_reader(reader, job.rel.feed.label(), &sp, &cb)
+                        let res = ingest_day_reader(reader, job.rel.feed.label(), &sp, &cb, day_context(job.day))
                             .map_err(|e| DataError(format!("{label} ({}): {e}", job.rel.tag)));
                         if tx.send((job.day_idx, job.rel.tag.clone(), res)).is_err() {
                             break;
@@ -696,7 +734,7 @@ pub fn fetch_window(
                 // Name the cache by what was actually streamed, so a missing feed
                 // cannot make a partial day look complete on a later run.
                 let fs = feedset_of_tags(&tags);
-                let store = build_store(parts, &day_spec(day), tags);
+                let store = build_day_store(parts, &day_spec(day), tags, day_context(day));
                 let dir = day_dir(cache_dir, day);
                 let path = dir.join(format!("{fs}_{key}.fdtrk"));
                 let (legs, points) = (store.legs.len(), store.n_points());
@@ -770,6 +808,7 @@ pub fn fetch_window(
         "feedset": feedset,
         "notes": notes,
         "day_stores": day_stats,
+        "leg_boundaries": out.meta.stats.get("leg_boundaries").cloned().unwrap_or_default(),
     });
     Ok(out)
 }
@@ -777,6 +816,8 @@ pub fn fetch_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::build_store;
+    use crate::ingest::ingest_reader;
 
     #[test]
     fn every_stand_in_feedset_is_reported() {
@@ -823,6 +864,105 @@ mod tests {
             sp,
             vec!["synthetic".into()],
         )
+    }
+
+    #[test]
+    fn midnight_cache_policy_preserves_single_day_reuse_and_prefers_proven_coverage() {
+        use crate::ingest::tests::{T0, gz, pc12_json, spec, tar_of};
+        let want = spec();
+        let day = (2026, 9, 8);
+        let context = day_context(day);
+        let label = "2026-09-08";
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!(
+            "fdop-midnight-cache-policy-{}-{nonce}",
+            std::process::id()
+        ));
+        let dir = day_dir(&cache, day);
+        let (small_box, small_key) = bbox_key(&want.bbox);
+        let cache_spec = IngestSpec {
+            bbox: small_box,
+            t_start: T0 - DAY_CACHE_PAD_S,
+            t_end: T0 + 86_400.0 + DAY_CACHE_PAD_S,
+            ..want
+        };
+        let legacy_path = dir.join(format!("prod_{small_key}.fdtrk"));
+        synthetic_store(&cache_spec).save(&legacy_path).unwrap();
+        let offline = FetchOptions {
+            include_mlat: false,
+            offline: true,
+            ..Default::default()
+        };
+        let online = FetchOptions {
+            offline: false,
+            ..offline.clone()
+        };
+        for opts in [&online, &offline] {
+            let (path, store) = find_cached(&dir, "prod", &want, label, opts, None).unwrap();
+            assert_eq!(path, legacy_path, "single-day legacy reuse changed");
+            assert!(cache_context_note(label, &store, None).is_none());
+        }
+        // This exercises the actual offline fetch, not just its cache selector.
+        let single_day = fetch_window(&want, &cache, &offline).unwrap();
+        assert_eq!(single_day.meta.stats["cache_hits"], 1);
+        assert!(single_day.n_points() > 0);
+        assert_eq!(single_day.meta.stats["notes"], serde_json::json!([]));
+        // The selector itself has no network path; online policy must decline this
+        // legacy cache before fetch_window decides which archive to download.
+        assert!(find_cached(&dir, "prod", &want, label, &online, Some(context)).is_none());
+        let (path, legacy) =
+            find_cached(&dir, "prod", &want, label, &offline, Some(context)).unwrap();
+        assert_eq!(path, legacy_path);
+        let note = cache_context_note(label, &legacy, Some(context)).unwrap();
+        assert!(note.starts_with("2026-09-08: legacy day cache lacks verified midnight coverage"));
+        assert!(note.contains("cross-midnight flights may be missing or discontinuous"));
+        assert!(note.contains("rerun online"));
+
+        let (large_box, large_key) = bbox_key(&small_box.padded_km(20.0));
+        assert!(large_box.area_km2() > small_box.area_km2());
+        let large_spec = IngestSpec {
+            bbox: large_box,
+            ..cache_spec
+        };
+        let archive = tar_of(&[("trace_full_a1b2c3.json", gz(&pc12_json()))]);
+        let part =
+            ingest_day_reader(archive.as_slice(), "prod", &large_spec, &|_| {}, context).unwrap();
+        let marked = build_day_store(vec![part], &large_spec, vec!["synthetic".into()], context);
+        let marked_path = dir.join(format!("prod_{large_key}.fdtrk"));
+        marked.save(&marked_path).unwrap();
+        for opts in [&online, &offline] {
+            let (path, store) =
+                find_cached(&dir, "prod", &want, label, opts, Some(context)).unwrap();
+            assert_eq!(
+                path, marked_path,
+                "a smaller legacy cache hid proven coverage"
+            );
+            assert!(cache_context_note(label, &store, Some(context)).is_none());
+        }
+        // A marker for another day or an unknown policy version is not coverage proof.
+        assert!(
+            find_cached(
+                &dir,
+                "prod",
+                &want,
+                label,
+                &online,
+                Some(day_context((2026, 9, 9)))
+            )
+            .is_none()
+        );
+        let mut future = marked;
+        future.meta.stats["midnight_context"]["version"] = serde_json::json!(255);
+        future.save(&marked_path).unwrap();
+        assert!(find_cached(&dir, "prod", &want, label, &online, Some(context)).is_none());
+        let (path, _) = find_cached(&dir, "prod", &want, label, &offline, Some(context)).unwrap();
+        assert_eq!(
+            path, legacy_path,
+            "offline fallback must keep the smallest usable legacy cache"
+        );
     }
 
     #[test]
@@ -1432,8 +1572,31 @@ mod tests {
                 .collect();
             assert_eq!(got.meta.stats["day_stores"], serde_json::json!(day_stats));
             let notes = got.meta.stats["notes"].as_array().unwrap();
-            assert_eq!(notes.len(), 1);
-            assert!(notes[0].as_str().unwrap().contains(NO_MLATONLY));
+            assert_eq!(notes.len(), 3);
+            assert_eq!(
+                notes
+                    .iter()
+                    .filter(|n| n.as_str().unwrap().contains(NO_MLATONLY))
+                    .count(),
+                1
+            );
+            for day in ["2026-09-08", "2026-09-09"] {
+                let prefix = format!("{day}: legacy day cache lacks verified midnight coverage");
+                let warnings: Vec<_> = notes
+                    .iter()
+                    .filter_map(|n| n.as_str())
+                    .filter(|n| n.starts_with(&prefix))
+                    .collect();
+                assert_eq!(
+                    warnings.len(),
+                    1,
+                    "missing or repeated coverage note for {day}"
+                );
+                assert!(
+                    warnings[0].contains("cross-midnight flights may be missing or discontinuous")
+                );
+                assert!(warnings[0].contains("rerun online"));
+            }
         }
         assert!(
             messages.lock().unwrap().iter().any(|s| {

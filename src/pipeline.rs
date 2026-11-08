@@ -688,6 +688,7 @@ fn run_curve_match(
     fine: &dyn fdop_types::Elevation,
     atmo: &dyn fdop_types::atmo::Atmosphere,
     log: &Arc<Log>,
+    warnings: &mut Vec<String>,
 ) -> Result<Option<curvematch::MatchResult>, String> {
     let (s_lo, s_hi) = clock;
     if let Some(why) = curve_match_skip_reason(p, bbox, clock) {
@@ -711,6 +712,16 @@ fn run_curve_match(
     };
     let store =
         fdop_data::fetch_window(&spec, &a.cache, &opts).map_err(|e| format!("ADS-B fetch: {e}"))?;
+    // The independent real/decoy catalogue can have different coverage from the trace
+    // catalogue. Keep its limitations in the final report as well as fetch progress.
+    if let Some(notes) = store.meta.stats["notes"].as_array() {
+        warnings.extend(
+            notes
+                .iter()
+                .filter_map(|n| n.as_str())
+                .map(|n| format!("curve match ADS-B {n}")),
+        );
+    }
     let bp = track::BuildParams::default();
     let tracks: Vec<track::TrackModel> = store
         .legs
@@ -958,14 +969,8 @@ fn locate_with_clock(
     } else {
         None
     };
-    let (mut archive, mut meta_window) = first_published_window(
-        a,
-        full_window,
-        metadata_window,
-        dur,
-        now(),
-        &mut warnings,
-    )?;
+    let (mut archive, mut meta_window) =
+        first_published_window(a, full_window, metadata_window, dur, now(), &mut warnings)?;
     let mut metadata_fallback = metadata_window.is_some() && !meta_window;
     let describe_window = |w: &PublishedWindow, metadata: bool, fallback: bool| {
         let (lo, hi) = w.clock;
@@ -1359,6 +1364,7 @@ fn locate_with_clock(
                 &fine,
                 &*atmo,
                 log,
+                &mut warnings,
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2349,7 +2355,8 @@ mod tests {
         let fixture =
             crate::selftest::synthesize(a.media.parent().unwrap(), &atmo, &|_| {}).unwrap();
         let mut mux = std::process::Command::new("ffmpeg");
-        mux.args(["-nostdin", "-v", "error", "-i"]).arg(&fixture.wav);
+        mux.args(["-nostdin", "-v", "error", "-i"])
+            .arg(&fixture.wav);
         let creation = if long_video {
             a.media.set_extension("mkv");
             a.start = Some(iso_utc(fixture.start));
@@ -2450,10 +2457,9 @@ mod tests {
             let clock = (fixture.start - a.clock_tol_s, fixture.start + a.clock_tol_s);
             // At this fixed clock the cached day has finished, but the next UTC day has
             // not. The former container-duration request really would reject the input.
-            let error =
-                published_start_window(&a, clock, info.duration_s, now, &mut Vec::new())
-                    .err()
-                    .expect("the longer container reaches an unpublished day");
+            let error = published_start_window(&a, clock, info.duration_s, now, &mut Vec::new())
+                .err()
+                .expect("the longer container reaches an unpublished day");
             assert!(error.contains("no published day covers"), "{error}");
             locate_with_clock(&a, &Log::new(true), &|| now).unwrap()
         } else {
@@ -2499,7 +2505,11 @@ mod tests {
             outcome.report.extra["window"]
                 .as_str()
                 .unwrap()
-                .contains(if long_video { "--start" } else { "creation_time" })
+                .contains(if long_video {
+                    "--start"
+                } else {
+                    "creation_time"
+                })
         );
         assert!(
             !outcome
@@ -3037,6 +3047,17 @@ mod tests {
                 .collect(),
         };
         cache_test_day(&a, fetch_box, (2026, 9, 8), vec![leg]);
+        let (_, key) = fdop_data::fetch::bbox_key(&fetch_box);
+        let cache_path = a
+            .cache
+            .join("adsb/2026-09-08")
+            .join(format!("prod+mlatonly_{key}.fdtrk"));
+        // A real partial-feed cache makes fetch_window generate its coverage warning.
+        std::fs::rename(
+            &cache_path,
+            cache_path.with_file_name(format!("prod_{key}.fdtrk")),
+        )
+        .unwrap();
         // Only the spectral bank is reduced; production clock and decoy parameters stay
         // unchanged. This runs the actual cache fetch, track builder and curve matcher.
         let p = curvematch::MatchParams {
@@ -3074,6 +3095,7 @@ mod tests {
         let image = curvematch::build_image(&vec![0.0; 120 * 4000], 4000, &p).unwrap();
         let dem = fdop_types::FlatElevation(0.0);
         let atmo = fdop_types::atmo::StandardAtmosphere::new(15.0, 0.0, 0.5);
+        let mut warnings = vec!["prior pipeline warning".into()];
         let result = run_curve_match(
             &a,
             &p,
@@ -3088,9 +3110,17 @@ mod tests {
             &dem,
             &atmo,
             &Log::new(true),
+            &mut warnings,
         )
         .unwrap()
         .unwrap();
+        assert_eq!(
+            warnings,
+            [
+                "prior pipeline warning",
+                "curve match ADS-B 2026-09-08: no mlatonly release, so aircraft located only by multilateration (transponders without ADS-B Out) are missing"
+            ]
+        );
         assert_eq!(result.n_tracks, 1);
         assert_eq!(result.decoys.len(), 48);
         let mut shifts: Vec<_> = result.decoys.iter().map(|d| d.shift_s).collect();

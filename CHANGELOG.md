@@ -36,6 +36,32 @@ at that commit, not per-change commits.
   review, focused formatting and whitespace checks pass. These are data-geometry and cache
   tests; no new recording accuracy or whole-workspace result is claimed.
 
+### Recover flight crossings lost between separately filtered UTC days
+
+- Retain bounded original airborne support around each UTC seam before per-day spatial filtering.
+  A flight can now cross the requested region between reports on adjoining days even when neither
+  day's separate segment enters it. Keep the existing five-minute day-join limit and interpolation
+  neighbours; do not add synthetic positions or a candidate cap.
+- Preserve filtering cuts and original ground/restart boundaries through raw ingestion, feed
+  preference, cache serialization and cross-day merging. Keep ground-only companion evidence
+  and exact new-leg times even when overlapping feeds insert reports or choose another duplicate.
+  Compact dense ground events during parsing without changing any decision at the existing
+  30-second minimum split gap. Boundary-only feeds cannot replace an airborne source's aircraft
+  type or registration.
+- Mark fresh day caches with their boundary-coverage policy. Online multi-day requests refresh
+  unmarked caches; offline requests retain them with a persistent coverage warning. Single-day
+  reuse remains unchanged, and a cropped store cannot claim complete boundary support.
+- Carry coverage warnings from the curve matcher's independent real/decoy catalogue into the
+  final report. Extend the existing real offline-catalogue test to require its missing-MLAT
+  warning while preserving the caller's prior warnings and all 48 decoy clocks.
+- **Validation:** all 27 actual production ingest/build module tests pass in a native component
+  with real `fdop-types`, including seven new seam, boundary, pruning and bounded-support
+  regressions. The raw two-day fixture now survives ingestion, cache save/load, merge and final
+  filtering with either one or two reports per day. The new offline-fetch policy and pipeline
+  integration tests remain unrun: unchanged `asupersync 0.6.2` compilation was killed by SIGKILL
+  in both native and metadata-only attempts on the shared 8 GiB machine. The component excludes
+  fetch/network/pipeline code; no full-workspace or new recording-accuracy result is claimed.
+
 ### Skip unreachable flights during confirmation and silent-pass checks
 
 - Cache complete Hermite trajectory bounds once with the trace search's immutable time index.

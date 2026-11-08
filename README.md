@@ -789,6 +789,22 @@ day is selected. This reduces retained track data for selective requests. A cach
 selected aircraft is decompressed twice, so broad requests may save little memory and pay for the extra
 scan. The binary store format is unchanged.
 
+Newly ingested day stores also retain the original reports needed to join a flight across UTC midnight,
+even when neither day's separate segment enters the cached region. Boundary support uses the closest
+airborne reports within the existing five-minute cross-day join limit, with their interpolation neighbours;
+source endpoints in the existing archive padding also keep their interpolation support. Duplicate
+candidates at those timestamps remain available for feed preference. This does not retain hours of
+worldwide position samples or bound total process memory. Stored flags and compact boundary metadata
+preserve cuts made by spatial filtering and ground or restart boundaries, including a marker after
+a feed's last airborne report or in a ground-only companion feed. A midnight join
+may bridge a filtering cut only when both day stores certify that their boundary support was retained.
+
+Online multi-day requests refresh older day stores without this coverage marker. Offline requests can
+still use those older stores, but warn that missing midnight reports cannot be recovered from them;
+the warning remains in the final report, including when it comes from the curve matcher's separate
+real/decoy catalogue. Single-day requests continue to reuse older caches. The coverage marker does not
+survive spatial/time cropping, which may remove the reports it certifies.
+
 Concurrent searches publish track stores through separate, exclusively created staging files, so one
 writer cannot truncate another writer's cache. A load also rejects bytes after its compressed member,
 including additional gzip members; a damaged cache goes through the recovery path above.
@@ -1225,6 +1241,27 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Midnight flight coverage: native data validation
+
+All 27 tests in the actual production `ingest.rs` and `build.rs` modules pass in a native component
+using the real `fdop-types`, pinned nightly and locked dependencies through genuine RCH. Seven new
+regressions cover raw two-day tar ingestion through cache save/load, merging and final filtering;
+one-report-per-day crossings; ground-only feeds and interleaved boundary reports; natural feed handoffs;
+retained filtering cuts; preferred-position duplicates; bounded seam support; and compact ground
+events under the unchanged 30-second boundary rule. Both separate legacy ingests drop the positive
+crossing fixture, while the new day-cache path retains its complete two- or four-report flight.
+The related full `fdop-types` suite passes all 27 tests, and its all-target Clippy check is clean.
+
+The new actual offline-fetch cache-policy test and curve-catalogue warning integration test remain
+**unrun**. Full HTTP/data/application compilation was blocked by SIGKILL in unchanged `asupersync 0.6.2`,
+both during native code generation and during a separate metadata-only check on the shared 8 GiB
+machine. The native component does not contain `fetch.rs`, network adapters or the application pipeline.
+Its separate Clippy attempt stopped on unused entry points whose callers are outside the component;
+no full-data Clippy pass is claimed.
+Changed source files pass focused formatting and whitespace checks; whole-workspace formatting still
+reports differences in eight untouched files. Full workspace tests/Clippy, CLI release selftest and
+recording replays remain unconfirmed. These data-geometry tests do not establish recording accuracy.
 
 ### Confirmation and silent-pass bounds: native output equivalence
 

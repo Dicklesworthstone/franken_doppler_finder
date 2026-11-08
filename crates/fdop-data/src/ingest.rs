@@ -15,8 +15,8 @@ use fdop_types::engine::{EngineClass, engine_class};
 use fdop_types::store::pt_flags;
 use fdop_types::{BBox, FPM_TO_MPS, FT_TO_M, KT_TO_MPS};
 use rayon::prelude::*;
-use serde::Deserialize;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::Read;
 use std::path::Path;
@@ -39,6 +39,86 @@ pub struct IngestSpec {
     pub keep_unknown: bool,
 }
 
+/// Nearest reports bracketing each UTC seam, with interpolation/duplicate support.
+/// The marker also certifies retained-run and original leg-boundary preservation.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct DayContext {
+    version: u8,
+    pub day_start: f64,
+    join_gap_s: f64,
+    archive_pad_s: f64,
+}
+
+impl DayContext {
+    pub fn new(day_start: f64, join_gap_s: f64, archive_pad_s: f64) -> Self {
+        Self {
+            version: 1,
+            day_start,
+            join_gap_s,
+            archive_pad_s,
+        }
+    }
+
+    pub fn from_stats(stats: &serde_json::Value) -> Option<Self> {
+        let context: Self = serde_json::from_value(stats.get("midnight_context")?.clone()).ok()?;
+        (context.version == 1
+            && context.day_start.is_finite()
+            && context.join_gap_s.is_finite()
+            && context.join_gap_s >= 0.0
+            && context.archive_pad_s.is_finite()
+            && context.archive_pad_s >= 0.0)
+            .then_some(context)
+    }
+
+    pub fn covers(&self, t0: f64, t1: f64) -> bool {
+        t0 <= t1
+            && t1 - t0 <= self.join_gap_s
+            && [self.day_start, self.day_start + 86_400.0]
+                .into_iter()
+                .any(|midnight| t0 <= midnight && midnight <= t1)
+    }
+
+    pub fn includes(&self, required: Self) -> bool {
+        self.day_start == required.day_start
+            && self.join_gap_s >= required.join_gap_s
+            && self.archive_pad_s >= required.archive_pad_s
+    }
+
+    fn retain_support(&self, points: &[RawPoint], keep: &mut [bool]) {
+        let mut anchors = Vec::with_capacity(6);
+        for midnight in [self.day_start, self.day_start + 86_400.0] {
+            let before = points
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.t < midnight && midnight - p.t <= self.join_gap_s)
+                .max_by(|a, b| a.1.t.total_cmp(&b.1.t));
+            let after = points
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.t >= midnight && p.t - midnight <= self.join_gap_s)
+                .min_by(|a, b| a.1.t.total_cmp(&b.1.t));
+            anchors.extend(before.into_iter().chain(after).map(|(_, p)| p.t));
+        }
+        // True source endpoints can also bridge same-side archive overlap. Keep
+        // only their usual interpolation support, not the intervening hours.
+        for p in points.first().into_iter().chain(points.last()) {
+            if [self.day_start, self.day_start + 86_400.0]
+                .into_iter()
+                .any(|midnight| (p.t - midnight).abs() <= self.archive_pad_s + self.join_gap_s)
+            {
+                anchors.push(p.t);
+            }
+        }
+        for (p, kept) in points.iter().zip(keep) {
+            // All duplicate candidates must remain available for feed/quality
+            // preference and boundary hints; a burst must not introduce a cap.
+            *kept |= anchors
+                .iter()
+                .any(|&t| (p.t - t).abs() < crate::build::DEDUPE_S);
+        }
+    }
+}
+
 /// One retained position. Altitudes are kept separately so the store builder can reconcile
 /// geometric and barometric heights.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,6 +137,11 @@ pub struct RawPoint {
     pub flags: u8,
     /// A readsb new-leg marker or ground report fell on this point or a dropped row before it.
     pub new_leg: bool,
+    /// Original airborne reports were removed before this retained run. Another
+    /// feed may bridge it only by retaining uninterrupted overlapping coverage.
+    pub retained_break: bool,
+    /// Original airborne reports were removed after this retained run.
+    pub retained_end: bool,
 }
 
 /// One aircraft's retained points from one feed.
@@ -71,6 +156,9 @@ pub struct RawAircraft {
     /// Feed label: "prod", "mlat" or "staging".
     pub feed: String,
     pub points: Vec<RawPoint>,
+    /// Observed leg boundaries, compacted without changing any split-eligible
+    /// gap. Kept separately so source interleaving cannot move an event.
+    pub leg_boundaries: crate::build::BoundaryEvents,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -442,7 +530,13 @@ fn gunzip_if_needed(b: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, std::io::Err
 }
 
 /// Parse one `trace_full` member (gzip or plain JSON) and filter it.
-fn parse_member(bytes: &[u8], name_hint: &str, feed: &str, spec: &IngestSpec) -> Parsed {
+fn parse_member(
+    bytes: &[u8],
+    name_hint: &str,
+    feed: &str,
+    spec: &IngestSpec,
+    context: Option<DayContext>,
+) -> Parsed {
     let Ok(json) = gunzip_if_needed(bytes) else {
         return Parsed::Error;
     };
@@ -453,10 +547,32 @@ fn parse_member(bytes: &[u8], name_hint: &str, feed: &str, spec: &IngestSpec) ->
     let base = tf.timestamp.0.unwrap_or(0.0);
     let n_geoid = spec.geoid_n_m;
     let mut pts: Vec<RawPoint> = Vec::with_capacity(tf.trace.len());
+    let mut leg_boundaries = crate::build::BoundaryEvents::default();
+    let mut boundary_overlap = false;
     let mut pending_leg = false;
+    let mut untimed_leg = false;
     for row in &tf.trace {
         if row.flags & 2 != 0 || row.alt == Alt::Ground {
             pending_leg = true;
+            if let Some(dt) = row.dt {
+                leg_boundaries.push(base + dt, row.alt == Alt::Ground);
+                boundary_overlap |= context.is_some_and(|c| {
+                    (base + dt >= spec.t_start
+                        && base + dt <= spec.t_end
+                        && row
+                            .lat
+                            .zip(row.lon)
+                            .is_some_and(|(lat, lon)| spec.bbox.contains(lat, lon)))
+                        || [c.day_start, c.day_start + 86_400.0]
+                            .into_iter()
+                            .any(|seam| (base + dt - seam).abs() <= c.join_gap_s)
+                });
+            } else {
+                untimed_leg = true;
+            }
+            if let Some(previous) = pts.last_mut() {
+                previous.flags |= pt_flags::NEW_LEG_AFTER;
+            }
         }
         let (Some(dt), Some(lat), Some(lon)) = (row.dt, row.lat, row.lon) else {
             continue;
@@ -481,6 +597,9 @@ fn parse_member(bytes: &[u8], name_hint: &str, feed: &str, spec: &IngestSpec) ->
             flags |= pt_flags::STALE;
         }
         let vrate = row.geom_rate.or(row.vrate);
+        if std::mem::take(&mut untimed_leg) {
+            leg_boundaries.push(base + dt, false);
+        }
         pts.push(RawPoint {
             t: base + dt,
             lat,
@@ -492,7 +611,12 @@ fn parse_member(bytes: &[u8], name_hint: &str, feed: &str, spec: &IngestSpec) ->
             vrate_mps: vrate.map_or(f32::NAN, |v| (v * FPM_TO_MPS) as f32),
             flags,
             new_leg: std::mem::take(&mut pending_leg),
+            retained_break: false,
+            retained_end: false,
         });
+    }
+    if untimed_leg && let Some(previous) = pts.last() {
+        leg_boundaries.push(previous.t, true);
     }
     let inside: Vec<bool> = pts
         .iter()
@@ -514,7 +638,10 @@ fn parse_member(bytes: &[u8], name_hint: &str, feed: &str, spec: &IngestSpec) ->
             keep[i + 1] = true;
         }
     }
-    if !keep.iter().any(|k| *k) {
+    if let Some(context) = context {
+        context.retain_support(&pts, &mut keep);
+    }
+    if !keep.iter().any(|k| *k) && !boundary_overlap {
         return Parsed::NoOverlap;
     }
     let typ = tf.t.0.as_deref().unwrap_or("").trim().to_ascii_uppercase();
@@ -526,6 +653,7 @@ fn parse_member(bytes: &[u8], name_hint: &str, feed: &str, spec: &IngestSpec) ->
         return Parsed::Dropped(DropReason::Unknown);
     }
     let points = retain_with_neighbours(&pts, &keep, 2);
+    leg_boundaries.normalize();
     let icao = tf
         .icao
         .0
@@ -548,11 +676,12 @@ fn parse_member(bytes: &[u8], name_hint: &str, feed: &str, spec: &IngestSpec) ->
         engine,
         feed: feed.to_string(),
         points,
+        leg_boundaries,
     })
 }
 
 /// Keep flagged points plus `k` neighbours each side. A new-leg marker on a dropped point is
-/// carried to the next retained point.
+/// carried to the next retained point. Removed airborne reports end a retained run.
 pub(crate) fn retain_with_neighbours(pts: &[RawPoint], keep: &[bool], k: usize) -> Vec<RawPoint> {
     let n = pts.len();
     let mut grown = vec![false; n];
@@ -567,14 +696,23 @@ pub(crate) fn retain_with_neighbours(pts: &[RawPoint], keep: &[bool], k: usize) 
     }
     let mut out = Vec::with_capacity(grown.iter().filter(|g| **g).count());
     let mut carry = false;
-    for (p, g) in pts.iter().zip(&grown) {
+    let mut dropped = false;
+    for (i, (p, g)) in pts.iter().zip(&grown).enumerate() {
         if *g {
             let mut q = *p;
             q.new_leg |= carry;
+            q.retained_break |= dropped;
+            q.retained_end |= grown.get(i + 1).is_some_and(|kept| !kept);
             carry = false;
+            dropped = false;
             out.push(q);
-        } else if p.new_leg {
-            carry = true;
+        } else {
+            let boundary = p.new_leg || p.flags & pt_flags::NEW_LEG_AFTER != 0;
+            carry |= boundary;
+            if boundary && let Some(previous) = out.last_mut() {
+                previous.flags |= pt_flags::NEW_LEG_AFTER;
+            }
+            dropped = true;
         }
     }
     out
@@ -609,7 +747,9 @@ impl<R: Read> CountingReader<R> {
                 Ok(0) => return Ok(()),
                 Ok(n) => {
                     if padding[..n].iter().any(|b| *b != 0) {
-                        return Err(DataError("tar has nonzero data after its end marker".into()));
+                        return Err(DataError(
+                            "tar has nonzero data after its end marker".into(),
+                        ));
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -666,6 +806,26 @@ pub fn ingest_reader<R: Read + Send>(
     spec: &IngestSpec,
     progress: &(dyn Fn(&IngestProgress) + Sync),
 ) -> Result<(Vec<RawAircraft>, IngestStats), DataError> {
+    ingest_reader_inner(r, feed, spec, progress, None)
+}
+
+pub(crate) fn ingest_day_reader<R: Read + Send>(
+    r: R,
+    feed: &str,
+    spec: &IngestSpec,
+    progress: &(dyn Fn(&IngestProgress) + Sync),
+    context: DayContext,
+) -> Result<(Vec<RawAircraft>, IngestStats), DataError> {
+    ingest_reader_inner(r, feed, spec, progress, Some(context))
+}
+
+fn ingest_reader_inner<R: Read + Send>(
+    r: R,
+    feed: &str,
+    spec: &IngestSpec,
+    progress: &(dyn Fn(&IngestProgress) + Sync),
+    context: Option<DayContext>,
+) -> Result<(Vec<RawAircraft>, IngestStats), DataError> {
     let count = Arc::new(AtomicU64::new(0));
     let reader = CountingReader {
         inner: r,
@@ -721,7 +881,7 @@ pub fn ingest_reader<R: Read + Send>(
         for batch in rx {
             let results: Vec<Parsed> = batch
                 .par_iter()
-                .map(|(name, b)| parse_member(b, name, feed, spec))
+                .map(|(name, b)| parse_member(b, name, feed, spec, context))
                 .collect();
             st.members += batch.len() as u64;
             for res in results {
@@ -774,7 +934,7 @@ pub fn ingest_path(
                 .par_iter()
                 .map(|p| match std::fs::read(p) {
                     Ok(b) => (
-                        parse_member(&b, &p.to_string_lossy(), feed, spec),
+                        parse_member(&b, &p.to_string_lossy(), feed, spec, None),
                         b.len() as u64,
                     ),
                     Err(_) => (Parsed::Error, 0),
@@ -818,7 +978,7 @@ pub fn ingest_path(
             ..Default::default()
         };
         accumulate(
-            parse_member(&b, &path.to_string_lossy(), feed, spec),
+            parse_member(&b, &path.to_string_lossy(), feed, spec, None),
             &mut out,
             &mut st,
         );
@@ -885,8 +1045,7 @@ pub(crate) mod tests {
         let bytes = tar_of(&[("trace_full_a1b2c3.json", gz(&pc12_json()))]);
         let payload_end = bytes.len() - 1024;
         for tail in [0, 1, 511, 512, 513, 1023] {
-            let result =
-                ingest_reader(&bytes[..payload_end + tail], "prod", &spec(), &|_| {});
+            let result = ingest_reader(&bytes[..payload_end + tail], "prod", &spec(), &|_| {});
             assert!(result.is_err(), "accepted only {tail} end-marker bytes");
         }
         let mut corrupt = bytes;
@@ -1120,6 +1279,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn midnight_support_is_bounded_and_keeps_duplicate_candidates() {
+        let point = |t| RawPoint {
+            t,
+            lat: 1.0,
+            lon: 1.0,
+            alt_geom_msl: 1000.0,
+            alt_baro_m: 1000.0,
+            gs_mps: 100.0,
+            track_deg: 90.0,
+            vrate_mps: 0.0,
+            flags: 0,
+            new_leg: false,
+            retained_break: false,
+            retained_end: false,
+        };
+        let context = DayContext::new(T0, 300.0, 3600.0);
+        let points: Vec<_> = (0..9000).map(|i| point(T0 + i as f64 * 10.0)).collect();
+        let mut keep = vec![false; points.len()];
+        context.retain_support(&points, &mut keep);
+        let retained = retain_with_neighbours(&points, &keep, 2);
+        assert!(
+            retained.len() <= 18,
+            "chronological support must not retain worldwide hours"
+        );
+        assert!(retained.iter().any(|p| p.t == T0 + 86_390.0));
+        assert!(retained.iter().any(|p| p.t == T0 + 86_400.0));
+        let burst: Vec<_> = (0..100)
+            .map(|i| point(T0 + 86_400.0 + i as f64 * 0.0004))
+            .collect();
+        let mut keep = vec![false; burst.len()];
+        context.retain_support(&burst, &mut keep);
+        assert!(
+            keep.into_iter().all(|kept| kept),
+            "duplicate preference must see the whole burst"
+        );
+    }
+
+    #[test]
     fn new_leg_carried_from_dropped_row() {
         let p = |t: f64, leg: bool| RawPoint {
             t,
@@ -1132,6 +1329,8 @@ pub(crate) mod tests {
             vrate_mps: 0.0,
             flags: 0,
             new_leg: leg,
+            retained_break: false,
+            retained_end: false,
         };
         let pts: Vec<RawPoint> = (0..10).map(|i| p(i as f64, i == 3)).collect();
         let keep: Vec<bool> = (0..10).map(|i| i == 0 || i == 9).collect();
