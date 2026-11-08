@@ -1225,6 +1225,38 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Confirmation and silent-pass bounds: native output equivalence
+
+The trace search now builds conservative spatial bounds alongside its time index. Confirmation
+and unheard-close-pass checks skip a track only when its complete Hermite path cannot reach the
+observer under the existing distance gate. This avoids repeated closest-approach scans of distant
+flights at every candidate and refined location. The bounds include between-knot excursions;
+invalid bounds or query geometry retain the original exact check. Time order, scores, pass
+selection, budgets and confidence thresholds are unchanged. The index belongs to one immutable
+track catalogue and must be rebuilt after geometry or ordering changes.
+
+All six focused search tests pass in the actual pinned-nightly core binary through RCH:
+
+- `spatial_bounds_keep_grazing_and_unknown_tracks`: grazing boundaries, temporal exclusion,
+  malformed bounds and nonfinite query values preserve the required candidates.
+- `spatial_bounds_preserve_confirmers_and_unheard_passes`: complete serialized outputs equal
+  the same scorer with spatial bounds disabled, with 1,024 distant flights, still and windy air,
+  a returning aircraft, a Hermite excursion outside its knot box, shifted observers/clocks,
+  same-pass exclusions and heard/silent close passes.
+- Existing narrow-circuit confirmation, same-pass exclusion and streamed pair-join regressions
+  pass. The existing closer-return test also passes after rebuilding its index following its
+  test-only trajectory mutation. It retains every prior assertion and additionally compares
+  the full silent-pass list against the bounds-disabled path.
+
+Together with the ridge, spectrogram, trajectory-bound and track-recovery checks in this section, 55
+distinct focused core tests passed during this continuation. This is not a complete 228-test
+core-suite or workspace pass. Core all-target Clippy also passes with warnings denied:
+`cargo clippy -p fdop-core --all-targets --locked -- -D warnings`, through the same pinned-toolchain
+RCH configuration. Focused formatting and staged bug scans passed review; whole-workspace
+formatting already reported 60 pre-existing diff sections on the untouched checkout.
+No whole-recording speedup or accuracy change is claimed, and
+CLI selftest plus reference/wrong-date/field replays remain unrun.
+
 ### Recover supported motion when another report component is unusable
 
 Track construction now recovers independently supported horizontal or vertical motion after the

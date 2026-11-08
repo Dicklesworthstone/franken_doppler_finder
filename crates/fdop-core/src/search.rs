@@ -17,7 +17,7 @@
 //! refinement with a chi-square confidence region.
 
 use crate::measure::MeasuredEvent;
-use crate::track::{Prop, TrackModel};
+use crate::track::{Prop, TrackBounds, TrackModel};
 use fdop_types::atmo::Atmosphere;
 use fdop_types::geo::{Enu, V3, dot, ecef_to_geodetic, geodetic_to_ecef, haversine_m, norm, sub};
 use fdop_types::{BBox, Elevation, MIC_HEIGHT_M};
@@ -1757,10 +1757,12 @@ fn ev_weight(ev: &SearchEvent) -> f64 {
     if ev.misfit { 0.5 } else { 1.0 }
 }
 
-/// Track indices sorted by start time, for time-window queries.
+/// Track indices sorted by start time, with conservative spatial bounds built once for
+/// the immutable catalogue. A possible box hit still needs the unchanged exact CPA checks.
 struct TimeIndex {
     by_t0: Vec<(f64, f64, u32)>,
     max_len: f64,
+    bounds: Vec<Option<TrackBounds>>,
 }
 
 impl TimeIndex {
@@ -1772,7 +1774,11 @@ impl TimeIndex {
             .collect();
         by_t0.sort_by(|a, b| a.0.total_cmp(&b.0));
         let max_len = by_t0.iter().map(|t| t.1 - t.0).fold(0.0, f64::max);
-        Self { by_t0, max_len }
+        Self {
+            by_t0,
+            max_len,
+            bounds: tracks.iter().map(TrackModel::bounds).collect(),
+        }
     }
     /// Tracks overlapping [a, b].
     fn overlapping(&self, a: f64, b: f64) -> impl Iterator<Item = u32> + '_ {
@@ -1782,6 +1788,20 @@ impl TimeIndex {
             .iter()
             .filter(move |t| t.1 >= a)
             .map(|t| t.2)
+    }
+
+    /// Time-overlapping tracks whose complete interpolated path might reach the observer.
+    /// Keep the original order, and fail open when a track has no valid spatial bound.
+    fn overlapping_near(
+        &self,
+        a: f64,
+        b: f64,
+        x: V3,
+        reach: f64,
+    ) -> impl Iterator<Item = u32> + '_ {
+        self.overlapping(a, b).filter(move |&ti| {
+            self.bounds[ti as usize].is_none_or(|bounds| bounds.may_reach(x, reach))
+        })
     }
 }
 
@@ -1801,7 +1821,12 @@ fn best_confirmer(
     let t_heard = t_start + ev.t_rec;
     let mut best: Option<(f64, EventMatch, u32)> = None;
     let mut scratch = TraceScratch::default();
-    for ti in tix.overlapping(t_heard - 1.2 * ev.d_gate[1] / c - 120.0, t_heard + 30.0) {
+    for ti in tix.overlapping_near(
+        t_heard - 1.2 * ev.d_gate[1] / c - 120.0,
+        t_heard + 30.0,
+        o.x,
+        1.15 * ev.d_gate[1],
+    ) {
         let tr = &tracks[ti as usize];
         if p.tonal_only && !tr.engine.tonal() {
             continue;
@@ -2687,7 +2712,7 @@ fn unheard_passes(
     }
     let thr = 0.5 * dmin;
     let (ta, tb) = (cand.t_start_utc, cand.t_start_utc + p.duration);
-    for ti in tix.overlapping(ta - thr / c - 60.0, tb + 60.0) {
+    for ti in tix.overlapping_near(ta - thr / c - 60.0, tb + 60.0, o.x, thr) {
         let tr = &tracks[ti as usize];
         if p.tonal_only && !tr.engine.tonal() {
             continue;
@@ -5944,6 +5969,215 @@ mod tests {
     }
 
     #[test]
+    fn spatial_bounds_keep_grazing_and_unknown_tracks() {
+        let case = narrow_circuit_case(fdop_types::atmo::Medium::still(343.0));
+        let o = observer(case.obs.0, case.obs.1, &FlatElevation(0.0));
+        // A track exactly 1 km from the observer on one ECEF box face, including
+        // negative Earth-scale coordinates. A small inward radius must prune it.
+        let grazing = TrackModel {
+            t: vec![case.t_s, case.t_s + 2.0],
+            pos: vec![
+                [o.x[0] + 1000.0, o.x[1], o.x[2] - 1.0],
+                [o.x[0] + 1000.0, o.x[1], o.x[2] + 1.0],
+            ],
+            vel: vec![[0.0, 0.0, 1.0]; 2],
+            ..case.tracks[0].clone()
+        };
+        let mut far = grazing.clone();
+        for p in &mut far.pos {
+            p[0] += 100_000.0;
+        }
+        let mut unknown = far.clone();
+        unknown.vel[0][0] = f64::NAN;
+        let tracks = [far, grazing, unknown];
+        let index = TimeIndex::new(&tracks);
+        assert!(index.bounds[2].is_none());
+        let query = |radius| {
+            index
+                .overlapping_near(case.t_s, case.t_s + 2.0, o.x, radius)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(query(1000.0), vec![1, 2]);
+        assert_eq!(query(999.99), vec![2]);
+        assert_eq!(query(f64::NAN), vec![0, 1, 2]);
+        assert_eq!(query(f64::INFINITY), vec![0, 1, 2]);
+        assert_eq!(
+            index
+                .overlapping_near(case.t_s + 3.0, case.t_s + 4.0, o.x, 1000.0)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn spatial_bounds_preserve_confirmers_and_unheard_passes() {
+        for med in [
+            fdop_types::atmo::Medium::still(343.0),
+            fdop_types::atmo::Medium {
+                c: 339.0,
+                wind_e: 7.0,
+                wind_n: -5.0,
+            },
+        ] {
+            let mut case = narrow_circuit_case(med);
+            let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+            let dem = FlatElevation(0.0);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let atmo = fdop_types::atmo::UniformAtmosphere(med);
+            let prop = Prop::from_medium(&med, &enu);
+            // The knots stay more than 4 km away while the central 80 s Hermite
+            // segment comes within 800 m. The outer segments cover the full heard
+            // trace, including sound delay, within the unchanged 90 s track-gap gate.
+            let bowed = TrackModel {
+                key: "between-knots".into(),
+                t: [400.0, 460.0, 540.0, 600.0].map(|t| case.t_s + t).to_vec(),
+                pos: vec![
+                    enu.to_ecef([11100.0, -7000.0, 700.0]),
+                    enu.to_ecef([3000.0, -2800.0, 700.0]),
+                    enu.to_ecef([3000.0, 2800.0, 700.0]),
+                    enu.to_ecef([11100.0, 7000.0, 700.0]),
+                ],
+                vel: vec![
+                    enu.vec_to_ecef([-135.0, 70.0, 0.0]),
+                    enu.vec_to_ecef([-135.0, 70.0, 0.0]),
+                    enu.vec_to_ecef([135.0, 70.0, 0.0]),
+                    enu.vec_to_ecef([135.0, 70.0, 0.0]),
+                ],
+                ..case.tracks[0].clone()
+            };
+            assert!(bowed.pos.iter().all(|&p| norm(sub(p, o.x)) > 4000.0));
+            let cpa = bowed.cpa_near(o.x, case.t_s + 500.0, 80.0).unwrap();
+            assert!(cpa.interior && cpa.d < 800.0);
+            let event = synth_event(
+                "between-knots",
+                &bowed,
+                o.x,
+                case.t_s,
+                143.5,
+                343.0,
+                case.t_s + 500.0,
+                &prop,
+            );
+            let knot_box_distance = norm(std::array::from_fn(|k| {
+                let lo = bowed.pos.iter().map(|p| p[k]).fold(f64::INFINITY, f64::min);
+                let hi = bowed
+                    .pos
+                    .iter()
+                    .map(|p| p[k])
+                    .fold(f64::NEG_INFINITY, f64::max);
+                (lo - o.x[k]).max(o.x[k] - hi).max(0.0)
+            }));
+            assert!(knot_box_distance > 1.15 * event.d_gate[1]);
+            case.events.push(event);
+            case.tracks.push(bowed);
+            let mut silent = straight_track(
+                &enu,
+                [100.0, 0.0, 100.0],
+                [0.0, 55.0, 0.0],
+                case.t_s + 500.0,
+                case.t_s + 100.0,
+                case.t_s + 850.0,
+                5.0,
+            );
+            silent.key = "silent-close-pass".into();
+            let heard = silent
+                .cpa_near(o.x, case.t_s + 500.0, 100.0)
+                .unwrap()
+                .t_r(case.p.c)
+                - case.t_s;
+            case.tracks.push(silent);
+            let far_start = case.tracks.len();
+            for k in 0..1024 {
+                let mut far = straight_track(
+                    &enu,
+                    [40_000.0 + 10.0 * k as f64, -40_000.0, 1200.0],
+                    [70.0, 0.0, 0.0],
+                    case.t_s + 450.0,
+                    case.t_s,
+                    case.t_s + 900.0,
+                    450.0,
+                );
+                far.key = format!("distant-{k}");
+                case.tracks.push(far);
+            }
+            let bounded = TimeIndex::new(&case.tracks);
+            // This is the former complete path: the identical time index and
+            // scorer, with no track ever excluded by a spatial bound.
+            let unbounded = TimeIndex {
+                by_t0: bounded.by_t0.clone(),
+                max_len: bounded.max_len,
+                bounds: vec![None; case.tracks.len()],
+            };
+            assert_eq!(
+                bounded.overlapping(case.t_s, case.t_s + 900.0).count(),
+                case.tracks.len()
+            );
+            assert!(
+                bounded
+                    .overlapping_near(case.t_s, case.t_s + 900.0, o.x, 5000.0)
+                    .all(|ti| (ti as usize) < far_start)
+            );
+            let evaluate = |index: &TimeIndex| {
+                let mut matches = Vec::new();
+                for (east, north, dt) in [(0.0, 0.0, 0.0), (37.0, -61.0, 0.5), (0.0, 0.0, 30.0)] {
+                    let (lat, lon, _) = enu.to_geodetic([east, north, 0.0]);
+                    let obs = observer(lat, lon, &dem);
+                    for ev in &case.events {
+                        for exclude in [vec![], vec![(0, case.t_s + 420.0)]] {
+                            matches.push(best_confirmer(
+                                &obs,
+                                case.t_s + dt,
+                                ev,
+                                &case.tracks,
+                                index,
+                                &case.p,
+                                &atmo,
+                                &exclude,
+                            ));
+                        }
+                    }
+                }
+                let candidate = Candidate {
+                    t_start_utc: case.t_s,
+                    events: [0, 2]
+                        .map(|k| matches[k].as_ref().unwrap().1.clone())
+                        .to_vec(),
+                    ..Candidate::default()
+                };
+                let unheard: Vec<_> = [vec![], vec![heard], vec![heard + 30.0]]
+                    .iter()
+                    .map(|heard| {
+                        unheard_passes(&candidate, &o, &case.tracks, index, heard, &case.p)
+                    })
+                    .collect();
+                (matches, unheard)
+            };
+            let before = std::time::Instant::now();
+            let expected = evaluate(&unbounded);
+            let unbounded_elapsed = before.elapsed();
+            let before = std::time::Instant::now();
+            let actual = evaluate(&bounded);
+            let bounded_elapsed = before.elapsed();
+            // Full metadata, floating-point results, selected track and ordering
+            // must match, including absent matches and same-pass exclusions.
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert!(actual.0[1].is_none(), "one pass cannot confirm twice");
+            assert_eq!(actual.0[4].as_ref().unwrap().1.flight, "narrow-circuit");
+            assert_eq!(actual.0[6].as_ref().unwrap().1.flight, "between-knots");
+            assert_eq!(actual.1[0].len(), 1);
+            assert!(actual.1[0][0].starts_with("silent-close-pass "));
+            assert!(actual.1[1].is_empty());
+            assert_eq!(actual.1[2], actual.1[0]);
+            eprintln!(
+                "1024 distant tracks, {med:?}: confirmation/unheard unbounded {unbounded_elapsed:?}, bounded {bounded_elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
     fn narrow_circuit_farther_visit_survives_search_and_refinement() {
         let med = fdop_types::atmo::Medium::still(343.0);
         let case = narrow_circuit_case(med);
@@ -6236,7 +6470,19 @@ mod tests {
         let close = circuit.cpa_near(o.x, case.t_s + 1200.0, 100.0).unwrap();
         assert!(candidate.events.iter().all(|m| close.d < 0.5 * m.d));
         let t_rec = close.t_r(case.p.c) - candidate.t_start_utc;
+        // The fixture changed the catalogue after indexing; production keeps it immutable.
+        // Rebuild its bounds, and compare with the original unscreened time query.
+        let mut unbounded = tix;
+        unbounded.bounds.fill(None);
+        let baseline = unheard_passes(&candidate, &o, &case.tracks, &unbounded, &[], &case.p);
+        assert_eq!(
+            baseline.len(),
+            1,
+            "the unpruned return was missed: {baseline:?}"
+        );
+        let tix = TimeIndex::new(&case.tracks);
         let silent = unheard_passes(&candidate, &o, &case.tracks, &tix, &[], &case.p);
+        assert_eq!(silent, baseline);
         assert_eq!(
             silent.len(),
             1,

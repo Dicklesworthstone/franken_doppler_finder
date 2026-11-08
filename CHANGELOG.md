@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Skip unreachable flights during confirmation and silent-pass checks
+
+- Cache complete Hermite trajectory bounds once with the trace search's immutable time index.
+  Reuse them for event confirmation and unheard close passes at candidate/refined observers,
+  before repeated closest-approach scans. Retain original distance/time gates and fail open
+  on unknown geometry.
+- Preserve candidate order, exact scoring, selected passes, comparison budgets and confidence
+  thresholds. Add a complete-output oracle with 1,024 distant flights, still/windy propagation,
+  returning flights and between-knot excursions, plus grazing/invalid-input controls.
+- **Validation:** all six focused native search checks pass, including both new regressions,
+  narrow-circuit confirmation, same-pass exclusion, upstream streamed pair joining and a closer
+  silent return. The latter test now rebuilds its index after moving its fixture's trajectory;
+  every original assertion remains, with an added full-list comparison to disabled bounds.
+  Production uses one immutable catalogue throughout the index's lifetime.
+- Across this continuation, 55 distinct focused core tests passed. This is not a full-suite
+  result. Core all-target Clippy passes with warnings denied on the pinned nightly through RCH;
+  focused formatting and staged bug scans passed review. CLI selftest and field replays remain
+  unrun; no recording speedup or accuracy is claimed.
+
 ### Recover independently supported flight-motion components
 
 - Keep valid horizontal turn motion when a corrupt vertical-rate report rejects the full vector,
