@@ -998,7 +998,10 @@ fn decoy_clock_runs(
                 ));
                 runs.push((s, o.trace_evidence));
             }
-            Err(e) => log.say(&format!("decoy clock {:+.0} h did not run: {e}", s / 3600.0)),
+            Err(e) => log.say(&format!(
+                "decoy clock {:+.0} h did not run: {e}",
+                s / 3600.0
+            )),
         }
     }
     runs
@@ -1020,6 +1023,10 @@ fn locate_with_clock(
     let mut timings = serde_json::Map::new();
     let mut warnings: Vec<String> = Vec::new();
     let c = fdop_types::C_SOUND;
+    // A decoy run is read only for its trace evidence. It draws no figures or map and asks the
+    // Census geocoder nothing, so it writes a few megabytes instead of its answer's hundred-odd
+    // and requests no tiles or place names for a place nobody asked about.
+    let extras = !decoy;
     // ---- inputs -------------------------------------------------------------------------
     if !a.media.is_file() {
         return Err(format!("{}: not a file", a.media.display()));
@@ -1279,12 +1286,16 @@ fn locate_with_clock(
         }
     }
     timings.insert("measure_s".into(), json!(t.elapsed().as_secs_f64()));
-    let _ = survey_png(&ls, &lin, &dets, &events, &run_dir.join("survey.png"));
+    if extras {
+        let _ = survey_png(&ls, &lin, &dets, &events, &run_dir.join("survey.png"));
+    }
     write_json(&run_dir.join("detections.json"), &dets)?;
     write_json(&run_dir.join("events.json"), &events)?;
     for e in &events {
         if e.fit.is_some() {
-            let _ = event_png(e, c, &run_dir.join(format!("{}.png", e.id)), None, "");
+            if extras {
+                let _ = event_png(e, c, &run_dir.join(format!("{}.png", e.id)), None, "");
+            }
             let _ = e
                 .trace
                 .write_csv(&run_dir.join(format!("{}_trace.csv", e.id)));
@@ -1642,7 +1653,7 @@ fn locate_with_clock(
                             "not searched (not an independent aircraft event)".into()
                         }
                     }),
-                figure: f.map(|_| format!("{}.png", e.id)),
+                figure: f.filter(|_| extras).map(|_| format!("{}.png", e.id)),
             }
         })
         .collect();
@@ -1654,6 +1665,9 @@ fn locate_with_clock(
                     headline: String,
                     (lat, lon, radius): (f64, f64, f64),
                     markers: Vec<(f64, f64)>| {
+        if !extras {
+            return;
+        }
         let mopts = fdop_geo::staticmap::StaticMapOptions {
             cache_dir: a.cache.clone(),
             headline: Some(headline),
@@ -1953,7 +1967,8 @@ fn locate_with_clock(
             "winner {lat:.6},{lon:.6} radius {radius:.0} m, {} events, confidence {confidence}",
             top.n_explained
         ));
-        let place = fdop_geo::geocode::describe_location(net.as_ref(), &gaz, lat, lon);
+        let place =
+            fdop_geo::geocode::describe_location(net.as_ref().filter(|_| extras), &gaz, lat, lon);
         log.say(&format!("place: {}", place.headline));
         if let Some(w) =
             region.outside_states_warning(place.state_abbr.as_deref(), place.source == "census-api")
@@ -2078,7 +2093,7 @@ fn locate_with_clock(
                 .collect(),
         );
         // event figures with the winning flights' predicted curves
-        let drawn: &[search::EventMatch] = if on_trace { &top.events } else { &[] };
+        let drawn: &[search::EventMatch] = if on_trace && extras { &top.events } else { &[] };
         for m in drawn {
             if let Some(e) = events.iter().find(|e| e.id == m.event)
                 && let Some(tm) = tracks.iter().find(|t| t.key == m.flight)
@@ -2134,7 +2149,12 @@ fn locate_with_clock(
             "winner {:.6},{:.6} radius {:.0} m from the curve match alone, confidence medium",
             v.lat, v.lon, v.radius_m
         ));
-        let place = fdop_geo::geocode::describe_location(net.as_ref(), &gaz, v.lat, v.lon);
+        let place = fdop_geo::geocode::describe_location(
+            net.as_ref().filter(|_| extras),
+            &gaz,
+            v.lat,
+            v.lon,
+        );
         log.say(&format!("place: {}", place.headline));
         if let Some(w) =
             region.outside_states_warning(place.state_abbr.as_deref(), place.source == "census-api")
@@ -2188,19 +2208,22 @@ fn locate_with_clock(
         };
         log.say(&report.answer.verdict);
     }
-    report.figures.insert(
-        0,
-        (
-            "Survey spectrogram (log frequency): detections (blue), measured traces (white)".into(),
-            "survey.png".into(),
-        ),
-    );
-    for e in &events {
-        if e.fit.is_some() {
-            report.figures.push((
-                format!("{} spectrogram, trace and fit", e.id),
-                format!("{}.png", e.id),
-            ));
+    if extras {
+        report.figures.insert(
+            0,
+            (
+                "Survey spectrogram (log frequency): detections (blue), measured traces (white)"
+                    .into(),
+                "survey.png".into(),
+            ),
+        );
+        for e in &events {
+            if e.fit.is_some() {
+                report.figures.push((
+                    format!("{} spectrogram, trace and fit", e.id),
+                    format!("{}.png", e.id),
+                ));
+            }
         }
     }
     report.funnel = serde_json::to_value(&res.funnel).unwrap_or_default();
@@ -2428,7 +2451,10 @@ mod tests {
             18.41,
             &runs([Some(15.99), Some(17.34), Some(14.70), Some(14.99)]),
         );
-        assert!(!pass && why.contains("vs 17.34") && why.contains("+1.07 nats"), "{why}");
+        assert!(
+            !pass && why.contains("vs 17.34") && why.contains("+1.07 nats"),
+            "{why}"
+        );
         let (pass, why) = decoy_gate(
             26.31,
             &runs([Some(11.69), Some(12.64), Some(11.12), Some(6.31)]),
@@ -2436,7 +2462,10 @@ mod tests {
         assert!(pass && why.contains("+13.67 nats"), "{why}");
         // a decoy where the search found no candidate adds no evidence (a_ref at +2 h)
         let (pass, why) = decoy_gate(29.58, &runs([Some(13.32), Some(11.80), Some(13.56), None]));
-        assert!(pass && why.contains("+2 h none") && why.contains("vs 13.56"), "{why}");
+        assert!(
+            pass && why.contains("+2 h none") && why.contains("vs 13.56"),
+            "{why}"
+        );
         // the line is the medium margin line, and it is inclusive
         assert!(decoy_gate(DECOY_LEAD_NATS, &runs([None; 4])).0);
         assert!(!decoy_gate(DECOY_LEAD_NATS - 0.01, &runs([None; 4])).0);
@@ -2463,8 +2492,26 @@ mod tests {
         assert_eq!(d.out.as_deref(), Some(Path::new("/runs/x/decoy_clock_-2h")));
         assert!(d.quiet && !d.curve_match);
         assert_eq!(
-            (&d.media, &d.dates, &d.near, &d.cache, d.offline, d.clock_tol_s, d.max_events, d.sr),
-            (&a.media, &a.dates, &a.near, &a.cache, a.offline, a.clock_tol_s, a.max_events, a.sr)
+            (
+                &d.media,
+                &d.dates,
+                &d.near,
+                &d.cache,
+                d.offline,
+                d.clock_tol_s,
+                d.max_events,
+                d.sr
+            ),
+            (
+                &a.media,
+                &a.dates,
+                &a.near,
+                &a.cache,
+                a.offline,
+                a.clock_tol_s,
+                a.max_events,
+                a.sr
+            )
         );
         let d = decoy_args(&a, t0, 3_600.0, Path::new("/runs/x"));
         assert_eq!(d.out.as_deref(), Some(Path::new("/runs/x/decoy_clock_+1h")));
@@ -2475,7 +2522,10 @@ mod tests {
         let day = (0.0, 86_400.0);
         let midday = decoy_shifts(43_200.0, day, 120.0);
         assert_eq!(midday.len(), DECOY_SHIFTS_S.len());
-        assert_eq!(midday[..DECOY_CLOCKS], [-7_200.0, -3_600.0, 3_600.0, 7_200.0]);
+        assert_eq!(
+            midday[..DECOY_CLOCKS],
+            [-7_200.0, -3_600.0, 3_600.0, 7_200.0]
+        );
         // 00:30: no decoy window may open before the dates, so later clocks stand in
         assert_eq!(
             decoy_shifts(1_800.0, day, 120.0),
@@ -2705,6 +2755,26 @@ mod tests {
                 decoys,
                 answer.verdict
             );
+            // Each decoy writes its result but no figure or map; the answer keeps its figures.
+            let mut results = 0;
+            for dir in std::fs::read_dir(&outcome.run_dir).unwrap() {
+                let dir = dir.unwrap().path();
+                if !dir
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("decoy_clock_"))
+                {
+                    continue;
+                }
+                results += usize::from(dir.join("result.json").is_file());
+                let images: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .map(|f| f.unwrap().path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "png" || x == "svg"))
+                    .collect();
+                assert!(images.is_empty(), "{}: {images:?}", dir.display());
+            }
+            assert_eq!(results, DECOY_CLOCKS);
+            assert!(outcome.run_dir.join("survey.png").is_file());
         } else {
             assert!(decoys.is_none(), "{decoys:?}");
         }

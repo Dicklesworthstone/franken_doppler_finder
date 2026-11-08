@@ -25,8 +25,8 @@ at that commit, not per-change commits.
   `locate` runs again with the start moved by −2, −1, +1 and +2 hours. Where a clock window would leave `--dates`,
   the next of ±3 and ±4 hours stands in, and a decoy that fails is skipped. The answer's top evidence must lead the
   best decoy's by 3 nats, the medium margin line, or the answer becomes low. Fewer than four decoys also mean low.
-  Each decoy writes its own run directory, `decoy_clock_<shift>h/`, inside the answer's. Curve-only answers and
-  runs without `--start` are unchanged.
+  Each decoy writes its own run directory, `decoy_clock_<shift>h/`, inside the answer's, with no figures or map,
+  and looks up no place name online. Curve-only answers and runs without `--start` are unchanged.
 - Why: on `c2c7578` the osprey cam's 11-02 recording, searched on 10-31, graded high 34 km off with a 6.34-nat
   margin (`n33_c2c7578`). `8be452d`'s peak-chirp factor tipped it, but the factor is correct physics. Without it,
   the same recording at a wrong place grades high instead (`n33_gnochirp`). The margin compares explanations at one
@@ -42,15 +42,16 @@ at that commit, not per-change commits.
   seeing one wrong answer, so these rows do not test it.
 - Cost: the decoys run without the curve match, which the gate does not read. On the development rows the four
   added 229 to 543 s to an answer, and every decoy's evidence was the same to 0.01 nats as with the curve match
-  on, which took 1,121 to 3,618 s (`ab_dec1_dec2`, `n1_dec2`).
+  on, which took 1,121 to 3,618 s (`ab_dec1_dec2`, `n1_dec2`). Without figures a decoy's directory takes about
+  7 MB, against about 137 MB with them (`ab_dec2_dec3`).
 - Tests:
   - `decoy_gate_reads_rows_from_real_runs`: the gate on these rows' numbers, the inclusive 3-nat line, a decoy
     with no answer, and three decoys.
   - `decoy_shifts_keep_each_clock_window_inside_the_dates`.
   - `decoy_runs_move_only_the_start_and_skip_the_curve_match`: a decoy's arguments differ from the answer's only
     in the start, the run directory, `quiet` and the curve match.
-  - The long-video known-answer test now requires its answer to pass its decoy clocks, and the `creation_time` test
-    requires that it runs none.
+  - The long-video known-answer test now requires its answer to pass its decoy clocks, with four decoy directories
+    that each hold a result and no image, and the `creation_time` test requires that it runs none.
   - `fdop-core`'s seven red tests are the same as on `c2c7578`.
 
 ### Refine curve locations on fixed observations

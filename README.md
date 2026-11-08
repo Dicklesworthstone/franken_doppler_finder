@@ -344,8 +344,9 @@ becomes **low**: nothing calibrated then checks that the extra events did not ju
 
 A high or medium answer from the trace search, on a run given `--start`, then meets its **decoy clocks**. `locate`
 runs again four times with the start moved by −2, −1, +1 and +2 hours, each into `decoy_clock_<shift>h/` inside
-the run directory. Hours off, no true pass lines up, but the recording, the place and the day's traffic are the
-same, so the best decoy shows how much evidence chance fits to this recording's sounds reach there. The answer must
+the run directory. A decoy draws no figures or map and looks up no place name online. Hours off, no true pass lines
+up, but the recording, the place and the day's traffic are the same, so the best decoy shows how much evidence
+chance fits to this recording's sounds reach there. The answer must
 lead it by 3 nats, the medium margin line, or it becomes **low**. The margin gate cannot see this, because it
 compares explanations at one clock. The gate was added after a wrong date graded high on `c2c7578`
 ([Known issues](#known-issues)), so the development rows are not a test of it. On them it lowers that run and keeps
@@ -786,6 +787,7 @@ Each `locate` run writes a directory:
 | `survey.png` | Whole-file log-frequency spectrogram with detections and traces marked |
 | `e<N>.png`, `e<N>_trace.csv` | Per-event spectrogram with the fitted curve, and the traced points |
 | `e<N>_match.png` | Each winning event's trace against the ADS-B prediction |
+| `decoy_clock_<shift>h/` | On a high or medium trace answer given `--start`: one run directory per [decoy clock](#the-gates), with its JSON, CSV and report files but no figures or map |
 | `curvematch.json` | The curve match, when it ran: its places with every pass's evidence, the best place's twins along the heard flights' tracks (`aliases`), each decoy window's best place and score, the margin over the best decoy and its rank p |
 | `detections.json`, `events.json`, `search.json` | Intermediate results. `search.json` keeps the best 10,000 candidates, and `candidates_total` counts them all |
 
