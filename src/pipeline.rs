@@ -44,6 +44,9 @@ pub struct LocateOutcome {
     pub run_dir: PathBuf,
     pub report: ReportInput,
     pub found: bool,
+    /// The trace search's top evidence (nats, the margin gate's "evidence"); None when it found no
+    /// candidate. A decoy-clock run hands it back to the run that asked for it.
+    pub trace_evidence: Option<f64>,
 }
 
 pub struct Log {
@@ -895,15 +898,112 @@ pub(crate) fn event_png(
     )
 }
 
-/// Run the whole pipeline.
-pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
-    locate_with_clock(a, log, &unix_now)
+/// Starts of the decoy clocks relative to `--start`, in the order tried; the first
+/// [`DECOY_CLOCKS`] whose whole `--clock-tol` window lies inside the dates are used. Hours apart,
+/// no true pass lines up at a decoy, and the traffic is that of the same place and day.
+const DECOY_SHIFTS_S: [f64; 8] = [
+    -7_200.0, -3_600.0, 3_600.0, 7_200.0, -10_800.0, 10_800.0, -14_400.0, 14_400.0,
+];
+/// Decoy clocks a high or medium trace answer is checked against.
+const DECOY_CLOCKS: usize = 4;
+/// Nats a high or medium trace answer must lead its best decoy clock by: the medium margin line.
+const DECOY_LEAD_NATS: f64 = 3.0;
+
+/// Decoy shifts for a recording that starts at `t0`, in the order tried: those whose clock window
+/// `t0 + shift +- tol` fits inside the date window.
+fn decoy_shifts(t0: f64, dates: (f64, f64), tol: f64) -> Vec<f64> {
+    DECOY_SHIFTS_S
+        .iter()
+        .copied()
+        .filter(|s| t0 + s - tol >= dates.0 && t0 + s + tol <= dates.1)
+        .collect()
 }
 
+/// The decoy-clock gate. Each run is a shift and the trace search's top evidence there (None when
+/// it found no candidate, which adds no evidence). It passes when [`DECOY_CLOCKS`] decoys ran and
+/// `evidence` leads the best of them by [`DECOY_LEAD_NATS`].
+fn decoy_gate(evidence: f64, runs: &[(f64, Option<f64>)]) -> (bool, String) {
+    let list = runs
+        .iter()
+        .map(|(s, e)| {
+            format!(
+                "{:+.0} h {}",
+                s / 3600.0,
+                e.map_or_else(|| "none".to_string(), |e| format!("{e:.2}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if runs.len() < DECOY_CLOCKS {
+        return (
+            false,
+            format!(
+                "only {} of {DECOY_CLOCKS} decoy clocks ran inside the dates ({list}); a high or medium answer needs all of them",
+                runs.len()
+            ),
+        );
+    }
+    let best = runs
+        .iter()
+        .filter_map(|r| r.1)
+        .reduce(f64::max)
+        .unwrap_or(0.0);
+    let lead = evidence - best;
+    (
+        lead >= DECOY_LEAD_NATS,
+        format!(
+            "evidence {evidence:.2} nats vs {best:.2} at the best of {DECOY_CLOCKS} decoy clocks, the same search with --start moved ({list}): {lead:+.2} nats, needs {DECOY_LEAD_NATS:.1}"
+        ),
+    )
+}
+
+/// Run the same locate at decoy clocks, each into `run_dir/decoy_clock_<shift>h`, until
+/// [`DECOY_CLOCKS`] have run. A decoy that fails (an unpublished day, say) is logged and the next
+/// shift is tried.
+fn decoy_clock_runs(
+    a: &LocateArgs,
+    now: &dyn Fn() -> f64,
+    t0: f64,
+    dates: (f64, f64),
+    run_dir: &Path,
+    log: &Arc<Log>,
+) -> Vec<(f64, Option<f64>)> {
+    let mut runs = Vec::new();
+    for s in decoy_shifts(t0, dates, a.clock_tol_s) {
+        if runs.len() == DECOY_CLOCKS {
+            break;
+        }
+        let mut d = a.clone();
+        d.start = Some(format!("{:.3}", t0 + s));
+        d.out = Some(run_dir.join(format!("decoy_clock_{:+.0}h", s / 3600.0)));
+        d.quiet = true;
+        match locate_with_clock(&d, &Log::new(true), now, true) {
+            Ok(o) => {
+                log.say(&format!(
+                    "decoy clock {:+.0} h: top evidence {}",
+                    s / 3600.0,
+                    o.trace_evidence
+                        .map_or_else(|| "none".to_string(), |e| format!("{e:.2} nats"))
+                ));
+                runs.push((s, o.trace_evidence));
+            }
+            Err(e) => log.say(&format!("decoy clock {:+.0} h did not run: {e}", s / 3600.0)),
+        }
+    }
+    runs
+}
+
+/// Run the whole pipeline.
+pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
+    locate_with_clock(a, log, &unix_now, false)
+}
+
+/// `decoy` marks a run made by [`decoy_clock_runs`], which checks no decoys of its own.
 fn locate_with_clock(
     a: &LocateArgs,
     log: &Arc<Log>,
     now: &dyn Fn() -> f64,
+    decoy: bool,
 ) -> Result<LocateOutcome, String> {
     let t_all = Instant::now();
     let mut timings = serde_json::Map::new();
@@ -1536,6 +1636,7 @@ fn locate_with_clock(
         })
         .collect();
     let mut found = !res.candidates.is_empty();
+    let mut trace_evidence: Option<f64> = None;
     let mut curve_used = CurveCall::Silent;
     let draw_map = |report: &mut ReportInput,
                     warnings: &mut Vec<String>,
@@ -1581,6 +1682,15 @@ fn locate_with_clock(
         };
         let margin_nats = res.margin.get("margin_nats").and_then(|v| v.as_f64());
         let alt_km = res.margin.get("next_distinct_km").and_then(|v| v.as_f64());
+        let evidence = match margin_nats {
+            Some(_) => res
+                .margin
+                .get("margin_top_score")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(top.score),
+            None => top.score,
+        };
+        trace_evidence = Some(evidence);
         let lock_ok = top.events.iter().all(|m| {
             let tol = sevs
                 .iter()
@@ -1804,6 +1914,29 @@ fn locate_with_clock(
             }
             (CurveCall::Silent, _) if unchecked => (lat, lon, radius, basis, "low"),
             _ => (lat, lon, radius, basis, confidence),
+        };
+        // A high or medium trace answer must lead what the same recording reaches at decoy clocks.
+        // Its margin compares explanations inside one clock window; a wrong date or place can
+        // still find two chance fits to a recording's strong passes there (nd_o02_1031 on
+        // c2c7578, np_o02_p3 without 8be452d's chirp factor), and the decoys measure that level.
+        let confidence = match given_start {
+            Some(t0) if !decoy && on_trace && matches!(confidence, "high" | "medium") => {
+                let t = Instant::now();
+                let runs = decoy_clock_runs(
+                    a,
+                    now,
+                    t0,
+                    start_window(d0, d1, region.utc_offset_h),
+                    &run_dir,
+                    log,
+                );
+                timings.insert("decoy_clocks_s".into(), json!(t.elapsed().as_secs_f64()));
+                let (passes, why) = decoy_gate(evidence, &runs);
+                log.say(&format!("decoy clocks: {why}"));
+                gates.push(("decoy clocks".to_string(), passes, why));
+                if passes { confidence } else { "low" }
+            }
+            _ => confidence,
         };
         log.say(&format!(
             "winner {lat:.6},{lon:.6} radius {radius:.0} m, {} events, confidence {confidence}",
@@ -2125,6 +2258,7 @@ fn locate_with_clock(
         run_dir,
         report,
         found,
+        trace_evidence,
     })
 }
 
@@ -2271,6 +2405,57 @@ mod tests {
         assert!(!weather.winds_aloft);
         assert!(elapsed.is_nan());
         assert!(weather.warnings[1].contains("ended before a final result"));
+    }
+
+    #[test]
+    fn decoy_gate_reads_rows_from_real_runs() {
+        // c2c7578 on the Mac, xdet/dclock_c2c7578 (LOG 2026-11-08T15:48Z): the wrong date
+        // nd_o02_1031 graded high, and right answers with their own four decoy clocks.
+        let shifts = [-7_200.0, -3_600.0, 3_600.0, 7_200.0];
+        let runs = |e: [Option<f64>; 4]| shifts.iter().copied().zip(e).collect::<Vec<_>>();
+        let (pass, why) = decoy_gate(
+            18.41,
+            &runs([Some(15.99), Some(17.34), Some(14.70), Some(14.99)]),
+        );
+        assert!(!pass && why.contains("vs 17.34") && why.contains("+1.07 nats"), "{why}");
+        let (pass, why) = decoy_gate(
+            26.31,
+            &runs([Some(11.69), Some(12.64), Some(11.12), Some(6.31)]),
+        );
+        assert!(pass && why.contains("+13.67 nats"), "{why}");
+        // a decoy where the search found no candidate adds no evidence (a_ref at +2 h)
+        let (pass, why) = decoy_gate(29.58, &runs([Some(13.32), Some(11.80), Some(13.56), None]));
+        assert!(pass && why.contains("+2 h none") && why.contains("vs 13.56"), "{why}");
+        // the line is the medium margin line, and it is inclusive
+        assert!(decoy_gate(DECOY_LEAD_NATS, &runs([None; 4])).0);
+        assert!(!decoy_gate(DECOY_LEAD_NATS - 0.01, &runs([None; 4])).0);
+        // three decoys cannot clear a high or medium answer, however far it leads
+        let (pass, why) = decoy_gate(
+            84.81,
+            &runs([Some(14.88), Some(14.64), Some(14.91), Some(16.88)])[..3],
+        );
+        assert!(!pass && why.contains("only 3 of 4"), "{why}");
+    }
+
+    #[test]
+    fn decoy_shifts_keep_each_clock_window_inside_the_dates() {
+        let day = (0.0, 86_400.0);
+        let midday = decoy_shifts(43_200.0, day, 120.0);
+        assert_eq!(midday.len(), DECOY_SHIFTS_S.len());
+        assert_eq!(midday[..DECOY_CLOCKS], [-7_200.0, -3_600.0, 3_600.0, 7_200.0]);
+        // 00:30: no decoy window may open before the dates, so later clocks stand in
+        assert_eq!(
+            decoy_shifts(1_800.0, day, 120.0),
+            [3_600.0, 7_200.0, 10_800.0, 14_400.0]
+        );
+        // 23:30
+        assert_eq!(
+            decoy_shifts(84_600.0, day, 120.0),
+            [-7_200.0, -3_600.0, -10_800.0, -14_400.0]
+        );
+        // the tolerance counts: at 01:01 an hour earlier leaves 60 s, under 120 s
+        assert!(!decoy_shifts(3_660.0, day, 120.0).contains(&-3_600.0));
+        assert!(decoy_shifts(3_660.0, day, 60.0).contains(&-3_600.0));
     }
 
     fn offline_test_args(name: &str) -> LocateArgs {
@@ -2461,7 +2646,7 @@ mod tests {
                 .err()
                 .expect("the longer container reaches an unpublished day");
             assert!(error.contains("no published day covers"), "{error}");
-            locate_with_clock(&a, &Log::new(true), &|| now).unwrap()
+            locate_with_clock(&a, &Log::new(true), &|| now, false).unwrap()
         } else {
             locate(&a, &Log::new(true)).unwrap()
         };
@@ -2475,6 +2660,21 @@ mod tests {
         );
         assert!(outcome.found, "{}", outcome.report.answer.verdict);
         let answer = &outcome.report.answer;
+        // Metamorphic: moved by hours, the clock lines up no true pass, so the known answer must
+        // lead its decoy clocks. Only an explicit --start (the long video) is moved; a
+        // creation_time window runs no decoys.
+        let decoys = answer.gates.iter().find(|g| g.0 == "decoy clocks");
+        if long_video {
+            assert!(
+                decoys.is_some_and(|g| g.1),
+                "{} {:?}: {}",
+                answer.confidence,
+                decoys,
+                answer.verdict
+            );
+        } else {
+            assert!(decoys.is_none(), "{decoys:?}");
+        }
         let error = haversine_m(
             answer.lat,
             answer.lon,

@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Check high and medium answers against decoy clocks
+
+- A high or medium answer from the trace search, on a run given `--start`, now meets a new gate, `decoy clocks`.
+  `locate` runs again with the start moved by −2, −1, +1 and +2 hours. Where a clock window would leave `--dates`,
+  the next of ±3 and ±4 hours stands in, and a decoy that fails is skipped. The answer's top evidence must lead the
+  best decoy's by 3 nats, the medium margin line, or the answer becomes low. Fewer than four decoys also mean low.
+  Each decoy writes its own run directory, `decoy_clock_<shift>h/`, inside the answer's. Curve-only answers and
+  runs without `--start` are unchanged.
+- Why: on `c2c7578` the osprey cam's 11-02 recording, searched on 10-31, graded high 34 km off with a 6.34-nat
+  margin (`n33_c2c7578`). `8be452d`'s peak-chirp factor tipped it, but the factor is correct physics. Without it,
+  the same recording at a wrong place grades high instead (`n33_gnochirp`). The margin compares explanations at one
+  clock, so it cannot tell chance fits to a recording's strong passes from a real answer.
+- Development rows (Mac, the offline A/B harness, `ab_c2c7578_dec1`):
+  - The five right answers keep their grades. Each one's lead over its best decoy, in nats: the reference
+    recording, high, +16.0; the osprey cam on 10-31, high, +14.0; on 11-01, high, +23.1; on 11-02, high, +17.9;
+    Duke Farms, medium, +67.8.
+  - Every low or no-answer row is unchanged, to the same evidence.
+  - The wrong date leads by 1.07 and is low (`n1_dec1`).
+- Before the gate was coded, the rule was written down and run offline. It was run on these rows' decoy clocks
+  (`dclock_c2c7578`) and against 17 fresh wrong dates (`f17_c2c7578`), none of which asserted. It was chosen after
+  seeing one wrong answer, so these rows do not test it.
+- Cost: a high or medium answer takes about five times as long.
+- Tests:
+  - `decoy_gate_reads_rows_from_real_runs`: the gate on these rows' numbers, the inclusive 3-nat line, a decoy
+    with no answer, and three decoys.
+  - `decoy_shifts_keep_each_clock_window_inside_the_dates`.
+  - The long-video known-answer test now requires its answer to pass its decoy clocks, and the `creation_time` test
+    requires that it runs none.
+  - `fdop-core`'s seven red tests are the same as on `c2c7578`.
+
 ### Refine curve locations on fixed observations
 
 - Separate local geometry fitting from template-dependent evidence support. After the existing
