@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Complete a fast pass's central drop without restarting its fitted ridge
+
+- Extend the existing bounded continuation to steep fits beyond the primary detector's speed
+  bank whose sole failed gate is central-drop coverage. Retain the final guided tolerance and
+  original spectrogram for this case; a new broad band can lose the already converging ridge.
+  Missing-side continuation keeps its existing spectral rebuild. Free reseeding, thresholds,
+  detector identity, time bounds and the six-round continuation ceiling are unchanged.
+- Keep an optional replacement spectrum so a successful central-drop continuation reuses the
+  original allocation. Accepted measurements stay on their original path; unsuccessful retries
+  retain the original refusal. Every recovered event must have continuous retained support for
+  both eight-second sides through the CPA and pass every existing gate.
+- The actual detected 180-second tail previously stops at 11% central-drop coverage and no
+  independent aircraft. Three additional fits, six total, now follow 91.56% and recover
+  83.084086 Hz, 244.897978 m/s, 698.011988 m and 169.360513 s against truth
+  83 Hz, 245 m/s, 700 m and 169.37 s. The exact old core fails the updated regression.
+- Native controls preserve accepted-event/spectrum output, inaccurate accepted short-pass
+  controls, missing-central/one-sided/steady-asymptote refusals, the faint-drop sensitivity
+  refusal and existing edge-recovery/crop/negative-audio behavior. Complete-core test Clippy
+  passes with warnings denied. The combined actual engine selftest retains both intended flights,
+  four events, 1.673779 m error, a 75 m radius and +0.019586 s clock error through real FFmpeg.
+  These establish synthetic recovery, not field accuracy; reference, wrong-date and field
+  recordings have not been replayed.
+
 ### Recover a missing second aircraft without counting the first sound twice
 
 - Run the existing bounded fast-edge survey when ordinary measurement has fewer than two

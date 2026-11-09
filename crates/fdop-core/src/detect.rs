@@ -1749,11 +1749,23 @@ mod tests {
             serde_json::to_value((&added, cut)).unwrap(),
             serde_json::to_value((&local, local_cut)).unwrap()
         );
-        // This longer context changes row normalization and does not yet supply an accurate
-        // measured event. Coordinate preservation must not be mistaken for a recovery claim.
+        // The long recording's row background used to leave the measured trace on both
+        // asymptotes without the central drop. Continue that fitted ridge through the unchanged
+        // gates, while keeping the survey's absolute recording coordinates.
         let events = measure_edge_families(&x, &lin, &added);
-        assert!(events.iter().all(|event| !event.is_aircraft_like()));
-        assert!(crate::search::independent_measured_events(&events, 0.0).is_empty());
+        let independent = crate::search::independent_measured_events(&events, 0.0);
+        assert_eq!(independent.len(), 1);
+        let event = events
+            .iter()
+            .find(|event| event.is_aircraft_like())
+            .unwrap();
+        let b = event.fit.as_ref().unwrap().best;
+        eprintln!("recovered absolute tail: {b:?}; {:?}", event.quality);
+        assert!(event.quality.reseeded);
+        assert!((b.f0 - pass.0).abs() < 0.3, "{b:?}");
+        assert!((b.v - pass.1).abs() < 4.0, "{b:?}");
+        assert!((b.d / pass.2 - 1.0).abs() < 0.08, "{b:?}");
+        assert!((b.t0r - pass.3).abs() < 0.3, "{b:?}");
     }
 
     #[test]

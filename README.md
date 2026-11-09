@@ -1186,9 +1186,12 @@ Design notes:
   Raw trace points, SNR and central-drop accounting remain unchanged. Accepted fits, and refusals whose retained trace held both sides, are
   measured exactly as before. A wrong fit can pass this way too: a climbing pass in a clip that starts mid-drop
   trades speed against distance, and the retry accepts the wrong pair.
-- **A fast fitted ridge can regain missing side coverage.** If the free trace also fails, the fitted speed is
-  already beyond the primary bank's 175 m/s limit, and the steep fitted ridge meets every gate except the
-  required approach/recede span, measurement renews its spectral band and window from that fitted geometry.
+- **A fast fitted ridge can regain missing side or central-drop coverage.** When the fitted speed is
+  already beyond the primary bank's 175 m/s limit and a steep fitted ridge fails only the required
+  approach/recede span or central frequency drop, measurement can continue that same fit. A missing side
+  renews its spectral band and window after free tracing fails. A missing central drop preserves the
+  original spectrogram and the final narrowed tracing band, so continuation does not restart discovery
+  or lose the ridge it was converging on.
   It continues the same ridge for at most twice the ordinary fitting budget, capped at six rounds. After
   completing the ordinary rounds, it stops when all gates pass or coverage stops growing on the missing
   side. Both eight-second sides must belong to the retained ridge through the fitted CPA: a gap longer
@@ -1440,6 +1443,32 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Following a detected fast pass through its missing central drop
+
+The fixed 180-second tail recording now reaches an accepted measurement from its actual detected
+seed. Previously three guided rounds followed only 11% of the central drop and correctly refused
+the event. `fitted_continuation_recovers_a_long_tail_with_a_missing_central_drop` continues that
+same fit and narrowed band for three further rounds, without redoing the first three. It observes
+91.56% of the drop and retains a continuous ridge through the CPA with at least eight seconds on
+each side. All original physical and quality gates remain required.
+
+| Quantity | Synthetic truth | Recovered |
+|---|---:|---:|
+| Emitted tone | 83 Hz | 83.084086 Hz |
+| Speed | 245 m/s | 244.897978 m/s |
+| Closest distance | 700 m | 698.011988 m |
+| Received CPA | 169.37 s | 169.360513 s |
+
+The exact previous core fails the updated tail regression with zero independent aircraft; the
+changed core recovers one. Missing central audio, a missing approach and steady asymptotes retain
+their original refused results. Existing accepted measurements, including the known inaccurate
+short-pass fits, retain identical events and spectra. Short-edge recovery, crop boundaries,
+noise/steady/reversed refusals and the faint-drop sensitivity refusal also pass. Core test Clippy
+passes with warnings denied. The combined production engine selftest also retains both intended
+flights, four events, 1.673779 m error, a 75 m radius and +0.019586 s clock error through real FFmpeg.
+These are native synthetic recording/measurement checks; no new
+field-accuracy or confidence-calibration result is claimed.
+
 ### The recording audit shares the location search's recovered events
 
 The native `detect_uses_locates_recovered_aircraft_and_event_ids` regression exercises the exact
@@ -1503,10 +1532,10 @@ that existing measurement unchanged; it does not repair its inaccurate geometry.
 family links, event renumbering, expanded-search provenance and both output caps are checked.
 
 Six focused native core checks also pass, covering recovery, candidate accounting, crop seams,
-absolute tail times, and preservation of the existing fast stages and cap. The 180-second control
-returns exactly the local edge crop's coarse detections translated into recording time, but its
-longer normalization context still fails physical measurement. It remains a refusal; this change
-does not establish accurate recovery for that longer recording. The fresh production engine
+absolute tail times, and preservation of the existing fast stages and cap. At that stage, the
+180-second control returned the local edge crop's coarse detections translated into recording
+time but still failed physical measurement. The later central-drop continuation described above
+now recovers it from that detected seed. The production engine
 selftest retains both intended flights, four events, 1.673779 m error, a 75 m radius and +0.019586 s
 clock error, identical to its prior baseline. Core library/test Clippy passes with warnings denied.
 
