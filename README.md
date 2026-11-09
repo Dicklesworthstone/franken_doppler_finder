@@ -708,15 +708,22 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 
 ### `fdop detect <MEDIA>`: flyovers only, no ADS-B
 
-Detects flyovers and measures them in detector order, strongest first within each stage, until 24 independent aircraft
-events survive the same eligibility and harmonic checks used by `locate`. If a family's primary lost its
+Detects flyovers using the same recording analysis as `locate`: detections are measured strongest
+first within each stage until 24 independent aircraft events survive. If ordinary measurement
+finds no aircraft, the same bounded half-second survey of the recording's true edges can recover
+a short fast pass. Every recovered candidate must pass the unchanged measurement and aircraft
+checks; a warning identifies the retry. Final events are ranked by measured quality and numbered
+`e1`, `e2`, ... exactly as in `locate`, so an audit and a location search identify the same measured
+passes. This replaces `detect`'s former detector-order output and event numbering.
+If a family's primary lost its
 ridge around the closest approach, its detected harmonic siblings are tried strongest first until one passes
 the existing quality and aircraft gates. The family supplies at most one result. Refused fits, non-aircraft fits and duplicate traces of one
 pass do not consume that allowance. The selected result for each measured family remains in `events.json`,
 including duplicates and unrecovered refusals. A warning on stderr says when either cap omits candidates, when the audio
 looks high-passed, or when the survey image was raised because its spread was under 0.5. A detection found
 only on the contrast image of such a recording has `"from_contrast": true` in `events.json`. The command
-writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv` for every fitted event. The default
+writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv` for every fitted event, using
+those final event IDs consistently. The default
 output directory is `fdop_runs/detect`.
 
 `--audio-stream N` and `--audio-channel N` select the same source as in `locate`. For example,
@@ -1402,6 +1409,21 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### The recording audit shares the location search's recovered events
+
+The native `detect_uses_locates_recovered_aircraft_and_event_ids` regression exercises the exact
+production `detect` path with real FFmpeg/FFprobe and fixed synthetic float WAV files. The original
+command misses the accepted aircraft in the 30-second fast-pass case; the shared analysis and
+updated command recover it within the existing tone, speed, distance and CPA tolerances. Saved
+events must exactly match `locate`'s recording analysis, with consistent survey/event figures and
+trace filenames. A noise-only control remains empty. The new command path passes; the original
+arm fails the same assertion. Changed-component Clippy also passes with warnings denied.
+
+This is native component validation against the complete production core and locked dependencies.
+Full application execution remains blocked by compilation of the unchanged transitive
+`asupersync 0.5.0` dependency. No new field-accuracy result is claimed. Like the other media tests,
+this regression is opt-in because it requires FFmpeg and FFprobe.
 
 ### Fast edge recovery after empty recording measurement (2026-11-09)
 

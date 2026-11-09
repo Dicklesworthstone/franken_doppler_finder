@@ -320,76 +320,27 @@ fn run(cli: Cli) -> Result<i32, String> {
             if let Some(w) = pipeline::low_band_warning(&x, 4000) {
                 eprintln!("fdop: warning: {w}");
             }
-            let dp = fdop_core::detect::DetectParams::default();
-            let (ls, lin) = fdop_core::detect::survey(&x, 4000, &dp)?;
-            let (dets, det_cut) = fdop_core::detect::detect_counted(&ls, &dp);
-            if ls.gain > 1.0 {
-                eprintln!(
-                    "fdop: warning: survey image spread {:.2} is under {:.2}: raised x{:.2} before detection",
-                    ls.scale, dp.min_image_scale, ls.gain
-                );
+            // Use exactly the observations `locate` would search, including its bounded
+            // recovery after ordinary measurement finds no aircraft and its final event IDs.
+            let measured =
+                pipeline::measure_recording(&x, 4000, &log, Some(&out.join("survey.png")))?;
+            for warning in &measured.warnings {
+                eprintln!("fdop: warning: {warning}");
             }
-            if det_cut > 0 {
-                eprintln!(
-                    "fdop: warning: kept the {} strongest of {}{} candidate curves",
-                    dp.max_detections,
-                    dp.max_detections + det_cut,
-                    if det_cut >= 2 * dp.max_detections {
-                        "+"
-                    } else {
-                        ""
-                    },
-                );
-            }
-            let mp = fdop_core::measure::MeasureParams::default();
-            // As in `locate`: every primary from the silence line up, strongest first, until
-            // MAX_MEASURED independent aircraft events survive the search's existing checks;
-            // a detected harmonic can rescue an unusable primary, once for the whole family.
-            let max_measured = fdop_core::measure::MAX_MEASURED;
-            let prim: Vec<_> = dets
-                .iter()
-                .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
-                .collect();
-            use rayon::prelude::*;
-            let evs = fdop_core::measure::measure_ranked_counted(
-                prim.len(),
-                max_measured,
-                |ranks| {
-                    prim[ranks.clone()]
-                        .par_iter()
-                        .enumerate()
-                        .map(|(i, det)| {
-                            fdop_core::measure::measure_family(
-                                &x,
-                                4000,
-                                &lin,
-                                det,
-                                &dets,
-                                &format!("e{}", ranks.start + i + 1),
-                                &mp,
-                            )
-                        })
-                        .collect()
-                },
-                |events| fdop_core::search::independent_measured_events(events, 0.0).len(),
-            );
-            if prim.len() > evs.len() {
-                eprintln!(
-                    "fdop: warning: measured the {} strongest of {} flyover detections, reaching the limit of {max_measured} independent aircraft events",
-                    evs.len(),
-                    prim.len(),
-                );
-            }
+            let evs = measured.events;
             std::fs::write(
                 out.join("events.json"),
                 serde_json::to_string_pretty(&evs).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
-            if let Err(e) = pipeline::survey_png(&ls, &lin, &dets, &evs, &out.join("survey.png")) {
-                log.say(&format!("survey.png: {e}"));
-            }
             for e in evs.iter().filter(|e| e.fit.is_some()) {
-                let _ = pipeline::event_png(e, mp.c, &out.join(format!("{}.png", e.id)), None, "");
+                let _ = pipeline::event_png(
+                    e,
+                    fdop_types::C_SOUND,
+                    &out.join(format!("{}.png", e.id)),
+                    None,
+                    "",
+                );
                 let _ = e.trace.write_csv(&out.join(format!("{}_trace.csv", e.id)));
             }
             for e in &evs {
@@ -549,6 +500,128 @@ fn run(cli: Cli) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn detect_uses_locates_recovered_aircraft_and_event_ids() {
+        use fdop_core::{detect, measure, physics, search};
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-detect-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The complete 30 s late-pass case from the recording-measurement regression.
+        // Float WAV preserves its exact PCM while exercising the real probe and decoder.
+        for (label, amplitude, n_aircraft) in [("fast", 0.32, 1), ("noise", 0.0, 0)] {
+            let mut seed = 4242u64;
+            let pcm: Vec<f32> = (0..30 * 4000)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let t = i as f64 / 4000.0;
+                    let tau = physics::retarded_tau(t, 19.37 - 700.0 / 343.0, 245.0, 700.0, 343.0);
+                    let range = physics::cv_radial(tau, 245.0, 700.0).0;
+                    let tone =
+                        amplitude * 700.0 / range * (std::f64::consts::TAU * 83.0 * tau).sin();
+                    let noise = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+                    (tone + noise + 0.03 * (std::f64::consts::TAU * 250.0 * t).sin()) as f32
+                })
+                .collect();
+            let raw = dir.join(format!("{label}.f32le"));
+            let media = dir.join(format!("{label}.wav"));
+            let out = dir.join(label);
+            std::fs::write(
+                &raw,
+                pcm.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let encoded = Command::new("ffmpeg")
+                .args([
+                    "-nostdin", "-v", "error", "-f", "f32le", "-ar", "4000", "-ac", "1", "-i",
+                ])
+                .arg(&raw)
+                .args(["-c:a", "pcm_f32le"])
+                .arg(&media)
+                .output()
+                .expect("ffmpeg is required for the media command regression");
+            assert!(
+                encoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&encoded.stderr)
+            );
+            let decoded = audio::decode(&media, 0.0, None, 4000).unwrap();
+            assert_eq!(decoded, pcm);
+
+            // The separate detector path formerly used by this command misses the pass.
+            let dp = detect::DetectParams::default();
+            let (ls, lin) = detect::survey(&decoded, 4000, &dp).unwrap();
+            let ordinary = detect::detect(&ls, &dp);
+            let original_events: Vec<_> = ordinary
+                .iter()
+                .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+                .map(|d| {
+                    measure::measure_family(
+                        &decoded,
+                        4000,
+                        &lin,
+                        d,
+                        &ordinary,
+                        "original",
+                        &measure::MeasureParams::default(),
+                    )
+                })
+                .collect();
+            assert!(search::independent_measured_events(&original_events, 0.0).is_empty());
+
+            let expected =
+                pipeline::measure_recording(&decoded, 4000, &Log::new(true), None).unwrap();
+            let selected = search::independent_measured_events(&expected.events, 0.0);
+            assert_eq!(selected.len(), n_aircraft, "{label}");
+            if n_aircraft > 0 {
+                let best = expected
+                    .events
+                    .iter()
+                    .find(|e| e.id == selected[0].id)
+                    .unwrap()
+                    .fit
+                    .as_ref()
+                    .unwrap()
+                    .best;
+                assert!((best.f0 - 83.0).abs() < 0.3, "{best:?}");
+                assert!((best.v - 245.0).abs() < 4.0, "{best:?}");
+                assert!((best.d / 700.0 - 1.0).abs() < 0.08, "{best:?}");
+                assert!((best.t0r - 19.37).abs() < 0.3, "{best:?}");
+            }
+            let cli = Cli::try_parse_from([
+                "fdop",
+                "detect",
+                media.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--quiet",
+            ])
+            .unwrap();
+            assert_eq!(run(cli).unwrap(), 0);
+            let actual = std::fs::read_to_string(out.join("events.json")).unwrap();
+            assert_eq!(
+                actual,
+                serde_json::to_string_pretty(&expected.events).unwrap(),
+                "{label}"
+            );
+            assert!(out.join("survey.png").is_file());
+            for event in expected.events.iter().filter(|e| e.fit.is_some()) {
+                assert!(out.join(format!("{}.png", event.id)).is_file());
+                assert!(out.join(format!("{}_trace.csv", event.id)).is_file());
+            }
+        }
+    }
 
     #[test]
     fn media_commands_accept_audio_selection_and_keep_defaults() {

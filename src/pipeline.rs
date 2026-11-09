@@ -1123,16 +1123,16 @@ struct PreparedRecording<'a> {
     measurements: &'a AudioMeasurements,
 }
 
-struct AudioMeasurements {
+pub(crate) struct AudioMeasurements {
     detections: Vec<Detection>,
-    events: Vec<MeasuredEvent>,
+    pub(crate) events: Vec<MeasuredEvent>,
     added: std::collections::HashSet<String>,
-    warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
     detect_s: f64,
     measure_s: f64,
 }
 
-fn measure_recording(
+pub(crate) fn measure_recording(
     x: &[f32],
     sr: u32,
     log: &Arc<Log>,
@@ -1330,8 +1330,10 @@ fn measure_recording(
         }
     }
     let measure_s = (t.elapsed().as_secs_f64() - recovery_detect_s).max(0.0);
-    if let Some(path) = survey_path {
-        let _ = survey_png(&ls, &lin, &dets, &events, path);
+    if let Some(path) = survey_path
+        && let Err(error) = survey_png(&ls, &lin, &dets, &events, path)
+    {
+        log.say(&format!("survey.png: {error}"));
     }
     Ok(AudioMeasurements {
         detections: dets,

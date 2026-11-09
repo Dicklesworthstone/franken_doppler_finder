@@ -39,6 +39,29 @@ at that commit, not per-change commits.
   coarse emission-time bound and terrain projection remain approximations; reference, wrong-date
   and field recordings have not been replayed for this change.
 
+### Let the recording audit recover the same aircraft as the location search
+
+- Route `fdop detect` through `locate`'s complete recording analysis. The audit previously kept
+  a separate detector/measurement path and missed the short fast passes recovered by the
+  half-second edge survey. Both commands now share the retry, harmonic recovery, independent-event
+  limit, physical gates and warnings.
+- `detect` now emits events in measured-quality order, with the same final `eN` IDs as `locate`.
+  Its event JSON, survey, per-event figures and traces use those IDs together; output filenames
+  and JSON field names are unchanged. The command still needs no ADS-B data or network.
+- Add a complete media-command regression using fixed synthetic float WAV audio: ordinary
+  measurement finds no aircraft in a 30-second fast pass, whereas the shared path must recover
+  exactly one accurate aircraft. The command's saved events must exactly equal the shared
+  analysis, with matching figures and traces; a noise-only control must remain empty.
+- The native media-path regression passes against the complete real core and locked dependencies.
+  The exact original `detect` arm fails the same test because its saved events lack the accepted
+  aircraft. The new arm passes both the fast-aircraft and noise-only cases, including exact decoded
+  PCM, physical-fit bounds, complete saved-event equality, figures and traces. The exact changed
+  component also passes Clippy with warnings denied, and changed-file formatting and whitespace
+  checks pass. The FFmpeg regression remains opt-in like the existing media tests.
+- These are native command-path component checks. Full application execution remains blocked by
+  the unchanged transitive `asupersync 0.5.0` dependency being killed during compilation, even with
+  a single compiler thread and reduced build memory. No reference or field recording was replayed.
+
 ### Recover short fast passes after ordinary recording measurement finds no aircraft
 
 - Give `locate` one half-second survey of the real recording edges only after every ordinary
