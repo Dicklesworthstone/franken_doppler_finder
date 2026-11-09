@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retry hillside flyover clocks at the actual observer
+
+- Recover a clock-rejected hypothesis by using the existing exact nearest-pass calculation
+  when a climbing or descending flight's coarse CPA line used a different terrain height
+  beneath the aircraft. Keep the candidate observer fixed, recompute propagation at its
+  actual CPA, and retain that exact emission time in the hypothesis.
+- Run this retry only after the original coarse geometry and region checks, and only when
+  the original clock estimate failed. Accepted hypotheses keep their original coordinates,
+  clocks and emission times. Retried passes must satisfy the unchanged clock window, exact
+  speed/distance gates, interior-CPA rule, track-gap limit and microphone terrain clearance.
+  Hypothesis accounting, search budgets and confidence rules are unchanged.
+- A native probe on the preceding production source used two crossing climb/descent tracks,
+  a known recording start and a planar hillside. Flat terrain retained one hypothesis per
+  intended flight; grades +0.1, +0.2 and -0.2 retained zero for both, despite the true CPAs
+  passing the existing gates. Add an assertive regression for those four scenes, the
+  intended flight identities, unchanged flat counts, hypothesis-budget accounting, and
+  wrong-clock, track-gap, terrain-clearance, speed and distance controls.
+- Validation boundary: the original-source probe and complete baseline core test-root
+  compilation ran natively. The executor disconnected before this correction was compiled
+  or its new tests, Clippy, formatting, selftest or recording replays could run. Source review
+  is not a runtime pass; neither full-search recovery nor field accuracy is established by
+  the pre-change hypothesis probe. The coarse terrain locus remains an approximation.
+
 ### Keep wind-delayed flyovers inside a known recording clock
 
 - Use the candidate observer's path-averaged atmosphere and moving-medium travel time when

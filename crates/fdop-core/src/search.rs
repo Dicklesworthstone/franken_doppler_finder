@@ -647,12 +647,37 @@ fn hypotheses(
                             let rv = sub(pos, obs.to_ecef([0.0; 3]));
                             prop.travel(rv, norm(rv))
                         };
-                        let t_s = t + travel - ev.t_rec;
+                        let mut t_e = t;
+                        let mut t_s = t + travel - ev.t_rec;
+                        if !(t_s >= p.start_lo - ev.t_tol && t_s <= p.start_hi + ev.t_tol) {
+                            // The coarse CPA line uses terrain beneath the aircraft. On a
+                            // hillside, a climb or descent reaches this observer's actual
+                            // CPA at another time. Retry only a clock-rejected point;
+                            // already accepted points keep their original clock and need
+                            // no extra closest-approach search.
+                            let o = observer(ola, olo, dem);
+                            if o.z == z0 || ve[2] == 0.0 {
+                                return None;
+                            }
+                            let cpa = tr.cpa_nearest_time(o.x, t, 150.0)?;
+                            let prop = prop_for(atmo, &o, tr, cpa.t_e);
+                            let (_, _, cpa_h) = ecef_to_geodetic(tr.pos_at(cpa.t_e));
+                            let agl = cpa_h - o.z - MIC_HEIGHT_M;
+                            if !agl.is_finite()
+                                || agl < p.min_agl_m
+                                || tr.gap_at(cpa.t_e) > p.max_gap_s
+                                || !gates_ok(ev, &cpa, &prop, 0.0)
+                            {
+                                return None;
+                            }
+                            t_e = cpa.t_e;
+                            t_s = cpa.t_r_p(&prop) - ev.t_rec;
+                        }
                         if t_s >= p.start_lo - ev.t_tol && t_s <= p.start_hi + ev.t_tol {
                             let (e, n) = frame.en(ola, olo);
                             Some(Hyp {
                                 trk: ti as u32,
-                                t_e: (t - t_base) as f32,
+                                t_e: (t_e - t_base) as f32,
                                 e: e as f32,
                                 n: n as f32,
                                 t_s: (t_s - t_base) as f32,
@@ -5852,6 +5877,117 @@ mod tests {
         assert!(haversine_m(lat, lon, winner.lat, winner.lon) < 75.0);
         assert!((winner.t_start_utc - t_s).abs() < 0.2);
         assert!(result.funnel.truncated.is_empty());
+    }
+
+
+    #[test]
+    fn known_clock_hillside_flyovers_reach_the_hypothesis_join() {
+        struct Slope {
+            lat: f64,
+            lon: f64,
+            grade: f64,
+        }
+        impl Elevation for Slope {
+            fn elev_m(&self, lat: f64, lon: f64) -> f64 {
+                let (mlat, mlon) = fdop_types::geo::m_per_deg(self.lat);
+                1000.0 + self.grade * ((lon - self.lon) * mlon + (lat - self.lat) * mlat)
+            }
+            fn describe(&self) -> String {
+                "synthetic planar hillside".into()
+            }
+        }
+        let (lat, lon) = (40.876466, -73.524951);
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+        let start = 1_788_895_000.0;
+        let enu = Enu::new(lat, lon, 1000.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        // At each true CPA, source-minus-observer is perpendicular to velocity.
+        // One track climbs and the other descends; their horizontal headings cross.
+        for (key, pos, vel, dt, f0) in [
+            (
+                "A",
+                [-400.0, 6500.0, 1760.0 + MIC_HEIGHT_M],
+                [110.0, 0.0, 25.0],
+                120.0,
+                112.7,
+            ),
+            (
+                "B",
+                [6500.0, 400.0, 2000.0 + MIC_HEIGHT_M],
+                [0.0, 100.0, -20.0],
+                360.0,
+                149.3,
+            ),
+        ] {
+            let mut tr = straight_track(
+                &enu,
+                pos,
+                vel,
+                start + dt,
+                start - 200.0,
+                start + 800.0,
+                5.0,
+            );
+            tr.key = key.into();
+            let mut ev =
+                synth_event(key, &tr, x, start, f0, 343.0, start + dt, &Prop::still(343.0));
+            ev.t_tol = 1.0;
+            let cpa = tr.cpa_nearest_time(x, start + dt, 100.0).unwrap();
+            assert!(gates_ok(&ev, &cpa, &Prop::still(343.0), 0.0));
+            tracks.push(tr);
+            events.push(ev);
+        }
+        let p = SearchParams::new(
+            start,
+            start,
+            600.0,
+            BBox::new(
+                lat - 25.0 / mlat,
+                lon - 25.0 / mlon,
+                lat + 25.0 / mlat,
+                lon + 25.0 / mlon,
+            ),
+        );
+        let frame = Frame::new(&p.region);
+        let t_base = start - 86_400.0;
+        for grade in [0.0, 0.1, 0.2, -0.2] {
+            let dem = Slope { lat, lon, grade };
+            let generate = |ev: &SearchEvent, params: &SearchParams, cap: usize| {
+                hypotheses(ev, &tracks, params, &frame, &dem, &atmo, t_base, cap)
+            };
+            let clouds: Vec<_> = events.iter().map(|ev| generate(ev, &p, 10_000)).collect();
+            let counts: Vec<_> = clouds.iter().map(|h| h.count).collect();
+            assert!(counts.iter().all(|&n| n > 0), "slope {grade}: {counts:?}");
+            if grade == 0.0 {
+                // Observed on the immutable implementation before the hillside retry.
+                assert_eq!(counts, vec![1, 1]);
+            }
+            for (i, (ev, cloud)) in events.iter().zip(&clouds).enumerate() {
+                assert!(cloud.stored.as_ref().unwrap().iter().any(|h| h.trk as usize == i));
+                let limited = generate(ev, &p, 0);
+                assert_eq!(limited.count, cloud.count);
+                assert!(limited.stored.is_none());
+                let mut wrong_clock = p.clone();
+                wrong_clock.start_lo += 30.0;
+                wrong_clock.start_hi += 30.0;
+                assert_eq!(generate(ev, &wrong_clock, 10_000).count, 0);
+                let mut gap = p.clone();
+                gap.max_gap_s = 4.0; // these track knots are five seconds apart
+                assert_eq!(generate(ev, &gap, 10_000).count, 0);
+                let mut below_ground = p.clone();
+                below_ground.min_agl_m = 5000.0;
+                assert_eq!(generate(ev, &below_ground, 10_000).count, 0);
+                let mut too_slow = ev.clone();
+                too_slow.v_gate = [5.0, 30.0];
+                assert_eq!(generate(&too_slow, &p, 10_000).count, 0);
+                let mut too_close = ev.clone();
+                too_close.d_gate = [20.0, 30.0];
+                assert_eq!(generate(&too_close, &p, 10_000).count, 0);
+            }
+        }
     }
 
     fn wind_delayed_case(med: fdop_types::atmo::Medium, start: f64) -> TwoCase {

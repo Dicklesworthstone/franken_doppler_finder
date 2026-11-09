@@ -1033,8 +1033,20 @@ Design notes:
   atmosphere at that observer, with wind in the observer's frame. The same moving-medium travel
   model is used by exact trace scoring. A far lateral pass can therefore remain inside a tightly
   specified recording clock instead of being discarded by a still-air travel-time seed. Calm
-  paths retain the original clock arithmetic. The existing coarse speed/distance and terrain
-  approximations, search budgets and confidence gates are unchanged.
+  paths first use the original clock arithmetic. The coarse geometry remains approximate;
+  search budgets and confidence gates are unchanged.
+- **A hillside clock rejection gets an exact closest-approach retry.** The initial CPA line
+  uses terrain beneath the aircraft. A climb or descent over a slope can therefore imply the
+  wrong recording start at a candidate observer, even when the real pass fits. If that point
+  passes the coarse geometry and region checks but fails the clock check, and the observer's
+  terrain differs, the search retries the nearest exact CPA in its existing 150 s window.
+  The exact pass must still pass the original clock, speed, distance, track-gap, interior-CPA
+  and terrain-clearance gates. Already accepted hypotheses keep their original arithmetic;
+  hypothesis budgets and confidence rules are unchanged. This retry does not replace the
+  approximate terrain projection or guarantee complete coverage of a hillside.
+  A native pre-change probe lost both intended hypotheses at grades +0.1, +0.2 and -0.2,
+  while the flat control retained both. The new recovery and gate regressions are present,
+  but post-change native validation is pending because the executor disconnected.
 - **Rejected reports cannot hide a separate supported flight segment.** Track cleaning keeps the
   original longest physically consistent chain, then can recover another supported chain wholly
   before or after it. Every retained interval must be separated by more than the existing 180 s
