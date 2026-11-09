@@ -284,6 +284,11 @@ same weighted trace objective. This prevents a noisy pass from pulling the repor
 weighting while the radius describes another. The radius remains conditional on the flight assignments and
 propagation model; this numerical consistency does not calibrate the search-wide confidence grade.
 
+When broad fitted timing intervals reach the shared clock scan's 400-cell limit, continuous
+refinement covers the actual spacing between those cells. It no longer confines the optimum to
+the nominal 0.25 s neighbourhood of a sample when the samples are farther apart. Narrow timing
+windows retain their original evaluation sequence; the scan budget and confidence gates are unchanged.
+
 Trace scoring retains the original least-squares tone fit and also tries a robust emitted-tone estimate
 from the median of observed frequency divided by predicted Doppler ratio. The alternative is used only
 when it improves the same capped residual objective. This prevents a minority of stray ridge points from

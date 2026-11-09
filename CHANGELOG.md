@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Refine the whole clock interval after the scan reaches its sample limit
+
+- Keep a broad fitted recording-clock interval's optimum reachable after the 400-cell scan cap
+  enlarges the sample spacing. Continuous refinement uses that actual spacing when it exceeds
+  the nominal 0.25 s step; ordinary windows retain their original bracket and evaluation sequence.
+- Extract the existing scalar profiler without changing its objective or final evaluation at the
+  returned clock. The caller's retained trace fits still describe exactly that clock.
+- Add an analytic regression at zero and Unix-epoch offsets, with asymmetric broad windows,
+  nonfinite-cost and zero-width controls, plus a weighted two-flyover regression on fixed observations.
+- Native pinned-nightly execution of the complete scalar profiler and its analytic test fails
+  before the repair at a 0.263864 s error and passes afterward within 0.01 s in all six clock cases.
+  The two-flyover and full-workspace runs remain blocked in dependency compilation; reference and
+  field recordings have not been replayed. This is a numerical regression result, not a new accuracy claim.
+
 ### Keep usable weather when missing hours lie outside the recording window
 
 - Parse the original hourly rows bracketing the requested interval before requiring their temperature,

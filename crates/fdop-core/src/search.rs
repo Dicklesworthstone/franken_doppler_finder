@@ -1439,7 +1439,7 @@ fn eval_point_weighted(
         .collect();
     let mut scratch = TraceScratch::default();
     let mut chis = Vec::with_capacity(assign.len());
-    let mut cost = |t_s: f64| -> f64 {
+    let cost = |t_s: f64| -> f64 {
         let mut tot = 0.0;
         chis.clear();
         for (k, &(ei, _, _)) in assign.iter().enumerate() {
@@ -1475,6 +1475,24 @@ fn eval_point_weighted(
         }
         tot
     };
+    let (bt, total) = profile_clock(lo, hi, quick, cost)?;
+    Some(PointEval {
+        t_s: bt,
+        chis,
+        cpas,
+        props,
+        total,
+    })
+}
+
+/// Scan the shared recording clock, then polish its best interval. The last objective
+/// evaluation is always at the returned clock, so callers retain that clock's trace fits.
+fn profile_clock(
+    lo: f64,
+    hi: f64,
+    quick: bool,
+    mut cost: impl FnMut(f64) -> f64,
+) -> Option<(f64, f64)> {
     let step = if quick { 1.0 } else { 0.25 };
     let n = (((hi - lo) / step).ceil() as usize).clamp(1, 400);
     let (mut bt, mut bc) = (lo, f64::INFINITY);
@@ -1490,7 +1508,11 @@ fn eval_point_weighted(
         return None;
     }
     if !quick {
-        let (mut a, mut b) = ((bt - step).max(lo), (bt + step).min(hi));
+        // The scan cap widens its actual spacing on uncertain clocks. Polish the whole
+        // neighbouring interval; using the nominal step leaves its best clock unreachable.
+        // Narrow windows keep their original bracket and evaluation sequence exactly.
+        let polish_half = step.max((hi - lo) / n as f64);
+        let (mut a, mut b) = ((bt - polish_half).max(lo), (bt + polish_half).min(hi));
         let gr = 0.618_033_988_749_895;
         let (mut c1, mut c2) = (b - gr * (b - a), a + gr * (b - a));
         let (mut f1, mut f2) = (cost(c1), cost(c2));
@@ -1514,14 +1536,7 @@ fn eval_point_weighted(
             bt = tm;
         }
     }
-    let total = cost(bt);
-    Some(PointEval {
-        t_s: bt,
-        chis,
-        cpas,
-        props,
-        total,
-    })
+    Some((bt, cost(bt)))
 }
 
 fn engine_str(tr: &TrackModel) -> String {
@@ -4508,6 +4523,80 @@ mod tests {
         assert_eq!(out[0].score, 7.0);
         assert!(refined.is_none());
         assert!(out.iter().all(|c| c.events[0].flight != "C"));
+    }
+
+    #[test]
+    fn clock_profile_keeps_subcell_minima_and_final_observations() {
+        for base in [0.0, 1_788_895_000.0] {
+            for (lo, hi) in [(-3.2, 4.1), (-21.73, 401.9), (-401.9, 21.73)] {
+                let mut last = f64::NAN;
+                let (clock, cost) = profile_clock(base + lo, base + hi, false, |t| {
+                    last = t;
+                    // Independently known minimum; an asymmetric broad window makes it
+                    // miss the coarse lattice without changing the observed objective.
+                    (t - base).powi(2)
+                })
+                .unwrap();
+                assert!(
+                    (clock - base).abs() < 0.01,
+                    "base {base}, window {lo}..{hi}: clock error {} s",
+                    clock - base
+                );
+                assert_eq!(last, clock);
+                assert_eq!(cost, (clock - base).powi(2));
+            }
+        }
+        assert!(profile_clock(0.0, 1000.0, false, |_| f64::INFINITY).is_none());
+        let mut last = 0.0;
+        assert_eq!(
+            profile_clock(12.0, 12.0, false, |t| {
+                last = t;
+                7.0
+            }),
+            Some((12.0, 7.0))
+        );
+        assert_eq!(last, 12.0);
+    }
+
+    #[test]
+    fn broad_clock_profiles_polish_the_whole_scanned_cell() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let o = observer(case.obs.0, case.obs.1, &dem);
+        let assign = [(0, 0, case.t_s + 1000.0), (1, 1, case.t_s + 1900.0)];
+        // Broad fit intervals and an asymmetric recording-start bound put the true clock
+        // between samples after the 400-cell limit enlarges their nominal 0.25 s spacing.
+        // Keep the exact same observed flyovers; uncertainty must not bias their best clock.
+        for event in &mut case.events {
+            event.t_tol = 600.0;
+        }
+        for phase in [0.0, 0.2, 0.7] {
+            case.p.start_lo = case.t_s - 20.73 - phase;
+            case.p.start_hi = case.t_s + 400.9 - phase;
+            for weights in [None, Some(&[1.0, 0.3][..])] {
+                let fitted = eval_point_weighted(
+                    &o,
+                    &assign,
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &atmo,
+                    true,
+                    true,
+                    false,
+                    weights,
+                )
+                .expect("both physical flyovers remain eligible");
+                assert!(
+                    (fitted.t_s - case.t_s).abs() < 0.05,
+                    "phase {phase}, weights {weights:?}: clock error {} s",
+                    fitted.t_s - case.t_s
+                );
+                assert!(fitted.chis.iter().all(|fit| fit.chi < 0.1));
+            }
+        }
     }
 
     // Starts from a cell whose clock is seconds off. The searches here cannot tell the clock
