@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover narrow trace-search regions between sampled flight moments
+
+- Detect when consecutive closest-approach lines skip the entire requested geographic box.
+  Bisect that interval using the actual track and terrain projection, then pass the intervening
+  line through the existing hypothesis generator. Include the final partial interval without
+  changing the regular sampling phase or globally increasing the flight-catalogue sampling rate.
+- Keep the existing speed, track-gap, terrain-clearance, distance and recording-clock gates,
+  hypothesis counting, deterministic overflow samples and truncation behavior. Invalid or
+  discontinuous projection probes do not manufacture a crossing.
+- Add a two-flyover regression spanning 15 box, heading, clock-phase and timestamp cases, plus
+  physical-gate, budget and nonlinear-projection controls. The original native core loses
+  candidates in 11 of those 15 cases; all three new native tests pass. Core library/test Clippy
+  passes with warnings denied, changed-file formatting passes, and UBS reports no critical finding.
+- The complete native search module finishes with 70 passing, zero failed and three existing
+  resource/timing benchmarks ignored. The unchanged production engine selftest, relinked against
+  the fresh complete core, passes with both intended flights, four events, 1.673779 m position error,
+  75 m radius and +0.019586 s clock error, identical to the prior baseline. Full application/workspace
+  checks remain blocked in unchanged `asupersync`; no reference or field recording was replayed.
+
 ### Retry the full dates when a metadata-clock candidate remains unconfirmed
 
 - Extend metadata fallback to low-confidence trace candidates, including candidates demoted by the

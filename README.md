@@ -1200,6 +1200,12 @@ Design notes:
   region and clock checks. This recovers an in-box strip without changing the regular grid;
   inclusive interval endpoints remain eligible when the interior probes fail. This is not an
   exhaustive search of disconnected terrain pockets.
+- **A narrow region can also lie between sampled moments of a flight.** If consecutive
+  closest-approach lines pass on opposite sides of the entire requested box, the search finds
+  an intervening line through it, re-evaluating the track and terrain during the search. The
+  final partial time interval is included. This retains the regular sampling phase and sends
+  every added point through the same speed, gap, terrain, distance and recording-clock gates
+  and hypothesis budgets; it does not reduce the timestep across the whole flight catalogue.
 - **Terrain is checked across the full cross-track reach.** A hillside can bring a later observer point back
   inside the slant-distance gate after a valley falls outside it. One failed point no longer cuts off that side.
 - **A location still needs two events after clock checks.** A candidate pruned to one flyover is removed.

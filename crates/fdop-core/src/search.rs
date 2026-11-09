@@ -499,6 +499,55 @@ fn region_cross_track_offset(
     endpoint
 }
 
+/// Signed along-track extent of a geographic box relative to one sampled CPA line.
+/// `tangent` converts latitude/longitude offsets to metres along the local flight heading.
+fn region_along_projection(region: &BBox, origin: (f64, f64), tangent: (f64, f64)) -> (f64, f64) {
+    let centre = region.center();
+    let offset = (centre.0 - origin.0) * tangent.0 + (centre.1 - origin.1) * tangent.1;
+    let half = 0.5
+        * ((region.north - region.south) * tangent.0.abs()
+            + (region.east - region.west) * tangent.1.abs());
+    (offset, half)
+}
+
+/// Adjacent coarse CPA lines can skip an entire narrow region. Find an actual intervening
+/// line through its centre, without changing the regular along-track sampling phase. Every
+/// probe re-evaluates the flight and terrain; the caller still applies all hypothesis gates.
+fn skipped_region_time(
+    left: (f64, (f64, f64)),
+    right: (f64, (f64, f64)),
+    project: impl Fn(f64) -> Option<(f64, f64)>,
+) -> Option<f64> {
+    let (mut lo, (a, ah)) = left;
+    let (mut hi, (b, bh)) = right;
+    if lo >= hi || !((a > ah && b < -bh) || (a < -ah && b > bh)) {
+        return None;
+    }
+    let mut best: Option<(f64, f64)> = None;
+    for _ in 0..24 {
+        let t = lo + 0.5 * (hi - lo);
+        if t <= lo || t >= hi {
+            break;
+        }
+        let (offset, half) = project(t)?;
+        if !offset.is_finite() || !half.is_finite() || half < 0.0 {
+            return None;
+        }
+        if offset.abs() <= half && best.is_none_or(|(_, old)| offset.abs() < old) {
+            best = Some((t, offset.abs()));
+        }
+        if offset == 0.0 {
+            break;
+        }
+        if (offset > 0.0) == (a > 0.0) {
+            lo = t;
+        } else {
+            hi = t;
+        }
+    }
+    best.map(|(t, _)| t)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hypotheses(
     ev: &SearchEvent,
@@ -522,8 +571,24 @@ fn hypotheses(
             let mut out = HypBuilder::new(cap);
             let te_lo = t_lo_all.max(tr.t0());
             let te_hi = (p.start_hi + ev.t_rec + ev.t_tol + 5.0).min(tr.t1());
-            let mut t = te_lo;
-            while t <= te_hi {
+            let project = |t| {
+                let (pos, vel) = tr.pv(t);
+                let (la, lo, h) = ecef_to_geodetic(pos);
+                let ve = Enu::new(la, lo, 0.0).vec_from_ecef(vel);
+                let vh = ve[0].hypot(ve[1]);
+                if vh <= 12.0 || !reach.contains(la, lo) || tr.gap_at(t) > p.max_gap_s {
+                    return None;
+                }
+                let (mlat, mlon) = fdop_types::geo::m_per_deg(la);
+                let (ux, uy) = (ve[0] / vh, ve[1] / vh);
+                let a0 = (h - dem.elev_m(la, lo) - MIC_HEIGHT_M) * ve[2] / vh;
+                Some(region_along_projection(
+                    &p.region,
+                    (la + a0 * uy / mlat, lo + a0 * ux / mlon),
+                    (uy * mlat, ux * mlon),
+                ))
+            };
+            let mut sample = |t| {
                 let (pos, vel) = tr.pv(t);
                 let (la, lo, h) = ecef_to_geodetic(pos);
                 let local = Enu::new(la, lo, 0.0);
@@ -533,9 +598,9 @@ fn hypotheses(
                 if !reach.contains(la, lo) {
                     // A close fast pass can enter and leave this entire box in ten seconds.
                     // Keep the usual along-track sampling outside too, so entry is not skipped.
-                    t += dt;
-                    continue;
+                    return (dt, None);
                 }
+                let mut projection = None;
                 let speed = norm(vel);
                 let z0 = dem.elev_m(la, lo);
                 let med = atmo.medium(la, lo, t, z0 + MIC_HEIGHT_M, h);
@@ -583,6 +648,11 @@ fn hypotheses(
                         }
                     };
                     let center = cross_point(1.0, 0.0);
+                    projection = Some(region_along_projection(
+                        &p.region,
+                        (center.0, center.1),
+                        (uy * mlat, ux * mlon),
+                    ));
                     let center_ok = to_hyp(center).is_some();
                     for side in [1.0f64, -1.0] {
                         // The central grid point is shared by both sides.
@@ -631,7 +701,29 @@ fn hypotheses(
                         }
                     }
                 }
-                t += dt;
+                (dt, projection)
+            };
+            let mut t = te_lo;
+            let mut previous = None;
+            while t <= te_hi {
+                let (dt, projection) = sample(t);
+                if let (Some(left), Some(right)) = (previous, projection)
+                    && let Some(extra) = skipped_region_time(left, (t, right), project)
+                {
+                    sample(extra);
+                }
+                previous = projection.map(|span| (t, span));
+                let next = t + dt;
+                // The final partial interval has no regular sample at its far endpoint.
+                // Probe that endpoint only to recover a region crossed before the clock ends.
+                if next > te_hi
+                    && t < te_hi
+                    && let (Some(left), Some(right)) = (previous, project(te_hi))
+                    && let Some(extra) = skipped_region_time(left, (te_hi, right), project)
+                {
+                    sample(extra);
+                }
+                t = next;
             }
             out.finish(cap, &count)
         })
@@ -6961,6 +7053,165 @@ mod tests {
         }
     }
 
+    fn tight_region_case(
+        half: (f64, f64),
+        heading: f64,
+        t_s: f64,
+        clock_half: f64,
+        clock_shift: f64,
+    ) -> TwoCase {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let angle = heading.to_radians();
+        let rotate = |v: V3| {
+            [
+                v[0] * angle.cos() - v[1] * angle.sin(),
+                v[0] * angle.sin() + v[1] * angle.cos(),
+                v[2],
+            ]
+        };
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        for (key, pos, vel, dt, f0) in [
+            ("A", [0.0, 175.0, 1000.0], [90.0, 0.0, 0.0], 120.0, 112.7),
+            ("B", [175.0, 0.0, 1000.0], [0.0, 95.0, 0.0], 360.0, 149.3),
+        ] {
+            let mut tr = straight_track(
+                &enu,
+                rotate(pos),
+                rotate(vel),
+                t_s + dt,
+                t_s - 200.0,
+                t_s + 800.0,
+                5.0,
+            );
+            tr.key = key.into();
+            events.push(synth_event(
+                key,
+                &tr,
+                x,
+                t_s,
+                f0,
+                343.0,
+                t_s + dt,
+                &Prop::still(343.0),
+            ));
+            tracks.push(tr);
+        }
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+        let mut p = SearchParams::new(
+            t_s + clock_shift - clock_half,
+            t_s + clock_shift + clock_half,
+            600.0,
+            BBox::new(
+                lat - half.1 / mlat,
+                lon - half.0 / mlon,
+                lat + half.1 / mlat,
+                lon + half.0 / mlon,
+            ),
+        );
+        p.refine_half_m = 200.0;
+        TwoCase {
+            tracks,
+            events,
+            p,
+            t_s,
+            obs: (lat, lon),
+        }
+    }
+
+    #[test]
+    fn tight_regions_keep_flyovers_between_along_track_samples() {
+        let epoch = 1_788_895_000.0;
+        let scenarios = [
+            ((100.0, 100.0), 0.0, epoch, 0.0, 0.0), // original 200 m control
+            ((50.0, 50.0), 0.0, epoch, 0.0, 0.0),
+            ((25.0, 25.0), 0.0, epoch, 0.0, 0.0),
+            ((50.0, 50.0), 90.0, epoch, 0.0, 0.0),
+            ((50.0, 50.0), 45.0, epoch, 0.0, 0.0),
+            ((50.0, 50.0), -45.0, epoch, 0.0, 0.0),
+            ((50.0, 50.0), 180.0, epoch, 0.0, 0.0),
+            ((50.0, 50.0), 0.0, epoch, 10.0, 0.25),
+            ((50.0, 50.0), 0.0, epoch, 10.0, 0.75),
+            ((50.0, 50.0), 0.0, epoch, 10.0, 1.25),
+            ((50.0, 50.0), 0.0, epoch, 10.0, 1.75),
+            ((50.0, 50.0), 0.0, 0.0, 0.0, 0.0),
+            ((50.0, 50.0), 0.0, 0.0, 10.0, 0.75),
+            ((25.0, 1000.0), 0.0, epoch, 0.0, 0.0),
+            ((1000.0, 25.0), 0.0, epoch, 0.0, 0.0),
+        ];
+        for (half, heading, start, clock_half, phase) in scenarios {
+            let case = tight_region_case(half, heading, start, clock_half, phase);
+            let result = run_case(&case, fdop_types::atmo::Medium::still(343.0));
+            let top = result.candidates.first().unwrap_or_else(|| {
+                panic!("half={half:?} heading={heading} epoch={start} clock_half={clock_half} phase={phase}: {:?}", result.funnel)
+            });
+            for key in ["A", "B"] {
+                assert!(
+                    top.events
+                        .iter()
+                        .any(|m| m.event == key && m.flight == key && m.core)
+                );
+            }
+            assert!(haversine_m(case.obs.0, case.obs.1, top.lat, top.lon) < 75.0);
+            assert!((top.t_start_utc - start).abs() < 0.2);
+            assert!(result.funnel.truncated.is_empty());
+        }
+    }
+
+    #[test]
+    fn tight_region_hypotheses_keep_accounting_and_physical_gates() {
+        let case = tight_region_case((50.0, 50.0), 0.0, 1_788_895_000.0, 0.0, 0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let generate = |ev: &SearchEvent, p: &SearchParams, ground: f64, cap: usize| {
+            hypotheses(
+                ev,
+                &case.tracks,
+                p,
+                &Frame::new(&p.region),
+                &FlatElevation(ground),
+                &atmo,
+                p.start_lo - 86_400.0,
+                cap,
+            )
+        };
+        let ev = &case.events[0];
+        let complete = generate(ev, &case.p, 0.0, 10_000);
+        assert!(complete.count > 0);
+        assert_eq!(complete.stored.as_ref().unwrap().len(), complete.count);
+        let cap = complete.count - 1;
+        let limited = generate(ev, &case.p, 0.0, cap);
+        let repeat = generate(ev, &case.p, 0.0, cap);
+        assert_eq!(limited.count, complete.count);
+        assert!(limited.stored.is_none());
+        let signature = |hs: &[Hyp]| {
+            hs.iter()
+                .map(|h| {
+                    (
+                        h.trk,
+                        h.t_e.to_bits(),
+                        h.e.to_bits(),
+                        h.n.to_bits(),
+                        h.t_s.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&limited.sample), signature(&repeat.sample));
+        assert_eq!(generate(ev, &case.p, 1000.0, 10_000).count, 0);
+        let mut too_slow = ev.clone();
+        too_slow.v_gate = [30.0, 40.0];
+        assert_eq!(generate(&too_slow, &case.p, 0.0, 10_000).count, 0);
+        let mut too_close = ev.clone();
+        too_close.d_gate = [20.0, 30.0];
+        assert_eq!(generate(&too_close, &case.p, 0.0, 10_000).count, 0);
+        let mut wrong_clock = case.p.clone();
+        wrong_clock.start_lo += 30.0;
+        wrong_clock.start_hi += 31.0;
+        assert_eq!(generate(ev, &wrong_clock, 0.0, 10_000).count, 0);
+    }
+
     #[test]
     fn region_cross_track_offsets_stay_inside_the_box_and_distance_gate() {
         let region = BBox::new(-0.001, -0.001, 0.001, 0.001);
@@ -7007,6 +7258,46 @@ mod tests {
             assert!(region.contains(0.002 - b * 0.00001, 0.0));
             assert!((d_lo..=d_hi).contains(&distance(b)));
         }
+    }
+
+    #[test]
+    fn skipped_region_times_follow_the_actual_plane_between_samples() {
+        for epoch in [0.0, 1_788_895_000.0] {
+            for direction in [-1.0, 1.0] {
+                // Changing heading or height makes this projection nonlinear in time.
+                // Its independently known centre crossing is 0.8 seconds after the start.
+                let project = |t: f64| {
+                    let dt = t - epoch;
+                    Some((direction * 100.0 * (dt - 0.8) * (1.0 + 0.2 * dt), 5.0))
+                };
+                // Include a shortened final interval as well as an ordinary two-second step.
+                for end in [1.0, 2.0] {
+                    let clock = skipped_region_time(
+                        (epoch, project(epoch).unwrap()),
+                        (epoch + end, project(epoch + end).unwrap()),
+                        project,
+                    )
+                    .unwrap();
+                    assert!((clock - epoch - 0.8).abs() < 1e-5);
+                }
+            }
+        }
+        for right in [(15.0, 5.0), (0.0, 5.0), (-5.0, 5.0)] {
+            assert!(
+                skipped_region_time((0.0, (10.0, 5.0)), (2.0, right), |_| {
+                    panic!("a region not skipped by both lines needs no extra sampling")
+                })
+                .is_none()
+            );
+        }
+        assert!(skipped_region_time((0.0, (10.0, 5.0)), (2.0, (-10.0, 5.0)), |_| None).is_none());
+        assert!(
+            skipped_region_time((0.0, (10.0, 5.0)), (2.0, (-10.0, 5.0)), |t| {
+                // A discontinuous projection never actually enters the requested strip.
+                Some((if t < 1.0 { 10.0 } else { -10.0 }, 5.0))
+            })
+            .is_none()
+        );
     }
 
     #[test]
