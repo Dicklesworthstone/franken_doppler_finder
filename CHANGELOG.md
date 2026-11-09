@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Find the same closest approach without scanning the whole window
+
+- Search outward from the proposed emission time on the original two-second sampling lattice.
+  Two three-sample cursors retain constant scratch space. Once an interior closest approach
+  is known, stop a direction only when every unvisited refinement bracket is strictly farther
+  in time. Keep the same golden-search brackets and arithmetic, first-sample tie order,
+  interior-over-boundary preference, and exhaustive fallback for nonfinite window arguments.
+- The native track suite passes all 36 ordinary tests. New regressions compare every returned
+  closest-approach bit against the previous exhaustive iterator for 3,024 queries across
+  straight, turning, sparse and invalid-segment tracks, plus 63 return/tie/boundary queries.
+  Complete core test-root Clippy passes with warnings denied.
+- `nearest_cpa_benchmark` passes six alternating-order trials of 20,000 queries over a 150 s
+  half-window: 256-422 ms exhaustive versus 43-107 ms outward, with a median paired speedup
+  of 5.27x. This pinned-nightly O1 native component measurement does not measure total search
+  runtime. Search gates, track interpolation, result values and confidence calculations are
+  unchanged; the adjacent narrow-clock, wind and full hillside localization regressions pass.
+
 ### Retry hillside flyover clocks at the actual observer
 
 - Recover a clock-rejected hypothesis by using the existing exact nearest-pass calculation
@@ -36,11 +53,17 @@ at that commit, not per-change commits.
   passing the existing gates. Add an assertive regression for those four scenes, the
   intended flight identities, unchanged flat counts, hypothesis-budget accounting, and
   wrong-clock, track-gap, terrain-clearance, speed and distance controls.
-- Validation boundary: the original-source probe and complete baseline core test-root
-  compilation ran natively. The executor disconnected before this correction was compiled
-  or its new tests, Clippy, formatting, selftest or recording replays could run. Source review
-  is not a runtime pass; neither full-search recovery nor field accuracy is established by
-  the pre-change hypothesis probe. The coarse terrain locus remains an approximation.
+- Native follow-up: the committed hypothesis regression and its extension through complete
+  search/refinement pass. The original source finds no location on all three slopes; the
+  retry recovers both intended core matches with 0.219068, 0.257398 and 0.493137 m position
+  error, at most 0.004065 s clock error, and no truncation. The flat control retains its
+  one-hypothesis-per-flight count and 0.000006 m result. Wrong-clock, track-gap, clearance,
+  speed, range and hypothesis-budget controls pass unchanged.
+- Eight adjacent native search checks also pass, including eleven wind/still-air scenarios
+  and fifteen tight-region localization scenarios. Complete still-air result fingerprints
+  retain their preceding values. These are synthetic search-layer checks against the actual
+  core and locked numerical dependencies; reference, wrong-date and field recordings have
+  not been replayed. The coarse terrain locus remains an approximation.
 
 ### Keep wind-delayed flyovers inside a known recording clock
 

@@ -1044,9 +1044,12 @@ Design notes:
   and terrain-clearance gates. Already accepted hypotheses keep their original arithmetic;
   hypothesis budgets and confidence rules are unchanged. This retry does not replace the
   approximate terrain projection or guarantee complete coverage of a hillside.
-  A native pre-change probe lost both intended hypotheses at grades +0.1, +0.2 and -0.2,
-  while the flat control retained both. The new recovery and gate regressions are present,
-  but post-change native validation is pending because the executor disconnected.
+  The native `known_clock_hillside_flyovers_reach_the_hypothesis_join` regression now runs
+  through search and refinement. Before the retry, grades +0.1, +0.2 and -0.2 produced no
+  hypotheses or location; all three now recover both intended core matches within 0.494 m
+  and 0.005 s, with no truncation. The flat control, wrong-clock and physical-gate controls
+  pass too. These are synthetic search cases; the reference and field recordings have not
+  been replayed.
 - **Rejected reports cannot hide a separate supported flight segment.** Track cleaning keeps the
   original longest physically consistent chain, then can recover another supported chain wholly
   before or after it. Every retained interval must be separated by more than the existing 180 s
@@ -1316,6 +1319,16 @@ recording timings above predate this optimization; they have not been remeasured
 Search clock scans also reuse trace-fit and result buffers, preserving the original clock grid and all
 candidate comparisons. Before/after synthetic comparisons check complete point scores and chosen clocks
 bit-for-bit; the size of the end-to-end speedup has not yet been measured on a real recording.
+
+Nearest-pass searches now visit the original two-second lattice outward from the proposed emission
+time. After finding an interior closest approach, a direction stops only when every remaining
+refinement bracket is strictly farther away in time. The lattice, refinement, tie order and boundary
+preference stay unchanged, with constant scratch space. The native track suite passes 36 tests,
+including 3,087 comparisons of every result bit against the exhaustive calculation.
+`nearest_cpa_benchmark` runs 20,000 queries with a 150 s half-window in each of six alternating-order
+trials: exhaustive 256-422 ms, outward 43-107 ms, median paired speedup **5.27x** (range 3.02-6.31x).
+This uses the pinned nightly at optimization level 1 on a shared AMD EPYC 9V74 Linux x86-64 host. It is a
+closest-approach component measurement; no whole-recording speedup is claimed.
 
 Pair joining now discards duplicate flight/place/clock seeds as they are generated, using bounded
 batches of 4,096 input hypotheses and ordered worker chunks. Previously it held every compatible

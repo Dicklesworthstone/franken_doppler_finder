@@ -756,12 +756,127 @@ impl TrackModel {
     /// in the window must not replace it. Boundary minima are a fallback only, still marked as
     /// non-interior so callers retain their existing gates.
     pub fn cpa_nearest_time(&self, x: V3, t_guess: f64, half: f64) -> Option<Cpa> {
-        self.local_cpas(x, t_guess - half, t_guess + half)
-            .min_by(|a, b| {
-                b.interior
-                    .cmp(&a.interior)
-                    .then_with(|| (a.t_e - t_guess).abs().total_cmp(&(b.t_e - t_guess).abs()))
-            })
+        let nearer = |a: &Cpa, b: &Cpa| {
+            b.interior
+                .cmp(&a.interior)
+                .then_with(|| (a.t_e - t_guess).abs().total_cmp(&(b.t_e - t_guess).abs()))
+        };
+        if !t_guess.is_finite() || !half.is_finite() {
+            return self
+                .local_cpas(x, t_guess - half, t_guess + half)
+                .min_by(nearer);
+        }
+        let (lo, hi) = (
+            (t_guess - half).max(self.t0()),
+            (t_guess + half).min(self.t1()),
+        );
+        if hi <= lo {
+            return None;
+        }
+        let n = (((hi - lo) / 2.0).ceil() as usize).max(4);
+        let step = (hi - lo) / n as f64;
+        let sample = |k| {
+            // Keep local_cpas' arithmetic, including its initial sample at lo.
+            let t = if k == 0 {
+                lo
+            } else {
+                lo + (hi - lo) * k as f64 / n as f64
+            };
+            let rv = sub(self.pos_at(t), x);
+            dot(rv, rv)
+        };
+        let centre = (((t_guess - lo) / (hi - lo) * n as f64).round() as usize).min(n);
+        let values = [
+            if centre > 0 {
+                sample(centre - 1)
+            } else {
+                f64::INFINITY
+            },
+            sample(centre),
+            if centre < n {
+                sample(centre + 1)
+            } else {
+                f64::INFINITY
+            },
+        ];
+        // Two three-sample cursors visit the same minima outward from the hypothesis,
+        // with constant scratch space and no repeated distance evaluation on either side.
+        let mut scans = [
+            Some((centre, values)),
+            (centre < n).then(|| {
+                (
+                    centre + 1,
+                    [
+                        values[1],
+                        values[2],
+                        if centre + 1 < n {
+                            sample(centre + 2)
+                        } else {
+                            f64::INFINITY
+                        },
+                    ],
+                )
+            }),
+        ];
+        let mut best: Option<(usize, Cpa)> = None;
+        loop {
+            let mut active = false;
+            for (side, scan) in scans.iter_mut().enumerate() {
+                let Some((k, [left, here, right])) = *scan else {
+                    continue;
+                };
+                let a = lo + k.saturating_sub(1) as f64 * step;
+                let b = (lo + (k + 1) as f64 * step).min(hi);
+                if let Some((_, cpa)) = &best
+                    && cpa.interior
+                    && (if side == 0 { t_guess - b } else { a - t_guess })
+                        > (cpa.t_e - t_guess).abs()
+                {
+                    // Every later bracket on this side is at least this far away. Strict
+                    // inequality leaves ties available in the original time/sample order.
+                    *scan = None;
+                    continue;
+                }
+                active = true;
+                if here.is_finite() && here < left && here <= right {
+                    let cpa = self.refine_cpa(x, a, b, lo, hi);
+                    if best
+                        .as_ref()
+                        .is_none_or(|(old_k, old)| nearer(&cpa, old).then(k.cmp(old_k)).is_lt())
+                    {
+                        best = Some((k, cpa));
+                    }
+                }
+                *scan = if side == 0 && k > 0 {
+                    Some((
+                        k - 1,
+                        [
+                            if k > 1 { sample(k - 2) } else { f64::INFINITY },
+                            left,
+                            here,
+                        ],
+                    ))
+                } else if side == 1 && k < n {
+                    Some((
+                        k + 1,
+                        [
+                            here,
+                            right,
+                            if k + 1 < n {
+                                sample(k + 2)
+                            } else {
+                                f64::INFINITY
+                            },
+                        ],
+                    ))
+                } else {
+                    None
+                };
+            }
+            if !active {
+                return best.map(|(_, cpa)| cpa);
+            }
+        }
     }
 
     fn refine_cpa(&self, x: V3, mut a: f64, mut b: f64, lo: f64, hi: f64) -> Cpa {
@@ -1637,6 +1752,179 @@ mod tests {
             assert_eq!(nearest.t_e, global.t_e);
             assert_eq!(nearest.d, global.d);
             assert_eq!(nearest.speed, global.speed);
+        }
+    }
+
+    fn exhaustive_nearest_cpa(tr: &TrackModel, x: V3, guess: f64, half: f64) -> Option<Cpa> {
+        tr.local_cpas(x, guess - half, guess + half).min_by(|a, b| {
+            b.interior
+                .cmp(&a.interior)
+                .then_with(|| (a.t_e - guess).abs().total_cmp(&(b.t_e - guess).abs()))
+        })
+    }
+
+    fn cpa_bits(cpa: Option<Cpa>) -> Option<(bool, [u64; 9])> {
+        cpa.map(|c| {
+            (
+                c.interior,
+                [
+                    c.t_e, c.d, c.speed, c.rv[0], c.rv[1], c.rv[2], c.vel[0], c.vel[1], c.vel[2],
+                ]
+                .map(f64::to_bits),
+            )
+        })
+    }
+
+    #[test]
+    fn nearest_cpa_preserves_exhaustive_results_across_tracks_and_windows() {
+        let enu = Enu::new(40.8765, -73.525, 0.0);
+        let mut checked = 0;
+        for epoch in [0.0, 1_788_895_000.0] {
+            let straight = straight_track(
+                &enu,
+                [0.0, 800.0, 600.0],
+                [80.0, 0.0, 0.0],
+                epoch + 200.0,
+                epoch,
+                epoch + 400.0,
+                2.5,
+            );
+            // Repeated turning visits, with simultaneous climbs and descents, admit
+            // several interior minima. The nearest in time need not be closest in range.
+            let mut turning = straight.clone();
+            let omega = std::f64::consts::PI / 90.0;
+            for (i, &time) in turning.t.iter().enumerate() {
+                let q = omega * (time - epoch - 200.0);
+                turning.pos[i] = enu.to_ecef([
+                    2400.0 * q.sin(),
+                    1000.0 * q.cos(),
+                    600.0 + 60.0 * (2.0 * q).sin(),
+                ]);
+                turning.vel[i] = enu.vec_to_ecef([
+                    2400.0 * omega * q.cos(),
+                    -1000.0 * omega * q.sin(),
+                    120.0 * omega * (2.0 * q).cos(),
+                ]);
+            }
+            let mut sparse = turning.clone();
+            let keep: Vec<_> = (0..turning.t.len())
+                .filter(|&i| i % 13 == 0 || i + 1 == turning.t.len())
+                .collect();
+            sparse.t = keep.iter().map(|&i| turning.t[i]).collect();
+            sparse.pos = keep.iter().map(|&i| turning.pos[i]).collect();
+            sparse.vel = keep.iter().map(|&i| turning.vel[i]).collect();
+            let mut gap = turning.clone();
+            gap.pos[80][1] = f64::NAN;
+            for (label, tr) in [
+                ("straight", straight),
+                ("turning", turning),
+                ("sparse", sparse),
+                ("invalid segment", gap),
+            ] {
+                for offset in [[0.0; 3], [500.0, -1000.0, 100.0], [4500.0, 2000.0, 0.0]] {
+                    let x = enu.to_ecef(offset);
+                    for time in [
+                        -20.0, 0.0, 0.25, 15.75, 69.5, 99.75, 100.0, 120.125, 199.125, 200.0,
+                        201.0, 240.3, 399.75, 400.0, 420.0,
+                    ] {
+                        for half in [-5.0, 0.0, 0.25, 1.5, 15.125, 60.0, 150.0, 500.0] {
+                            let guess = epoch + time;
+                            assert_eq!(
+                                cpa_bits(tr.cpa_nearest_time(x, guess, half)),
+                                cpa_bits(exhaustive_nearest_cpa(&tr, x, guess, half)),
+                                "{label}: epoch {epoch}, offset {offset:?}, guess {time}, half {half}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                    for (guess, half) in [
+                        (f64::NAN, 150.0),
+                        (f64::INFINITY, 150.0),
+                        (f64::NEG_INFINITY, 150.0),
+                        (epoch + 200.0, f64::NAN),
+                        (epoch + 200.0, f64::INFINITY),
+                        (epoch + 200.0, f64::NEG_INFINITY),
+                    ] {
+                        assert_eq!(
+                            cpa_bits(tr.cpa_nearest_time(x, guess, half)),
+                            cpa_bits(exhaustive_nearest_cpa(&tr, x, guess, half))
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("nearest CPA: {checked} exhaustive comparisons retain every result bit");
+    }
+
+    #[test]
+    fn nearest_cpa_preserves_time_ties_and_boundary_preference() {
+        let enu = Enu::new(40.8765, -73.525, 0.0);
+        let mut tr = straight_track(&enu, [0.0; 3], [1.0, 0.0, 0.0], 0.0, 0.0, 200.0, 5.0);
+        for (i, &t) in tr.t.iter().enumerate() {
+            // A quadratic path is represented exactly by its Hermite segments and
+            // visits the same closest point at 50 and 150 s, on either side of 100 s.
+            tr.pos[i] = [(t - 50.0) * (t - 150.0), 1000.0, 0.0];
+            tr.vel[i] = [2.0 * t - 200.0, 0.0, 0.0];
+        }
+        for guess in [
+            0.0, 49.75, 50.0, 99.999, 100.0, 100.001, 150.0, 150.25, 200.0,
+        ] {
+            for half in [0.1, 0.5, 2.0, 49.5, 50.0, 50.5, 150.0] {
+                assert_eq!(
+                    cpa_bits(tr.cpa_nearest_time([0.0; 3], guess, half)),
+                    cpa_bits(exhaustive_nearest_cpa(&tr, [0.0; 3], guess, half)),
+                    "guess {guess}, half {half}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing benchmark"]
+    fn nearest_cpa_benchmark() {
+        let enu = Enu::new(40.8765, -73.525, 0.0);
+        let tr = straight_track(
+            &enu,
+            [0.0, 800.0, 600.0],
+            [80.0, 0.0, 0.0],
+            200.0,
+            0.0,
+            400.0,
+            5.0,
+        );
+        let x = enu.to_ecef([0.0; 3]);
+        let measure = |accelerated| {
+            let started = std::time::Instant::now();
+            let mut checksum = 0u64;
+            for i in 0..20_000 {
+                let guess = std::hint::black_box(197.0 + (i % 64) as f64 * 0.1);
+                let cpa = if accelerated {
+                    tr.cpa_nearest_time(x, guess, 150.0)
+                } else {
+                    exhaustive_nearest_cpa(&tr, x, guess, 150.0)
+                }
+                .unwrap();
+                checksum = checksum
+                    .wrapping_mul(31)
+                    .wrapping_add(std::hint::black_box(cpa.t_e.to_bits()));
+            }
+            (started.elapsed(), checksum)
+        };
+        for trial in 0..6 {
+            let (old, new) = if trial % 2 == 0 {
+                (measure(false), measure(true))
+            } else {
+                let new = measure(true);
+                (measure(false), new)
+            };
+            assert_eq!(old.1, new.1);
+            eprintln!(
+                "nearest CPA trial {trial}, 20,000 hypotheses, 150 s half-window: exhaustive {:?}, outward {:?}, ratio {:.3}",
+                old.0,
+                new.0,
+                old.0.as_secs_f64() / new.0.as_secs_f64()
+            );
         }
     }
 

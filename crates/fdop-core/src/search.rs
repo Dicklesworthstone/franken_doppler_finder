@@ -5879,7 +5879,6 @@ mod tests {
         assert!(result.funnel.truncated.is_empty());
     }
 
-
     #[test]
     fn known_clock_hillside_flyovers_reach_the_hypothesis_join() {
         struct Slope {
@@ -5932,15 +5931,23 @@ mod tests {
                 5.0,
             );
             tr.key = key.into();
-            let mut ev =
-                synth_event(key, &tr, x, start, f0, 343.0, start + dt, &Prop::still(343.0));
+            let mut ev = synth_event(
+                key,
+                &tr,
+                x,
+                start,
+                f0,
+                343.0,
+                start + dt,
+                &Prop::still(343.0),
+            );
             ev.t_tol = 1.0;
             let cpa = tr.cpa_nearest_time(x, start + dt, 100.0).unwrap();
             assert!(gates_ok(&ev, &cpa, &Prop::still(343.0), 0.0));
             tracks.push(tr);
             events.push(ev);
         }
-        let p = SearchParams::new(
+        let mut p = SearchParams::new(
             start,
             start,
             600.0,
@@ -5951,6 +5958,7 @@ mod tests {
                 lon + 25.0 / mlon,
             ),
         );
+        p.refine_half_m = 100.0;
         let frame = Frame::new(&p.region);
         let t_base = start - 86_400.0;
         for grade in [0.0, 0.1, 0.2, -0.2] {
@@ -5966,7 +5974,14 @@ mod tests {
                 assert_eq!(counts, vec![1, 1]);
             }
             for (i, (ev, cloud)) in events.iter().zip(&clouds).enumerate() {
-                assert!(cloud.stored.as_ref().unwrap().iter().any(|h| h.trk as usize == i));
+                assert!(
+                    cloud
+                        .stored
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .any(|h| h.trk as usize == i)
+                );
                 let limited = generate(ev, &p, 0);
                 assert_eq!(limited.count, cloud.count);
                 assert!(limited.stored.is_none());
@@ -5987,6 +6002,37 @@ mod tests {
                 too_close.d_gate = [20.0, 30.0];
                 assert_eq!(generate(&too_close, &p, 10_000).count, 0);
             }
+            let result = run(
+                &SearchInputs {
+                    events: events.clone(),
+                    tracks: &tracks,
+                    heard_times: events.iter().map(|ev| ev.t_rec).collect(),
+                    coarse_dem: &dem,
+                    fine_dem: &dem,
+                    atmo: &atmo,
+                },
+                &p,
+                &|_| {},
+            );
+            let top = result
+                .candidates
+                .first()
+                .unwrap_or_else(|| panic!("hillside {grade}: no location; {:?}", result.funnel));
+            for key in ["A", "B"] {
+                assert!(
+                    top.events
+                        .iter()
+                        .any(|m| { m.event == key && m.flight == key && m.core && m.chi < 1.0 })
+                );
+            }
+            let error = haversine_m(lat, lon, top.lat, top.lon);
+            assert!(error < 75.0, "hillside {grade}: error {error} m");
+            assert!((top.t_start_utc - start).abs() < 0.2);
+            assert!(result.funnel.truncated.is_empty());
+            eprintln!(
+                "hillside {grade}: counts {counts:?}, error {error:.6} m, clock {:.6} s",
+                top.t_start_utc - start
+            );
         }
     }
 
