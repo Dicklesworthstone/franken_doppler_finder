@@ -30,8 +30,8 @@ use crate::spectro::{median_f32, stft_band_db};
 use crate::track::{Prop, TrackBounds, TrackModel};
 use fdop_types::atmo::Atmosphere;
 use fdop_types::geo::{
-    Enu, V3, WGS84_A, WGS84_E2, ecef_to_geodetic, geodetic_to_ecef, haversine_m, m_per_deg, norm,
-    sub,
+    Enu, V3, WGS84_A, WGS84_E2, dot, ecef_to_geodetic, geodetic_to_ecef, haversine_m, m_per_deg,
+    norm, sub,
 };
 use fdop_types::{BBox, Elevation, MIC_HEIGHT_M};
 use rayon::prelude::*;
@@ -1154,16 +1154,56 @@ struct Pass {
     tpl: u16,
 }
 
+/// Still-air bank speed, distance and heard-centre offset for a locally straight pass through
+/// a moving medium. Completing the quadratic in the wavefront travel time gives the same
+/// frequency curve, with emitted tone rescaled by `1 / (1 + w.v / (c² - w²))`; the bank already
+/// searches that tone. Its centre need not be the geometric CPA's reception time. Physical
+/// range weights and the exact scorer's null calibration are left to their existing models.
+fn wind_bank_pass(rv: V3, vel: V3, prop: &Prop) -> Option<(f64, f64, f64)> {
+    if !prop.c.is_finite()
+        || prop.c <= 0.0
+        || rv.iter().chain(&vel).chain(&prop.w).any(|v| !v.is_finite())
+    {
+        return None;
+    }
+    let c2 = prop.c * prop.c;
+    let a = c2 - dot(prop.w, prop.w);
+    let relative = sub(vel, prop.w);
+    // The ordinary bank represents one monotone subsonic reception curve. A source at or
+    // above the sound speed relative to the medium has no such bank representation.
+    if !a.is_finite() || a <= 0.0 || dot(relative, relative) >= c2 {
+        return None;
+    }
+    let (b, q) = (dot(prop.w, rv), dot(prop.w, vel));
+    let aa = q * q + a * dot(vel, vel);
+    // The sampled CPA estimate can have rv.vel != 0, especially on turns and at track ends.
+    let bb = b * q + a * dot(rv, vel);
+    let cc = b * b + a * dot(rv, rv);
+    let l = 1.0 + q / a;
+    let speed = BASE_C * aa.sqrt() / (a + q);
+    let distance = BASE_C / a * (cc - bb * bb / aa).sqrt();
+    let heard = b / a - l * bb / aa + distance / BASE_C;
+    (speed.is_finite()
+        && speed > 0.0
+        && speed < BASE_C
+        && distance.is_finite()
+        && distance > 0.0
+        && heard.is_finite())
+    .then_some((speed, distance, heard))
+}
+
 /// Local closest approaches of `tr` to every cell in reach, so a flight that comes back counts
 /// once per visit even when several visits fit in one chunk. All chunks use the same sampling
 /// lattice and read one extra sample at either edge; a minimum belongs to the chunk that owns its
 /// central sample. This also keeps a shortened final chunk from moving a boundary pass between
 /// chunks. Scratch is bounded by the chunk's positions, not by its cells or number of visits.
+#[allow(clippy::too_many_arguments)]
 fn stamp_track(
     tr: &TrackModel,
     g: &Grid,
     p: &MatchParams,
     c_at: &(dyn Fn(f64) -> f64 + Sync),
+    atmo: Option<&dyn Atmosphere>,
     t_base: f64,
     span: (f64, f64),
     out: &mut Vec<(u32, Pass)>,
@@ -1304,12 +1344,35 @@ fn stamp_track(
                     }
                     let c = c_at(bt);
                     let scale = BASE_C / c;
-                    let tv = nearest_log(&p.v_grid, v * scale);
-                    let td = nearest_log(&p.d_grid, d * scale);
+                    // Keep the established calm arithmetic and time-interpolated sound table.
+                    // A regional calm wind does not establish calm along this observer's path:
+                    // query it only after a CPA survives the existing physical gates.
+                    let (mut bank_v, mut bank_d, mut arrive) = (v * scale, d * scale, bt + d / c);
+                    if let Some(atmo) = atmo {
+                        let (lat, lon) = g.latlon(xx as usize, yy as usize);
+                        let observer = g.enu.to_ecef(x);
+                        let (_, _, z) = ecef_to_geodetic(observer);
+                        let (_, _, h) = ecef_to_geodetic(pos);
+                        let medium = atmo.medium(lat, lon, bt, z, h);
+                        if !medium.c.is_finite() || medium.c <= 0.0 {
+                            continue;
+                        }
+                        if medium.wind_e != 0.0 || medium.wind_n != 0.0 {
+                            let prop = Prop::from_medium(&medium, &Enu::new(lat, lon, z));
+                            let Some((mapped_v, mapped_d, heard)) =
+                                wind_bank_pass(sub(pos, observer), vel, &prop)
+                            else {
+                                continue;
+                            };
+                            (bank_v, bank_d, arrive) = (mapped_v, mapped_d, bt + heard);
+                        }
+                    }
+                    let tv = nearest_log(&p.v_grid, bank_v);
+                    let td = nearest_log(&p.d_grid, bank_d);
                     out.push((
                         cell as u32,
                         Pass {
-                            arrive: (bt + d / c - t_base) as f32,
+                            arrive: (arrive - t_base) as f32,
                             tpl: (tv * p.d_grid.len() + td) as u16,
                         },
                     ));
@@ -2664,7 +2727,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         .tracks
         .par_iter()
         .fold(Vec::new, |mut v, tr| {
-            stamp_track(tr, &g, p, &c_at, t_base, span, &mut v);
+            stamp_track(tr, &g, p, &c_at, Some(inp.atmo), t_base, span, &mut v);
             v
         })
         .reduce(Vec::new, |mut a, mut b| {
@@ -3852,6 +3915,7 @@ mod tests {
             &g,
             &p,
             &|_| BASE_C,
+            None,
             clock,
             (clock, clock + 200.0),
             &mut stamps,
@@ -3980,6 +4044,7 @@ mod tests {
             &observer_cell(&p),
             &p,
             &|_| BASE_C,
+            None,
             clock,
             (clock, clock + 8.0),
             &mut stamped,
@@ -4004,6 +4069,7 @@ mod tests {
                         &g,
                         &p,
                         &|_| BASE_C,
+                        None,
                         clock,
                         (clock + phase, clock + 360.0 + phase),
                         &mut stamped,
@@ -4118,6 +4184,7 @@ mod tests {
                     &g,
                     &p,
                     &|_| BASE_C,
+                    None,
                     clock,
                     (clock, clock + 719.0),
                     &mut stamped,
@@ -4174,6 +4241,7 @@ mod tests {
             &g,
             &p,
             &|_| BASE_C,
+            None,
             clock,
             (clock, clock + 720.0),
             &mut stamped,
@@ -4189,7 +4257,7 @@ mod tests {
             (clock + 310.0, clock + 500.0),
         ] {
             stamped.clear();
-            stamp_track(&tr, &g, &p, &|_| BASE_C, clock, span, &mut stamped);
+            stamp_track(&tr, &g, &p, &|_| BASE_C, None, clock, span, &mut stamped);
             assert!(stamped.is_empty());
         }
         // A real track endpoint is still retained for the exact scorer's existing end rule.
@@ -4206,6 +4274,7 @@ mod tests {
             &g,
             &p,
             &|_| BASE_C,
+            None,
             clock,
             (clock, clock + 720.0),
             &mut stamped,
@@ -4229,6 +4298,7 @@ mod tests {
                 &g,
                 &p,
                 &|_| BASE_C,
+                None,
                 clock,
                 (clock, clock + 720.0),
                 &mut stamped,
@@ -4423,7 +4493,7 @@ mod tests {
         assert!(tr.t.iter().all(|&t| t < span.0 || t > span.1));
         let grid = make_grid(&p, &region, &FlatElevation(0.0));
         let mut stamps = Vec::new();
-        stamp_track(&tr, &grid, &p, &|_| BASE_C, 0.0, span, &mut stamps);
+        stamp_track(&tr, &grid, &p, &|_| BASE_C, None, 0.0, span, &mut stamps);
         assert!(
             !stamps.is_empty(),
             "the coarse search sees the crossing pass"
@@ -5997,8 +6067,14 @@ mod tests {
             );
             let mut stamped = Vec::new();
             stamp_track(
-                &tr, &g, &p, &|_| BASE_C, clock,
-                (clock - 200.0, clock + 500.0), &mut stamped,
+                &tr,
+                &g,
+                &p,
+                &|_| BASE_C,
+                None,
+                clock,
+                (clock - 200.0, clock + 500.0),
+                &mut stamped,
             );
             assert_eq!(stamped.len(), 1, "lost {speed} m/s pass");
             let arrival = 120.0 + 900.0f64.hypot(600.0) / BASE_C;
@@ -6014,10 +6090,19 @@ mod tests {
         );
         let mut stamped = Vec::new();
         stamp_track(
-            &tr, &g, &p, &|_| BASE_C, clock,
-            (clock - 200.0, clock + 500.0), &mut stamped,
+            &tr,
+            &g,
+            &p,
+            &|_| BASE_C,
+            None,
+            clock,
+            (clock - 200.0, clock + 500.0),
+            &mut stamped,
         );
-        assert!(stamped.is_empty(), "the configured speed allowance still applies");
+        assert!(
+            stamped.is_empty(),
+            "the configured speed allowance still applies"
+        );
     }
 
     /// New fast fixtures alone suppress harmonics beyond the sample rate's usable band.
@@ -6172,5 +6257,516 @@ mod tests {
             let result = run_case(&control, &p, control.clock - 2.0, control.clock + 2.0);
             assert_refused(&result);
         }
+    }
+
+    #[test]
+    fn wind_bank_pass_matches_the_actual_retarded_frequency() {
+        let enu = Enu::new(40.8765, -73.525, 0.0);
+        let x = enu.to_ecef([0.0; 3]);
+        let velocity = [140.0, 20.0, 4.0];
+        let raw = [0.0, 0.8, 0.6];
+        let perpendicular = sub(
+            raw,
+            fdop_types::geo::scale(velocity, dot(raw, velocity) / dot(velocity, velocity)),
+        );
+        for epoch in [1_000.0, 1_800_000_000.0] {
+            for distance in [800.0, 6_000.0] {
+                let r0 = fdop_types::geo::scale(perpendicular, distance / norm(perpendicular));
+                let tr = straight_track(
+                    &enu,
+                    r0,
+                    velocity,
+                    epoch,
+                    epoch - 240.0,
+                    epoch + 240.0,
+                    20.0,
+                );
+                for wind in [
+                    [0.0; 3],
+                    [-60.0, 25.0, 0.0],
+                    [60.0, -25.0, 0.0],
+                    [0.0, 100.0, 10.0],
+                ] {
+                    let prop = Prop {
+                        c: BASE_C,
+                        w: enu.vec_to_ecef(wind),
+                    };
+                    for anchor in [-20.0, 0.0, 20.0] {
+                        let (pos, vel) = tr.pv(epoch + anchor);
+                        let rv = sub(pos, x);
+                        let (v, d, heard) = wind_bank_pass(rv, vel, &prop).unwrap();
+                        let a = prop.c * prop.c - dot(prop.w, prop.w);
+                        let tone = 100.0 / (1.0 + dot(prop.w, vel) / a);
+                        let emission = anchor + heard - d / BASE_C;
+                        if wind == [0.0; 3] && anchor == 0.0 {
+                            assert!((v - norm(vel)).abs() < 1e-10);
+                            assert!((d - norm(rv)).abs() < 1e-8);
+                            assert!((heard - norm(rv) / BASE_C).abs() < 1e-8);
+                        }
+                        for offset in [-120.0, -30.0, 0.0, 30.0, 120.0] {
+                            let (pos, vel) = tr.pv(epoch + offset);
+                            let rv = sub(pos, x);
+                            let received = epoch + offset + prop.travel(rv, norm(rv));
+                            let (_, _, ratio) =
+                                tr.solve_emission_p(received, x, &prop, None).unwrap();
+                            let bank = crate::physics::cv_curve(
+                                received - epoch,
+                                tone,
+                                v,
+                                d,
+                                emission,
+                                BASE_C,
+                            );
+                            assert!(
+                                (100.0 * ratio - bank).abs() < 2e-5,
+                                "epoch={epoch}, distance={distance}, wind={wind:?}, anchor={anchor}, offset={offset}"
+                            );
+                            // Independently check the moving-wavefront ratio at its known emission.
+                            assert!((ratio - prop.ratio(rv, norm(rv), vel)).abs() < 2e-7);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wind_bank_pass_refuses_invalid_and_non_subsonic_media() {
+        let rv = [0.0, 800.0, 600.0];
+        let vel = [140.0, 0.0, 0.0];
+        for prop in [
+            Prop::still(0.0),
+            Prop::still(-1.0),
+            Prop::still(f64::NAN),
+            Prop::still(f64::INFINITY),
+            Prop {
+                c: BASE_C,
+                w: [BASE_C, 0.0, 0.0],
+            },
+            Prop {
+                c: BASE_C,
+                w: [0.0, BASE_C + 1.0, 0.0],
+            },
+            Prop {
+                c: BASE_C,
+                w: [f64::NAN, 0.0, 0.0],
+            },
+            // Wind itself is subsonic, but the source is supersonic relative to it.
+            Prop {
+                c: BASE_C,
+                w: [-250.0, 0.0, 0.0],
+            },
+        ] {
+            assert!(wind_bank_pass(rv, vel, &prop).is_none(), "{prop:?}");
+        }
+        let prop = Prop::still(BASE_C);
+        assert!(wind_bank_pass(rv, [0.0; 3], &prop).is_none());
+        assert!(wind_bank_pass([f64::INFINITY, 0.0, 0.0], vel, &prop).is_none());
+        assert!(wind_bank_pass(rv, [f64::NAN, 0.0, 0.0], &prop).is_none());
+    }
+
+    #[test]
+    fn calm_coarse_stamps_preserve_the_original_bits() {
+        struct Calm;
+        impl Atmosphere for Calm {
+            fn describe(&self) -> String {
+                "calm test atmosphere".into()
+            }
+
+            fn medium(&self, _lat: f64, _lon: f64, t: f64, z0: f64, _z1: f64) -> Medium {
+                Medium::still(325.0 + 0.01 * (t % 600.0) + z0 * 0.001)
+            }
+        }
+        let (lat, lon, clock) = SCENE_AT;
+        let p = MatchParams::default();
+        let region = BBox::new(lat - 0.004, lon - 0.006, lat + 0.004, lon + 0.006);
+        let g = make_grid(&p, &region, &FlatElevation(400.0));
+        let span = (clock - 120.0, clock + 960.0);
+        let sound = SoundTable::new(&Calm, lat, lon, span);
+        let straight = scene_track(
+            [0.0, 800.0, 1_000.0],
+            [190.0, 0.0, 0.0],
+            300.0,
+            -120.0,
+            960.0,
+        );
+        for tr in [
+            straight,
+            short_circuit(60.0),
+            scene_track([0.0, 800.0, 1_000.0], [80.0, 0.0, 0.0], 300.0, 0.0, 292.0),
+        ] {
+            let (mut original, mut current) = (Vec::new(), Vec::new());
+            stamp_track(
+                &tr,
+                &g,
+                &p,
+                &|t| sound.at(t),
+                None,
+                clock,
+                span,
+                &mut original,
+            );
+            stamp_track(
+                &tr,
+                &g,
+                &p,
+                &|t| sound.at(t),
+                Some(&Calm),
+                clock,
+                span,
+                &mut current,
+            );
+            let bits = |stamps: &[(u32, Pass)]| {
+                stamps
+                    .iter()
+                    .map(|(cell, pass)| (*cell, pass.arrive.to_bits(), pass.tpl))
+                    .collect::<Vec<_>>()
+            };
+            assert!(!original.is_empty());
+            assert_eq!(bits(&current), bits(&original));
+        }
+    }
+
+    #[test]
+    fn wind_coarse_stamps_do_not_depend_on_the_prior_clock() {
+        struct ChangingWind;
+        impl Atmosphere for ChangingWind {
+            fn describe(&self) -> String {
+                "time-varying test wind".into()
+            }
+
+            fn medium(&self, _lat: f64, _lon: f64, t: f64, _z0: f64, _z1: f64) -> Medium {
+                Medium {
+                    c: 330.0 + (t / 600.0).sin(),
+                    wind_e: 25.0 + 10.0 * (t / 300.0).sin(),
+                    wind_n: 20.0 + 10.0 * (t / 400.0).cos(),
+                }
+            }
+        }
+        let (lat, lon, clock) = SCENE_AT;
+        let p = MatchParams::default();
+        let g = observer_cell(&p);
+        let tr = short_circuit(60.0);
+        let mut reference: Option<Vec<(u32, u16, f64)>> = None;
+        for prior in [clock, clock - 1_000.0, clock + 1_000.0] {
+            let span = (prior - 2_000.0, prior + 3_000.0);
+            let sound = SoundTable::new(&ChangingWind, lat, lon, span);
+            let mut stamped = Vec::new();
+            stamp_track(
+                &tr,
+                &g,
+                &p,
+                &|t| sound.at(t),
+                Some(&ChangingWind),
+                prior,
+                span,
+                &mut stamped,
+            );
+            let absolute: Vec<_> = stamped
+                .iter()
+                .map(|(cell, pass)| (*cell, pass.tpl, prior + f64::from(pass.arrive)))
+                .collect();
+            assert!(absolute.len() > 1);
+            if let Some(reference) = &reference {
+                assert_eq!(absolute.len(), reference.len());
+                for (a, b) in absolute.iter().zip(reference) {
+                    assert_eq!((a.0, a.1), (b.0, b.1));
+                    // Stamps store relative times as f32, whose resolution changes with the prior.
+                    assert!((a.2 - b.2).abs() < 2e-4);
+                }
+            } else {
+                reference = Some(absolute);
+            }
+        }
+    }
+
+    #[test]
+    fn coarse_wind_uses_each_observers_position_and_path_heights() {
+        struct LocalWind(std::sync::Mutex<Vec<[f64; 5]>>);
+        impl Atmosphere for LocalWind {
+            fn describe(&self) -> String {
+                "observer-local test wind".into()
+            }
+
+            fn medium(&self, lat: f64, lon: f64, t: f64, z0: f64, z1: f64) -> Medium {
+                self.0.lock().unwrap().push([lat, lon, t, z0, z1]);
+                let wind = if z0 > 500.0 && lat > SCENE_AT.0 + 1e-6 {
+                    35.0
+                } else {
+                    0.0
+                };
+                Medium {
+                    c: BASE_C,
+                    wind_e: wind,
+                    wind_n: wind,
+                }
+            }
+        }
+        let (lat, lon, clock) = SCENE_AT;
+        let atmo = LocalWind(std::sync::Mutex::new(Vec::new()));
+        let p = MatchParams::default();
+        let region = BBox::new(lat - 0.004, lon - 0.006, lat + 0.004, lon + 0.006);
+        let g = make_grid(&p, &region, &FlatElevation(700.0));
+        let tr = scene_track(
+            [0.0, 6_000.0, 1_700.0 + MIC_HEIGHT_M],
+            [190.0, 0.0, 0.0],
+            200.0,
+            -200.0,
+            500.0,
+        );
+        let span = (clock - 200.0, clock + 500.0);
+        let sound = SoundTable::new(&atmo, lat, lon, span);
+        assert_eq!(atmo.medium(lat, lon, clock, 10.0, 1_500.0).wind_e, 0.0);
+        atmo.0.lock().unwrap().clear();
+        let (mut original, mut current) = (Vec::new(), Vec::new());
+        stamp_track(
+            &tr,
+            &g,
+            &p,
+            &|t| sound.at(t),
+            None,
+            clock,
+            span,
+            &mut original,
+        );
+        stamp_track(
+            &tr,
+            &g,
+            &p,
+            &|t| sound.at(t),
+            Some(&atmo),
+            clock,
+            span,
+            &mut current,
+        );
+        assert_eq!(original.len(), current.len());
+        assert!(
+            original
+                .iter()
+                .zip(&current)
+                .any(|(a, b)| a.1.tpl != b.1.tpl)
+        );
+        let queries = atmo.0.lock().unwrap();
+        assert_eq!(
+            queries.len(),
+            current.len(),
+            "one atmosphere query per retained CPA"
+        );
+        let mut calm = 0;
+        let mut windy = 0;
+        for ((old, new), query) in original.iter().zip(&current).zip(queries.iter()) {
+            let cell = old.0 as usize;
+            assert_eq!(old.0, new.0);
+            let (la, lo) = g.latlon(cell % g.ncols, cell / g.ncols);
+            let (_, _, z) = ecef_to_geodetic(g.enu.to_ecef(g.observers[cell]));
+            let (_, _, h) = ecef_to_geodetic(tr.pos_at(query[2]));
+            assert_eq!((query[0], query[1]), (la, lo));
+            assert!((query[3] - z).abs() < 1e-8 && (query[4] - h).abs() < 1e-8);
+            assert!((z - 700.0 - MIC_HEIGHT_M).abs() < 1e-5);
+            if la <= lat + 1e-6 {
+                calm += 1;
+                assert_eq!(
+                    (old.1.arrive.to_bits(), old.1.tpl),
+                    (new.1.arrive.to_bits(), new.1.tpl)
+                );
+            } else {
+                windy += 1;
+            }
+        }
+        assert!(calm > 0 && windy > 0);
+        let invalid = UniformAtmosphere(Medium {
+            c: BASE_C,
+            wind_e: BASE_C + 1.0,
+            wind_n: 0.0,
+        });
+        current.clear();
+        stamp_track(
+            &tr,
+            &g,
+            &p,
+            &|_| BASE_C,
+            Some(&invalid),
+            clock,
+            span,
+            &mut current,
+        );
+        assert!(current.is_empty());
+    }
+
+    #[test]
+    fn wind_bank_stamps_recover_two_supported_pcm_passes() {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let observer = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let mut tracks = vec![
+            scene_track(
+                [0.0, 6_000.0, 1_000.0 + MIC_HEIGHT_M],
+                [190.0, 0.0, 0.0],
+                200.0,
+                -200.0,
+                1_100.0,
+            ),
+            scene_track(
+                [6_000.0, 0.0, 1_000.0 + MIC_HEIGHT_M],
+                [0.0, 190.0, 0.0],
+                650.0,
+                -200.0,
+                1_100.0,
+            ),
+        ];
+        for (i, tr) in tracks.iter_mut().enumerate() {
+            tr.key = format!("wind-{i}");
+            tr.icao = tr.key.clone();
+        }
+        // Keep all 221 production templates and the existing physical/evidence thresholds.
+        // This checks reachability of exact scoring, not a confidence claim without decoys.
+        let p = MatchParams {
+            decoy_span_s: 0.0,
+            top_modes: 6,
+            refine_modes: 2,
+            ..Default::default()
+        };
+        assert_eq!(p.v_grid.len() * p.d_grid.len(), 221);
+        let medium = Medium {
+            c: BASE_C,
+            wind_e: 35.0,
+            wind_n: 35.0,
+        };
+        let prop = Prop::from_medium(&medium, &enu);
+        let mut audio = noise(900 * 2800, 42, 0.05);
+        for (i, tr) in tracks.iter().enumerate() {
+            add_flight(
+                &mut audio,
+                2800.0,
+                clock,
+                tr,
+                observer,
+                &prop,
+                90.0 + 35.0 * i as f64,
+                2.0,
+            );
+        }
+        let pcm: Vec<f32> = audio.iter().map(|&v| v as f32).collect();
+        let im = build_image(&pcm, 2800, &p).unwrap();
+        let atmo = UniformAtmosphere(medium);
+        let dem = FlatElevation(0.0);
+        let (mlat, mlon) = m_per_deg(lat);
+        let region = BBox::new(
+            lat - 200.0 / mlat,
+            lon - 200.0 / mlon,
+            lat + 200.0 / mlat,
+            lon + 200.0 / mlon,
+        );
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &tracks,
+            region,
+            start_lo: clock,
+            start_hi: clock,
+            duration_s: 900.0,
+            catalog: (clock - 200.0, clock + 1_100.0),
+            dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let bank = build_bank(&im, &p);
+        let g = make_grid(&p, &region, &dem);
+        assert!(g.inside.iter().filter(|&&inside| inside).count() > 1);
+        let mut original = Vec::new();
+        for tr in &tracks {
+            stamp_track(
+                tr,
+                &g,
+                &p,
+                &|_| BASE_C,
+                None,
+                clock,
+                inp.catalog,
+                &mut original,
+            );
+        }
+        assert!(!original.is_empty());
+        eprintln!(
+            "old calm stamps: {} passes across {} active cells; zero recording-clock votes",
+            original.len(),
+            g.inside.iter().filter(|&&inside| inside).count(),
+        );
+        // The unchanged original stamp cannot start even the first exact comparison anywhere
+        // in this region: its selected surfaces have no votes in the recording-clock window.
+        for (_, pass) in &original {
+            let (mut votes, mut touched) = (vec![0.0; 3], Vec::new());
+            accumulate_votes(&[*pass], &bank, &im, clock, clock, &mut votes, &mut touched);
+            assert!(votes.iter().all(|&v| v == 0.0));
+        }
+        let keep: Vec<_> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
+        let direct = score_exact(&inp, &p, &bank, &keep, lat, lon, clock).unwrap();
+        assert_eq!(
+            direct.n_heard, 2,
+            "the original exact scorer supports both passes"
+        );
+        let result = run(&inp, &p, &|_| {});
+        let top = result
+            .modes
+            .first()
+            .expect("wind-mapped votes must reach exact scoring");
+        eprintln!(
+            "mapped PCM: modes={}, heard={}, error_m={:.6}, clock_error_s={:.9}, evidence={:.12}; direct exact evidence={:.12}",
+            result.modes.len(),
+            top.n_heard,
+            haversine_m(top.lat, top.lon, lat, lon),
+            top.clock_unix - clock,
+            top.evidence,
+            direct.evidence,
+        );
+        assert_eq!(top.n_heard, 2);
+        assert!((top.clock_unix - clock).abs() < 1e-6);
+        assert!(haversine_m(top.lat, top.lon, lat, lon) < 300.0);
+        for key in ["wind-0", "wind-1"] {
+            assert!(
+                top.passes
+                    .iter()
+                    .any(|pass| pass.key == key
+                        && counts_as_heard(pass.value, pass.nats, pass.shared))
+            );
+        }
+        assert!(
+            !verdict(&result).is_some_and(|v| v.stands),
+            "missing decoys must still prevent a confidence claim"
+        );
+        let wrong_clock = MatchInputs {
+            start_lo: clock + 120.0,
+            start_hi: clock + 120.0,
+            ..inp
+        };
+        let wrong = run(&wrong_clock, &p, &|_| {});
+        assert!(wrong.modes.iter().all(|mode| mode.n_heard < 2));
+        let noise_pcm: Vec<f32> = noise(pcm.len(), 77, 0.05)
+            .iter()
+            .map(|&v| v as f32)
+            .collect();
+        let noise_image = build_image(&noise_pcm, 2800, &p).unwrap();
+        let noise_input = MatchInputs {
+            image: &noise_image,
+            ..inp
+        };
+        let no_signal = run(&noise_input, &p, &|_| {});
+        assert!(no_signal.modes.iter().all(|mode| mode.n_heard < 2));
+        eprintln!(
+            "controls: wrong-clock heard={:?}, noise heard={:?}",
+            wrong
+                .modes
+                .iter()
+                .map(|mode| mode.n_heard)
+                .collect::<Vec<_>>(),
+            no_signal
+                .modes
+                .iter()
+                .map(|mode| mode.n_heard)
+                .collect::<Vec<_>>(),
+        );
     }
 }

@@ -415,6 +415,12 @@ in `crates/fdop-core/src/curvematch.rs`:
 - **Search.** Flights vote for (place, clock) cells 200 m apart. The best 16 places are rescored with the exact
   curve (the real trajectory, emission-time solve, modelled wind and sound speed).
   The coarse vote uses the same terrain and microphone position as its reported latitude and longitude.
+  A retained CPA queries the atmosphere at that observer and the actual source/receiver heights.
+  In wind, its locally straight frequency curve is mapped to the existing bank's equivalent
+  speed, distance and heard centre; correcting travel time alone would leave the wrong shape.
+  Calm paths retain their original arithmetic. This mapping changes which supported candidates
+  reach exact scoring; exact trajectory scores, amplitude weights, nulls and decoy gates retain
+  their existing models. It assumes a homogeneous path-averaged medium and local constant velocity.
   The grid bounds the geographic box's ellipsoid projection, keeps a centre point on narrow axes, and
   includes a one-cell fringe clipped onto the boundary. Small boxes and long, thin regions therefore
   retain searchable locations at their edges instead of losing them to a tangent-plane approximation.
@@ -1442,6 +1448,29 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Wind-supported curves reach exact scoring
+
+`wind_bank_stamps_recover_two_supported_pcm_passes` uses a fixed 900-second physical PCM recording,
+two orthogonal 190 m/s flights, and wind components of 35 m/s east and north. It keeps the full
+221-template production bank and a 400 m-wide region containing 25 active observer cells. The
+unchanged exact scorer already hears both aircraft at the true observer, but the preceding coarse
+matcher selects shapes with no recording-clock votes anywhere in that region. Replaying the actual
+old module confirms zero coarse candidates, zero exact starts and no mode.
+
+Mapping the wind-distorted frequency curve into the existing bank now produces one mode at the
+correct synthetic observer cell with both intended aircraft, exactly the known recording clock,
+and evidence 8.606058 nats. The separate wrong-clock and pure-noise controls return no modes.
+The fixture deliberately omits decoys to isolate foreground reachability and asserts that it
+cannot stand as a confident answer without them; this is not a new confidence-calibration result.
+
+Five further native regressions compare the mapping with actual retarded propagation, reject
+invalid/relative-supersonic media, preserve calm stamps bit for bit, and check prior-clock
+independence and observer-specific atmosphere coordinates/heights. All six pass, as does component
+Clippy with warnings denied. The combined actual production engine selftest retains its prior
+four-event, two-flight result through real FFmpeg. These checks use synthetic recordings; reference,
+wrong-date and field recordings have not been replayed. The mapping is exact for the frequency
+shape under its local model, not for the bank's amplitude weighting or curved/changing-medium paths.
 
 ### Following a detected fast pass through its missing central drop
 

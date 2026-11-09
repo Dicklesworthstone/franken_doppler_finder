@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Map wind-distorted flyovers into the coarse curve bank
+
+- Map each retained locally straight pass through its observer-specific moving medium into the
+  existing bank's equivalent speed, distance and heard centre. The general quadratic includes
+  non-perpendicular CPA anchors; only adjusting arrival delay would leave the wrong frequency
+  shape. Query actual source/receiver heights and time, including local wind when the regional
+  sound table is calm. Preserve original calm arithmetic and refuse invalid or unrepresentable
+  subsonic paths. No additional template, dependency or per-grid cache is introduced.
+- Keep exact scoring, physical amplitude weights, empirical nulls, decoy comparisons, thresholds
+  and confidence gates unchanged. The mapping is exact for a homogeneous, constant-velocity
+  frequency curve; it does not establish equivalent amplitude weighting or field accuracy.
+- An actual old-module replay of a fixed 900-second PCM scene, with two 190 m/s aircraft, 35 m/s
+  east/north wind, all 221 templates and 25 observer cells, produces no coarse candidates or
+  exact starts. Its unchanged exact scorer already hears both aircraft at truth. The corrected
+  matcher reaches one mode at the correct synthetic cell with both aircraft, zero clock error
+  and 8.606058 nats evidence. Wrong-clock and pure-noise controls return no modes; the positive
+  explicitly remains unconfirmed without decoys.
+- All six new native regressions pass, covering actual propagation equivalence, invalid media,
+  exact calm stamps, prior-clock independence, observer-local atmosphere queries and full PCM
+  recovery. Component Clippy passes with warnings denied. The combined production engine
+  selftest through real FFmpeg retains its prior two-flight result. No reference, wrong-date
+  or field replay, full-workspace build pass, or runtime improvement is claimed.
+
 ### Complete a fast pass's central drop without restarting its fitted ridge
 
 - Extend the existing bounded continuation to steep fits beyond the primary detector's speed
