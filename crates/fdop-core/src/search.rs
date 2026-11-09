@@ -1829,11 +1829,19 @@ pub struct EventNull {
     pub chi_null_median: f64,
 }
 
+/// How far the fitted lower tail may reach past the empirical null's own resolution, ln(n+1):
+/// ln(1000), three orders of magnitude. The log-normal is fitted to two quantiles only. When the
+/// median and the 5 % quantile sit close together its spread is tiny, and a chance match a few
+/// times below every sample was given the full 25 nats: on a development recording's decoy clock,
+/// one chance flight at chi 1.05 against a null with median 8.88 and 5 % quantile 6.56 (n 315)
+/// out-scored the true clock, and a wrong-date run carried 21.7 to 24.2 such nats on every build.
+pub const NULL_TAIL_EXTRA_NATS: f64 = 6.907_755_278_982_137;
+
 impl EventNull {
     /// -ln P(chance chi <= chi | gates), from the empirical null (bounded by ln(n+1)).
     /// Below the 5 % quantile the empirical CDF is too coarse (a match far better than every
     /// chance sample would cap at ln(n+1)), so the lower tail is log-normal, fitted to the null's
-    /// median and 5 % quantile; capped at 25 nats.
+    /// median and 5 % quantile, and reaches at most `NULL_TAIL_EXTRA_NATS` past ln(n+1).
     pub fn trace_nats(&self, chi: f64) -> f64 {
         let n = self.chi_null.len();
         if n < 20 || !chi.is_finite() {
@@ -1848,7 +1856,8 @@ impl EventNull {
         } else {
             emp
         };
-        (-p.max(1e-300).ln()).min(25.0)
+        let reach = ((n + 1) as f64).ln() + NULL_TAIL_EXTRA_NATS;
+        (-p.max(1e-300).ln()).min(reach).min(25.0)
     }
     pub fn nats(&self, chi: f64) -> f64 {
         self.gate_nats + self.trace_nats(chi)
@@ -5762,6 +5771,36 @@ mod tests {
             a < 0.5 && b > 2.5 && c > b + 3.0 && c <= 25.0,
             "{a} {b} {c}"
         );
+    }
+
+    /// A narrow null (median 8.88, 5 % quantile 6.56, n 315: the shape that gave one chance match
+    /// 25 trace nats) reaches ln(n+1) + NULL_TAIL_EXTRA_NATS and no further. Inside the sample the
+    /// empirical value stands, and the tail still rises toward the cap.
+    #[test]
+    fn null_tail_reaches_three_orders_past_the_sample_and_no_further() {
+        let chi_null: Vec<f64> = (0..315).map(|k| 6.0 + 0.02 * k as f64).collect();
+        let nl = EventNull {
+            chi_null_p05: 6.56,
+            chi_null_median: 8.88,
+            n_null: 315,
+            chi_null,
+            ..Default::default()
+        };
+        let reach = (316.0f64).ln() + NULL_TAIL_EXTRA_NATS;
+        assert!((NULL_TAIL_EXTRA_NATS - 1000.0f64.ln()).abs() < 1e-12);
+        let far = nl.trace_nats(1.05);
+        assert!((far - reach).abs() < 1e-9, "{far} {reach}");
+        let (mu, sd) = (8.88f64.ln(), (8.88f64.ln() - 6.56f64.ln()) / 1.6449);
+        let fitted = -normal_cdf((1.05f64.ln() - mu) / sd).max(1e-300).ln();
+        assert!(fitted > 25.0, "the fitted tail alone would give {fitted}");
+        let k = 100;
+        let inside = nl.trace_nats(nl.chi_null[k]);
+        assert!(
+            (inside + ((k as f64 + 1.5) / 316.0).ln()).abs() < 1e-9,
+            "{inside}"
+        );
+        let near = nl.trace_nats(6.2);
+        assert!(near < far && near > 0.0, "{near} {far}");
     }
 
     #[test]

@@ -19,6 +19,55 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Stop the fitted null tail three orders of magnitude past its sample
+
+- `EventNull::trace_nats` now stops the fitted lower tail at ln(n+1) + `NULL_TAIL_EXTRA_NATS` nats, where n is
+  the size of the event's empirical chance null and the new constant is ln(1000), about 6.91. The 25-nat cap
+  stays. Inside the sample nothing changes: below the null's 5 % quantile the tail is still a log-normal fitted
+  to the median and the 5 % quantile, and it still rises with a better match until it meets the new limit.
+- **Observed defect:** on `b8abf86` the osprey cam on 10-31 (`b1_osprey_1031`) located 0.12 km from the truth
+  but was low. It failed only the decoy-clock gate: 28.14 nats against 32.79 for its +1 h decoy. That decoy's
+  lead was one chance match at chi 1.05 against a narrow null (median 8.88, 5 % quantile 6.56, n 315). Fitted to
+  those two quantiles, the log-normal's spread is 0.18 in log, so chi 1.05 sits 11.6 spreads out and took the
+  full 25 trace nats, plus 4.32 gate nats. An empirical null of 315 samples can itself say at most ln(316),
+  about 5.76.
+- **How often:** in saved top candidates (the 33-null battery on six builds, `b8abf86`'s development rows and
+  three `c2c7578` replays), 37 of 484 chance matches earned more than ln(n+1) and 7 earned 15 or more. One
+  wrong-date null earned 21.7 to 24.2 on every build. Of 28 true matches, 4 earned more than ln(n+1): 25 on the
+  reference recording, 15.9 on the osprey cam on 11-02.
+- **How the limit was chosen:** by arithmetic on those saved candidates and scores, with these recordings in
+  view. Each limit of ln(n+1) + X was tried. X from 6 to 8 kept every right answer's grade, restored the 10-31
+  decoy lead (+7.7 nats at ln 1000) and lifted no null's margin past 3. X of 5 or less lifted one null's margin
+  to 3.43; X of 10 lifted another's to 4.82.
+- **Replays, `b8abf86` against this change:** macOS arm64 builds from the benchmark machine, run on the same rows
+  on one Mac, with the pass rule written down before any row of this change ran. The rule: no null graded medium or
+  high, every row `b8abf86` asserts correctly stays correct and asserted, and no wrong assertion anywhere.
+  - Development rows (six with a known place, nine wrong-date or wrong-place nulls): 5 right and asserted against
+    4, none wrong. The osprey cam on 10-31 rose from low to high at 0.12 km. Every other row kept its grade and its
+    distance.
+  - The 33-null battery: 26 low and 7 with no location on both builds, every row's grade the same; no medium,
+    no high, no fault.
+  - The eagle cam's clip, the seventh development recording, is unchanged: low at 0.68 km with the same evidence.
+  - The rule passed. The limit was chosen on these rows, so this shows no harm on them; it is not an
+    independent test.
+- **Set K (read after its seal; development only):** first-order arithmetic on its saved runs. On `b759c6f` and
+  `1dec7d6`, `k_weehawken` was 41 m from the truth and low on its decoy clocks alone (23.99 nats against 27.04).
+  Its −2 h decoy's best candidate held one chance match with 20.44 trace nats against a null of 262 samples.
+  Under the limit that match takes 12.48, the decoy 19.08, and the gate's lead +4.91. No top candidate or rival
+  on any set K row changes evidence. Every set K null fails the core-match or margin gate, so none can rise.
+  This is not a replay: the search pruned and refined with the old values.
+- Test: `search::tests::null_tail_reaches_three_orders_past_the_sample_and_no_further`. On a 315-sample null of
+  that shape, a match at chi 1.05 now takes exactly ln(316) + ln(1000), where the fitted tail alone would give
+  more than 25. A chi inside the sample keeps its empirical value, and one just below the sample stays positive
+  and below the limit. `null_tail_extends_beyond_samples` passes unchanged.
+- Checked on rch (Linux, worker vmi1152480): fdop-core 267 passed and the root package 44 passed. Workspace
+  Clippy with warnings denied passes. Four fdop-core tests fail, the same four that fail on `0dae249` without
+  this change: `fast_edge_passes_reach_measurement_at_both_recording_ends`,
+  `grazing_passes_are_heard_across_exact_clock_seeds`, `three_flights_locate_the_observer_and_beat_every_decoy`
+  and `refinement_climbs_from_a_start_beyond_one_move_per_scale`. They fail with the same values with and without
+  this change, and neither `curvematch.rs` nor `detect.rs` calls `trace_nats`. The same four fail, bit for bit, on
+  macOS arm64. The macOS release build passes `fdop selftest`.
+
 ### Say why the full date window is fetched before fetching it
 
 - When the `creation_time` window's grade is low or absent, `locate` now logs that grade and that it is widening

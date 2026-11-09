@@ -1675,6 +1675,13 @@ library 32 (the binary target has no tests). On `8be452d` the same run had eight
 does not depend on `asupersync`, so `cargo test -p fdop-core --lib` needs no application build; it
 took 145 s on four threads.
 
+On `0dae249` (2026-11-09, `cargo test --release --workspace --no-fail-fast` through RCH on x86-64
+Linux), four of the seven still fail and every other target passes. `fdop-core`: 266 passed, 4 failed,
+8 ignored. The four are the first four rows below: `three_flights_locate_the_observer_and_beat_every_decoy`
+now at a margin of 4.979, the refinement control, the grazing pass and the fast edge pass. With the
+null-tail limit added (none of the four calls `trace_nats`) they fail with the same values on x86-64
+Linux and on macOS arm64, the platform the benchmark binaries are built for: not platform effects.
+
 The curve-match and measurement causes were measured: the earlier behaviour was put back behind a
 test-only switch in a scratch tree outside this repository, and the unchanged test was run again.
 The contrast row's cause follows from the failing detection, which only `c7c1206`'s stage can
@@ -2861,15 +2868,20 @@ audio or video recorded somewhere sensitive:
   And no rival passes the gate, however small the search: one county search scored 20 fine
   cells, found no rival, and is low only on its other gates. A large margin means nothing when the core gate fails:
   the eagle cam's county search has 26.83 nats with 1 core match of 7, and is low (`f_duke_county_r5`).
-- **Trace evidence past what the chance null measures is extrapolated.** Below the null's 5 % quantile `trace_nats`
-  follows a log-normal tail fitted to two quantiles, capped at 25 nats, where an empirical null of n samples supports
-  at most ln(n+1), about 6. On the `*_r5` runs one reference event earns 2.3–8.3 nats past that bound on right and
-  wrong dates alike, and rivals carry it too: 10.6 for the feeder's. Capping it at ln(n+1) in the stored candidates
-  (arithmetic on `search.json`, not a rerun) moves margins both ways, by up to 3.7 nats. The stored scores mix refined
-  points and fine cells, and refinement moved scores by 0.15–1.21 nats on these runs, so each capped margin is
-  uncertain by about that much: county about 14 and state-wide 7.2–8.4, both high; three-day 5.8–7.0, either side of
-  the high line; 09-07 0.8–3.2 and 09-09 at most 0.2, both with new leaders; the feeder's wrong answer 2.0–3.2, either
-  side of the medium line. So the arithmetic cannot say what a cap does to grades; that needs replays.
+- **Trace evidence past what the chance null measures is extrapolated, within a limit.** Below the null's 5 %
+  quantile `trace_nats` follows a log-normal tail fitted to two quantiles, where an empirical null of n samples
+  supports at most ln(n+1), about 6. The fitted tail stops at ln(n+1) + ln(1000), three orders of magnitude further,
+  and never above 25 nats. Without that limit a narrow null gave one chance match the full 25. On `b8abf86` the osprey
+  cam on 10-31 was placed 0.12 km from the truth and graded low: one chance match on its +1 h decoy clock carried 25
+  trace nats. With the limit it is high, and no null or answer got worse in replays of the development rows and the
+  33-null battery ([CHANGELOG](CHANGELOG.md)). The limit was picked by arithmetic on saved runs with these recordings
+  in view, so those replays could only have shown harm. Set K's saved runs, read after their seal and used for
+  development only, show the same failure. On `b759c6f` and `1dec7d6`, `k_weehawken` was placed 41 m from the
+  truth and graded low on its decoy clocks alone: its −2 h decoy had one chance match with 20.4 trace nats against
+  a null of 262. First-order arithmetic grades it high under the limit and changes no other set K row; that is not a
+  replay. A match inside the limit can still earn about 6.9 nats more than its null can show. On the older `*_r5`
+  runs, one reference event earned 2.3–8.3 nats past ln(n+1) on right and wrong dates alike. Capping at ln(n+1)
+  itself in stored candidates moved margins both ways, by up to 3.7 nats, so a tighter limit needs its own replays.
 - **The ridge check rests on limited evidence.** The 15 % line was picked with these recordings in view; synthetic
   tests justify its two sides, and the replays can only show harm. Real ridges steeper than 4 Hz/s exist in the
   recordings, but no event follows one, so that side is synthetic only. A faint steep pass can fall under the line
