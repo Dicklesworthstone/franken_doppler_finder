@@ -1043,11 +1043,16 @@ Design notes:
   specified recording clock instead of being discarded by a still-air travel-time seed. Calm
   paths first use the original clock arithmetic. The coarse geometry remains approximate;
   search budgets and confidence gates are unchanged.
-- **A hillside clock rejection gets an exact closest-approach retry.** The initial CPA line
+- **Hillside rejections can reach the observer's exact closest approach.** The initial CPA line
   uses terrain beneath the aircraft. A climb or descent over a slope can therefore imply the
-  wrong recording start at a candidate observer, even when the real pass fits. If that point
+  wrong distance or recording start at a candidate observer, even when the real pass fits. If that point
   passes the coarse geometry and region checks but fails the clock check, and the observer's
   terrain differs, the search retries the nearest exact CPA in its existing 150 s window.
+  A geometry rejection can use that same retry when the original sampling and all its fallbacks
+  leave the track with no hypotheses. This second pass also clips the approximate cross-track
+  ray to the requested box, so a narrow region can supply a candidate even when the approximate
+  distances all fail. Discovery in the first pass never adds a new point or suppresses an old
+  successful fallback; any original nonempty cloud is retained unchanged.
   The exact pass must still pass the original clock, speed, distance, track-gap, interior-CPA
   and terrain-clearance gates. Already accepted hypotheses keep their original arithmetic;
   hypothesis budgets and confidence rules are unchanged. This retry does not replace the
@@ -1448,6 +1453,33 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### A terrain distance rejection no longer hides an otherwise valid pair
+
+`hillside_cpa_survives_an_approximate_distance_rejection` uses two crossing flights about 6 km
+above the observer, climbing and descending at 15 m/s, with the normal three-second timing
+tolerance and 25% multiplicative distance floor. The actual range lies near the gate's upper
+edge. On a 40% planar hillside the preceding source rejects both approximate ranges and never
+reaches the valid exact CPAs; both event clouds are empty and there is no location. The bounded
+second geometry pass recovers one matching hypothesis per event and, for the 6,650 m lateral
+case, locates within 0.351176 m at exactly the known recording clock.
+
+The new native regression passes twelve full-search scenes across three grid phases and four
+terrain slopes, including wrong-clock, gap, clearance, speed, range and zero-cap accounting controls.
+Fourteen neighboring regressions and test-root Clippy with warnings denied also pass. A separate
+comparison with the immutable preceding source preserves every ordered hypothesis field bit
+for all 33 originally positive scene pairs; exactly three previously empty slope cases recover.
+Flat, +20% and -40% full-search locations and clocks retain their previous values.
+
+Three alternating native timing trials measured each two-event/two-track workload 100 times.
+Accepted 20 km scenes measured 0.655 ms versus 0.657 ms before on flat terrain, and 2.171 ms
+versus 2.080 ms before on a slope. The newly recovered 50 m slope case takes 0.572 ms versus
+0.309 ms before. Deliberately incompatible short-range flights in a 20 km sloping box still
+produce no hypotheses but take 1.318 ms versus 0.168 ms before: exact retries cost about 1.15 ms
+there. These are component measurements, not whole-search performance claims. Recovery remains
+bounded and retains every physical gate; it does not guarantee complete hillside coverage.
+The combined production engine selftest retains its prior result. Reference, wrong-date and
+field recordings have not been replayed.
 
 ### Wind-supported curves reach exact scoring
 

@@ -19,6 +19,31 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover valid hillside passes rejected by approximate geometry
+
+- Let a terrain-dependent distance or clearance rejection reach the same bounded exact-CPA
+  check already used for hillside clock recovery. Finish every original sample and fallback
+  first; only a track with zero original hypotheses and eligible terrain differences receives
+  the second geometry pass. Preserve any nonempty original cloud and its ordering exactly.
+- Reuse cross-track clipping to find an in-region candidate even when every approximate
+  distance fails. The new midpoint only records retry eligibility during original sampling;
+  it cannot add a point or suppress an established interior fallback. Retry at the actual
+  observer through the existing 150-second nearest-CPA search, retaining clock, exact speed
+  and range, track-gap, interior-CPA, clearance and hypothesis-budget checks.
+- Two crossing climb/descent tracks over a 40% slope previously yield no location despite
+  physically valid exact passes. With ordinary three-second timing and 25% distance floors,
+  the corrected 6,650 m lateral case recovers both intended flights within 0.351176 m at zero
+  clock error. Twelve full-search scenes across three phases/four slopes pass, alongside
+  physical/clock/zero-cap controls and fourteen neighboring native tests. All 33 previously
+  positive scene pairs retain every ordered hypothesis field bit; three empty cases recover.
+- Test-root Clippy passes with warnings denied, and the combined production engine selftest
+  keeps its baseline result. Three alternating component timing trials measure accepted flat
+  workloads at 0.655 versus 0.657 ms before and accepted slopes at 2.171 versus 2.080 ms before.
+  The new recovery costs 0.572 versus 0.309 ms; an incompatible empty sloping case costs 1.318
+  versus 0.168 ms per two-event/two-track workload. This bounded extra work buys recovery,
+  not a runtime improvement. No full hillside-coverage or field-accuracy claim is made; no
+  reference, wrong-date or field replay was available.
+
 ### Map wind-distorted flyovers into the coarse curve bank
 
 - Map each retained locally straight pass through its observer-specific moving medium into the
