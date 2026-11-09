@@ -307,3 +307,61 @@ about `dopplerprint` on five of the eight cases.
   falsifier are not rewritten. Any read these rows would change is named as changed by the supplementary run.
 - Rows are rerun only for a harness or machine fault, each listed with its cause. A day the store still lacks counts as
   a harness fault.
+
+### Supplementary result
+
+Read once at 19:35:32Z on 2026-11-09: `tools/score.py data/set_k/jobs/cases.json runs_k r2i`, into
+`runs_k/SCORE_r2i_setK_supp_20261109.txt`, sha256 `e947429b538bb284`.
+
+**Runs** (`runs_k/supp_r2i.log`).
+
+- **Launchers.** The first launcher did not retry an interrupted download, so rows could have started with a day
+  missing. It was stopped at 16:14:17Z, during the 2023-09-16 download, before any job script was written or any row
+  ran. `launch_k_supp2.sh` replaced it at 16:14:26Z: it resumes each download with a size check, and it starts no row
+  until all eleven days are in the store.
+- **Downloads.** Downloads interrupted mid-transfer (curl 55 or 56) were resumed: 2023-07-06 and 2023-07-07 once
+  each, 2023-09-16 twice.
+- **Ingests.** All eleven days ingested with no parse error and none truncated, 40,080 to 51,648 traces a day. The
+  first three ingests took 44 to 56 minutes each while the machine's USB volume was stalled. From 18:51Z each took
+  about 25 s.
+- **Timing.** All eleven days were in the store at 19:03:00Z. The national DEM was aside for `dp` and `dp48` and
+  back at 19:11:18Z, before `dpdem`. The last row ended at 19:15:19Z.
+- **Exit codes.** Every row exited 0, or 3, which `dopplerprint` uses for "inconclusive" and the scorer counts as a
+  decline. No row has an error or a fault, and none was rerun.
+
+| Row | `dpi` | `dp48i` | `dpdemi` |
+|---|---|---|---|
+| `k_tribeca` | declined (4975 m, high) | declined (2878 m, high) | **wrong**, 2878 m, high |
+| `k_weehawken` | declined (9362 m, high) | **right**, 765 m, high | **right**, 765 m, high |
+| `k_sakurapark` | declined (9260 m, medium) | declined (14 km, medium) | declined (14 km, medium) |
+| `k_pier35` | declined | 6614 m, low | 6607 m, low |
+| `k_bowlinggreen` | **right**, 110 m, medium | declined (2163 m, medium) | declined (2163 m, medium) |
+| `k_tribeca_n` | declined (15 km, medium) | declined (15 km, high) | declined (15 km, high) |
+| `k_weehawken_n` | declined (8280 m, high) | declined (7994 m, high) | declined (7994 m, high) |
+| `k_sakurapark_n` | **wrong**, 13 km, high | declined (8199 m, high) | declined (8199 m, high) |
+| `k_pier35_n` | declined (5110 m, high) | declined (14 km, low) | declined (14 km, low) |
+| `k_bowlinggreen_n` | 2855 m, low | declined (4626 m, medium) | declined (4626 m, medium) |
+
+With the sealed result's other six rows (its `dp`, `dp48` and `dpdem` columns, `dp`'s rerun row included):
+
+| Tool | Right on cases | Wrong on cases | Wrong on nulls | Errors |
+|---|---|---|---|---|
+| `dpi` | 2 | 0 | 2 | 0 |
+| `dp48i` | 2 | 0 | 2 | 0 |
+| `dpdemi` | 2 | 1 | 2 | 0 |
+
+**Reads restated with these rows in place of the ten errors.**
+
+- **More accurate.** `9087ec4` (2 right, none wrong) meets the rule against `dpi`, `dp48i` and `dpdemi`: as many
+  right and fewer wrong. `3c51eae` (1 right, none wrong) does not meet it against any of the three, because each has 2
+  right. *Changed by the supplementary run:* in the sealed read, `3c51eae` meets the rule against `dp`, `dp48` and
+  `dpdem`.
+- **Falsifier.** The sealed reading stands as written. Restated with these rows, its clause "fewer correct assertions
+  than any rival" would also fire for `3c51eae`. It still does not fire for `9087ec4`.
+- **Works near population centres.** Unchanged: no tool works. `dpi` and `dp48i` are right on 2 of the 8 cases but
+  wrong on 2 nulls each.
+- **Sets J and K together.** `dpi` and `dp48i` are 2 right and 2 wrong, and `dpdemi` 2 right and 3 wrong. Set J adds
+  nothing to any of the three.
+
+On `k_weehawken`, `dp48` and `dpdem` were right at 765 m, while `dp` put it 9.4 km off and declined. `9087ec4` was
+right there at 20 m (medium) and `3c51eae` at 33 m (high).
