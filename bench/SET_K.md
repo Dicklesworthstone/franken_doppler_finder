@@ -272,3 +272,38 @@ gate.
 
 These rows are now read. A change suggested by them has to be shown on development recordings and the null battery,
 and set K cannot test it.
+
+## 2026-11-09: a supplementary run of `dopplerprint` with its days ingested by hand
+
+This section was written and committed before any of its rows ran. It changes nothing above. Set K's read and the reads
+made from it stand as written.
+
+**Why.** Ten rows of each `dopplerprint` regime ended in an error: the five cases `k_tribeca`, `k_weehawken`,
+`k_sakurapark`, `k_pier35` and `k_bowlinggreen`, and their nulls. The cause is that `dopplerprint`'s downloader reads
+only releases split into parts, and these days' releases are single `.tar` files. Its `docs/DATA.md` gives the manual
+path: `dopplerprint ingest <archive> --out <store>`, which accepts a single `.tar`. Its downloader makes the same
+`ingest_day` call, into `<cache>/adsb/store` with `<cache>/typedb`, and `locate` skips any day the store already holds.
+So these rows show what a `dopplerprint` user who followed that page would have got. Without them, nothing is known
+about `dopplerprint` on five of the eight cases.
+
+**What runs.**
+
+- **Days.** Each UTC day the ten rows need is downloaded once, as its single `.tar`, from the adsb.lol release
+  (`v<date>-planes-readsb-prod-0`) into the benchmark machine's `cache/dp_ingest_src/`. The days are 2023-07-05,
+  2023-07-06, 2023-07-07, 2023-09-16, 2023-09-17, 2024-03-24, 2024-03-25, 2024-03-30, 2024-03-31, 2024-04-06 and
+  2024-04-07.
+- **Ingest.** Each day is ingested with `dopplerprint ingest <tar> --out cache/dp/adsb/store --typedb cache/dp/typedb`,
+  using the same installed `dopplerprint` as every other row.
+- **Rows.** The ten rows run once in each of `dp`, `dp48` and `dpdem`, in that order. They use the job lines of
+  `k_r2_dp.sh`, `k_r2_dp48.sh` and `k_r2_dpdem.sh` unchanged, except that output goes to `runs_k/r2i_<tool>`. As in
+  `launch_k.sh`, the national DEM is renamed aside for `dp` and `dp48` and back before `dpdem`.
+
+**Read and report.**
+
+- The rows are read once, after all 30 have an exit code: `tools/score.py data/set_k/jobs/cases.json runs_k r2i`, into a
+  new file whose sha256 is recorded.
+- They are reported beside the sealed result as `dpi`, `dp48i` and `dpdemi`: right, wrong and errors. The "more
+  accurate" and "works" reads are then restated with these rows in place of the ten errors. The sealed reads and the
+  falsifier are not rewritten. Any read these rows would change is named as changed by the supplementary run.
+- Rows are rerun only for a harness or machine fault, each listed with its cause. A day the store still lacks counts as
+  a harness fault.
