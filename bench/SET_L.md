@@ -88,3 +88,44 @@ from busy airports, with close traffic in the recording's span. The start is the
 3 drops only the times that look rounded.
 
 Recordings, coordinates and aircraft identifiers stay out of this repository.
+
+## 2026-11-09: screens closed, no case
+
+The search was taken at 23:40:06Z on 2026-11-08, 68 s after this file's commit (`search_raw.json`, sha256
+`4713b130292a6416`). Every row, with the step it stopped at, is in the benchmark machine's
+`data/set_l/screen/screen_final.tsv` (no coordinates there).
+
+| Step | Outcome | Rows |
+|---|---|---|
+| 1 | rows | 1,838 |
+| 2 | out, not a contiguous-US zone | 1,090 |
+| 3 | out, longest audio under 10 minutes | 530 |
+| 3 | out, under 10 minutes and a start at :00 or :30 | 86 |
+| 3 | out, a start at :00 or :30 | 23 |
+| 3 | out, no metadata (the Internet Archive answered "item metadata may be invalid", twice) | 1 |
+| 4 | out (no site given 25, no public or outdoor site 4, indoors or a building 21, a home or yard 7, moving 4, a walk 3, music or a stage 3, a private event 1) | 68 |
+| 6 | out, within 1 km of an earlier set L pass | 7 |
+| 7 | out | 31 |
+| 9 | out | 2 |
+| 10 | case | 0 |
+
+No licence and no missing coordinate put an item out at step 3. Of the 33 items that reached step 7, 2 lay in a metro
+of at least 1,000,000 on a tract of at least 1,000 people per square mile, both in Atlanta. Both passed step 8
+(nearest medium airport 9.4 and 5.4 km). At step 9 one had no pass within 3 km in its 12 minutes. The other is from
+2023-02-26, and adsb.lol's `globe_history_2023` has no release for that day or the next, so there is no ADS-B to
+count (`fdop fetch` exits 2). That puts it out, as it would every tool.
+
+Nothing was captured and no row was run. `tools/score_l.py` was made and checked (byte-identical to `score.py` on the
+seven earlier result files) but has nothing to read.
+
+### Readings of the rules, made during the screens
+
+- A recording at a station, or at an airport's gates, is out as indoors, as step 4 lists; an airport viewing park is a
+  public outdoor site (it then met step 7, on a tract of 1 person per square mile).
+- Step 4 reads "describe one stationary take at a public outdoor site" as: the title or description names an outdoor
+  site that is not private (a park, trail, creek, river, lake, street, square, rest area, parking lot, campground,
+  courts or garden), and nothing in them says the take moves or falls under an exclusion. A title that names no site
+  ("crickets", "birds at dawn") is out. Almost no description says "stationary" in words.
+- Church singing heard from a public wetland is not added music.
+- The one item with an error for metadata was fetched a second time, as a fetch fault, and kept out when the answer
+  was the same.

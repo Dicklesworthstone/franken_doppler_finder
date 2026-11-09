@@ -142,3 +142,73 @@ screen picks windows a blind user could only pick with ADS-B in hand. So a "work
 close, not every hour.
 
 Recordings, coordinates and aircraft identifiers stay out of this repository.
+
+## 2026-11-09: screens, a harness fault and its rerun, and the result
+
+### Screens
+
+Every stream reached, with the step it stopped at, is in the benchmark machine's `data/set_j/screen/screen_final.tsv`
+(no coordinates there).
+
+| Step | Outcome | Rows |
+|---|---|---|
+| 1 | rows | 1,002 |
+| 2 | out (title screen, including Go Martha's Vineyard's streams) | 422 |
+| 3 | out (set I's outs, its cases and Boulder County Fairgrounds; four development cameras) | 38 |
+| 4 | out, mean at or below -60 dBFS | 307 |
+| 4 | not taken (fetch failed twice, no audio, or no wall clock) | 71 |
+| 5 | out (description screen) | 111 |
+| 6 | out (truth and the 5 km and same-site rules) | 11 |
+| 7 | out (not in a metro of 1,000,000, or a tract under 1,000 people per square mile) | 37 |
+| 8 | out, a large airport within 5 km (4.7 and 4.9 km) | 2 |
+| 9 | out, no window qualifies | 1 |
+| 10 | candidate | 2 |
+
+The two candidates were Times Square (New York, window 20Z) and the Chicago power-plant cam (window 22Z). Times
+Square's capture was not kept: its stream clock held for 260 s, under the 30 minutes the capture rule asks for. The set
+is `j_chicagopower` and its null.
+
+### Readings of the rules, made during the screens
+
+- Set I's decisions carry over as step 3 and the steps that say so (levels, descriptions, truths).
+- Go Martha's Vineyard's streams are out at step 2, as in Addendum 6 (use needs a written request).
+- Streams whose terms allow reproduction only with a prominent attribution are out at step 5, as Addendum 6's Grand
+  Sierra Resort (rows 21, 350, 382 and 481). So is the Port Lorain stream (row 461), whose terms say it "should not be
+  used for any surveillance or any other lawful or unlawful purpose".
+- Two truths were requeried once in Nominatim because the first match was not the place named: Main Street,
+  Jonesborough, Tennessee (as "West Main Street, Jonesborough, Tennessee") and Two Harbors, Catalina Island (as
+  "Two Harbors, California"). Both keep a 5 km limit.
+
+### A harness fault, and its rerun
+
+The case's window starts at 21:59Z on 2026-11-07 and runs two hours, so with its ±2 min it ends just after midnight
+UTC, and its local date in Chicago runs to 06:00Z. `fdop` and `dopplerprint` therefore need the ADS-B archive for UTC
+2026-11-08. The rows were launched at 21:21Z on 2026-11-08, before that day was published (it appears at about 03:35Z
+the next day). Every `fdop` and `dopplerprint` case row stopped with "not published yet" or "no archive". That is my
+scheduling fault, not a property of any tool. `dopplertrack` reads one UTC day and ran; its rows stand.
+
+`requeue_j.sh` waited for the release, renamed the 7 faulted case rows `*_fault_unpub` (kept), and ran the same job
+scripts again: the 11-08 release was seen at 03:38:24Z on 2026-11-09, and the rerun ended at 03:58:30Z, with the DEM
+renamed aside for `dp` and `dp48` and back for `dpdem`. No rerun hit the error again, and no row ended in a fault exit
+code. **Deviation:** for those tools the case rows ran after the null rows, not before.
+
+While monitoring, before the read, I saw two null rows' exit codes (pinned `fdop` 1, `dp` 3). Nothing else was looked
+at.
+
+### Result
+
+Read once at 03:59:56Z on 2026-11-09: `tools/score.py data/set_j/jobs/cases.json runs_j r2`, into
+`runs_j/SCORE_r2_setJ_20261109.txt`, sha256 `abeddd509a70e088`.
+
+| Row | pinned `7e66501` | `9087ec4` | `b759c6f` | `1dec7d6` | `dp` | `dp48` | `dpdem` | `dt` | `dtfb` |
+|---|---|---|---|---|---|---|---|---|---|
+| `j_chicagopower` | declined | declined | declined | declined | 14 km, low | declined | declined | **wrong**, 40 km | **wrong**, 40 km |
+| `j_chicagopower_n` | declined | declined | declined | declined | declined | declined | declined | **wrong**, 34 km | **wrong**, 34 km |
+
+No tool was right. Every `fdop` build asserted nothing, on the case or the null. `dopplerprint` asserted nothing
+(its one location was graded low). `dopplertrack` was wrong on both rows.
+
+- **More accurate.** Every `fdop` build meets the rule against `dt` and `dtfb` (no wrong assertion against two) and
+  ties `dp`, `dp48` and `dpdem` (0 and 0 each), so it does not meet it against them. The falsifier does not fire for
+  any build on set J.
+- **Works near population centres.** No tool works on set J: none is right on its one case.
