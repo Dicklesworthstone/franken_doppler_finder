@@ -451,7 +451,7 @@ fn verdict_text(confidence: &str, gates: &[(String, bool, String)], matched: &st
 /// width, and they have to fit inside the days being fetched.
 const CURVE_MAX_CLOCK_S: f64 = 1800.0;
 /// Largest grid the curve match searches. Its time and memory go with cells times windows.
-const CURVE_MAX_CELLS: f64 = 200_000.0;
+const CURVE_MAX_CELLS: usize = 200_000;
 /// A trace answer asserted this far from a curve-match answer that stands names another place.
 const CURVE_CONFLICT_M: f64 = 3000.0;
 
@@ -468,12 +468,11 @@ fn curve_match_skip_reason(
             "the recording clock is known to {width:.0} s, and it needs {CURVE_MAX_CLOCK_S:.0} s or better"
         ));
     }
-    let km_ns = (bbox.north - bbox.south) * 111.2;
-    let km_ew =
-        (bbox.east - bbox.west) * 111.2 * (0.5 * (bbox.north + bbox.south)).to_radians().cos();
-    let cells = km_ns * km_ew * 1e6 / (p.cell_m * p.cell_m);
+    let Some(cells) = curvematch::grid_cell_count(p, &bbox) else {
+        return Some("the requested region cannot form a finite local curve grid".into());
+    };
     (cells > CURVE_MAX_CELLS).then(|| {
-        format!("the region needs {cells:.0} cells, and it searches {CURVE_MAX_CELLS:.0} at most")
+        format!("the region needs {cells} cells, and it searches {CURVE_MAX_CELLS} at most")
     })
 }
 

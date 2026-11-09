@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Search the requested curve-grid boundaries at their physical observer positions
+
+- Bound the geographic box's full WGS84 projection instead of a metre-per-degree rectangle. Retain
+  centre observers on narrow axes and project a one-cell fringe onto the requested boundary, so tiny
+  and long, thin regions do not silently lose their valid search locations.
+- Store actual terrain-plus-microphone ENU observers for coarse flight votes. Previously the vote
+  combined nominal tangent-plane east/north with only the observer's physical up coordinate, so it
+  could score a different location from the one reported. Expand index lookup by the measured
+  displacement, then keep the existing exact physical range check.
+- Expose checked grid allocation and use it for the CLI's unchanged 200,000-cell limit. Invalid,
+  overflowing and unprojectable dimensions are rejected before allocation. Persistent grid storage
+  grows by 20 bytes per cell, about 3.8 MiB at the CLI limit; evidence and hearing gates are unchanged.
+- Four native regressions pass against the actual production physics, track, spectrogram and curve
+  modules. Three fail against the original geometry: a 1 m half-width box has no observer, a long thin
+  box misses a boundary by 1,178.44 m, and a coarse arrival differs from its reported observer by
+  4.447 s. Independent WGS84 projection and allocation checks also pass. Component Clippy passes
+  with only the unchanged helper unused by that subset exempted from dead-code linting. Full acoustic,
+  workspace and real-recording validation remains separate; no field accuracy claim follows.
+
 ### Refine the whole clock interval after the scan reaches its sample limit
 
 - Keep a broad fitted recording-clock interval's optimum reachable after the 400-cell scan cap

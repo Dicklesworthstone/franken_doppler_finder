@@ -30,7 +30,8 @@ use crate::spectro::{median_f32, stft_band_db};
 use crate::track::{Prop, TrackBounds, TrackModel};
 use fdop_types::atmo::Atmosphere;
 use fdop_types::geo::{
-    Enu, V3, ecef_to_geodetic, geodetic_to_ecef, haversine_m, m_per_deg, norm, sub,
+    Enu, V3, WGS84_A, WGS84_E2, ecef_to_geodetic, geodetic_to_ecef, haversine_m, m_per_deg, norm,
+    sub,
 };
 use fdop_types::{BBox, Elevation, MIC_HEIGHT_M};
 use rayon::prelude::*;
@@ -956,18 +957,24 @@ pub struct MatchResult {
 
 struct Grid {
     enu: Enu,
+    region: BBox,
     ncols: usize,
     nrows: usize,
     e0: f64,
     n0: f64,
     step: f64,
-    /// Up coordinate of the observer and whether the cell is in the region, per cell.
-    up: Vec<f32>,
+    /// Actual ENU observer positions, including terrain and microphone height. Removing the
+    /// tangent plane's geodetic height changes east/north as well as up away from its origin.
+    observers: Vec<V3>,
+    /// Largest horizontal displacement from a lattice node to its physical observer. Expand
+    /// the local index lookup by this measured bound before applying exact range checks.
+    horizontal_shift_m: f64,
+    /// Interior nodes and a one-cell boundary fringe projected into the requested region.
     inside: Vec<bool>,
 }
 
 impl Grid {
-    fn latlon(&self, ix: usize, iy: usize) -> (f64, f64) {
+    fn projected_latlon(&self, ix: usize, iy: usize) -> (f64, f64) {
         let (la, lo, _) = self.enu.to_geodetic([
             self.e0 + ix as f64 * self.step,
             self.n0 + iy as f64 * self.step,
@@ -975,42 +982,167 @@ impl Grid {
         ]);
         (la, lo)
     }
+
+    fn latlon(&self, ix: usize, iy: usize) -> (f64, f64) {
+        let (la, lo) = self.projected_latlon(ix, iy);
+        (
+            la.clamp(self.region.south, self.region.north),
+            lo.clamp(self.region.west, self.region.east),
+        )
+    }
 }
 
-fn make_grid(p: &MatchParams, region: &BBox, dem: &dyn Elevation) -> Grid {
-    let (clat, clon) = region.center();
-    let enu = Enu::new(clat, clon, 0.0);
+struct GridShape {
+    ncols: usize,
+    nrows: usize,
+    e0: f64,
+    n0: f64,
+}
+
+/// Conservative bounds of the whole geographic box on the existing tangent plane. A surface
+/// point P and its geodetic normal n project to P + h*n where the local up coordinate is zero.
+/// With D = n dot n0 and X = N(latitude)*sin(latitude), N+h = (R0 + e2*X*sin(lat0))/D.
+/// Bound those factors over the full box rather than replacing curved edges by metre/degree
+/// chords. The angular triangle inequality bounds D below without sampling its boundary.
+fn projected_region_bounds(region: &BBox) -> Option<(f64, f64, f64, f64)> {
+    if ![region.south, region.west, region.north, region.east]
+        .into_iter()
+        .all(f64::is_finite)
+        || !(-90.0..=90.0).contains(&region.south)
+        || !(-90.0..=90.0).contains(&region.north)
+        || !(-180.0..=180.0).contains(&region.west)
+        || !(-180.0..=180.0).contains(&region.east)
+        || region.south > region.north
+        || region.west > region.east
+    {
+        return None;
+    }
+    let (south, north) = (region.south.to_radians(), region.north.to_radians());
+    let lat0 = 0.5 * (south + north);
+    let half_lon = 0.5 * (region.east - region.west).to_radians();
+    let angle = 0.5 * (north - south) + half_lon;
+    if angle >= std::f64::consts::FRAC_PI_2 {
+        return None;
+    }
+    let d_min = angle.cos();
+    let (s0, c0) = lat0.sin_cos();
+    let prime_radius = |s: f64| WGS84_A / (1.0 - WGS84_E2 * s * s).sqrt();
+    let (sin_lo, sin_hi) = (south.sin(), north.sin());
+    let (x_lo, x_hi) = (prime_radius(sin_lo) * sin_lo, prime_radius(sin_hi) * sin_hi);
+    let x0 = prime_radius(s0) * s0;
+    let r0 = prime_radius(s0) * (1.0 - WGS84_E2 * s0 * s0);
+    let product = |a: (f64, f64), b: (f64, f64)| {
+        let xs = [a.0 * b.0, a.0 * b.1, a.1 * b.0, a.1 * b.1];
+        (
+            xs.into_iter().fold(f64::INFINITY, f64::min),
+            xs.into_iter().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let extra = product((WGS84_E2 * s0, WGS84_E2 * s0), (x_lo, x_hi));
+    let radial = (r0 + extra.0, (r0 + extra.1) / d_min);
+    let cos_lo = south.cos().min(north.cos());
+    let cos_hi = if south <= 0.0 && north >= 0.0 {
+        1.0
+    } else {
+        south.cos().max(north.cos())
+    };
+    let east = (radial.1 * cos_hi * half_lon.sin()).next_up();
+    let normal_north = product((-s0, -s0), (cos_lo * half_lon.cos(), cos_hi));
+    let northward = product(
+        radial,
+        (c0 * sin_lo + normal_north.0, c0 * sin_hi + normal_north.1),
+    );
+    let offset = product((-WGS84_E2 * c0, -WGS84_E2 * c0), (x_lo - x0, x_hi - x0));
+    Some((
+        -east,
+        east,
+        (northward.0 + offset.0).next_down(),
+        (northward.1 + offset.1).next_up(),
+    ))
+}
+
+fn grid_shape(p: &MatchParams, region: &BBox) -> Option<GridShape> {
+    if !p.cell_m.is_finite() || p.cell_m <= 0.0 {
+        return None;
+    }
+    let (e_lo, e_hi, n_lo, n_hi) = projected_region_bounds(region)?;
+    let (clat, _) = region.center();
     let (mlat, mlon) = m_per_deg(clat);
     let (he, hn) = (
         0.5 * (region.east - region.west) * mlon,
         0.5 * (region.north - region.south) * mlat,
     );
-    let (ncols, nrows) = (
-        (2.0 * he / p.cell_m).ceil() as usize + 1,
-        (2.0 * hn / p.cell_m).ceil() as usize + 1,
-    );
-    let mut g = Grid {
-        enu,
+    let axis = |lo: f64, hi: f64, half: f64| {
+        // Keep the established lattice for ordinary regions. A narrow axis needs its centre:
+        // geographic corner roundoff can otherwise leave even a one-cell-wide box empty.
+        let origin = if half <= p.cell_m { 0.0 } else { -half };
+        let first = ((lo - origin) / p.cell_m).floor();
+        let last = ((hi - origin) / p.cell_m).ceil();
+        let count = last - first + 1.0;
+        (count.is_finite() && (1.0..=u32::MAX as f64).contains(&count))
+            .then_some((origin + first * p.cell_m, count as usize))
+    };
+    let (e0, ncols) = axis(e_lo, e_hi, he)?;
+    let (n0, nrows) = axis(n_lo, n_hi, hn)?;
+    let cells = ncols.checked_mul(nrows)?;
+    (cells <= u32::MAX as usize).then_some(GridShape {
         ncols,
         nrows,
-        e0: -he,
-        n0: -hn,
+        e0,
+        n0,
+    })
+}
+
+/// Exact rectangular allocation of the curve grid, including its geographic boundary fringe.
+/// `None` means invalid dimensions, overflow, or a box too wide for one local tangent plane.
+pub fn grid_cell_count(p: &MatchParams, region: &BBox) -> Option<usize> {
+    grid_shape(p, region).map(|s| s.ncols * s.nrows)
+}
+
+fn make_grid(p: &MatchParams, region: &BBox, dem: &dyn Elevation) -> Grid {
+    let (clat, clon) = region.center();
+    let GridShape {
+        ncols,
+        nrows,
+        e0,
+        n0,
+    } = grid_shape(p, region).expect("validated local grid");
+    let mut g = Grid {
+        enu: Enu::new(clat, clon, 0.0),
+        region: *region,
+        ncols,
+        nrows,
+        e0,
+        n0,
         step: p.cell_m,
-        up: Vec::new(),
+        observers: Vec::new(),
+        horizontal_shift_m: 0.0,
         inside: Vec::new(),
     };
-    let cells: Vec<(f32, bool)> = (0..ncols * nrows)
+    let cells: Vec<(V3, bool, f64)> = (0..ncols * nrows)
         .into_par_iter()
         .map(|i| {
             let (ix, iy) = (i % ncols, i / ncols);
+            let (raw_la, raw_lo) = g.projected_latlon(ix, iy);
             let (la, lo) = g.latlon(ix, iy);
+            // A clipped geographic edge may cross between every row of a narrow box. Keep
+            // its one-cell fringe on the boundary, rather than silently leaving that strip
+            // unsearched. Far corners of the enclosing projected rectangle remain inactive.
+            let inside = region.contains(raw_la, raw_lo)
+                || haversine_m(raw_la, raw_lo, la, lo) <= p.cell_m * std::f64::consts::SQRT_2;
+            if !inside {
+                return ([0.0; 3], false, 0.0);
+            }
             let z = dem.elev_m(la, lo);
             let e = g.enu.from_geodetic(la, lo, z + MIC_HEIGHT_M);
-            (e[2] as f32, region.contains(la, lo))
+            let shift =
+                (e[0] - (g.e0 + ix as f64 * g.step)).hypot(e[1] - (g.n0 + iy as f64 * g.step));
+            (e, true, shift)
         })
         .collect();
-    g.up = cells.iter().map(|c| c.0).collect();
+    g.observers = cells.iter().map(|c| c.0).collect();
     g.inside = cells.iter().map(|c| c.1).collect();
+    g.horizontal_shift_m = cells.iter().map(|c| c.2).fold(0.0, f64::max);
     g
 }
 
@@ -1041,7 +1173,7 @@ fn stamp_track(
         return;
     }
     let reach = p.reach_m;
-    let rc = (reach / g.step).ceil() as i64;
+    let rc = ((reach + g.horizontal_shift_m) / g.step).ceil() as i64;
     let last_sample = ((tb - ta) / p.sample_s).ceil() as usize;
     let (ends_a, ends_b) = (ta <= tr.t0() + 1.0, tb >= tr.t1() - 1.0);
     let trim = 0.5 * (p.chunk_s - p.chunk_step_s);
@@ -1091,11 +1223,7 @@ fn stamp_track(
                     if !g.inside[cell] {
                         continue;
                     }
-                    let x = [
-                        g.e0 + xx as f64 * g.step,
-                        g.n0 + yy as f64 * g.step,
-                        g.up[cell] as f64,
-                    ];
+                    let x = g.observers[cell];
                     let dist2 = |q: V3| {
                         let (dx, dy, dz) = (x[0] - q[0], x[1] - q[1], x[2] - q[2]);
                         dx * dx + dy * dy + dz * dz
@@ -2497,6 +2625,13 @@ impl SoundTable {
 
 /// Run the whole match. `say` reports progress.
 pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) -> MatchResult {
+    if grid_cell_count(p, &inp.region).is_none() {
+        say("curve match: the region cannot be represented by a bounded local grid");
+        return MatchResult {
+            n_tracks: inp.tracks.len(),
+            ..MatchResult::default()
+        };
+    }
     let mut timings = Vec::new();
     let im = inp.image;
     let t = std::time::Instant::now();
@@ -3558,16 +3693,198 @@ mod tests {
         );
     }
 
+    #[test]
+    fn small_region_grids_keep_a_centre_observer() {
+        let (lat, lon, _) = SCENE_AT;
+        let (mlat, mlon) = m_per_deg(lat);
+        let p = MatchParams::default();
+        for half_m in [1.0, 25.0, 50.0, 99.0, 100.0] {
+            let region = BBox::new(
+                lat - half_m / mlat,
+                lon - half_m / mlon,
+                lat + half_m / mlat,
+                lon + half_m / mlon,
+            );
+            let g = make_grid(&p, &region, &FlatElevation(0.0));
+            assert_eq!(grid_cell_count(&p, &region), Some(g.inside.len()));
+            let nearest = g
+                .inside
+                .iter()
+                .enumerate()
+                .filter(|&(_, &inside)| inside)
+                .map(|(i, _)| {
+                    let (la, lo) = g.latlon(i % g.ncols, i / g.ncols);
+                    assert!(region.contains(la, lo));
+                    haversine_m(lat, lon, la, lo)
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                nearest < 0.001,
+                "{half_m} m half-width: nearest cell {nearest} m"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_dimensions_bound_the_geographic_projection_and_check_allocation() {
+        let (lat, lon, _) = SCENE_AT;
+        let p = MatchParams::default();
+        for (half_lat, half_lon) in [(0.001, 0.001), (5.0, 0.025), (0.0005, 2.0), (2.0, 3.0)] {
+            let region = BBox::new(
+                lat - half_lat,
+                lon - half_lon,
+                lat + half_lat,
+                lon + half_lon,
+            );
+            let shape = grid_shape(&p, &region).unwrap();
+            assert_eq!(
+                grid_cell_count(&p, &region),
+                Some(shape.ncols * shape.nrows)
+            );
+            let enu = Enu::new(lat, lon, 0.0);
+            for i in 0..=16 {
+                let la = region.south + (region.north - region.south) * i as f64 / 16.0;
+                for j in 0..=16 {
+                    let lo = region.west + (region.east - region.west) * j as f64 / 16.0;
+                    // Independently intersect the actual WGS84 normal with the tangent plane.
+                    let at = enu.from_geodetic(la, lo, 0.0);
+                    let (slat, clat) = la.to_radians().sin_cos();
+                    let (slon, clon) = lo.to_radians().sin_cos();
+                    let normal = enu.vec_from_ecef([clat * clon, clat * slon, slat]);
+                    let h = -at[2] / normal[2];
+                    let (east, north) = (at[0] + h * normal[0], at[1] + h * normal[1]);
+                    assert!(
+                        east >= shape.e0 && east <= shape.e0 + (shape.ncols - 1) as f64 * p.cell_m
+                    );
+                    assert!(
+                        north >= shape.n0
+                            && north <= shape.n0 + (shape.nrows - 1) as f64 * p.cell_m
+                    );
+                }
+            }
+        }
+        let region = BBox::new(lat - 0.1, lon - 0.1, lat + 0.1, lon + 0.1);
+        for cell_m in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-12] {
+            assert!(
+                grid_cell_count(
+                    &MatchParams {
+                        cell_m,
+                        ..p.clone()
+                    },
+                    &region
+                )
+                .is_none()
+            );
+        }
+        assert!(grid_cell_count(&p, &BBox::new(-80.0, -170.0, 80.0, 170.0)).is_none());
+    }
+
+    #[test]
+    fn regional_grids_cover_both_edges_of_long_thin_regions() {
+        let (lat, lon, _) = SCENE_AT;
+        let p = MatchParams::default();
+        for region in [
+            BBox::new(lat - 5.0, lon - 0.025, lat + 5.0, lon + 0.025),
+            BBox::new(lat - 0.0005, lon - 2.0, lat + 0.0005, lon + 2.0),
+        ] {
+            let g = make_grid(&p, &region, &FlatElevation(0.0));
+            let points: Vec<_> = g
+                .inside
+                .iter()
+                .enumerate()
+                .filter(|&(_, &inside)| inside)
+                .map(|(i, _)| g.latlon(i % g.ncols, i / g.ncols))
+                .collect();
+            assert!(!points.is_empty(), "no cells in {region:?}");
+            assert!(points.iter().all(|&(la, lo)| region.contains(la, lo)));
+            for k in 0..=8 {
+                let f = k as f64 / 8.0;
+                let la = region.south + f * (region.north - region.south);
+                let lo = region.west + f * (region.east - region.west);
+                for (la, lo) in [
+                    (la, region.west),
+                    (la, region.east),
+                    (region.south, lo),
+                    (region.north, lo),
+                ] {
+                    let distance = points
+                        .iter()
+                        .map(|&(a, b)| haversine_m(la, lo, a, b))
+                        .fold(f64::INFINITY, f64::min);
+                    assert!(
+                        distance <= p.cell_m * std::f64::consts::SQRT_2,
+                        "grid misses boundary ({la}, {lo}) of {region:?} by {distance} m"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coarse_passes_use_the_observer_the_grid_reports() {
+        let (lat, lon, clock) = SCENE_AT;
+        let p = MatchParams::default();
+        let region = BBox::new(lat - 5.0, lon - 0.025, lat + 5.0, lon + 0.025);
+        let ground = 1200.0;
+        let g = make_grid(&p, &region, &FlatElevation(ground));
+        let (cell, (la, lo)) = g
+            .inside
+            .iter()
+            .enumerate()
+            .filter(|&(_, &inside)| inside)
+            .map(|(i, _)| (i, g.latlon(i % g.ncols, i / g.ncols)))
+            .max_by(|a, b| a.1.0.total_cmp(&b.1.0))
+            .unwrap();
+        assert!(la > lat + 4.5);
+        let local = Enu::new(la, lo, ground + MIC_HEIGHT_M);
+        let tr = straight_track(
+            &local,
+            [0.0, -200.0, 700.0],
+            [100.0, 0.0, 0.0],
+            clock + 100.0,
+            clock,
+            clock + 200.0,
+            4.0,
+        );
+        let mut stamps = Vec::new();
+        stamp_track(
+            &tr,
+            &g,
+            &p,
+            &|_| BASE_C,
+            clock,
+            (clock, clock + 200.0),
+            &mut stamps,
+        );
+        let passes: Vec<_> = stamps
+            .iter()
+            .filter(|&&(i, _)| i as usize == cell)
+            .collect();
+        assert_eq!(
+            passes.len(),
+            1,
+            "the reported cell must retain its physical pass"
+        );
+        let expected = 100.0 + 200.0f64.hypot(700.0) / BASE_C;
+        assert!(
+            (f64::from(passes[0].1.arrive) - expected).abs() < 0.001,
+            "coarse arrival {} differs from the reported observer's {expected}",
+            passes[0].1.arrive
+        );
+    }
+
     fn observer_cell(p: &MatchParams) -> Grid {
         let (lat, lon, _) = SCENE_AT;
         Grid {
             enu: Enu::new(lat, lon, 0.0),
+            region: BBox::new(lat, lon, lat, lon),
             ncols: 1,
             nrows: 1,
             e0: 0.0,
             n0: 0.0,
             step: p.cell_m,
-            up: vec![MIC_HEIGHT_M as f32],
+            observers: vec![[0.0, 0.0, MIC_HEIGHT_M]],
+            horizontal_shift_m: 0.0,
             inside: vec![true],
         }
     }

@@ -413,7 +413,12 @@ in `crates/fdop-core/src/curvematch.rs`:
   Weighing against a flat spread instead credited every flight at every clock on rumbling audio, because the
   rumble sits where the propeller tones are. The decoy clocks are weighted the same way.
 - **Search.** Flights vote for (place, clock) cells 200 m apart. The best 16 places are rescored with the exact
-  curve (the real trajectory, emission-time solve, modelled wind and sound speed). At each selected place,
+  curve (the real trajectory, emission-time solve, modelled wind and sound speed).
+  The coarse vote uses the same terrain and microphone position as its reported latitude and longitude.
+  The grid bounds the geographic box's ellipsoid projection, keeps a centre point on narrow axes, and
+  includes a one-cell fringe clipped onto the boundary. Small boxes and long, thin regions therefore
+  retain searchable locations at their edges instead of losing them to a tangent-plane approximation.
+  At each selected place,
   positive local peaks in the clock votes, including tied plateaus, supply alternative recording times.
   Exact evidence chooses the clock that reaches spatial refinement; a stronger coarse alias is no longer
   the only timing seed. The original seed is tried first. A later sweep is skipped only when every
@@ -508,7 +513,9 @@ in `crates/fdop-core/src/curvematch.rs`:
   medium). A stand it removes no longer conflicts with the trace answer either. The verdict line says how many
   twins tied, and `curvematch.json` lists them under `aliases`.
 - **When it runs.** Only when the recording clock is known to 30 min or better and the region holds at most
-  200,000 cells (about 8,000 km²); otherwise it is skipped with a log line. A state-wide search with no start
+  200,000 allocated cells, including the enclosing grid and boundary fringe (roughly 8,000 km² for a compact
+  region); otherwise it is skipped with a log line. Invalid or unprojectable grids are also skipped before
+  allocation. A state-wide search with no start
   therefore uses the trace search alone. It fetches its own wider ADS-B span, and the trace search's tracks are
   unchanged. Eligibility is checked before constructing its harmonic image, so a skipped match does not build
   an unused whole-file spectrogram. `--no-curve-match` turns it off.
