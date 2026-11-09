@@ -807,6 +807,10 @@ Each `locate` run writes a directory:
 | `curvematch.json` | The curve match, when it ran: its places with every pass's evidence, the best place's twins along the heard flights' tracks (`aliases`), each decoy window's best place and score, the margin over the best decoy and its rank p |
 | `detections.json`, `events.json`, `search.json` | Intermediate results. `search.json` keeps the best 10,000 candidates, and `candidates_total` counts them all |
 
+UTC timestamps are rounded to the nearest millisecond, carrying into the next minute or date when
+needed. Whole seconds omit the fractional part; rounding never leaves a `:60` seconds field or moves
+the reported recording clock back a minute.
+
 ---
 
 ## Configuration

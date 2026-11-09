@@ -35,24 +35,23 @@ pub fn iso_utc(t: f64) -> String {
     if !t.is_finite() {
         return "NaN".into();
     }
-    let days = (t / 86_400.0).floor();
-    let rem = t - days * 86_400.0;
+    let mut days = (t / 86_400.0).floor();
+    // Round before splitting the clock: rounding seconds alone can produce 60
+    // without carrying into the next minute, hour or civil date.
+    let mut millis = ((t - days * 86_400.0) * 1000.0).round() as u64;
+    if millis == 86_400_000 {
+        days += 1.0;
+        millis = 0;
+    }
     let (y, m, d) = civil_from_days(days as i64);
-    let h = (rem / 3600.0).floor();
-    let mi = ((rem - h * 3600.0) / 60.0).floor();
-    let s = rem - h * 3600.0 - mi * 60.0;
-    if (s - s.round()).abs() < 5e-4 {
-        format!(
-            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-            h as u32,
-            mi as u32,
-            s.round() as u32 % 60
-        )
+    let h = millis / 3_600_000;
+    let mi = millis / 60_000 % 60;
+    let s = millis / 1000 % 60;
+    let fraction = millis % 1000;
+    if fraction == 0 {
+        format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
     } else {
-        format!(
-            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:06.3}Z",
-            h as u32, mi as u32, s
-        )
+        format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{fraction:03}Z")
     }
 }
 
@@ -192,6 +191,45 @@ mod tests {
             parse_iso_utc("2026-09-08").unwrap(),
             unix_from_utc(2026, 9, 8, 0, 0, 0.0)
         );
+    }
+
+    #[test]
+    fn iso_rounding_carries_across_civil_boundaries() {
+        for (input, expected) in [
+            ("2026-09-08T20:53:59.9994Z", "2026-09-08T20:53:59.999Z"),
+            ("2026-09-08T20:53:59.9996Z", "2026-09-08T20:54:00Z"),
+            ("2026-09-08T20:59:59.9996Z", "2026-09-08T21:00:00Z"),
+            ("2026-09-08T23:59:59.9996Z", "2026-09-09T00:00:00Z"),
+            ("2026-09-30T23:59:59.9996Z", "2026-10-01T00:00:00Z"),
+            ("2026-12-31T23:59:59.9996Z", "2027-01-01T00:00:00Z"),
+            ("2024-02-28T23:59:59.9996Z", "2024-02-29T00:00:00Z"),
+            ("2024-02-29T23:59:59.9996Z", "2024-03-01T00:00:00Z"),
+            ("2026-02-28T23:59:59.9996Z", "2026-03-01T00:00:00Z"),
+            ("1969-12-31T23:59:59.9996Z", "1970-01-01T00:00:00Z"),
+            ("1969-12-30T23:59:59.9996Z", "1969-12-31T00:00:00Z"),
+            ("1969-12-31T23:59:59.1234Z", "1969-12-31T23:59:59.123Z"),
+            ("2026-09-08T20:53:25.1236Z", "2026-09-08T20:53:25.124Z"),
+        ] {
+            assert_eq!(iso_utc(parse_iso_utc(input).unwrap()), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn iso_roundtrip_stays_within_half_a_millisecond() {
+        for date in ["1969-12-31", "1970-01-01", "2024-02-29", "2026-12-31"] {
+            let midnight = parse_iso_utc(date).unwrap();
+            for seconds in [-1.0, 0.0, 59.0, 3599.0, 86_399.0] {
+                for fraction in [0.0, 0.0001, 0.0004, 0.0006, 0.1234, 0.1236, 0.9994, 0.9996] {
+                    let t = midnight + seconds + fraction;
+                    let text = iso_utc(t);
+                    let parsed = parse_iso_utc(&text).unwrap();
+                    assert!(
+                        (parsed - t).abs() <= 0.0005,
+                        "{t:.6} -> {text} -> {parsed:.6}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

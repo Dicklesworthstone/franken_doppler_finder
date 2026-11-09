@@ -19,6 +19,16 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve recording clocks when timestamp rounding crosses a boundary
+
+- Round the UTC instant to milliseconds before splitting the clock into hours, minutes and seconds.
+  A time such as `23:59:59.9996` now reports the following day's midnight instead of the same day's
+  `23:59:00`. Minute, month, year and leap-day carries follow the same rule.
+- Keep whole-second and three-digit fractional output, without changing accepted start-time inputs.
+- Add explicit civil-boundary examples and 160 parse/format round trips with a 0.5 ms error limit.
+- Validation: all five time-module tests pass with the pinned nightly; both new regressions fail when
+  run against the original formatter. Changed-file formatting and whitespace checks pass.
+
 ### Refine accepted aircraft using locally supported raw spectral vertices
 
 - Preserve normalized-ridge discovery and recovery, then optionally refine an already accepted aircraft
