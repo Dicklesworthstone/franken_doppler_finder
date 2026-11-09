@@ -19,6 +19,19 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Reuse Doppler interpolation coefficients across the recording-clock search
+
+- Prepare each ratio grid's monotone cubic intervals and finite differences once, rather than repeating
+  those calculations for every trace sample at every trial clock. The evaluation expression, bounded
+  cubic acceptance, linear fallback, missing support and physical prediction spacing are unchanged.
+- Add short-grid and affine-curve checks alongside the existing polynomial, turn, plateau and gap tests.
+- Validation: the two native interpolation test functions pass. A native comparison using the original
+  and changed source evaluates 257,664 samples across monotone, turning, flat, noisy, missing and extreme
+  grids: every finite value is bit-identical, and missing support is unchanged. A preliminary interpolation
+  microbenchmark was about 30% faster; this is not an end-to-end runtime measurement. Changed-file
+  formatting and whitespace checks pass; UBS reports no critical finding. Full core and workspace
+  validation remains pending while dependencies build on the shared executor.
+
 ### Preserve recording clocks when timestamp rounding crosses a boundary
 
 - Round the UTC instant to milliseconds before splitting the clock into hours, minutes and seconds.

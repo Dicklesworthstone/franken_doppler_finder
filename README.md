@@ -294,6 +294,9 @@ Between stored Doppler predictions, the search uses a four-point cubic on a fini
 bounded by the two bracketing predictions. This reduces curvature bias for close, fast passes without
 additional emission-time solves or a denser table. Boundaries, turns, plateaus and gaps retain the linear
 fallback; missing bracketing samples remain missing.
+Each prediction grid now prepares its monotone intervals and cubic differences once, then reuses them
+through the repeated recording-clock fits. This costs 16 extra bytes per interval and preserves the
+original interpolation values and fallback rules; it does not change the search grid or scoring model.
 
 The reported candidate is regenerated at the refined position and its fitted recording clock: terrain
 elevation, trace fits, independent clock checks, core matches, unheard close passes, evidence and the final

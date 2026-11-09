@@ -876,6 +876,9 @@ struct RatioGrid {
     t0: f64,
     dt: f64,
     r: Vec<f64>,
+    /// Newton second/third differences for each monotone interior interval. NaN
+    /// disables the cubic at boundaries, turns or gaps; the linear fallback stays.
+    cubic: Vec<[f64; 2]>,
 }
 
 /// Newton stops once a step is shorter than this (s); each solve also checks its final
@@ -905,7 +908,21 @@ impl RatioGrid {
                 }
             }
         }
-        Self { t0: lo, dt, r }
+        Self::from_samples(lo, dt, r)
+    }
+
+    fn from_samples(t0: f64, dt: f64, r: Vec<f64>) -> Self {
+        // A clock scan reads each interval many times. Its support and differences
+        // depend only on the stored predictions, not on the clock being tested.
+        let mut cubic = vec![[f64::NAN; 2]; r.len().saturating_sub(1)];
+        for (i, values) in r.windows(4).enumerate() {
+            let [a, b, c, d] = [values[0], values[1], values[2], values[3]];
+            let (left, middle, right) = (b - a, c - b, d - c);
+            if a.is_finite() && d.is_finite() && left * middle >= 0.0 && middle * right >= 0.0 {
+                cubic[i + 1] = [middle - left, right - 2.0 * middle + left];
+            }
+        }
+        Self { t0, dt, r, cubic }
     }
     #[inline]
     fn at(&self, tu: f64) -> f64 {
@@ -924,20 +941,14 @@ impl RatioGrid {
         // curvature. Use the four-point interpolating cubic on a continuous monotone
         // stretch, without extra emission solves or a denser grid. Newton differences
         // avoid cancellation between large polynomial terms on nearly flat tails.
-        if i > 0 && i + 2 < self.r.len() && linear.is_finite() {
-            let (a, d) = (self.r[i - 1], self.r[i + 2]);
-            let (left, middle, right) = (b - a, c - b, d - c);
-            if a.is_finite() && d.is_finite() && left * middle >= 0.0 && middle * right >= 0.0 {
-                let second = middle - left;
-                let third = right - 2.0 * middle + left;
-                let cubic =
-                    b + w * middle + w * (w - 1.0) * (0.5 * second + (w + 1.0) * third / 6.0);
-                // A turn, a plateau or sparse samples must not invent a new extremum.
-                // The original linear path remains at boundaries and beside gaps; a
-                // missing bracketing endpoint remains missing even at an exact node.
-                if cubic.is_finite() && cubic >= b.min(c) && cubic <= b.max(c) {
-                    return cubic;
-                }
+        let [second, third] = self.cubic[i];
+        if second.is_finite() && linear.is_finite() {
+            let cubic = b + w * (c - b) + w * (w - 1.0) * (0.5 * second + (w + 1.0) * third / 6.0);
+            // A turn, a plateau or sparse samples must not invent a new extremum.
+            // The original linear path remains at boundaries and beside gaps; a
+            // missing bracketing endpoint remains missing even at an exact node.
+            if cubic.is_finite() && cubic >= b.min(c) && cubic <= b.max(c) {
+                return cubic;
             }
         }
         linear
@@ -5235,11 +5246,8 @@ mod tests {
     #[test]
     fn ratio_grid_interpolation_preserves_support_and_local_bounds() {
         let polynomial = |t: f64| 1.2 - 0.02 * t + 0.0004 * t * t * t;
-        let g = RatioGrid {
-            t0: -2.0,
-            dt: 1.0,
-            r: (-2..=4).map(|k| polynomial(k as f64)).collect(),
-        };
+        let g =
+            RatioGrid::from_samples(-2.0, 1.0, (-2..=4).map(|k| polynomial(k as f64)).collect());
         for t in [-0.87, -0.33, 0.15, 0.72, 1.63] {
             assert!((g.at(t) - polynomial(t)).abs() < 1e-13);
         }
@@ -5250,22 +5258,14 @@ mod tests {
             [0.2, 1.2, 1.0, 0.9],
             [1.3, 1.2, 1.2, 0.9],
         ] {
-            let g = RatioGrid {
-                t0: 0.0,
-                dt: 1.0,
-                r: values.to_vec(),
-            };
+            let g = RatioGrid::from_samples(0.0, 1.0, values.to_vec());
             for k in 0..100 {
                 let t = 1.0 + k as f64 / 100.0;
                 let r = g.at(t);
                 assert!(r >= values[1].min(values[2]) && r <= values[1].max(values[2]));
             }
         }
-        let hole = RatioGrid {
-            t0: 0.0,
-            dt: 1.0,
-            r: vec![1.3, 1.2, f64::NAN, 1.0, 0.9],
-        };
+        let hole = RatioGrid::from_samples(0.0, 1.0, vec![1.3, 1.2, f64::NAN, 1.0, 0.9]);
         for t in [
             1.0,
             1.3,
@@ -5282,6 +5282,31 @@ mod tests {
             assert!(hole.at(t).is_nan(), "unsupported t={t}");
         }
         assert_eq!(hole.at(3.5), 0.95);
+    }
+
+    #[test]
+    fn ratio_grid_preserves_short_support_and_linear_stretches() {
+        for r in [vec![], vec![1.0]] {
+            let g = RatioGrid::from_samples(0.0, 0.2, r);
+            for t in [-0.1, 0.0, 0.05, 0.2] {
+                assert!(g.at(t).is_nan(), "a bracket is required at {t}");
+            }
+        }
+        // Both boundary intervals and prepared interior intervals must reproduce
+        // the same affine curve, even for a descending or completely flat pass.
+        for n in [2, 3, 7] {
+            for slope in [-0.02, 0.0, 0.02] {
+                let g = RatioGrid::from_samples(
+                    1000.0,
+                    0.2,
+                    (0..n).map(|k| 1.0 + slope * k as f64 * 0.2).collect(),
+                );
+                for k in 0..100 {
+                    let t = 1000.0 + (n - 1) as f64 * 0.2 * k as f64 / 100.0;
+                    assert!((g.at(t) - (1.0 + slope * (t - 1000.0))).abs() < 1e-14);
+                }
+            }
+        }
     }
 
     #[test]
