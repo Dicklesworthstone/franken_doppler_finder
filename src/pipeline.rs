@@ -1142,7 +1142,7 @@ fn measure_recording(
     let t = Instant::now();
     let dp = DetectParams::default();
     let (ls, lin) = detect::survey(x, sr, &dp)?;
-    let (dets, det_cut) = detect::detect_counted(&ls, &dp);
+    let (mut dets, det_cut, remaining_candidates) = detect::detect_counted_with_budget(&ls, &dp);
     let n_strong = dets
         .iter()
         .filter(|d| d.score >= dp.thr_db && d.harmonic_of.is_none())
@@ -1167,7 +1167,7 @@ fn measure_recording(
             if det_cut >= 2 * dp.max_detections { "+" } else { "" },
         ));
     }
-    let detect_s = t.elapsed().as_secs_f64();
+    let mut detect_s = t.elapsed().as_secs_f64();
     let t = Instant::now();
     let mp = MeasureParams::default();
     // Every primary from the silence line up is measured strongest first. Refused, duplicate
@@ -1206,10 +1206,88 @@ fn measure_recording(
             prim.len(),
         ));
     }
-    let added_ranks: std::collections::HashSet<String> = (0..events.len())
+    let mut added_ranks: std::collections::HashSet<String> = (0..events.len())
         .filter(|&k| past_the_old_line(k, prim[k], &events[k].detection, max_measured, dp.thr_db))
         .map(|k| format!("e{}", k + 1))
         .collect();
+    let mut recovery_detect_s = 0.0;
+    // A one-second survey can smear a steep, short pass beyond the fast templates' reach.
+    // Only retry recordings with no aircraft: appending another fit of an accepted pass can
+    // manufacture an independent event. Existing accepted measurements keep their exact path.
+    if !events.iter().any(MeasuredEvent::is_aircraft_like)
+        && dets.len() < dp.max_detections
+        && remaining_candidates > 0
+    {
+        log.say("no aircraft measured; checking recording edges with a shorter fast-pass survey");
+        let recovery_started = Instant::now();
+        let recovery = detect::recover_fast_edges(
+            x,
+            sr,
+            &dp,
+            dp.max_detections - dets.len(),
+            remaining_candidates,
+        );
+        recovery_detect_s = recovery_started.elapsed().as_secs_f64();
+        detect_s += recovery_detect_s;
+        match recovery {
+            Ok((mut recovered, recovery_cut)) => {
+                let first_detection = dets.len();
+                let recovered_count = recovered.len();
+                for d in &mut recovered {
+                    d.id += first_detection;
+                    d.harmonic_of = d.harmonic_of.map(|id| id + first_detection);
+                }
+                dets.extend(recovered);
+                let recovery_prim: Vec<&Detection> = dets[first_detection..]
+                    .iter()
+                    .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
+                    .collect();
+                let first_event = events.len();
+                let mut recovered_events = measure::measure_ranked_counted(
+                    recovery_prim.len(),
+                    max_measured,
+                    |ranks| {
+                        recovery_prim[ranks.clone()]
+                            .par_iter()
+                            .enumerate()
+                            .map(|(i, d)| {
+                                measure::measure_family(
+                                    x,
+                                    sr,
+                                    &lin,
+                                    d,
+                                    &dets,
+                                    &format!("e{}", first_event + ranks.start + i + 1),
+                                    &mp,
+                                )
+                            })
+                            .collect()
+                    },
+                    |events| search::independent_measured_events(events, 0.0).len(),
+                );
+                if recovery_prim.len() > recovered_events.len() {
+                    warnings.push(format!(
+                        "short-window fast-pass recovery measured {} of {} families, reaching the limit of {max_measured} independent aircraft events; the rest only mark passes as heard",
+                        recovered_events.len(), recovery_prim.len(),
+                    ));
+                }
+                // Provenance belongs to the recovery stage even if refinement lowers speed.
+                added_ranks.extend(recovered_events.iter().map(|e| e.id.clone()));
+                events.append(&mut recovered_events);
+                warnings.push(format!(
+                    "short-window fast-pass recovery: ordinary measurement found no aircraft; a shorter survey of the recording's true edges supplied {recovered_count} candidates within the remaining detection budget; all use the existing measurement gates and count as measured past the old line",
+                ));
+                if recovery_cut > 0 {
+                    warnings.push(format!(
+                        "short-window fast-pass recovery discarded at least {recovery_cut} candidate curves at the remaining detection limit; discarded curves neither explain events nor mark passes as heard",
+                    ));
+                }
+            }
+            Err(error) => warnings.push(format!(
+                "short-window fast-pass recovery failed: {error}; retaining the original measurements",
+            )),
+        }
+    }
     events.sort_by(|p, q| q.quality.score.total_cmp(&p.quality.score));
     let mut added = std::collections::HashSet::new();
     for (k, e) in events.iter_mut().enumerate() {
@@ -1220,7 +1298,7 @@ fn measure_recording(
         e.id = id;
     }
     log.say(&format!(
-        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, found only on the contrast image, from the fast bank, or recovered from a harmonic)",
+        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, found only on the contrast image, from the fast bank or shorter edge survey, or recovered from a harmonic)",
         added.len(),
         dp.thr_db
     ));
@@ -1251,7 +1329,7 @@ fn measure_recording(
             ));
         }
     }
-    let measure_s = t.elapsed().as_secs_f64();
+    let measure_s = (t.elapsed().as_secs_f64() - recovery_detect_s).max(0.0);
     if let Some(path) = survey_path {
         let _ = survey_png(&ls, &lin, &dets, &events, path);
     }
@@ -2525,6 +2603,183 @@ fn locate_with_clock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fast_edge_recording((f0, v, d, t0r): (f64, f64, f64, f64), amplitude: f64) -> Vec<f32> {
+        let (sr, c) = (4000.0, 343.0);
+        let t0e = t0r - d / c;
+        let mut seed = 4242u64;
+        (0..30 * 4000)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr;
+                let tau = physics::retarded_tau(t, t0e, v, d, c);
+                let range = physics::cv_radial(tau, v, d).0;
+                let source = amplitude * d / range * (std::f64::consts::TAU * f0 * tau).sin();
+                let noise = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+                (source + noise + 0.03 * (std::f64::consts::TAU * 250.0 * t).sin()) as f32
+            })
+            .collect()
+    }
+
+    fn assert_measurement_bookkeeping(measured: &AudioMeasurements) {
+        assert!(measured.detections.len() <= DetectParams::default().max_detections);
+        assert!(
+            search::independent_measured_events(&measured.events, 0.0).len()
+                <= measure::MAX_MEASURED
+        );
+        for (id, detection) in measured.detections.iter().enumerate() {
+            assert_eq!(detection.id, id);
+            if let Some(parent) = detection.harmonic_of {
+                assert!(parent < id);
+                assert!(measured.detections[parent].harmonic_of.is_none());
+            }
+        }
+        for (k, event) in measured.events.iter().enumerate() {
+            assert_eq!(event.id, format!("e{}", k + 1));
+            assert!(event.detection.id < measured.detections.len());
+        }
+        assert!(
+            measured
+                .added
+                .iter()
+                .all(|id| measured.events.iter().any(|event| &event.id == id))
+        );
+        assert!(measured.detect_s.is_finite() && measured.detect_s >= 0.0);
+        assert!(measured.measure_s.is_finite() && measured.measure_s >= 0.0);
+    }
+
+    #[test]
+    fn short_window_recovery_retains_fast_edge_passes_and_provenance() {
+        let dp = DetectParams::default();
+        let mp = MeasureParams::default();
+        for t0r in [19.37, 19.75] {
+            let x = fast_edge_recording((83.0, 245.0, 700.0, t0r), 0.32);
+            let (ls, lin) = detect::survey(&x, 4000, &dp).unwrap();
+            let ordinary = detect::detect(&ls, &dp);
+            let ordinary_events: Vec<_> = ordinary
+                .iter()
+                .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+                .map(|d| measure::measure_family(&x, 4000, &lin, d, &ordinary, "ordinary", &mp))
+                .collect();
+            assert!(ordinary_events.iter().all(|e| !e.is_aircraft_like()));
+            assert!(search::independent_measured_events(&ordinary_events, 0.0).is_empty());
+
+            let log = Log::new(true);
+            let measured = measure_recording(&x, 4000, &log, None).unwrap();
+            let independent = search::independent_measured_events(&measured.events, 0.0);
+            assert_eq!(
+                independent.len(),
+                1,
+                "late pass at {t0r}: {:?}",
+                log.lines()
+            );
+            let event = measured
+                .events
+                .iter()
+                .find(|event| event.id == independent[0].id)
+                .unwrap();
+            let best = event.fit.as_ref().unwrap().best;
+            eprintln!(
+                "short-window recovery at {t0r}: f0={:.9} Hz, speed={:.9} m/s, distance={:.9} m, heard CPA={:.9} s; detection={}, event={}, added={}",
+                best.f0,
+                best.v,
+                best.d,
+                best.t0r,
+                event.detection.id,
+                event.id,
+                measured.added.contains(&event.id),
+            );
+            assert!((best.f0 - 83.0).abs() < 0.3, "{best:?}");
+            assert!((best.t0r - t0r).abs() < 0.3, "{best:?}");
+            assert!((best.v - 245.0).abs() < 4.0, "{best:?}");
+            assert!((best.d / 700.0 - 1.0).abs() < 0.08, "{best:?}");
+            assert!(event.detection.id >= ordinary.len());
+            assert!(measured.added.contains(&event.id));
+            assert!(
+                measured
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("short-window fast-pass recovery"))
+            );
+            assert_measurement_bookkeeping(&measured);
+        }
+    }
+
+    #[test]
+    fn short_window_recovery_leaves_accepted_measurements_on_the_original_path() {
+        let x = fast_edge_recording((118.0, 215.0, 900.0, 10.13), 0.32);
+        let dp = DetectParams::default();
+        let (ls, _) = detect::survey(&x, 4000, &dp).unwrap();
+        let original_detections = detect::detect(&ls, &dp);
+        let measured = measure_recording(&x, 4000, &Log::new(true), None).unwrap();
+        let independent = search::independent_measured_events(&measured.events, 0.0);
+        assert_eq!(independent.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&measured.detections).unwrap(),
+            serde_json::to_value(original_detections).unwrap()
+        );
+        assert!(
+            measured
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("short-window fast-pass recovery"))
+        );
+        let event = measured
+            .events
+            .iter()
+            .find(|event| event.id == independent[0].id)
+            .unwrap();
+        let best = event.fit.as_ref().unwrap().best;
+        eprintln!("unchanged early accepted control: {best:?}");
+        assert!((best.f0 - 118.0).abs() < 0.3, "{best:?}");
+        assert!((best.t0r - 10.13).abs() < 0.3, "{best:?}");
+        assert!((best.v - 215.0).abs() < 4.0, "{best:?}");
+        assert!((best.d / 900.0 - 1.0).abs() < 0.08, "{best:?}");
+        assert_measurement_bookkeeping(&measured);
+    }
+
+    #[test]
+    fn short_window_recovery_does_not_invent_aircraft_from_null_audio() {
+        let pass = (83.0, 245.0, 700.0, 19.37);
+        let noise = fast_edge_recording(pass, 0.0);
+        let tone: Vec<_> = noise
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                x + (0.4 * (std::f64::consts::TAU * 118.0 * i as f64 / 4000.0).sin()) as f32
+            })
+            .collect();
+        let mut reversed = fast_edge_recording(pass, 0.32);
+        reversed.reverse();
+        for (label, x) in [
+            ("noise", noise),
+            ("steady tone", tone),
+            ("reversed", reversed),
+        ] {
+            let log = Log::new(true);
+            let measured = measure_recording(&x, 4000, &log, None).unwrap();
+            eprintln!(
+                "short-window null {label}: {} detections, {} independent aircraft",
+                measured.detections.len(),
+                search::independent_measured_events(&measured.events, 0.0).len(),
+            );
+            assert!(
+                measured
+                    .events
+                    .iter()
+                    .all(|event| !event.is_aircraft_like()),
+                "{label}: {:?}",
+                log.lines()
+            );
+            assert!(
+                search::independent_measured_events(&measured.events, 0.0).is_empty(),
+                "{label}"
+            );
+            assert_measurement_bookkeeping(&measured);
+        }
+    }
 
     fn test_weather(source: &str, t_c: f64, winds_aloft: bool) -> fdop_data::Weather {
         use fdop_types::atmo::{GriddedAtmosphere, standard_levels};

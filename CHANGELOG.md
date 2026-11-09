@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover short fast passes after ordinary recording measurement finds no aircraft
+
+- Give `locate` one half-second survey of the real recording edges only after every ordinary
+  family fails aircraft selection. The fast edge bank uses the existing strong line and at most
+  48 seconds from each end; overlapping crops are merged and internal crop seams cannot create
+  eligible recording edges. Original accepted recordings retain their analysis unchanged.
+- Carry forward the ordinary detector's unused 400,000 candidate-cell allowance and remaining
+  detection slots. Preserve the combined three-times-cap acceptance stop, residual ownership,
+  harmonic families and final 60-detection limit. The ordinary detector API and stage output remain
+  available unchanged; its last contrast stage now debits the budget exposed to this retry.
+- Refine and measure recovered seeds with the original linear survey and existing physical gates.
+  Preserve the 24-independent-aircraft measurement limit, rebase detection/family IDs together,
+  retain every recovery event's expanded-search provenance after event sorting, and report the
+  fallback and any cut. No detection, measurement or confidence threshold is lowered.
+- Five native checks of the complete production recording-measurement routine pass against the
+  rebuilt actual core. Two fixed 30-second PCM cases go from zero to one independent aircraft,
+  recovering the 245 m/s, 700 m pass within the existing physical tolerances. Noise, steady tone
+  and reversed audio stay empty. Accurate and previously inaccurate accepted controls remain
+  byte-identical to the immutable original routine, avoiding the naive scan's duplicate aircraft.
+  These checks include original-survey refinement, IDs, family links, caps, warnings and expanded
+  provenance. Full application/workspace checks and real-recording replay remain uncompleted.
+- Six focused native core checks pass: four recovery regressions, contrast-edge budget/coherence,
+  and original fast-stage ordering/cap preservation. The 180-second tail control checks exact
+  crop-to-recording coordinate equivalence and continued refusal; its longer normalization context
+  does not supply an accepted measurement, so no long-recording recovery is claimed.
+- Core library/test Clippy passes with warnings denied, changed-file formatting and whitespace
+  checks pass, and UBS reports no critical finding. The unchanged production engine selftest,
+  freshly relinked to the complete core, repeats both intended flights, four events, 1.673779 m
+  position error, 75 m radius and +0.019586 s clock error. Existing unrelated red tests remain separate.
+
 ### Recover narrow trace-search regions between sampled flight moments
 
 - Detect when consecutive closest-approach lines skip the entire requested geographic box.

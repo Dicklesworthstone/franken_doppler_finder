@@ -1087,6 +1087,16 @@ Design notes:
   recovery with no baseline event; it does not establish recovery of a real field miss. The new
   fast-edge PCM recovery assertion still fails in the native baseline: its early 215 m/s case adds
   no fast-edge seed. The contrast-edge change does not repair or weaken that separate assertion (Testing).
+- **`locate` retries a recording with no measured aircraft using a shorter edge survey.** A steep
+  fast pass can smear across frequency in the ordinary one-second survey. If every ordinary
+  family fails aircraft selection, a half-second survey searches only fast edge templates at the
+  recording's true ends, using at most 48 seconds of audio from each end. Crop seams cannot supply
+  artificial edge detections. The retry shares the remaining candidate allowance and 60 detection
+  slots, uses the same strong line, and sends its seeds through ordinary refinement, family
+  measurement and independent-event selection with the same 24-aircraft limit. Every retry event
+  counts as measured past the old line, including one whose fitted speed falls. A warning records
+  the retry and any detection cut. A recording with an already accepted aircraft keeps its original
+  analysis; this recovery does not search for additional passes in such recordings.
 - **STFT working storage stays bounded as recordings grow.** Frames transform into a reusable block of
   at most 256 columns and 4 MiB of frequency values, then copy into the final row-major spectrogram.
   A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
@@ -1385,6 +1395,38 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Fast edge recovery after empty recording measurement (2026-11-09)
+
+Five native checks execute the complete production recording-measurement routine against the
+fresh, complete core and locked numerical dependencies. Two fixed 30-second PCM recordings have
+zero aircraft on the original routine and exactly one independent aircraft after the shorter
+edge survey, with the original one-second image still used for refinement and measurement:
+
+| Synthetic truth: 83 Hz, 245 m/s, 700 m | Recovered tone (Hz) | Speed (m/s) | Distance (m) | Received CPA (s) |
+|---|---:|---:|---:|---:|
+| CPA 19.37 s | 82.986035 | 245.024777 | 701.630478 | 19.376120 |
+| CPA 19.75 s | 83.002345 | 244.998950 | 700.216656 | 19.750013 |
+
+Noise, a steady tone and reversed audio remain at zero detections and zero aircraft in the full
+routine. Two already accepted recordings retain byte-identical detections, events, provenance and
+warnings against the immutable prior routine. That includes the known inaccurate single-source
+fit which a naive supplemental scan had turned into two independent aircraft. The new guard leaves
+that existing measurement unchanged; it does not repair its inaccurate geometry. Recovery warnings,
+family links, event renumbering, expanded-search provenance and both output caps are checked.
+
+Six focused native core checks also pass, covering recovery, candidate accounting, crop seams,
+absolute tail times, and preservation of the existing fast stages and cap. The 180-second control
+returns exactly the local edge crop's coarse detections translated into recording time, but its
+longer normalization context still fails physical measurement. It remains a refusal; this change
+does not establish accurate recovery for that longer recording. The fresh production engine
+selftest retains both intended flights, four events, 1.673779 m error, a 75 m radius and +0.019586 s
+clock error, identical to its prior baseline. Core library/test Clippy passes with warnings denied.
+
+These are native audio-analysis component results, including the exact production function and its
+repository tests, with no replacement algorithms. They do not establish a new two-flight location,
+faint-pass recovery or field accuracy. Full application/workspace validation remains blocked in
+unchanged `asupersync`; reference, wrong-date and field recordings were not replayed.
 
 ### Local raw vertices improve accepted-aircraft measurements (2026-11-08)
 

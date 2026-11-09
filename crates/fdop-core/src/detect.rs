@@ -572,18 +572,39 @@ pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
 /// [`detect`], plus how many accepted candidates the cap `p.max_detections` cut. The count is a
 /// lower bound when the scan stopped at three times the cap.
 pub fn detect_counted(ls: &LogSpec, p: &DetectParams) -> (Vec<Detection>, usize) {
-    detect_counted_impl(ls, p, true)
+    let (detections, cut, _) = detect_counted_with_budget(ls, p);
+    (detections, cut)
+}
+
+/// [`detect_counted`], also returning the unused part of the shared 400,000 candidate-cell
+/// allowance. A later recovery scan must use this allowance rather than start another scan
+/// budget. This does not change the ordinary stage order or any accepted detection.
+pub fn detect_counted_with_budget(
+    ls: &LogSpec,
+    p: &DetectParams,
+) -> (Vec<Detection>, usize, usize) {
+    detect_with_budget_impl(ls, p, true)
 }
 
 // Keep the complete original stage sequence available for output-equivalence tests.
+#[cfg(test)]
 fn detect_counted_impl(
     ls: &LogSpec,
     p: &DetectParams,
     recover_contrast_edges: bool,
 ) -> (Vec<Detection>, usize) {
+    let (detections, cut, _) = detect_with_budget_impl(ls, p, recover_contrast_edges);
+    (detections, cut)
+}
+
+fn detect_with_budget_impl(
+    ls: &LogSpec,
+    p: &DetectParams,
+    recover_contrast_edges: bool,
+) -> (Vec<Detection>, usize, usize) {
     let (nt, nr) = (ls.nt(), ls.nr());
     if nt < 8 || nr < 8 {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, 400_000);
     }
     let tmpls = build_templates(p, ls.hop_s);
     let mut lp = ls.data.clone();
@@ -795,6 +816,7 @@ fn detect_counted_impl(
         cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
         // This last stage can consume only what the shared candidate budget left.
         cand.truncate(remaining_candidates);
+        remaining_candidates -= cand.len();
         let before = out.len();
         let room = p.max_detections - before;
         // A short sparse path can join unrelated peaks while the intervening frames hold
@@ -848,7 +870,130 @@ fn detect_counted_impl(
         d.id = i;
     }
     group_harmonics(&mut out, p);
-    (out, cut)
+    (out, cut, remaining_candidates)
+}
+
+/// Try a half-second survey for fast passes clipped by a recording end. Call this only when
+/// every ordinary measurement was refused: rejected slow seeds must not mask the faster
+/// ridge, but an already accepted event must keep its original measurement and family.
+///
+/// At most 48 seconds from each real recording end are surveyed. Only fast edge templates
+/// score, at the existing strong line, and crop seams cannot become artificial recording
+/// ends. `slots` is the room left by the ordinary detections; `remaining_candidates` must
+/// come from [`detect_counted_with_budget`]. The returned IDs and harmonic references start
+/// at zero and must be rebased when appending. The ordinary linear survey remains the input
+/// to refinement and measurement, with all their existing gates.
+pub fn recover_fast_edges(
+    x: &[f32],
+    sr: u32,
+    p: &DetectParams,
+    slots: usize,
+    mut remaining_candidates: usize,
+) -> Result<(Vec<Detection>, usize), String> {
+    let slots = slots.min(p.max_detections);
+    if slots == 0 || remaining_candidates == 0 || !p.fast_templates {
+        return Ok((Vec::new(), 0));
+    }
+    let short = DetectParams {
+        win_s: 0.5,
+        hop_s: 0.5,
+        ..p.clone()
+    };
+    let templates = build_fast_edge_templates(&short, short.hop_s);
+    if templates.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let base_half = p.min_half_s.min(p.max_half_s);
+    let edge_samples = ((2.0 * base_half).min(48.0) * f64::from(sr)) as usize;
+    if edge_samples == 0 || x.len() < (short.win_s * f64::from(sr)) as usize {
+        return Ok((Vec::new(), 0));
+    }
+    let chunks = if x.len() <= 2 * edge_samples {
+        vec![(0, x.len())]
+    } else {
+        vec![(0, edge_samples), (x.len() - edge_samples, x.len())]
+    };
+    // With spare detection slots the ordinary stages never truncated accepted candidates,
+    // so max_detections - slots is also their accepted count. Preserve the combined 3x stop.
+    let accepted_limit = p.max_detections * 3 - (p.max_detections - slots);
+    let threshold = p.thr_db.max(p.thr_silence_db);
+    let mut out = Vec::new();
+    for (start, end) in chunks {
+        if remaining_candidates == 0 || out.len() >= accepted_limit {
+            break;
+        }
+        let (mut ls, _) = survey(&x[start..end], sr, &short)?;
+        for t in &mut ls.t {
+            *t += start as f64 / f64::from(sr);
+        }
+        let (nt, nr) = (ls.nt(), ls.nr());
+        if nt < 8 || nr < 8 {
+            continue;
+        }
+        let windows = recovery_edge_windows(&ls, start == 0, end == x.len(), base_half);
+        let (bs, bi) = score_bank(&ls, &templates, &ls.data, &windows);
+        let mut cand: Vec<_> = (0..nr * nt)
+            .filter(|&k| bs[k] as f64 >= threshold)
+            .collect();
+        cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
+        cand.truncate(remaining_candidates);
+        remaining_candidates -= cand.len();
+        let mut known = vec![false; nr * nt];
+        for k in cand {
+            if out.len() >= accepted_limit {
+                break;
+            }
+            accept_candidates(
+                &ls,
+                &short,
+                &templates,
+                (&bs, &bi),
+                &[k],
+                threshold,
+                &mut known,
+                &mut out,
+            );
+        }
+    }
+    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let cut = out.len().saturating_sub(slots);
+    out.truncate(slots);
+    for (id, detection) in out.iter_mut().enumerate() {
+        detection.id = id;
+    }
+    group_harmonics(&mut out, p);
+    Ok((out, cut))
+}
+
+/// A cropped edge keeps the complete base-template context toward the recording interior.
+/// Its other boundary is a crop seam, so no candidate there is eligible for edge recovery.
+fn recovery_edge_windows(
+    ls: &LogSpec,
+    at_start: bool,
+    at_end: bool,
+    base_half: f64,
+) -> Vec<(usize, usize)> {
+    let nt = ls.nt();
+    let first = ls.t[0];
+    let last = ls.t[nt - 1];
+    let head = if at_start {
+        ls.t.partition_point(|&t| t - first < base_half && (at_end || t + base_half <= last))
+    } else {
+        0
+    };
+    let tail = if at_end {
+        ls.t.partition_point(|&t| last - t >= base_half || (!at_start && t - base_half < first))
+    } else {
+        nt
+    };
+    if tail <= head {
+        vec![(0, nt)]
+    } else {
+        [(0, head), (tail, nt)]
+            .into_iter()
+            .filter(|(a, b)| a < b)
+            .collect()
+    }
 }
 
 /// Require one coherent curve between a short contrast seed's sparse samples. Keep its
@@ -1374,6 +1519,164 @@ mod tests {
     }
 
     #[test]
+    fn fast_edge_recovery_windows_exclude_crop_seams() {
+        let scene = |offset, frames| LogSpec {
+            t: (0..frames)
+                .map(|i| offset + 0.25 + 0.5 * i as f64)
+                .collect(),
+            freqs: Vec::new(),
+            data: Vec::new(),
+            bins_per_octave: 48,
+            hop_s: 0.5,
+            scale: 1.0,
+            gain: 1.0,
+            contrast: None,
+        };
+        let head = scene(0.0, 96);
+        let tail = scene(132.0, 96);
+        assert_eq!(
+            recovery_edge_windows(&head, true, false, 24.0),
+            vec![(0, 48)]
+        );
+        assert_eq!(
+            recovery_edge_windows(&tail, false, true, 24.0),
+            vec![(48, 96)]
+        );
+        assert!(recovery_edge_windows(&head, false, false, 24.0).is_empty());
+        assert_eq!(
+            recovery_edge_windows(&scene(0.0, 60), true, true, 24.0),
+            vec![(0, 60)]
+        );
+        // Overlapping edge crops use one survey, with the middle still ineligible.
+        assert_eq!(
+            recovery_edge_windows(&scene(0.0, 140), true, true, 24.0),
+            vec![(0, 48), (92, 140)]
+        );
+    }
+
+    #[test]
+    fn fast_edge_recovery_restores_refused_passes_with_the_original_survey() {
+        let p = DetectParams::default();
+        for t0r in [19.37, 19.75] {
+            let pass = (83.0, 245.0, 700.0, t0r);
+            let mut x = fast_pass_scene(pass, 0.32);
+            x.truncate(30 * 4000);
+            let (ls, lin) = survey(&x, 4000, &p).unwrap();
+            let (ordinary, cut, budget) = detect_counted_with_budget(&ls, &p);
+            assert_eq!(cut, 0);
+            assert!(budget > 0 && budget < 400_000);
+            assert_eq!(
+                serde_json::to_value((&ordinary, cut)).unwrap(),
+                serde_json::to_value(detect_counted(&ls, &p)).unwrap()
+            );
+            let old = measure_edge_families(&x, &lin, &ordinary);
+            assert!(old.iter().all(|event| !event.is_aircraft_like()));
+            let slots = p.max_detections - ordinary.len();
+            assert!(
+                recover_fast_edges(&x, 4000, &p, 0, budget)
+                    .unwrap()
+                    .0
+                    .is_empty()
+            );
+            assert!(
+                recover_fast_edges(&x, 4000, &p, slots, 0)
+                    .unwrap()
+                    .0
+                    .is_empty()
+            );
+            let (added, cut) = recover_fast_edges(&x, 4000, &p, slots, budget).unwrap();
+            assert_eq!(cut, 0);
+            assert!(!added.is_empty() && added.len() <= slots);
+            for (id, seed) in added.iter().enumerate() {
+                assert_eq!(seed.id, id);
+                assert!(seed.harmonic_of.is_none_or(|parent| parent < id));
+                assert!(seed.v > PRIMARY_MAX_SPEED_MPS && seed.v <= 0.8 * p.c);
+                assert!(seed.score >= p.thr_db.max(p.thr_silence_db));
+                assert_eq!(seed.half_s, p.edge_half_s);
+                assert!(!seed.from_contrast);
+            }
+            // Refinement must use the ORIGINAL one-second linear image, exactly as locate
+            // does; the new survey supplies coarse seeds, never different measurement gates.
+            let mut events = old;
+            events.extend(measure_edge_families(&x, &lin, &added));
+            let independent = crate::search::independent_measured_events(&events, 0.0);
+            assert_eq!(independent.len(), 1, "{t0r}: {added:?}");
+            let event = events
+                .iter()
+                .find(|event| event.is_aircraft_like())
+                .unwrap();
+            let b = event.fit.as_ref().unwrap().best;
+            eprintln!("half-second fast edge {t0r}: {b:?}; {:?}", event.quality);
+            assert!((b.f0 - pass.0).abs() < 0.3, "{b:?}");
+            assert!((b.v - pass.1).abs() < 4.0, "{b:?}");
+            assert!((b.d / pass.2 - 1.0).abs() < 0.08, "{b:?}");
+            assert!((b.t0r - pass.3).abs() < 0.3, "{b:?}");
+            let limited = recover_fast_edges(&x, 4000, &p, 1, 1).unwrap();
+            assert!(limited.0.len() <= 1 && limited.1 == 0);
+        }
+    }
+
+    #[test]
+    fn fast_edge_recovery_keeps_absolute_tail_coordinates() {
+        let p = DetectParams::default();
+        let pass = (83.0, 245.0, 700.0, 169.37);
+        let x = fast_pass_scene(pass, 0.32);
+        let (_, lin) = survey(&x, 4000, &p).unwrap();
+        let (added, cut) = recover_fast_edges(&x, 4000, &p, p.max_detections, 400_000).unwrap();
+        assert_eq!(cut, 0);
+        assert!(!added.is_empty());
+        assert!(added.iter().all(|seed| seed.t0r > 156.0));
+        // The last 48 seconds have exactly the same image in local and recording time.
+        // Compare every coarse field, including scores, IDs and harmonic references.
+        let (mut local, local_cut) =
+            recover_fast_edges(&x[132 * 4000..], 4000, &p, p.max_detections, 400_000).unwrap();
+        for seed in &mut local {
+            seed.t0r += 132.0;
+        }
+        assert_eq!(
+            serde_json::to_value((&added, cut)).unwrap(),
+            serde_json::to_value((&local, local_cut)).unwrap()
+        );
+        // This longer context changes row normalization and does not yet supply an accurate
+        // measured event. Coordinate preservation must not be mistaken for a recovery claim.
+        let events = measure_edge_families(&x, &lin, &added);
+        assert!(events.iter().all(|event| !event.is_aircraft_like()));
+        assert!(crate::search::independent_measured_events(&events, 0.0).is_empty());
+    }
+
+    #[test]
+    fn fast_edge_recovery_refuses_noise_tones_and_reversed_passes() {
+        let pass = (83.0, 245.0, 700.0, 19.37);
+        let mut noise = fast_pass_scene(pass, 0.0);
+        noise.truncate(30 * 4000);
+        let mut steady = noise.clone();
+        for (i, sample) in steady.iter_mut().enumerate() {
+            *sample += (0.32 * (std::f64::consts::TAU * 83.0 * i as f64 / 4000.0).sin()) as f32;
+        }
+        let mut reversed = fast_pass_scene(pass, 0.32);
+        reversed.truncate(30 * 4000);
+        reversed.reverse();
+        let p = DetectParams::default();
+        for (label, x) in [
+            ("noise and hum", noise),
+            ("steady tone", steady),
+            ("reversed", reversed),
+        ] {
+            let (_, lin) = survey(&x, 4000, &p).unwrap();
+            let (added, _) = recover_fast_edges(&x, 4000, &p, p.max_detections, 400_000).unwrap();
+            let events = measure_edge_families(&x, &lin, &added);
+            assert!(
+                events.iter().all(|event| !event.is_aircraft_like()),
+                "{label}: {added:?}"
+            );
+            assert!(
+                crate::search::independent_measured_events(&events, 0.0).is_empty(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn contrast_edges_require_support_between_the_bank_samples() {
         let (v, d) = (90.0, 900.0);
         for hop_s in [0.5, 1.0] {
@@ -1416,10 +1719,16 @@ mod tests {
                     contrast: Some(contrast),
                 }
             };
-            let continuous = detect(&scene(false), &p);
+            let continuous_image = scene(false);
+            let (continuous, _, remaining) = detect_counted_with_budget(&continuous_image, &p);
             assert_eq!(continuous.len(), 1, "hop {hop_s}: {continuous:?}");
             assert!(continuous[0].from_contrast);
             assert_eq!(continuous[0].half_s, p.edge_half_s);
+            let (_, _, before_edge) = detect_with_budget_impl(&continuous_image, &p, false);
+            assert!(
+                remaining < before_edge,
+                "contrast edges did not consume the shared budget"
+            );
 
             // The two images agree at every sample of the winning sparse template. Its
             // score still clears the strong line, but the second image has no ridge between
@@ -1624,10 +1933,7 @@ mod tests {
         };
         // Thirty seconds cannot cover both halves of any full-length template. Keep
         // enough audio on either side for the unchanged eight-second measurement gate.
-        for pass @ (f0, v, d, t0r) in [
-            (118.0, 215.0, 900.0, 10.13),
-            (83.0, 245.0, 700.0, 19.37),
-        ] {
+        for pass @ (f0, v, d, t0r) in [(118.0, 215.0, 900.0, 10.13), (83.0, 245.0, 700.0, 19.37)] {
             let mut recovered = 0;
             // A complete attenuation ladder: measure every new fast seed, not a case
             // chosen after looking at its fit. At least one real recovery per end is required.
@@ -1677,7 +1983,10 @@ mod tests {
                 assert!((b.d / d - 1.0).abs() < 0.08, "v={v} t={t0r}: {b:?}");
                 recovered += 1;
             }
-            assert!(recovered > 0, "no fast edge pass recovered at v={v}, t={t0r}");
+            assert!(
+                recovered > 0,
+                "no fast edge pass recovered at v={v}, t={t0r}"
+            );
         }
     }
 
@@ -1691,7 +2000,9 @@ mod tests {
         let tone: Vec<_> = noise
             .iter()
             .enumerate()
-            .map(|(i, &x)| x + (0.4 * (std::f64::consts::TAU * 118.0 * i as f64 / 4000.0).sin()) as f32)
+            .map(|(i, &x)| {
+                x + (0.4 * (std::f64::consts::TAU * 118.0 * i as f64 / 4000.0).sin()) as f32
+            })
             .collect();
         let mut cases = vec![("noise and hum", noise), ("steady tone", tone)];
         for (label, pass) in [("early reversed", early), ("late reversed", late)] {
