@@ -476,14 +476,10 @@ fn curve_match_skip_reason(
     })
 }
 
-/// A failed trace is not a failed metadata window: the independent curve match can still
-/// locate passes whose ridges could not be measured. Only widen once both have had a chance.
-fn metadata_needs_fallback(
-    meta_window: bool,
-    trace_has_candidate: bool,
-    curve: Option<&curvematch::CurveVerdict>,
-) -> bool {
-    meta_window && !trace_has_candidate && !curve.is_some_and(|v| v.stands)
+/// Metadata is only a hint: a chance trace candidate must not hide the rest of the dates.
+/// Judge both searches and the decoy clocks before deciding whether that hint located anything.
+fn metadata_needs_fallback(meta_window: bool, confidence: &str) -> bool {
+    meta_window && !matches!(confidence, "high" | "medium")
 }
 
 /// Where the clock window the curve match searched came from.
@@ -625,6 +621,141 @@ fn leans_on_added(
         && call == CurveCall::Silent
         && !judged
         && core_events.iter().any(|id| added.contains(*id))
+}
+
+/// The same assessment decides whether to keep a metadata clock and grades the final report.
+/// Keeping these decisions together prevents a rejected candidate from blocking a wider search.
+struct AnswerAssessment {
+    trace_confidence: &'static str,
+    confidence: &'static str,
+    call: CurveCall,
+    unchecked: bool,
+    lock_ok: bool,
+    n_core: usize,
+    lat: f64,
+    lon: f64,
+    radius: f64,
+    radius_basis: String,
+    radius_unresolved: bool,
+    evidence: Option<f64>,
+    decoy_gate: Option<(bool, String)>,
+}
+
+impl AnswerAssessment {
+    fn new(
+        res: &search::SearchResult,
+        events: &[search::SearchEvent],
+        curve: Option<&curvematch::CurveVerdict>,
+        judged: bool,
+        added: &std::collections::HashSet<String>,
+    ) -> Self {
+        let mut answer = Self {
+            trace_confidence: "none",
+            confidence: "none",
+            call: CurveCall::Silent,
+            unchecked: false,
+            lock_ok: false,
+            n_core: 0,
+            lat: f64::NAN,
+            lon: f64::NAN,
+            radius: f64::NAN,
+            radius_basis: "no candidate".into(),
+            radius_unresolved: true,
+            evidence: None,
+            decoy_gate: None,
+        };
+        let trace_at = res.candidates.first().map(|top| {
+            if let Some(r) = &res.refine {
+                (answer.lat, answer.lon, answer.radius) = (r.lat, r.lon, r.radius_m);
+                answer.radius_basis = r.radius_basis.clone();
+                answer.radius_unresolved = r.radius_lower_bound || r.region_cells == 0;
+            } else {
+                (answer.lat, answer.lon, answer.radius) = (top.lat, top.lon, 300.0);
+                answer.radius_basis =
+                    "fine-grid winner (refinement unavailable); nominal 300 m".into();
+            }
+            answer.n_core = top.events.iter().filter(|m| m.core).count();
+            answer.lock_ok = top.events.iter().all(|m| {
+                let tol = events
+                    .iter()
+                    .find(|e| e.id == m.event)
+                    .map_or(4.0, search::lock_tol);
+                m.dt_free.is_none_or(|d| d.abs() <= tol)
+            });
+            answer.evidence = Some(
+                if res
+                    .margin
+                    .get("margin_nats")
+                    .and_then(|v| v.as_f64())
+                    .is_some()
+                {
+                    res.margin
+                        .get("margin_top_score")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(top.score)
+                } else {
+                    top.score
+                },
+            );
+            answer.trace_confidence = if answer.n_core >= 2
+                && answer.lock_ok
+                && res.margin_passes(6.0)
+                && top.unheard_close_passes.is_empty()
+                && answer.radius <= 1000.0
+                && !answer.radius_unresolved
+            {
+                "high"
+            } else if answer.n_core >= 2 && answer.lock_ok && res.margin_passes(3.0) {
+                "medium"
+            } else {
+                "low"
+            };
+            (answer.lat, answer.lon)
+        });
+        answer.call = curve_call(answer.trace_confidence, trace_at, curve, judged);
+        let core_ids: Vec<&str> = res
+            .candidates
+            .first()
+            .into_iter()
+            .flat_map(|top| &top.events)
+            .filter(|m| m.core)
+            .map(|m| m.event.as_str())
+            .collect();
+        answer.unchecked = leans_on_added(
+            answer.trace_confidence,
+            answer.call,
+            judged,
+            &core_ids,
+            added,
+        );
+        answer.confidence = match answer.call {
+            CurveCall::Adopts | CurveCall::Confirms => "medium",
+            CurveCall::Conflicts | CurveCall::Unsupported => "low",
+            CurveCall::Silent if answer.unchecked => "low",
+            _ => answer.trace_confidence,
+        };
+        answer
+    }
+
+    fn apply_decoys(&mut self, gate: (bool, String)) {
+        if !gate.0 {
+            self.confidence = "low";
+        }
+        self.decoy_gate = Some(gate);
+    }
+
+    /// Publication clipping can leave the full dates no wider than the metadata attempt.
+    /// Repeating that clock without its decoy gate would turn a failed check into an answer.
+    fn retries_metadata(
+        &self,
+        meta_window: bool,
+        searched: (f64, f64),
+        permitted: (f64, f64),
+    ) -> bool {
+        metadata_needs_fallback(meta_window, self.confidence)
+            && permitted.0 <= permitted.1
+            && (permitted.0 < searched.0 || permitted.1 > searched.1)
+    }
 }
 
 /// Radius of a trace answer the curve match confirms. The curve match's radius is the spread of its
@@ -1334,7 +1465,7 @@ fn locate_with_clock(
         log.say(&format!("curve match skipped: {why}"));
     }
     let t = Instant::now();
-    let curve_image = if a.curve_match && curve_skip.is_none() {
+    let mut curve_image = if a.curve_match && curve_skip.is_none() {
         match curvematch::build_image(&x, a.sr, &curve_params) {
             Ok(im) => Some(im),
             Err(e) => {
@@ -1457,7 +1588,7 @@ fn locate_with_clock(
     let (mut weather_fetch_s, mut weather_wait_s, mut search_s) = (0.0, 0.0, 0.0);
     let mut curve_match_s = curve_image_s;
     let mut curve = None;
-    let (tracks, atmo, has_wind, sevs, res) = loop {
+    let (tracks, atmo, has_wind, sevs, res, assessment) = loop {
         // ---- ADS-B for this attempt ------------------------------------------------------
         let spec = archive.track_spec(fetch_box, dur, geoid_n);
         log.say(&format!(
@@ -1585,20 +1716,90 @@ fn locate_with_clock(
             };
             curve_match_s += t.elapsed().as_secs_f64();
         }
-        let verdict = curve.as_ref().and_then(curvematch::verdict);
-        if metadata_needs_fallback(meta_window, !res.candidates.is_empty(), verdict.as_ref()) {
-            log.say("neither search located the recording inside the metadata window; widening to the full date window");
-            warnings.push(
-                "creation_time window gave no trace candidate or standing curve match; the full date window was searched. A curve match in the metadata window does not judge the wider search".into(),
-            );
-            meta_window = false;
-            metadata_fallback = true;
-            archive = published_start_window(a, full_window, dur, now(), &mut warnings)?;
-            weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
-            log.say(&describe_window(&archive, false, true));
-            continue;
+        if !meta_window {
+            // This attempt cannot retry. Release the whole-recording images before the
+            // trace-only decoys, as the report path did before grading moved into this loop.
+            curve_image = None;
         }
-        break (tracks, atmo, has_wind, sevs, res);
+        let verdict = curve.as_ref().and_then(curvematch::verdict);
+        let curve_judged = curve
+            .as_ref()
+            .is_some_and(|r| curve_judges_window(curve_clock, archive.clock, r.decoys.len()));
+        let mut assessment = AnswerAssessment::new(
+            &res,
+            &sevs,
+            verdict.as_ref().filter(|_| curve_clock == archive.clock),
+            curve_judged,
+            added,
+        );
+        // Grade the metadata attempt completely before accepting its clock. Decoys can
+        // reject a provisional high answer too, and must then leave the full dates available.
+        let decoy_window = match given_start {
+            Some(t0) => Some((t0, a.clock_tol_s)),
+            None if meta_window => Some((
+                0.5 * (archive.clock.0 + archive.clock.1),
+                0.5 * (archive.clock.1 - archive.clock.0),
+            )),
+            None => None,
+        };
+        if !decoy
+            && assessment.call != CurveCall::Adopts
+            && matches!(assessment.confidence, "high" | "medium")
+            && let (Some(window), Some(evidence)) = (decoy_window, assessment.evidence)
+        {
+            let t = Instant::now();
+            let runs = decoy_clock_runs(
+                a,
+                now,
+                window,
+                start_window(d0, d1, region.utc_offset_h),
+                &run_dir,
+                log,
+                &PreparedRecording {
+                    info: &info,
+                    duration_s: dur,
+                    low_band_warning: low_band.as_deref(),
+                    measurements,
+                },
+            );
+            timings.insert("decoy_clocks_s".into(), json!(t.elapsed().as_secs_f64()));
+            let gate = decoy_gate(evidence, &runs);
+            log.say(&format!("decoy clocks: {}", gate.1));
+            assessment.apply_decoys(gate);
+        }
+        if metadata_needs_fallback(meta_window, assessment.confidence) {
+            let mut fallback_warnings = Vec::new();
+            let fallback =
+                published_start_window(a, full_window, dur, now(), &mut fallback_warnings)?;
+            if assessment.retries_metadata(meta_window, archive.clock, fallback.clock) {
+                let why = format!(
+                    "creation_time window gave {} confidence{}; the full date window was searched. A curve match in the metadata window does not judge the wider search",
+                    assessment.confidence,
+                    assessment
+                        .decoy_gate
+                        .as_ref()
+                        .map_or_else(String::new, |(_, why)| {
+                            format!(" after the decoy-clock check ({why})")
+                        }),
+                );
+                log.say(&why);
+                warnings.push(why);
+                warnings.extend(fallback_warnings);
+                meta_window = false;
+                metadata_fallback = true;
+                archive = fallback;
+                weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
+                log.say(&describe_window(&archive, false, true));
+                continue;
+            }
+            let why = format!(
+                "creation_time window gave {} confidence; the available full date window adds no recording start times, so the existing checks and grade were kept",
+                assessment.confidence
+            );
+            log.say(&why);
+            warnings.push(why);
+        }
+        break (tracks, atmo, has_wind, sevs, res, assessment);
     };
     drop(curve_image);
     let curve_verdict = curve.as_ref().and_then(curvematch::verdict);
@@ -1778,41 +1979,15 @@ fn locate_with_clock(
     };
     if found {
         let top = &res.candidates[0];
-        let (lat, lon, radius, basis, radius_unresolved) = match &res.refine {
-            Some(r) => (
-                r.lat,
-                r.lon,
-                r.radius_m,
-                r.radius_basis.clone(),
-                r.radius_lower_bound || r.region_cells == 0,
-            ),
-            None => (
-                top.lat,
-                top.lon,
-                300.0,
-                "fine-grid winner (refinement unavailable); nominal 300 m".into(),
-                true,
-            ),
-        };
+        let (lat, lon, radius) = (assessment.lat, assessment.lon, assessment.radius);
+        let (basis, radius_unresolved) = (
+            assessment.radius_basis.clone(),
+            assessment.radius_unresolved,
+        );
         let margin_nats = res.margin.get("margin_nats").and_then(|v| v.as_f64());
         let alt_km = res.margin.get("next_distinct_km").and_then(|v| v.as_f64());
-        let evidence = match margin_nats {
-            Some(_) => res
-                .margin
-                .get("margin_top_score")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(top.score),
-            None => top.score,
-        };
-        trace_evidence = Some(evidence);
-        let lock_ok = top.events.iter().all(|m| {
-            let tol = sevs
-                .iter()
-                .find(|e| e.id == m.event)
-                .map_or(4.0, search::lock_tol);
-            m.dt_free.is_none_or(|d| d.abs() <= tol)
-        });
-        let n_core = top.events.iter().filter(|m| m.core).count();
+        trace_evidence = assessment.evidence;
+        let (lock_ok, n_core) = (assessment.lock_ok, assessment.n_core);
         let gates = vec![
             (
                 "core matches".to_string(),
@@ -1923,26 +2098,15 @@ fn locate_with_clock(
                 },
             ),
         ];
-        let passed = gates.iter().filter(|g| g.1).count();
-        let confidence = if passed == gates.len() {
-            "high"
-        } else if n_core >= 2 && gates[1].1 && res.margin_passes(3.0) {
-            "medium"
-        } else {
-            "low"
-        };
         // The curve match is a second, independent reading of the recording: it can confirm a
         // low trace answer, replace it, or stop an asserted one that names another place.
-        let trace_confidence = confidence;
-        let call = curve_call(
-            confidence,
-            Some((lat, lon)),
-            curve_verdict.as_ref(),
-            curve_judged,
-        );
+        let trace_confidence = assessment.trace_confidence;
+        let call = assessment.call;
         curve_used = call;
         let on_trace = call != CurveCall::Adopts;
-        let standing = curve_verdict.as_ref().filter(|v| v.stands);
+        let standing = curve_verdict
+            .as_ref()
+            .filter(|v| v.stands && curve_clock == archive.clock);
         let mut gates = gates;
         if let Some(v) = standing {
             let apart = fdop_types::geo::haversine_m(lat, lon, v.lat, v.lon);
@@ -1978,8 +2142,7 @@ fn locate_with_clock(
             .filter(|m| m.core)
             .map(|m| m.event.as_str())
             .collect();
-        let unchecked = leans_on_added(trace_confidence, call, curve_judged, &core_ids, added);
-        if unchecked {
+        if assessment.unchecked {
             let on: Vec<&str> = core_ids
                 .iter()
                 .copied()
@@ -1994,7 +2157,7 @@ fn locate_with_clock(
                 ),
             ));
         }
-        let (lat, lon, radius, basis, confidence) = match (call, standing) {
+        let (lat, lon, radius, basis) = match (call, standing) {
             (CurveCall::Adopts, Some(v)) => (
                 v.lat,
                 v.lon,
@@ -2004,7 +2167,6 @@ fn locate_with_clock(
                     curvematch::TIED_NATS,
                     v.radius_m
                 ),
-                "medium",
             ),
             (CurveCall::Confirms, Some(v)) => {
                 // The curve radius is measured from the curve's own best place. Kept at the trace
@@ -2020,54 +2182,14 @@ fn locate_with_clock(
                         curvematch::TIED_NATS,
                         v.radius_m
                     ),
-                    "medium",
                 )
             }
-            (CurveCall::Conflicts, Some(_)) | (CurveCall::Unsupported, _) => {
-                (lat, lon, radius, basis, "low")
-            }
-            (CurveCall::Silent, _) if unchecked => (lat, lon, radius, basis, "low"),
-            _ => (lat, lon, radius, basis, confidence),
+            _ => (lat, lon, radius, basis),
         };
-        // A high or medium trace answer must lead what the same recording reaches at decoy clocks.
-        // Its margin compares explanations inside one clock window; a wrong date or place can
-        // still find two chance fits to a recording's strong passes there (nd_o02_1031 on
-        // c2c7578, np_o02_p3 without 8be452d's chirp factor), and the decoys measure that level.
-        // The window moved is `--start +- --clock-tol`, or the creation_time window the answer
-        // came from; the full date window, after a fallback or with neither, compares every clock.
-        let decoy_window = match given_start {
-            Some(t0) => Some((t0, a.clock_tol_s)),
-            None if meta_window => Some((
-                0.5 * (archive.clock.0 + archive.clock.1),
-                0.5 * (archive.clock.1 - archive.clock.0),
-            )),
-            None => None,
-        };
-        let confidence = match decoy_window {
-            Some(window) if !decoy && on_trace && matches!(confidence, "high" | "medium") => {
-                let t = Instant::now();
-                let runs = decoy_clock_runs(
-                    a,
-                    now,
-                    window,
-                    start_window(d0, d1, region.utc_offset_h),
-                    &run_dir,
-                    log,
-                    &PreparedRecording {
-                        info: &info,
-                        duration_s: dur,
-                        low_band_warning: low_band.as_deref(),
-                        measurements,
-                    },
-                );
-                timings.insert("decoy_clocks_s".into(), json!(t.elapsed().as_secs_f64()));
-                let (passes, why) = decoy_gate(evidence, &runs);
-                log.say(&format!("decoy clocks: {why}"));
-                gates.push(("decoy clocks".to_string(), passes, why));
-                if passes { confidence } else { "low" }
-            }
-            _ => confidence,
-        };
+        if let Some((passes, why)) = &assessment.decoy_gate {
+            gates.push(("decoy clocks".to_string(), *passes, why.clone()));
+        }
+        let confidence = assessment.confidence;
         log.say(&format!(
             "winner {lat:.6},{lon:.6} radius {radius:.0} m, {} events, confidence {confidence}",
             top.n_explained
@@ -2243,11 +2365,9 @@ fn locate_with_clock(
                 report.figures.push((format!("{}: trace (white), straight-line fit (cyan), ADS-B prediction for {ac} ({}, {}) at the answer (magenta)", e.id, m.flight, m.role), format!("{}_match.png", e.id)));
             }
         }
-    } else if let (CurveCall::Adopts, Some(v), Some(r)) = (
-        curve_call("none", None, curve_verdict.as_ref(), curve_judged),
-        curve_verdict.as_ref(),
-        curve.as_ref(),
-    ) {
+    } else if let (CurveCall::Adopts, Some(v), Some(r)) =
+        (assessment.call, curve_verdict.as_ref(), curve.as_ref())
+    {
         found = true;
         curve_used = CurveCall::Adopts;
         log.say(&format!(
@@ -3348,22 +3468,61 @@ mod tests {
         }
     }
 
+    fn assessment_result() -> search::SearchResult {
+        let mut candidate = search::Candidate::default();
+        candidate.lat = 40.876466;
+        candidate.lon = -73.524951;
+        candidate.score = 24.0;
+        candidate.n_explained = 2;
+        candidate.events = ["e1", "e2"]
+            .into_iter()
+            .map(|id| search::EventMatch {
+                event: id.into(),
+                core: true,
+                dt_free: Some(0.0),
+                ..Default::default()
+            })
+            .collect();
+        search::SearchResult {
+            funnel: Default::default(),
+            nulls: Vec::new(),
+            refine: Some(search::RefineResult {
+                lat: candidate.lat,
+                lon: candidate.lon,
+                t_start_utc: 0.0,
+                radius_m: 500.0,
+                radius_basis: "synthetic known contour".into(),
+                step_m: 25.0,
+                lats: Vec::new(),
+                lons: Vec::new(),
+                dchi2: Vec::new(),
+                radius_lower_bound: false,
+                region_cells: 1,
+            }),
+            candidates: vec![candidate],
+            margin: json!({"margin_nats": 8.0, "margin_top_score": 24.0}),
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn a_standing_curve_match_rescues_an_empty_metadata_trace_search() {
         let good = stands_at(40.876466, -73.524951, true);
         let weak = stands_at(40.876466, -73.524951, false);
+        let mut empty = assessment_result();
+        empty.candidates.clear();
+        empty.refine = None;
+        let added = std::collections::HashSet::new();
         // A usable metadata clock must reach the independent matcher even when no trace
         // survived measurement. Its standing answer follows the existing adoption gates.
-        assert!(!metadata_needs_fallback(true, false, Some(&good)));
-        assert_eq!(
-            curve_call("none", None, Some(&good), true),
-            CurveCall::Adopts
-        );
+        let rescued = AnswerAssessment::new(&empty, &[], Some(&good), true, &added);
+        assert!(!metadata_needs_fallback(true, rescued.confidence));
+        assert_eq!(rescued.call, CurveCall::Adopts);
         for curve in [None, Some(&weak)] {
-            assert!(metadata_needs_fallback(true, false, curve));
-            assert!(!metadata_needs_fallback(true, true, curve));
+            let absent = AnswerAssessment::new(&empty, &[], curve, true, &added);
+            assert!(metadata_needs_fallback(true, absent.confidence));
             // An explicit --start never widens, whether or not either search succeeded.
-            assert!(!metadata_needs_fallback(false, false, curve));
+            assert!(!metadata_needs_fallback(false, absent.confidence));
         }
         // A negative curve test inside the old metadata window cannot veto a medium
         // trace answer that was found only after widening to the full date window.
@@ -3372,6 +3531,120 @@ mod tests {
             curve_call("medium", Some((40.876466, -73.524951)), Some(&weak), judged),
             CurveCall::Silent
         );
+    }
+
+    #[test]
+    fn metadata_retries_candidates_rejected_by_the_report_gates() {
+        let base = assessment_result();
+        let added = std::collections::HashSet::new();
+        let assess = |r: &search::SearchResult| AnswerAssessment::new(r, &[], None, false, &added);
+        let high = assess(&base);
+        assert_eq!(high.confidence, "high");
+        assert!(!metadata_needs_fallback(true, high.confidence));
+        for defect in ["core", "lock", "margin", "truncated"] {
+            let mut r = base.clone();
+            match defect {
+                "core" => r.candidates[0].events[1].core = false,
+                "lock" => r.candidates[0].events[1].dt_free = Some(4.1),
+                "margin" => r.margin["margin_nats"] = json!(2.9),
+                "truncated" => r.funnel.truncated.push("synthetic comparison cut".into()),
+                _ => unreachable!(),
+            }
+            let rejected = assess(&r);
+            assert_eq!(rejected.confidence, "low", "{defect}");
+            assert!(
+                metadata_needs_fallback(true, rejected.confidence),
+                "{defect}"
+            );
+            assert!(
+                !metadata_needs_fallback(false, rejected.confidence),
+                "{defect}"
+            );
+        }
+        let mut medium = base.clone();
+        medium.margin["margin_nats"] = json!(4.0);
+        assert_eq!(assess(&medium).confidence, "medium");
+        assert!(!metadata_needs_fallback(true, assess(&medium).confidence));
+        // The two high-only gates must not accidentally become conditions for keeping
+        // a medium metadata answer when the shared assessment replaces report-local grading.
+        for unresolved in [false, true] {
+            let mut r = base.clone();
+            if unresolved {
+                r.refine.as_mut().unwrap().radius_lower_bound = true;
+            } else {
+                r.candidates[0]
+                    .unheard_close_passes
+                    .push("unheard synthetic pass".into());
+            }
+            let accepted = assess(&r);
+            assert_eq!(accepted.confidence, "medium");
+            assert!(!metadata_needs_fallback(true, accepted.confidence));
+        }
+        let added = ["e2".to_string()].into();
+        let unchecked = AnswerAssessment::new(&medium, &[], None, false, &added);
+        assert!(unchecked.unchecked);
+        assert!(metadata_needs_fallback(true, unchecked.confidence));
+        let weak = stands_at(40.876466, -73.524951, false);
+        let unsupported = AnswerAssessment::new(&medium, &[], Some(&weak), true, &added);
+        assert_eq!(unsupported.call, CurveCall::Unsupported);
+        assert!(metadata_needs_fallback(true, unsupported.confidence));
+        let conflict = stands_at(40.876466, -73.3, true);
+        let conflict = AnswerAssessment::new(&base, &[], Some(&conflict), true, &added);
+        assert_eq!(conflict.call, CurveCall::Conflicts);
+        assert!(metadata_needs_fallback(true, conflict.confidence));
+        // Even a provisional high must retry if the decoys explain it by chance. Applying
+        // the same gate to an explicit clock may lower its grade but cannot widen that clock.
+        let mut demoted = high;
+        demoted.apply_decoys(decoy_gate(24.0, &[(0.0, Some(23.0)); 4]));
+        assert_eq!(demoted.confidence, "low");
+        assert!(metadata_needs_fallback(true, demoted.confidence));
+        assert!(!metadata_needs_fallback(false, demoted.confidence));
+    }
+
+    #[test]
+    fn metadata_retry_keeps_failed_decoys_when_no_new_clock_is_available() {
+        let mut answer = AnswerAssessment::new(
+            &assessment_result(),
+            &[],
+            None,
+            false,
+            &std::collections::HashSet::new(),
+        );
+        let failed = decoy_gate(24.0, &[(0.0, Some(23.0)); 4]);
+        answer.apply_decoys(failed.clone());
+        assert!(metadata_needs_fallback(true, answer.confidence));
+
+        // A 12-hour recording near the archive's latest midnight leaves fewer than 12
+        // hours of available start times. Both requests clip to the same permitted clock.
+        let full = (0.0, 86_400.0);
+        let duration = 43_200.0;
+        let hint = metadata_start_window(full, 43_000.0, duration, 60.0).unwrap();
+        let published_last_start = 86_400.0 - duration - 300.0;
+        let searched = (hint.0, hint.1.min(published_last_start));
+        let permitted = (full.0, full.1.min(published_last_start));
+        assert_eq!(searched, permitted);
+        for no_new_clock in [
+            permitted,
+            (permitted.0 + 1.0, permitted.1),
+            (permitted.0, permitted.1 - 1.0),
+            (permitted.0 + 1.0, permitted.1 - 1.0),
+        ] {
+            assert!(
+                !answer.retries_metadata(true, searched, no_new_clock),
+                "{no_new_clock:?} adds no search coverage"
+            );
+        }
+        // Keeping this attempt keeps both the low grade and the failed gate's explanation.
+        assert_eq!(answer.confidence, "low");
+        assert_eq!(answer.decoy_gate, Some(failed));
+        for wider in [
+            (searched.0 - 1.0, searched.1),
+            (searched.0, searched.1 + 1.0),
+            full,
+        ] {
+            assert!(answer.retries_metadata(true, searched, wider));
+            assert!(!answer.retries_metadata(false, searched, wider));
+        }
     }
 
     #[test]

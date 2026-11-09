@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retry the full dates when a metadata-clock candidate remains unconfirmed
+
+- Extend metadata fallback to low-confidence trace candidates, including candidates demoted by the
+  existing curve, measurement or decoy-clock checks. A plausible match at an export timestamp no
+  longer blocks other recording times. A high or medium final assessment still retains the hint,
+  and a standing independent curve can still rescue an empty trace search.
+- Share the existing answer assessment between the retry decision and the final report, with the
+  same core, clock, margin, unheard-pass, radius and measurement gates. Move required decoy checks
+  before that decision; do not widen an explicit `--start` or repeat decoded audio and measurements.
+- Retain the original grade and decoy failure when publication clipping leaves no new start times
+  to search. A retained curve verdict from another clock window cannot adopt, confirm or conflict
+  with the wider answer; its original window remains available in diagnostics.
+- Thirteen native tests using the exact production assessment, geometry and gate definitions pass,
+  including accepted high/medium answers, rejected candidates, standing-curve rescue, decoy demotion,
+  clipped-window preservation and explicit-start controls. This verifies decision logic. Full
+  application checking stopped in the unchanged `asupersync` dependency with SIGKILL, including an
+  optimization-disabled, serialized retry, before reaching the pipeline. The full synthetic
+  recording retry and workspace/field validation remain uncompleted.
+
 ### Search the requested curve-grid boundaries at their physical observer positions
 
 - Bound the geographic box's full WGS84 projection instead of a metre-per-degree rectangle. Retain
@@ -35,8 +54,11 @@ at that commit, not per-change commits.
   modules. Three fail against the original geometry: a 1 m half-width box has no observer, a long thin
   box misses a boundary by 1,178.44 m, and a coarse arrival differs from its reported observer by
   4.447 s. Independent WGS84 projection and allocation checks also pass. Component Clippy passes
-  with only the unchanged helper unused by that subset exempted from dead-code linting. Full acoustic,
-  workspace and real-recording validation remains separate; no field accuracy claim follows.
+  with only the unchanged helper unused by that subset exempted from dead-code linting. The full
+  102-test production-module run finishes with 99 passing and three failures, each reproduced on
+  the immutable baseline: grazing-pass hearing, the refinement control, and the three-flight margin.
+  Noise, rumble, typed-noise and fast-aircraft controls pass. Workspace and real-recording validation
+  remain separate; no field accuracy claim follows.
 
 ### Refine the whole clock interval after the scan reaches its sample limit
 
@@ -49,8 +71,9 @@ at that commit, not per-change commits.
   nonfinite-cost and zero-width controls, plus a weighted two-flyover regression on fixed observations.
 - Native pinned-nightly execution of the complete scalar profiler and its analytic test fails
   before the repair at a 0.263864 s error and passes afterward within 0.01 s in all six clock cases.
-  The two-flyover and full-workspace runs remain blocked in dependency compilation; reference and
-  field recordings have not been replayed. This is a numerical regression result, not a new accuracy claim.
+  The weighted two-flyover regression also passes against the complete native core after its
+  dependency build completed. Full-workspace validation is separate; reference and field recordings
+  have not been replayed. This is a numerical regression result, not a new accuracy claim.
 
 ### Keep usable weather when missing hours lie outside the recording window
 

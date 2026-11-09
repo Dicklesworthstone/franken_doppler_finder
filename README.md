@@ -671,15 +671,19 @@ local midnight after the last, using every UTC offset the region spans, DST incl
 `creation_time` falls inside that window, the search first narrows to it, allowing for both start and end
 conventions, and a high or medium trace answer found there meets the [decoy clocks](#the-gates). Both the trace
 search and, when eligible, the independent curve match try that window. A standing
-curve match can locate the recording even when no trace candidate survives. Only when there is neither a trace
-candidate nor a standing curve match does the search widen to the full window, with a warning. The curve match
-retries too if the wider window is still eligible. A curve test from the earlier narrow window does not grade
-that wider search. Its original `clock_window` and
+curve match can locate the recording even when no trace candidate survives. The metadata window is retained
+only if the complete assessment reaches high or medium confidence, including any required decoy-clock check.
+A low or absent answer retries the full date window when it adds available recording start times, so a chance
+candidate at an export timestamp cannot block the rest of the dates. If publication limits leave the same or a
+narrower available window, the original grade and failed checks are retained. The audio, detections and
+measurements are reused. The curve match
+retries too if the wider window is still eligible. A curve test from the earlier narrow window cannot adopt,
+confirm or overrule an answer in that wider search. Its original `clock_window` and
 `judged_search_window` flag are recorded in `result.json` under `extra.curve_match` when it has a verdict.
 
 Archive availability, track loading and weather follow the window actually being tried. A metadata
 attempt can therefore run offline with just its required cached UTC day, even when `--dates` includes
-uncached surrounding days. If its archive cannot be loaded, or neither search finds an answer, the
+uncached surrounding days. If its archive cannot be loaded, or its answer remains unconfirmed, the
 full-date attempt loads its own tracks and weather and rebuilds the wind-dependent speed gates. An
 eligible curve match still needs its wider decoy catalogue; weather covers those same decoy times,
 including the radiosonde brackets, before adding the normal padding. An evening catalogue that fits
