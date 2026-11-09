@@ -19,6 +19,34 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover a missing second aircraft without counting the first sound twice
+
+- Run the existing bounded fast-edge survey when ordinary measurement has fewer than two
+  independent aircraft. Preserve accepted measurements, masking their observed ridges and
+  detected harmonic-family ratios in both residual bank scoring and candidate acceptance.
+  Interpolate only through observed stretches with at most three-second gaps; never extrapolate
+  or infer ownership from potentially inaccurate fitted geometry. Occupied samples remain in
+  scoring denominators. The original empty-owner recovery API remains available.
+- Share the ordinary detector's remaining candidate allowance and detection slots. Reserve
+  already accepted aircraft against the 24-independent-event limit; retain physical gates,
+  expanded-search provenance, harmonic rebasing, final event ordering and cut warnings. Both
+  `locate` and `detect` receive the extension through their shared recording analysis.
+- Two fixed 30-second mixtures now retain the original accurate 450 Hz aircraft and recover
+  a separate 83 Hz, 245 m/s, 700 m aircraft. The preceding routine fails the new regression
+  with one event instead of two. The stronger mixture also locates through the actual search
+  and refinement: both intended core matches, 2.315639 m error, +0.004065 s clock error and
+  no truncation, using a known start and orthogonal synthetic tracks.
+- Native controls retain two inaccurate single-pass fits as one event each, preserve a genuine
+  150/300 Hz harmonic family as one aircraft, keep the earlier empty-result recoveries, and
+  refuse noise, steady tone and reversed audio. Original measurements and spectra are checked
+  exactly where applicable. Component Clippy passes with warnings denied.
+- The combined actual production engine selftest passes real FFmpeg decoding, detection,
+  measurement, association and refinement: four events, both intended flights, 1.673779 m
+  error, 75 m radius and +0.019586 s clock error, identical to the prior baseline. These are
+  native synthetic component/engine results. Full application execution is still blocked by
+  unchanged `asupersync` dependency compilation; no reference, wrong-date or field replay
+  is claimed.
+
 ### Find the same closest approach without scanning the whole window
 
 - Search outward from the proposed emission time on the original two-second sampling lattice.

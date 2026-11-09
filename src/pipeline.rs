@@ -1212,20 +1212,39 @@ pub(crate) fn measure_recording(
         .collect();
     let mut recovery_detect_s = 0.0;
     // A one-second survey can smear a steep, short pass beyond the fast templates' reach.
-    // Only retry recordings with no aircraft: appending another fit of an accepted pass can
-    // manufacture an independent event. Existing accepted measurements keep their exact path.
-    if !events.iter().any(MeasuredEvent::is_aircraft_like)
-        && dets.len() < dp.max_detections
-        && remaining_candidates > 0
-    {
-        log.say("no aircraft measured; checking recording edges with a shorter fast-pass survey");
+    // A location needs two independent passes. Preserve the observed ridges of any accepted
+    // aircraft so another fit of that same sound cannot manufacture the missing second event.
+    let ordinary_aircraft = search::independent_measured_events(&events, 0.0).len();
+    if ordinary_aircraft < 2 && dets.len() < dp.max_detections && remaining_candidates > 0 {
+        log.say(&format!(
+            "{ordinary_aircraft} independent aircraft measured; checking unclaimed recording edges with a shorter fast-pass survey"
+        ));
+        let owners: Vec<_> = events
+            .iter()
+            .filter(|event| event.is_aircraft_like())
+            .map(|event| {
+                let measured = &dets[event.detection.id];
+                let family = measured.harmonic_of.unwrap_or(measured.id);
+                detect::RecoveryOwner {
+                    trace: &event.trace,
+                    harmonics: dets
+                        .iter()
+                        .filter(|d| {
+                            d.id != measured.id && (d.id == family || d.harmonic_of == Some(family))
+                        })
+                        .map(|d| d.f0 / measured.f0)
+                        .collect(),
+                }
+            })
+            .collect();
         let recovery_started = Instant::now();
-        let recovery = detect::recover_fast_edges(
+        let recovery = detect::recover_fast_edges_with_owners(
             x,
             sr,
             &dp,
             dp.max_detections - dets.len(),
             remaining_candidates,
+            &owners,
         );
         recovery_detect_s = recovery_started.elapsed().as_secs_f64();
         detect_s += recovery_detect_s;
@@ -1243,9 +1262,10 @@ pub(crate) fn measure_recording(
                     .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
                     .collect();
                 let first_event = events.len();
+                let remaining_events = max_measured.saturating_sub(ordinary_aircraft);
                 let mut recovered_events = measure::measure_ranked_counted(
                     recovery_prim.len(),
-                    max_measured,
+                    remaining_events,
                     |ranks| {
                         recovery_prim[ranks.clone()]
                             .par_iter()
@@ -1274,9 +1294,11 @@ pub(crate) fn measure_recording(
                 // Provenance belongs to the recovery stage even if refinement lowers speed.
                 added_ranks.extend(recovered_events.iter().map(|e| e.id.clone()));
                 events.append(&mut recovered_events);
-                warnings.push(format!(
-                    "short-window fast-pass recovery: ordinary measurement found no aircraft; a shorter survey of the recording's true edges supplied {recovered_count} candidates within the remaining detection budget; all use the existing measurement gates and count as measured past the old line",
-                ));
+                if recovered_count > 0 || ordinary_aircraft == 0 {
+                    warnings.push(format!(
+                        "short-window fast-pass recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; a shorter survey of the recording's true edges, excluding its measured ridges and harmonic families, supplied {recovered_count} candidates within the remaining detection budget; all use the existing measurement gates and count as measured past the old line",
+                    ));
+                }
                 if recovery_cut > 0 {
                     warnings.push(format!(
                         "short-window fast-pass recovery discarded at least {recovery_cut} candidate curves at the remaining detection limit; discarded curves neither explain events nor mark passes as heard",
@@ -2739,6 +2761,291 @@ mod tests {
         assert!((best.t0r - 10.13).abs() < 0.3, "{best:?}");
         assert!((best.v - 215.0).abs() < 4.0, "{best:?}");
         assert!((best.d / 900.0 - 1.0).abs() < 0.08, "{best:?}");
+        assert_measurement_bookkeeping(&measured);
+    }
+
+    #[test]
+    fn short_window_recovery_supplies_a_missing_second_aircraft() {
+        let dp = DetectParams::default();
+        let mp = MeasureParams::default();
+        // A separate, slower aircraft is audible above the fast pass's entire frequency
+        // range. The existing ordinary bank measures it accurately at both strengths; the
+        // steep 83 Hz pass still needs the short-window edge bank.
+        for ordinary_amplitude in [0.08, 0.04] {
+            let mut x = fast_edge_recording((83.0, 245.0, 700.0, 19.37), 0.32);
+            for (i, sample) in x.iter_mut().enumerate() {
+                let t = i as f64 / 4000.0;
+                let tau = physics::retarded_tau(t, 9.13 - 900.0 / 343.0, 90.0, 900.0, 343.0);
+                let range = physics::cv_radial(tau, 90.0, 900.0).0;
+                *sample += (ordinary_amplitude * 900.0 / range
+                    * (std::f64::consts::TAU * 450.0 * tau).sin())
+                    as f32;
+            }
+            let (ls, lin) = detect::survey(&x, 4000, &dp).unwrap();
+            let ordinary = detect::detect(&ls, &dp);
+            let ordinary_events: Vec<_> = ordinary
+                .iter()
+                .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+                .enumerate()
+                .map(|(i, d)| {
+                    measure::measure_family(
+                        &x,
+                        4000,
+                        &lin,
+                        d,
+                        &ordinary,
+                        &format!("e{}", i + 1),
+                        &mp,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                search::independent_measured_events(&ordinary_events, 0.0).len(),
+                1
+            );
+            let original = ordinary_events
+                .iter()
+                .find(|event| event.is_aircraft_like())
+                .unwrap();
+            let b = original.fit.as_ref().unwrap().best;
+            assert!(
+                (b.f0 - 450.0).abs() < 0.3
+                    && (b.v - 90.0).abs() < 4.0
+                    && (b.d / 900.0 - 1.0).abs() < 0.08
+                    && (b.t0r - 9.13).abs() < 0.3,
+                "{b:?}"
+            );
+
+            let measured = measure_recording(&x, 4000, &Log::new(true), None).unwrap();
+            let independent = search::independent_measured_events(&measured.events, 0.0);
+            assert_eq!(
+                independent.len(),
+                2,
+                "amplitude {ordinary_amplitude}: {:?}",
+                measured.warnings
+            );
+            // Existing detections, fits, quality and spectra remain unchanged. Final event
+            // IDs are reassigned by the established quality sort after appending recovery.
+            assert_eq!(
+                serde_json::to_value(&measured.detections[..ordinary.len()]).unwrap(),
+                serde_json::to_value(&ordinary).unwrap()
+            );
+            for original in &ordinary_events {
+                let kept = measured
+                    .events
+                    .iter()
+                    .find(|event| event.detection.id == original.detection.id)
+                    .unwrap();
+                let mut expected = serde_json::to_value(original).unwrap();
+                expected["id"] = serde_json::json!(kept.id);
+                assert_eq!(expected, serde_json::to_value(kept).unwrap());
+                let (old_spec, kept_spec) =
+                    (original.spec.as_ref().unwrap(), kept.spec.as_ref().unwrap());
+                assert_eq!(old_spec.t, kept_spec.t);
+                assert_eq!(old_spec.f, kept_spec.f);
+                assert_eq!(old_spec.db, kept_spec.db);
+            }
+            let recovered = measured
+                .events
+                .iter()
+                .find(|event| event.is_aircraft_like() && event.detection.id >= ordinary.len())
+                .unwrap();
+            let b = recovered.fit.as_ref().unwrap().best;
+            eprintln!("second aircraft, ordinary amplitude {ordinary_amplitude}: {b:?}");
+            assert!((b.f0 - 83.0).abs() < 0.3, "{b:?}");
+            assert!((b.v - 245.0).abs() < 4.0, "{b:?}");
+            assert!((b.d / 700.0 - 1.0).abs() < 0.08, "{b:?}");
+            assert!((b.t0r - 19.37).abs() < 0.3, "{b:?}");
+            assert!(measured.added.contains(&recovered.id));
+            assert!(measured.warnings.iter().any(|warning| {
+                warning.contains("ordinary measurement found 1 independent aircraft")
+            }));
+            assert_measurement_bookkeeping(&measured);
+            if ordinary_amplitude == 0.08 {
+                // The recovered event must actually make the recording locatable. These
+                // orthogonal tracks have the exact geometry used to synthesize both tones.
+                let (lat, lon, start) = (40.876466, -73.524951, 1_788_895_000.0);
+                let enu = fdop_types::geo::Enu::new(lat, lon, fdop_types::MIC_HEIGHT_M);
+                let mut tracks = Vec::new();
+                for (key, speed, distance, heard, northbound) in [
+                    ("ordinary", 90.0f64, 900.0f64, 9.13, false),
+                    ("recovered", 245.0, 700.0, 19.37, true),
+                ] {
+                    let lateral = (distance * distance - 500.0f64.powi(2)).sqrt();
+                    let (position, velocity) = if northbound {
+                        ([lateral, 0.0, 500.0], [0.0, speed, 0.0])
+                    } else {
+                        ([0.0, lateral, 500.0], [speed, 0.0, 0.0])
+                    };
+                    let mut track = fdop_core::track::straight_track(
+                        &enu,
+                        position,
+                        velocity,
+                        start + heard - distance / 343.0,
+                        start - 100.0,
+                        start + 130.0,
+                        2.0,
+                    );
+                    track.key = key.into();
+                    track.icao = key.into();
+                    tracks.push(track);
+                }
+                let dem = fdop_types::FlatElevation(0.0);
+                let atmo =
+                    fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+                let params = search::SearchParams::new(
+                    start,
+                    start,
+                    30.0,
+                    fdop_types::BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01),
+                );
+                let located = search::run(
+                    &search::SearchInputs {
+                        events: independent,
+                        tracks: &tracks,
+                        heard_times: measured.detections.iter().map(|d| d.t0r).collect(),
+                        coarse_dem: &dem,
+                        fine_dem: &dem,
+                        atmo: &atmo,
+                    },
+                    &params,
+                    &|message| eprintln!("second-aircraft search: {message}"),
+                );
+                let best = located
+                    .candidates
+                    .first()
+                    .expect("both measured passes must locate");
+                for key in ["ordinary", "recovered"] {
+                    assert!(
+                        best.events
+                            .iter()
+                            .any(|event| event.flight == key && event.core),
+                        "{:?}",
+                        best.events
+                    );
+                }
+                let refined = located
+                    .refine
+                    .as_ref()
+                    .expect("two-pass location must refine");
+                let error = fdop_types::geo::haversine_m(lat, lon, refined.lat, refined.lon);
+                eprintln!(
+                    "second-aircraft location error={error:.6} m, clock error={:.9} s",
+                    refined.t_start_utc - start
+                );
+                assert!(error <= 75.0, "{error} m");
+                assert!((refined.t_start_utc - start).abs() <= 0.2);
+                assert!(located.funnel.truncated.is_empty(), "{:?}", located.funnel);
+            }
+        }
+    }
+
+    #[test]
+    fn short_window_recovery_never_recounts_an_accepted_partial_fast_ridge() {
+        let dp = DetectParams::default();
+        let mp = MeasureParams::default();
+        // These ordinary accepted fits have incorrect geometry. The observed ridge must
+        // nevertheless retain ownership, so an accurate fast-bank fit cannot count twice.
+        for attenuation in [3, 6] {
+            let x = fast_edge_recording(
+                (83.0, 245.0, 700.0, 19.37),
+                0.32 * 10.0f64.powf(-f64::from(attenuation) / 20.0),
+            );
+            let (ls, lin) = detect::survey(&x, 4000, &dp).unwrap();
+            let ordinary = detect::detect(&ls, &dp);
+            let baseline: Vec<_> = ordinary
+                .iter()
+                .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+                .enumerate()
+                .map(|(i, d)| {
+                    measure::measure_family(
+                        &x,
+                        4000,
+                        &lin,
+                        d,
+                        &ordinary,
+                        &format!("e{}", i + 1),
+                        &mp,
+                    )
+                })
+                .collect();
+            assert_eq!(search::independent_measured_events(&baseline, 0.0).len(), 1);
+            assert!(baseline.iter().any(|event| event.is_aircraft_like()
+                && (event.fit.as_ref().unwrap().best.v - 245.0).abs() > 4.0));
+            let measured = measure_recording(&x, 4000, &Log::new(true), None).unwrap();
+            assert_eq!(
+                search::independent_measured_events(&measured.events, 0.0).len(),
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(&measured.detections).unwrap(),
+                serde_json::to_value(&ordinary).unwrap()
+            );
+            let mut baseline = baseline;
+            baseline.sort_by(|a, b| b.quality.score.total_cmp(&a.quality.score));
+            for (i, event) in baseline.iter_mut().enumerate() {
+                event.id = format!("e{}", i + 1);
+            }
+            assert_eq!(
+                serde_json::to_value(&measured.events).unwrap(),
+                serde_json::to_value(&baseline).unwrap()
+            );
+            assert_measurement_bookkeeping(&measured);
+        }
+    }
+
+    #[test]
+    fn short_window_recovery_keeps_an_accepted_harmonic_family_as_one_aircraft() {
+        let dp = DetectParams::default();
+        let mp = MeasureParams::default();
+        let mut x = fast_edge_recording((150.0, 90.0, 900.0, 9.13), 0.16);
+        for (i, sample) in x.iter_mut().enumerate() {
+            let t = i as f64 / 4000.0;
+            let tau = physics::retarded_tau(t, 9.13 - 900.0 / 343.0, 90.0, 900.0, 343.0);
+            let range = physics::cv_radial(tau, 90.0, 900.0).0;
+            *sample += (0.08 * 900.0 / range * (std::f64::consts::TAU * 300.0 * tau).sin()) as f32;
+        }
+        let (ls, lin) = detect::survey(&x, 4000, &dp).unwrap();
+        let ordinary = detect::detect(&ls, &dp);
+        assert!(ordinary.iter().any(|d| d.harmonic_of.is_some()));
+        let baseline: Vec<_> = ordinary
+            .iter()
+            .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+            .enumerate()
+            .map(|(i, d)| {
+                measure::measure_family(&x, 4000, &lin, d, &ordinary, &format!("e{}", i + 1), &mp)
+            })
+            .collect();
+        assert_eq!(baseline.len(), 1);
+        assert!(baseline[0].is_aircraft_like());
+        let b = baseline[0].fit.as_ref().unwrap().best;
+        assert!(
+            (b.f0 - 150.0).abs() < 0.3
+                && (b.v - 90.0).abs() < 4.0
+                && (b.d / 900.0 - 1.0).abs() < 0.08
+                && (b.t0r - 9.13).abs() < 0.3,
+            "{b:?}"
+        );
+        let measured = measure_recording(&x, 4000, &Log::new(true), None).unwrap();
+        assert_eq!(
+            search::independent_measured_events(&measured.events, 0.0).len(),
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(&measured.detections).unwrap(),
+            serde_json::to_value(&ordinary).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&measured.events).unwrap(),
+            serde_json::to_value(&baseline).unwrap()
+        );
+        let (old_spec, kept_spec) = (
+            baseline[0].spec.as_ref().unwrap(),
+            measured.events[0].spec.as_ref().unwrap(),
+        );
+        assert_eq!(old_spec.t, kept_spec.t);
+        assert_eq!(old_spec.f, kept_spec.f);
+        assert_eq!(old_spec.db, kept_spec.db);
         assert_measurement_bookkeeping(&measured);
     }
 

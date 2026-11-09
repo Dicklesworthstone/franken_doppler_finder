@@ -873,9 +873,17 @@ fn detect_with_budget_impl(
     (out, cut, remaining_candidates)
 }
 
-/// Try a half-second survey for fast passes clipped by a recording end. Call this only when
-/// every ordinary measurement was refused: rejected slow seeds must not mask the faster
-/// ridge, but an already accepted event must keep its original measurement and family.
+/// An already measured ridge and its detected harmonic family. Ownership follows the observed
+/// frequencies, not the fitted speed and distance: an accepted partial curve can have inaccurate
+/// geometry and still own the sound it traced. Ratios are relative to this trace's tone.
+pub struct RecoveryOwner<'a> {
+    pub trace: &'a crate::trace::Trace,
+    pub harmonics: Vec<f64>,
+}
+
+/// Try a half-second survey for fast passes clipped by a recording end when every ordinary
+/// measurement was refused. With accepted aircraft, use [`recover_fast_edges_with_owners`]
+/// to retain their observed ridges and harmonic families as occupied evidence.
 ///
 /// At most 48 seconds from each real recording end are surveyed. Only fast edge templates
 /// score, at the existing strong line, and crop seams cannot become artificial recording
@@ -888,7 +896,21 @@ pub fn recover_fast_edges(
     sr: u32,
     p: &DetectParams,
     slots: usize,
+    remaining_candidates: usize,
+) -> Result<(Vec<Detection>, usize), String> {
+    recover_fast_edges_with_owners(x, sr, p, slots, remaining_candidates, &[])
+}
+
+/// The same bounded edge recovery on the residual of already measured aircraft. Known samples
+/// contribute zero without shortening a template's denominator, exactly as in the ordinary
+/// detector. The caller preserves those measurements and counts them toward its event limit.
+pub fn recover_fast_edges_with_owners(
+    x: &[f32],
+    sr: u32,
+    p: &DetectParams,
+    slots: usize,
     mut remaining_candidates: usize,
+    owners: &[RecoveryOwner<'_>],
 ) -> Result<(Vec<Detection>, usize), String> {
     let slots = slots.min(p.max_detections);
     if slots == 0 || remaining_candidates == 0 || !p.fast_templates {
@@ -931,14 +953,17 @@ pub fn recover_fast_edges(
             continue;
         }
         let windows = recovery_edge_windows(&ls, start == 0, end == x.len(), base_half);
-        let (bs, bi) = score_bank(&ls, &templates, &ls.data, &windows);
+        let mut known = vec![false; nr * nt];
+        mark_observed_ridges(&ls, owners, &mut known);
+        let mut residual = ls.data.clone();
+        zero_known(&mut residual, &known);
+        let (bs, bi) = score_bank(&ls, &templates, &residual, &windows);
         let mut cand: Vec<_> = (0..nr * nt)
             .filter(|&k| bs[k] as f64 >= threshold)
             .collect();
         cand.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
         cand.truncate(remaining_candidates);
         remaining_candidates -= cand.len();
-        let mut known = vec![false; nr * nt];
         for k in cand {
             if out.len() >= accepted_limit {
                 break;
@@ -963,6 +988,46 @@ pub fn recover_fast_edges(
     }
     group_harmonics(&mut out, p);
     Ok((out, cut))
+}
+
+/// Interpolate only through observed stretches. A larger gap is not owned evidence, matching
+/// the measurement's three-second ridge-continuity limit. Never extrapolate to untraced audio.
+fn mark_observed_ridges(ls: &LogSpec, owners: &[RecoveryOwner<'_>], known: &mut [bool]) {
+    let (nt, nr) = (ls.nt(), ls.nr());
+    for owner in owners {
+        for (times, frequencies) in owner.trace.t.windows(2).zip(owner.trace.f.windows(2)) {
+            let dt = times[1] - times[0];
+            if !(dt > 0.0 && dt <= 3.0 && times[0].is_finite() && times[1].is_finite()) {
+                continue;
+            }
+            let lo = ls.t.partition_point(|&t| t < times[0]);
+            let hi = ls.t.partition_point(|&t| t <= times[1]);
+            for j in lo..hi {
+                let u = (ls.t[j] - times[0]) / dt;
+                let f = frequencies[0] + u * (frequencies[1] - frequencies[0]);
+                for ratio in std::iter::once(1.0).chain(owner.harmonics.iter().copied()) {
+                    let frequency = f * ratio;
+                    if !(frequency.is_finite() && frequency > 0.0) {
+                        continue;
+                    }
+                    let row =
+                        ((frequency / ls.freqs[0]).log2() * ls.bins_per_octave as f64).round();
+                    if !row.is_finite()
+                        || row < -RIDGE_HALF_ROWS as f64
+                        || row > (nr - 1) as f64 + RIDGE_HALF_ROWS as f64
+                    {
+                        continue;
+                    }
+                    let row = row as i64;
+                    for r in
+                        (row - RIDGE_HALF_ROWS).max(0)..=(row + RIDGE_HALF_ROWS).min(nr as i64 - 1)
+                    {
+                        known[r as usize * nt + j] = true;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A cropped edge keeps the complete base-template context toward the recording interior.
@@ -1448,6 +1513,53 @@ pub(crate) const FAST_PASSES: [(f64, f64, f64, f64); 3] = [
 mod tests {
     use super::*;
     use crate::physics::cv_curve;
+
+    #[test]
+    fn recovery_ownership_uses_observations_and_preserves_unobserved_gaps() {
+        let ls = LogSpec {
+            t: (0..21).map(|i| i as f64 * 0.5).collect(),
+            freqs: (0..240)
+                .map(|i| 35.0 * 2.0f64.powf(i as f64 / 48.0))
+                .collect(),
+            data: vec![1.0; 240 * 21],
+            bins_per_octave: 48,
+            hop_s: 0.5,
+            scale: 1.0,
+            gain: 1.0,
+            contrast: None,
+        };
+        let trace = crate::trace::Trace {
+            t: vec![2.0, 2.5, 3.0, 7.0, 7.5],
+            f: vec![100.0; 5],
+            snr: vec![10.0; 5],
+        };
+        let mut known = vec![false; ls.data.len()];
+        mark_observed_ridges(
+            &ls,
+            &[RecoveryOwner {
+                trace: &trace,
+                harmonics: vec![2.0],
+            }],
+            &mut known,
+        );
+        let owned = |time: usize, frequency: f64| {
+            let row =
+                ((frequency / ls.freqs[0]).log2() * ls.bins_per_octave as f64).round() as usize;
+            known[row * ls.nt() + time]
+        };
+        for frame in 0..ls.nt() {
+            let in_stretch = (4..=6).contains(&frame) || (14..=15).contains(&frame);
+            assert_eq!(owned(frame, 100.0), in_stretch);
+            assert_eq!(owned(frame, 200.0), in_stretch);
+            assert!(!owned(frame, 150.0));
+            assert!(!owned(frame, 300.0));
+        }
+        let mut residual = ls.data.clone();
+        zero_known(&mut residual, &known);
+        for (value, owned) in residual.iter().zip(known) {
+            assert_eq!(*value, if owned { 0.0 } else { 1.0 });
+        }
+    }
 
     #[test]
     fn fast_templates_respect_the_existing_subsonic_measurement_bound() {

@@ -710,9 +710,11 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 
 Detects flyovers using the same recording analysis as `locate`: detections are measured strongest
 first within each stage until 24 independent aircraft events survive. If ordinary measurement
-finds no aircraft, the same bounded half-second survey of the recording's true edges can recover
-a short fast pass. Every recovered candidate must pass the unchanged measurement and aircraft
-checks; a warning identifies the retry. Final events are ranked by measured quality and numbered
+finds fewer than two independent aircraft, a bounded half-second survey of the recording's true
+edges can recover a missing short fast pass. The observed ridges and detected harmonic families
+of accepted aircraft are excluded from that recovery. Every recovered candidate must pass the
+unchanged measurement and aircraft checks; warnings identify added candidates and any cap.
+Final events are ranked by measured quality and numbered
 `e1`, `e2`, ... exactly as in `locate`, so an audit and a location search identify the same measured
 passes. This replaces `detect`'s former detector-order output and event numbering.
 If a family's primary lost its
@@ -1116,16 +1118,19 @@ Design notes:
   recovery with no baseline event; it does not establish recovery of a real field miss. The new
   fast-edge PCM recovery assertion still fails in the native baseline: its early 215 m/s case adds
   no fast-edge seed. The contrast-edge change does not repair or weaken that separate assertion (Testing).
-- **`locate` retries a recording with no measured aircraft using a shorter edge survey.** A steep
-  fast pass can smear across frequency in the ordinary one-second survey. If every ordinary
-  family fails aircraft selection, a half-second survey searches only fast edge templates at the
+- **A shorter edge survey can supply the missing second aircraft.** A steep fast pass can smear
+  across frequency in the ordinary one-second survey. If fewer than two independent aircraft
+  survive ordinary measurement, a half-second survey searches only fast edge templates at the
   recording's true ends, using at most 48 seconds of audio from each end. Crop seams cannot supply
-  artificial edge detections. The retry shares the remaining candidate allowance and 60 detection
-  slots, uses the same strong line, and sends its seeds through ordinary refinement, family
-  measurement and independent-event selection with the same 24-aircraft limit. Every retry event
-  counts as measured past the old line, including one whose fitted speed falls. A warning records
-  the retry and any detection cut. A recording with an already accepted aircraft keeps its original
-  analysis; this recovery does not search for additional passes in such recordings.
+  artificial edge detections. An accepted aircraft keeps its original measurement and owns its
+  observed ridge and detected harmonic family, even when its fitted geometry is inaccurate.
+  Ownership interpolates only across traced gaps of at most three seconds and never extrapolates;
+  occupied samples contribute zero without shortening the scoring denominator. The retry shares
+  the remaining candidate allowance and 60 detection slots, uses the same strong line, and sends
+  its seeds through ordinary refinement and family measurement. Original and recovered aircraft
+  share the 24-event limit. Every retry event counts as measured past the old line, including one
+  whose fitted speed falls. Warnings record added candidates and any cut. Recordings with two
+  independent aircraft already measured keep their original path.
 - **STFT working storage stays bounded as recordings grow.** Frames transform into a reusable block of
   at most 256 columns and 4 MiB of frequency values, then copy into the final row-major spectrogram.
   A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
@@ -1450,7 +1455,35 @@ Full application execution remains blocked by compilation of the unchanged trans
 `asupersync 0.5.0` dependency. No new field-accuracy result is claimed. Like the other media tests,
 this regression is opt-in because it requires FFmpeg and FFprobe.
 
-### Fast edge recovery after empty recording measurement (2026-11-09)
+### Recovering the second aircraft needed for a location (2026-11-09)
+
+`short_window_recovery_supplies_a_missing_second_aircraft` combines a 450 Hz, 90 m/s, 900 m
+pass with a separate 83 Hz, 245 m/s, 700 m pass in fixed 30-second PCM. At both tested strengths,
+the previous recording routine accepts only the slower aircraft. Recovery now supplies two
+independent aircraft while retaining the original detections, measurements and spectra exactly
+(apart from the established final quality-based event numbering). The fast fit is 245.024776 m/s,
+701.63047 m and 19.376120 s received CPA against the 19.37 s truth.
+
+The stronger mixture also passes through actual flight association, search and refinement with
+orthogonal synthetic tracks and a known recording start: both intended core matches, **2.315639 m**
+position error, **+0.004065 s** clock error, a 75 m radius and no truncation. The exact preceding
+recording routine fails the same test because it supplies only one independent aircraft.
+
+Two single-pass controls whose ordinary fits have incorrect geometry remain one aircraft with
+unchanged detections and serialized measurements. A genuine 150/300 Hz harmonic-family control
+also remains one aircraft with identical events and spectra. The earlier empty-result recoveries
+still pass; noise, steady tone and reversed audio remain empty. Recovery retains the original
+physical gates, shared candidate/detection limits, 24-independent-event limit and expanded-search
+provenance. These native checks execute the complete production recording routine against actual
+core modules and locked dependencies. They establish synthetic recovery, not field accuracy.
+
+The combined production engine selftest also passes through real FFmpeg decoding and the original
+1300-second synthetic scene: four events, both `ACE391` and `A1DFEB`, 1.673779 m error, 75 m radius
+and +0.019586 s clock error, unchanged from the preceding baseline. Full application/workspace
+execution remains blocked by the unchanged `asupersync` dependency compilation; reference,
+wrong-date and field recordings have not been replayed.
+
+### Earlier fast edge recovery after empty recording measurement (2026-11-09)
 
 Five native checks execute the complete production recording-measurement routine against the
 fresh, complete core and locked numerical dependencies. Two fixed 30-second PCM recordings have
