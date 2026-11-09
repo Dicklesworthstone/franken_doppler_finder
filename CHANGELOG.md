@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep wind-delayed flyovers inside a known recording clock
+
+- Use the candidate observer's path-averaged atmosphere and moving-medium travel time when
+  constructing windy search hypotheses. Previously this stage used `d / c`, even though final
+  scoring includes wind; a valid pass could be discarded before the two-event clock join.
+  Query the observer's own path after the geometry gates, including when the air beneath the
+  aircraft is calm. Preserve the original still-air clock expression and every existing gate,
+  hypothesis budget and refinement rule.
+- Three native search regressions cover eleven synthetic scenarios: four 35 m/s wind directions
+  at two timestamp origins, two still-air controls, and spatially varying wind that is calm at
+  the aircraft and windy at the observer. The original source fails both wind tests with zero
+  hypotheses for one intended flight and no location pair. The changed source passes all three,
+  recovering both intended core matches with under 0.408 m error, about -0.004065 s clock error,
+  and no truncation. The complete still-air results have identical before/after fingerprints
+  at both timestamp origins.
+- This is native search-layer validation using the real production modules and locked numerical
+  dependencies. It does not establish wind-affected PCM recovery or field accuracy. The existing
+  coarse emission-time bound and terrain projection remain approximations; reference, wrong-date
+  and field recordings have not been replayed for this change.
+
 ### Recover short fast passes after ordinary recording measurement finds no aircraft
 
 - Give `locate` one half-second survey of the real recording edges only after every ordinary

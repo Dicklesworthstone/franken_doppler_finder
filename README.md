@@ -1021,6 +1021,13 @@ Design notes:
   moment of the flight is a candidate CPA: the recorder then sits on the perpendicular to the path through that
   point, at a distance that fits the measured CPA distance, and the moment fixes the recording start. A hash join
   on (east, north, recording start) finds the places two events share in O(N) time.
+- **Wind delay is included before the recording-clock join.** After a candidate ground point
+  passes the existing geometry gates, its source-to-observer propagation uses the path-averaged
+  atmosphere at that observer, with wind in the observer's frame. The same moving-medium travel
+  model is used by exact trace scoring. A far lateral pass can therefore remain inside a tightly
+  specified recording clock instead of being discarded by a still-air travel-time seed. Calm
+  paths retain the original clock arithmetic. The existing coarse speed/distance and terrain
+  approximations, search budgets and confidence gates are unchanged.
 - **Rejected reports cannot hide a separate supported flight segment.** Track cleaning keeps the
   original longest physically consistent chain, then can recover another supported chain wholly
   before or after it. Every retained interval must be separated by more than the existing 180 s

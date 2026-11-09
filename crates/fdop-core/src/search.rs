@@ -633,7 +633,21 @@ fn hypotheses(
                         {
                             return None;
                         }
-                        let t_s = t + d / c - ev.t_rec;
+                        let observer_z = h - hh;
+                        let path = atmo.medium(ola, olo, t, observer_z, h);
+                        let travel = if path.wind_e == 0.0 && path.wind_n == 0.0 {
+                            // Preserve the established still-air cloud and sampling exactly.
+                            d / c
+                        } else {
+                            // The clock join must see the same wind delay as the exact trace
+                            // scorer. At long lateral ranges, d/c alone can miss a known clock
+                            // by seconds and discard the pass before it can be scored.
+                            let obs = Enu::new(ola, olo, observer_z);
+                            let prop = Prop::from_medium(&path, &obs);
+                            let rv = sub(pos, obs.to_ecef([0.0; 3]));
+                            prop.travel(rv, norm(rv))
+                        };
+                        let t_s = t + travel - ev.t_rec;
                         if t_s >= p.start_lo - ev.t_tol && t_s <= p.start_hi + ev.t_tol {
                             let (e, n) = frame.en(ola, olo);
                             Some(Hyp {
@@ -5838,6 +5852,174 @@ mod tests {
         assert!(haversine_m(lat, lon, winner.lat, winner.lon) < 75.0);
         assert!((winner.t_start_utc - t_s).abs() < 0.2);
         assert!(result.funnel.truncated.is_empty());
+    }
+
+    fn wind_delayed_case(med: fdop_types::atmo::Medium, start: f64) -> TwoCase {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let prop = Prop::from_medium(&med, &enu);
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        for (key, pos, vel, dt, f0) in [
+            ("A", [0.0, 8000.0, 1200.0], [90.0, 0.0, 0.0], 120.0, 112.7),
+            ("B", [6500.0, 0.0, 900.0], [0.0, 95.0, 0.0], 360.0, 149.3),
+        ] {
+            let mut tr = straight_track(
+                &enu,
+                pos,
+                vel,
+                start + dt,
+                start - 200.0,
+                start + 800.0,
+                5.0,
+            );
+            tr.key = key.into();
+            let mut event = synth_event(key, &tr, x, start, f0, 343.0, start + dt, &prop);
+            // A well-measured pass can reach this existing one-second tolerance floor.
+            // It must not need enough artificial uncertainty to absorb the wind delay.
+            event.t_tol = 1.0;
+            events.push(event);
+            tracks.push(tr);
+        }
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+        let mut p = SearchParams::new(
+            start,
+            start,
+            600.0,
+            BBox::new(
+                lat - 50.0 / mlat,
+                lon - 50.0 / mlon,
+                lat + 50.0 / mlat,
+                lon + 50.0 / mlon,
+            ),
+        );
+        p.refine_half_m = 100.0;
+        TwoCase {
+            tracks,
+            events,
+            p,
+            t_s: start,
+            obs: (lat, lon),
+        }
+    }
+
+    fn check_wind_delayed_case(
+        case: &TwoCase,
+        med: fdop_types::atmo::Medium,
+        result: SearchResult,
+    ) -> SearchResult {
+        let top = result
+            .candidates
+            .first()
+            .unwrap_or_else(|| panic!("medium {med:?}, start {}: {:?}", case.t_s, result.funnel));
+        for key in ["A", "B"] {
+            assert!(
+                top.events
+                    .iter()
+                    .any(|m| { m.event == key && m.flight == key && m.core && m.chi < 1.0 })
+            );
+        }
+        let error = haversine_m(case.obs.0, case.obs.1, top.lat, top.lon);
+        assert!(error < 75.0, "medium {med:?}: error {error} m");
+        assert!((top.t_start_utc - case.t_s).abs() < 0.2);
+        assert!(result.funnel.truncated.is_empty());
+        eprintln!(
+            "wind-delayed medium {med:?}: error {error:.6} m clock {:.6} s; funnel {:?}",
+            top.t_start_utc - case.t_s,
+            result.funnel
+        );
+        result
+    }
+
+    #[test]
+    fn narrow_clock_search_keeps_wind_delayed_flyovers() {
+        for (east, north) in [(0.0, 35.0), (35.0, 0.0), (0.0, -35.0), (-35.0, 0.0)] {
+            let med = fdop_types::atmo::Medium {
+                c: 343.0,
+                wind_e: east,
+                wind_n: north,
+            };
+            for start in [0.0, 1_788_895_000.0] {
+                let case = wind_delayed_case(med, start);
+                check_wind_delayed_case(&case, med, run_case(&case, med));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_clock_still_air_search_control() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        for start in [0.0, 1_788_895_000.0] {
+            let case = wind_delayed_case(med, start);
+            let result = check_wind_delayed_case(&case, med, run_case(&case, med));
+            // Record the complete result, including its evidence and contour, for the
+            // immutable before/after still-air comparison used with this regression.
+            let fingerprint = serde_json::to_vec(&result)
+                .unwrap()
+                .into_iter()
+                .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+                });
+            eprintln!("still-air start {start}: result fingerprint {fingerprint:016x}");
+        }
+    }
+
+    #[test]
+    fn narrow_clock_uses_wind_on_the_observers_path() {
+        struct LocalWind {
+            centre: (f64, f64),
+        }
+        impl Atmosphere for LocalWind {
+            fn medium(
+                &self,
+                lat: f64,
+                lon: f64,
+                _: f64,
+                _: f64,
+                _: f64,
+            ) -> fdop_types::atmo::Medium {
+                let range = haversine_m(self.centre.0, self.centre.1, lat, lon);
+                fdop_types::atmo::Medium {
+                    c: 343.0,
+                    wind_e: 0.0,
+                    wind_n: 35.0 * ((2000.0 - range) / 1500.0).clamp(0.0, 1.0),
+                }
+            }
+            fn describe(&self) -> String {
+                "synthetic observer-local wind".into()
+            }
+        }
+        let med = fdop_types::atmo::Medium {
+            c: 343.0,
+            wind_e: 0.0,
+            wind_n: 35.0,
+        };
+        let case = wind_delayed_case(med, 1_788_895_000.0);
+        let atmo = LocalWind { centre: case.obs };
+        let dem = FlatElevation(0.0);
+        let o = observer(case.obs.0, case.obs.1, &dem);
+        for (event, tr) in case.events.iter().zip(&case.tracks) {
+            let cpa = tr
+                .cpa_nearest_time(o.x, case.t_s + event.t_rec, 100.0)
+                .unwrap();
+            let ((lat, lon, h), _) = tr.geo_at(cpa.t_e);
+            assert_eq!(atmo.medium(lat, lon, cpa.t_e, MIC_HEIGHT_M, h).wind_n, 0.0);
+            assert_eq!(atmo.medium(o.lat, o.lon, cpa.t_e, MIC_HEIGHT_M, h), med);
+        }
+        let result = run(
+            &SearchInputs {
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                heard_times: vec![],
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            },
+            &case.p,
+            &|_| {},
+        );
+        check_wind_delayed_case(&case, med, result);
     }
 
     #[test]
