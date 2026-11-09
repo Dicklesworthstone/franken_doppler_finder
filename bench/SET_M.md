@@ -100,3 +100,101 @@ Six cases, one recordist, one metro: every case is listed and no significance is
 recordist's word, and a wrong one makes a case unsolvable for every tool alike.
 
 Recordings, coordinates and aircraft identifiers stay out of this repository.
+
+## 2026-11-09: capture, runs and result
+
+### Capture and runs
+
+- **Capture.** All six uploads fetched once and sealed in `data/set_m/seal_m.txt` (12 lines). None is void: their
+  means are −25.7 to −14.1 dBFS, and they run 33 to 72 minutes.
+- **Scorer.** `tools/score.py` gained groups "M", "MN" and "M+MN" before any row ran. Its output on set J and on set K
+  (both regimes) was byte-identical before and after the change.
+- **Runs.** Regime `mr2` started at 20:15:32Z and finished at 22:13:23Z.
+  - All 15 listed days were downloaded and ingested into `dopplerprint`'s store with exit code 0 by 20:38:03Z. No
+    `dopplerprint` row failed for a missing day.
+  - The national DEM was renamed aside at 20:38:03Z and back at 20:47:15Z, between `dp48i` and `dpdemi`.
+  - No row ended in a fault exit code (101, 127, 133, 137 or 143), so no row was rerun.
+  - `dt`'s refine step exited 1 on five rows. Both causes are in its own code: a `ValueError` ("no flight near the
+    candidate") in its refine, and a pandas `IndexError` on an empty candidate table. They are scored as errors, and
+    `dtfb` covers them as registered.
+
+### Result
+
+Read once at 22:15:02Z by `data/set_m/tools/m_read.sh`: `tools/score.py data/set_m/jobs/cases.json runs_m r2`, then
+the same on `r2i`, into `runs_m/SCORE_setM_20261109.txt`, sha256 `a114f60932a5488b`. `score.py` prints the rule only
+within one regime, so `fdop` against `dopplerprint` was decided from the two tallies by a script fixed and logged before
+the read.
+
+| Row | `11313ba` | `b8abf86` | `9087ec4` | `dpi` | `dp48i` | `dpdemi` | `dt` | `dtfb` |
+|---|---|---|---|---|---|---|---|---|
+| `m_washsq` | **wrong**, 5936 m, medium | **wrong**, 5936 m, medium | declined | declined | declined | declined | **wrong**, 15 km | **wrong**, 15 km |
+| `m_highline` | declined | declined | declined | declined | declined | declined | **wrong**, 15 km | **wrong**, 15 km |
+| `m_hunterspt` | declined | declined | declined | declined | declined | declined | **wrong**, 24 km | **wrong**, 24 km |
+| `m_ftwadsworth` | **right**, 32 m, high | **right**, 32 m, high | **right**, 23 m, high | **right**, 19 m, high | **right**, 19 m, high | **right**, 36 m, high | error | **wrong**, 11 km |
+| `m_bryantpark` | declined | declined | declined | declined | declined | declined | error | declined |
+| `m_eastriver` | declined | declined | declined | declined | declined | declined | **wrong**, 2816 m | **wrong**, 2816 m |
+| `m_washsq_n` | 12 km, low | 12 km, low | 12 km, low | declined | declined | declined | error | declined |
+| `m_highline_n` | declined | declined | declined | 13 km, low | 22 km, low | 22 km, low | **wrong**, 26 km | **wrong**, 26 km |
+| `m_hunterspt_n` | declined | declined | declined | declined | declined | declined | **wrong**, 23 km | **wrong**, 23 km |
+| `m_ftwadsworth_n` | 31 km, low | 31 km, low | declined | **wrong**, 14 km, medium | **wrong**, 14 km, medium | **wrong**, 14 km, medium | **wrong**, 23 km | **wrong**, 23 km |
+| `m_bryantpark_n` | declined | declined | declined | declined | declined | declined | error | declined |
+| `m_eastriver_n` | declined | declined | declined | declined | declined | declined | error | declined |
+
+"Declined" includes a location that the tool itself graded inconclusive or did not assert; the score file has each
+one's distance and grade.
+
+| Tool | Right | Wrong |
+|---|---|---|
+| `9087ec4` | 1 | 0 |
+| `11313ba`, `b8abf86` | 1 | 1 each |
+| `dpi`, `dp48i`, `dpdemi` | 1 | 1 each |
+| `dt` | 0 | 7 (and 5 errors) |
+| `dtfb` | 0 | 8 |
+
+- **More accurate.**
+  - `9087ec4` meets the rule against every rival.
+  - `11313ba` and `b8abf86` meet it against `dt` and `dtfb` only. Against each `dopplerprint` regime they tie at
+    1 right and 1 wrong.
+- **Falsifier.** It fires for `11313ba` and for `b8abf86`: each made a wrong assertion on a sealed set. It does not
+  fire for `9087ec4`.
+- **Works near population centres.** No tool works on set M; that needs 3 of the 6 cases right with no wrong
+  assertion.
+- **`11313ba` beside `b8abf86`.** Every row is the same apart from wall time. The null-tail limit changed nothing on
+  set M.
+
+Sets J, K and M summed (`11313ba` and `b8abf86` ran on set M only):
+
+| Tool | Right | Wrong | Cases right |
+|---|---|---|---|
+| `9087ec4` | 3 | 0 | 3 of 15 |
+| `dopplerprint`, set K's supplementary counts (`dpi`, `dp48i`, `dpdemi`) | 3 | 3, 3 and 4 | 3 of 15 |
+| `dopplerprint`, set K's sealed counts (`dp`, `dp48`, `dpdem`) | 2 | 2, 3 and 3 | 2 of 15 |
+| `dt`, `dtfb` | 0 | 25 and 26 | 0 of 15 |
+
+On the sums `9087ec4` meets the rule against every rival, on either count of `dopplerprint`. No tool works: none is
+right on 8 of the 15 cases.
+
+### Why the current code was wrong on `m_washsq` (read after the seal; for development only)
+
+`11313ba`'s answer there came from the curve match alone. The trace search's own best was not asserted: its
+core-match gate found 1 of the 2 matches it needs. The curve match scored 21.4 nats with six passes heard, 0.2 over the best of its
+48 decoy clocks; its line is 0.0, so it stood. The decoy test checks the clock, not the place. On the right date the
+real window holds real aircraft tones, so a wrong place can beat every decoy. `9087ec4`'s older curve match heard one
+pass there, scored 10.2 nats, 7.6 below its best decoy, and did not stand.
+
+The lead over the best decoy does not separate right from wrong. Across the benchmark, 25 `fdop` runs have had a
+curve match ahead of every decoy, several of them different builds on one case.
+- The wrong places led by 0.2 (`m_washsq`), 1.9 (`e_harbourgate`, set E, medium) and 4.1 nats (`i_winterpark` on
+  `a0795de`, low).
+- The right places led by 1.1 to 44.8. Among them are Olympia (set E) at 2.5 and 2.9, and Winter Park (set I) on
+  `9087ec4` at 2.0, both medium.
+- `9087ec4`'s two right answers on set K came from the curve match alone.
+
+So raising the line, or dropping the curve match's own answers, would cost right answers as well as wrong ones. Set M
+gives no threshold to change.
+
+### The null-tail limit's development replay of `k_weehawken`
+
+The `b8abf86` control replay of `k_weehawken`, read after this file was registered, gives the same answer as `11313ba`
+(high, 33 m; its −2 h decoy has no chance match). So on the current code the limit is not what grades it high. The
+"Known before" line above is true but did not say so.
