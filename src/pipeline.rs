@@ -1870,6 +1870,12 @@ fn locate_with_clock(
             assessment.apply_decoys(gate);
         }
         if metadata_needs_fallback(meta_window, assessment.confidence) {
+            // Say so before the wider dates are fetched: that fetch can take long, or fail
+            // (an offline cache without those days), and the log must show why they were asked for.
+            log.say(&format!(
+                "creation_time window gave {} confidence; widening to the full date window if it adds recording start times",
+                assessment.confidence
+            ));
             let mut fallback_warnings = Vec::new();
             let fallback =
                 published_start_window(a, full_window, dur, now(), &mut fallback_warnings)?;

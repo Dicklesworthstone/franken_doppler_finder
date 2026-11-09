@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Say why the full date window is fetched before fetching it
+
+- When the `creation_time` window's grade is low or absent, `locate` now logs that grade and that it is widening
+  to the full date window before it checks which of those days adsb.lol has published. `af51296` had replaced
+  the earlier "widening to the full date window" line with lines written only after that check, so a check that
+  fails (no published day covers the window) left no line saying why the wider days were asked for.
+  `pipeline::tests::empty_metadata_search_fetches_the_wider_dates` asserts that line and failed on `72e021f`
+  (the benchmark machine's `check_72e021f`; 40 of 41 root-package tests passed). No grade, window, gate or warning
+  changes.
+- Checked on `dc7f11a` plus this change (Linux, rch worker vmi1153651): the root package's 44 tests pass (1
+  ignored), that test included; workspace Clippy with warnings denied passes; `fdop selftest` passes (1.7 m,
+  radius 75 m). `rustfmt --check` passes on the changed file. The workspace's other crates' tests did not run, and
+  no macOS build of this change has finished. `pipeline.rs` is unchanged between `dc7f11a` and the base of this
+  commit.
+
 ### Recover valid hillside passes rejected by approximate geometry
 
 - Let a terrain-dependent distance or clearance rejection reach the same bounded exact-CPA
