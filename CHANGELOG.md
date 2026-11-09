@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep usable weather when missing hours lie outside the recording window
+
+- Parse the original hourly rows bracketing the requested interval before requiring their temperature,
+  pressure and winds. An incomplete unrelated hour no longer forces a short recording to lose its
+  pressure-level or surface weather. Required endpoints still follow the existing failure and fallback rules.
+- Validate intact, matching hourly time axes without compacting malformed entries onto another hour's data.
+  Require source coverage instead of extrapolating an uncovered window; a late-night request includes the
+  following midnight bracket. Exact-hour point windows retain one profile, fractional points both brackets.
+- Add offline cached-response regressions for positive recovery, pressure/surface fallbacks, midnight,
+  point windows, malformed and shifted axes, and full-day interpolation equivalence. Recovered complete and
+  partial responses must agree exactly; comparison with all valid day columns allows only 1e-12 m/s rounding.
+- Validation: changed-file formatting and whitespace checks pass, and UBS reports no critical finding.
+  The cached-weather regressions have not executed here: the cold dependency build stalled before
+  application checks, including after a one-job, reduced-optimization retry through real RCH. No full
+  workspace, CLI selftest or real-recording improvement is claimed from this source change.
+
 ### Reuse Doppler interpolation coefficients across the recording-clock search
 
 - Prepare each ratio grid's monotone cubic intervals and finite differences once, rather than repeating
@@ -30,7 +46,7 @@ at that commit, not per-change commits.
   grids: every finite value is bit-identical, and missing support is unchanged. A preliminary interpolation
   microbenchmark was about 30% faster; this is not an end-to-end runtime measurement. Changed-file
   formatting and whitespace checks pass; UBS reports no critical finding. Full core and workspace
-  validation remains pending while dependencies build on the shared executor.
+  validation could not complete because the shared executor's cold dependency builds stalled.
 
 ### Preserve recording clocks when timestamp rounding crosses a boundary
 

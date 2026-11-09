@@ -138,28 +138,57 @@ fn arr(h: &serde_json::Value, key: &str, i: usize) -> f64 {
 }
 
 fn times_of(h: &serde_json::Value) -> Result<Vec<f64>, DataError> {
-    Ok(h.get("time")
+    let times: Vec<f64> = h
+        .get("time")
         .and_then(|t| t.as_array())
         .ok_or_else(|| DataError::new("open-meteo: no time axis"))?
         .iter()
-        .filter_map(|t| t.as_i64().map(|x| x as f64))
-        .collect())
+        .map(|t| {
+            t.as_i64()
+                .map(|x| x as f64)
+                .ok_or_else(|| DataError::new("open-meteo: invalid hourly timestamp"))
+        })
+        .collect::<Result<_, _>>()?;
+    if times.len() < 2 {
+        return Err(DataError::new("open-meteo: fewer than two hours"));
+    }
+    if times.windows(2).any(|p| p[1] - p[0] != 3600.0) {
+        return Err(DataError::new("open-meteo: non-hourly time axis"));
+    }
+    Ok(times)
 }
 
-/// One Open-Meteo location's hourly block -> per-hour level lists. With `levels`, pressure
+/// Original row indices bracketing the entire requested interval. A point on an exact
+/// hour needs only that row; otherwise retain both sides of every interpolation.
+fn hours_for_window(
+    times: &[f64],
+    t_start: f64,
+    t_end: f64,
+) -> Result<std::ops::Range<usize>, DataError> {
+    if t_start < times[0] || t_end > times[times.len() - 1] {
+        return Err(DataError::new(
+            "open-meteo: hourly data do not cover the requested window",
+        ));
+    }
+    let start = times.partition_point(|&t| t <= t_start).saturating_sub(1);
+    let end = times.partition_point(|&t| t < t_end) + 1;
+    Ok(start..end)
+}
+
+/// Selected original rows of one Open-Meteo hourly block -> level lists. With `levels`, pressure
 /// levels are placed by the hypsometric equation from the surface pressure and temperature;
 /// without, the profile is the surface value with a standard lapse.
 fn parse_location(
     loc: &serde_json::Value,
     levels: bool,
-) -> Result<(Vec<f64>, Vec<Vec<Level>>), DataError> {
+    hours: std::ops::Range<usize>,
+) -> Result<Vec<Vec<Level>>, DataError> {
     let elev = loc.get("elevation").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let h = loc
         .get("hourly")
         .ok_or_else(|| DataError::new("open-meteo: no hourly block"))?;
-    let times = times_of(h)?;
-    let mut out = Vec::with_capacity(times.len());
-    for i in 0..times.len() {
+    let mut out = Vec::with_capacity(hours.len());
+    for i in hours {
         let t2 = arr(h, "temperature_2m", i);
         if !t2.is_finite() {
             return Err(DataError::new("open-meteo: missing surface temperature"));
@@ -223,7 +252,7 @@ fn parse_location(
         fill_wind(&mut lv);
         out.push(lv);
     }
-    Ok((times, out))
+    Ok(out)
 }
 
 /// Replace NaN winds by linear interpolation in height (constant beyond the ends). At least one
@@ -261,6 +290,9 @@ fn om_grid(
     offline: bool,
     levels: bool,
 ) -> Result<GriddedAtmosphere, DataError> {
+    if !t_start.is_finite() || !t_end.is_finite() || t_start > t_end {
+        return Err(DataError::new("open-meteo: invalid requested time window"));
+    }
     let (lats, lons) = grid_axes(b, 1.5, 3);
     let mut qla = Vec::new();
     let mut qlo = Vec::new();
@@ -289,7 +321,8 @@ fn om_grid(
         qla.join(","),
         qlo.join(","),
         date_str(t_start),
-        date_str(t_end),
+        // A late-night interval needs the next day's 00Z interpolation bracket.
+        date_str((t_end / 3600.0).ceil() * 3600.0),
         vars.join(",")
     );
     let v = get_cached(
@@ -314,19 +347,19 @@ fn om_grid(
     let mut times: Option<Vec<f64>> = None;
     let mut per_loc = Vec::with_capacity(locs.len());
     for l in &locs {
-        let (t, p) = parse_location(l, levels)?;
-        if times.as_ref().is_some_and(|t0| t0.len() != t.len()) {
-            return Err(DataError::new("open-meteo: ragged time axes"));
+        let t = times_of(&l["hourly"])?;
+        if times.as_ref().is_some_and(|t0| *t0 != t) {
+            return Err(DataError::new("open-meteo: mismatched time axes"));
         }
+        let hours = hours_for_window(&t, t_start, t_end)?;
+        let p = parse_location(l, levels, hours)?;
         times.get_or_insert(t);
         per_loc.push(p);
     }
     let times = times.unwrap_or_default();
-    if times.len() < 2 {
-        return Err(DataError::new("open-meteo: fewer than two hours"));
-    }
-    let mut profiles = Vec::with_capacity(times.len() * locs.len());
-    for it in 0..times.len() {
+    let hours = hours_for_window(&times, t_start, t_end)?;
+    let mut profiles = Vec::with_capacity(hours.len() * locs.len());
+    for it in 0..hours.len() {
         for p in &per_loc {
             profiles.push(p[it].clone());
         }
@@ -339,7 +372,7 @@ fn om_grid(
     GriddedAtmosphere::new(
         lats,
         lons,
-        times[0],
+        times[hours.start],
         times[1] - times[0],
         &profiles,
         src.to_string(),
@@ -1035,6 +1068,228 @@ mod tests {
         assert_eq!((la.len(), lo.len()), (2, 2));
     }
 
+    fn open_meteo_fixture(day: i64, hours: usize) -> serde_json::Value {
+        let mut hourly = serde_json::json!({
+            "time": (0..hours).map(|i| day + i as i64 * 3600).collect::<Vec<_>>(),
+            "temperature_2m": (0..hours).map(|i| 15.0 + i as f64 * 0.25).collect::<Vec<_>>(),
+            "relative_humidity_2m": vec![50.0; hours],
+            "wind_speed_10m": (0..hours).map(|i| 2.0 + i as f64 * 0.1).collect::<Vec<_>>(),
+            "wind_direction_10m": vec![270.0; hours],
+            "surface_pressure": vec![1010.0; hours],
+        });
+        for (j, p) in LEVELS_HPA.into_iter().enumerate() {
+            hourly[format!("temperature_{p}hPa")] = serde_json::json!(
+                (0..hours)
+                    .map(|i| 10.0 - j as f64 * 12.0 + i as f64 * 0.25)
+                    .collect::<Vec<_>>()
+            );
+            hourly[format!("wind_speed_{p}hPa")] = serde_json::json!(
+                (0..hours)
+                    .map(|i| 5.0 + j as f64 + i as f64 * 0.2)
+                    .collect::<Vec<_>>()
+            );
+            hourly[format!("wind_direction_{p}hPa")] = serde_json::json!(vec![270.0; hours]);
+        }
+        serde_json::json!({"elevation": 30.0, "hourly": hourly})
+    }
+
+    fn cache_open_meteo_fixture(
+        dir: &Path,
+        levels: bool,
+        end_date: &str,
+        value: &serde_json::Value,
+    ) {
+        let base = if levels { OM_HIST_FORECAST } else { OM_ARCHIVE };
+        let mut vars =
+            "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m".to_string();
+        if levels {
+            vars.push_str(",surface_pressure");
+            for p in LEVELS_HPA {
+                vars.push_str(&format!(
+                    ",temperature_{p}hPa,wind_speed_{p}hPa,wind_direction_{p}hPa"
+                ));
+            }
+        }
+        // Independent query spelling verifies the requested date bracket and existing cache keys.
+        let url = format!(
+            "{base}?latitude=40.876&longitude=-73.525&start_date=2026-09-08&end_date={end_date}&hourly={vars}&wind_speed_unit=ms&timeformat=unixtime&timezone=GMT"
+        );
+        let path = dir.join("weather").join(format!("{:016x}.json", fnv(&url)));
+        std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn cached_weather_keeps_required_hours_when_other_rows_are_missing() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let bbox = BBox::new(lat, lon, lat, lon);
+        for levels in [true, false] {
+            let dir = std::env::temp_dir().join(format!(
+                "fdop-hour-window-{levels}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("weather")).unwrap();
+            let base = if levels { OM_HIST_FORECAST } else { OM_ARCHIVE };
+            for (start, end, rows, count, end_date) in [
+                (4.25, 5.75, 4..7, 24, "2026-09-08"),
+                (6.0, 6.0, 6..7, 24, "2026-09-08"),
+                (6.25, 6.25, 6..8, 24, "2026-09-08"),
+                (23.25, 23.75, 23..25, 48, "2026-09-09"),
+            ] {
+                let (t0, t1) = (day + start * 3600.0, day + end * 3600.0);
+                let complete = open_meteo_fixture(day as i64, count);
+                cache_open_meteo_fixture(&dir, levels, end_date, &complete);
+                let complete_window = om_grid(base, &bbox, t0, t1, &dir, true, levels).unwrap();
+                let full_day = GriddedAtmosphere::new(
+                    vec![lat],
+                    vec![lon],
+                    day,
+                    3600.0,
+                    &parse_location(&complete, levels, 0..count).unwrap(),
+                    "complete day".into(),
+                )
+                .unwrap();
+                let mut partial = complete.clone();
+                for (key, column) in partial["hourly"].as_object_mut().unwrap() {
+                    if key != "time" {
+                        for (i, value) in column.as_array_mut().unwrap().iter_mut().enumerate() {
+                            if !rows.contains(&i) {
+                                *value = serde_json::Value::Null;
+                            }
+                        }
+                    }
+                }
+                cache_open_meteo_fixture(&dir, levels, end_date, &partial);
+                let recovered = om_grid(base, &bbox, t0, t1, &dir, true, levels).unwrap();
+                assert_eq!(recovered.describe(), complete_window.describe());
+                for fraction in [0.0, 0.137, 0.5, 0.863, 1.0] {
+                    let t = t0 + (t1 - t0) * fraction;
+                    for (za, zb) in [(30.0, 1000.0), (2500.0, 6000.0)] {
+                        let got = recovered.medium(lat, lon, t, za, zb);
+                        assert_eq!(got, complete_window.medium(lat, lon, t, za, zb));
+                        let all_hours = full_day.medium(lat, lon, t, za, zb);
+                        // Re-basing the grid's time origin may round interpolation
+                        // weights differently; preserve the full-day physical result.
+                        assert!(
+                            (got.c - all_hours.c).abs() < 1e-12,
+                            "{got:?} != {all_hours:?}"
+                        );
+                        assert!((got.wind_e - all_hours.wind_e).abs() < 1e-12);
+                        assert!((got.wind_n - all_hours.wind_n).abs() < 1e-12);
+                    }
+                }
+                let weather = fetch_atmosphere(&bbox, t0, t1, &dir, true);
+                assert_eq!(weather.winds_aloft, levels);
+                assert_eq!(weather.atmo.describe(), recovered.describe());
+                assert_eq!(weather.warnings.is_empty(), levels);
+
+                // Both interpolation endpoints remain mandatory, including a next-day bracket.
+                for (key, missing) in [
+                    ("temperature_2m", "missing surface temperature"),
+                    ("surface_pressure", "missing surface pressure"),
+                ] {
+                    if !levels && key == "surface_pressure" {
+                        continue;
+                    }
+                    for i in [rows.start, rows.end - 1] {
+                        let mut broken = partial.clone();
+                        broken["hourly"][key][i] = serde_json::Value::Null;
+                        cache_open_meteo_fixture(&dir, levels, end_date, &broken);
+                        let err = om_grid(base, &bbox, t0, t1, &dir, true, levels)
+                            .err()
+                            .unwrap();
+                        assert!(err.0.contains(missing), "{err}");
+                        let fallback = fetch_atmosphere(&bbox, t0, t1, &dir, true);
+                        assert!(
+                            fallback
+                                .warnings
+                                .iter()
+                                .any(|w| w.contains("using a 15 C standard atmosphere"))
+                        );
+                        assert!(!fallback.winds_aloft);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn weather_hours_preserve_indices_and_require_real_brackets() {
+        let times = times_of(&serde_json::json!({"time": [0, 3600, 7200, 10800]})).unwrap();
+        for (start, end, expected) in [
+            (0.0, 0.0, 0..1),
+            (3600.0, 3600.0, 1..2),
+            (10800.0, 10800.0, 3..4),
+            (3600.0, 7200.0, 1..3),
+            (3600.1, 7199.9, 1..3),
+            (3600.1, 7200.1, 1..4),
+        ] {
+            assert_eq!(hours_for_window(&times, start, end).unwrap(), expected);
+        }
+        for (start, end) in [
+            (-1.0, 0.0),
+            (10800.0, 10801.0),
+            (-7200.0, -3600.0),
+            (14400.0, 18000.0),
+        ] {
+            assert!(hours_for_window(&times, start, end).is_err());
+        }
+        for axis in [
+            serde_json::json!([0, null, 7200]),
+            serde_json::json!([0, "3600", 7200]),
+            serde_json::json!([0, true, 7200]),
+            serde_json::json!([0, 3600, 10800]),
+            serde_json::json!([0, 3600, 3600]),
+            serde_json::json!([7200, 3600, 0]),
+            serde_json::json!([0]),
+        ] {
+            assert!(times_of(&serde_json::json!({"time": axis})).is_err());
+        }
+    }
+
+    #[test]
+    fn cached_weather_rejects_shifted_location_time_axes() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let bbox = BBox::new(lat, lon, lat, lon + 0.01);
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-hour-grid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("weather")).unwrap();
+        let url = format!(
+            "{OM_ARCHIVE}?latitude=40.876,40.876&longitude=-73.525,-73.515&start_date=2026-09-08&end_date=2026-09-08&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&timeformat=unixtime&timezone=GMT"
+        );
+        let path = dir.join("weather").join(format!("{:016x}.json", fnv(&url)));
+        let first = open_meteo_fixture(day as i64, 24);
+        let second = open_meteo_fixture(day as i64 + 3600, 24);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!([first, second])).unwrap(),
+        )
+        .unwrap();
+        let err = om_grid(
+            OM_ARCHIVE,
+            &bbox,
+            day + 4.25 * 3600.0,
+            day + 5.75 * 3600.0,
+            &dir,
+            true,
+            false,
+        )
+        .err()
+        .unwrap();
+        assert!(err.0.contains("mismatched time axes"), "{err}");
+    }
+
     #[test]
     fn parses_pressure_level_payload_with_hypsometric_heights() {
         let mut hourly = serde_json::json!({
@@ -1056,7 +1311,8 @@ mod tests {
             hourly[format!("wind_direction_{p}hPa")] = serde_json::json!([315, 315]);
         }
         let loc = serde_json::json!({"elevation": 30.0, "hourly": hourly});
-        let (t, p) = parse_location(&loc, true).unwrap();
+        let t = times_of(&loc["hourly"]).unwrap();
+        let p = parse_location(&loc, true, 0..t.len()).unwrap();
         assert_eq!(t.len(), 2);
         // hypsometric 500 hPa height within 60 m of the model's geopotential height (5866 m)
         let z500 = p[0]
@@ -1084,16 +1340,16 @@ mod tests {
             hourly[format!("temperature_{p}hPa")] = serde_json::json!([t, t]);
         }
         let loc = |h: &serde_json::Value| serde_json::json!({"elevation": 30.0, "hourly": h});
-        let err = parse_location(&loc(&hourly), true).err().unwrap();
+        let err = parse_location(&loc(&hourly), true, 0..2).err().unwrap();
         assert!(err.0.contains("no winds aloft"), "{err}");
         // one hour without them is enough: the grid would hold a false profile there
         hourly["wind_speed_500hPa"] = serde_json::json!([20.0, null]);
         hourly["wind_direction_500hPa"] = serde_json::json!([315, 315]);
-        let err = parse_location(&loc(&hourly), true).err().unwrap();
+        let err = parse_location(&loc(&hourly), true, 0..2).err().unwrap();
         assert!(err.0.contains("no winds aloft"), "{err}");
         // one level with them is fine: the others take it, and the surface keeps its own
         hourly["wind_speed_500hPa"] = serde_json::json!([20.0, 20.0]);
-        let (_, p) = parse_location(&loc(&hourly), true).unwrap();
+        let p = parse_location(&loc(&hourly), true, 0..2).unwrap();
         let (surface, top) = (p[0].first().unwrap(), p[0].last().unwrap());
         assert!(surface.wind_e > 1.9 && surface.wind_e < 2.1, "{surface:?}");
         assert!(top.wind_e > 14.0 && top.wind_n < -14.0, "{top:?}");
@@ -1216,20 +1472,30 @@ mod tests {
                 // Spell the expected provider URL independently of raob_url: truncating a
                 // non-K identifier must miss the cache, rather than create its own oracle.
                 let url = format!("{IEM_RAOB}?ts=20240908{hour}00&station={requested}");
-                put(&url, serde_json::json!({"profiles": [{"profile": profile}]}));
+                put(
+                    &url,
+                    serde_json::json!({"profiles": [{"profile": profile}]}),
+                );
             }
             let chosen = raob_stations(&dir, true, (day, day + 43_200.0)).unwrap();
             assert_eq!(chosen.len(), 1, "{label}: {chosen:?}");
             assert_eq!(chosen[0].0, id);
             let weather = fetch_atmosphere(&bbox, day + 3600.0, day + 39_600.0, &dir, true);
             let source = weather.atmo.describe();
-            assert!(weather.winds_aloft, "{label}: {source}; {:?}", weather.warnings);
+            assert!(
+                weather.winds_aloft,
+                "{label}: {source}; {:?}",
+                weather.warnings
+            );
             assert!(
                 source.contains(id) && source.contains("2 of 2 soundings usable"),
                 "{source}"
             );
             let medium = weather.atmo.medium(lat, lon, day + 21_600.0, 100.0, 5000.0);
-            assert!((medium.c - sound_speed(10.0, 1.0)).abs() < 1e-8, "{medium:?}");
+            assert!(
+                (medium.c - sound_speed(10.0, 1.0)).abs() < 1e-8,
+                "{medium:?}"
+            );
             assert!((medium.wind_e - 30.0 * KT).abs() < 1e-8, "{medium:?}");
             assert!(medium.wind_n.abs() < 1e-8, "{medium:?}");
             assert!(
@@ -1251,9 +1517,15 @@ mod tests {
             "online": false,
         });
         assert!(raob_station_overlaps(&closed, (day, day)));
-        assert!(raob_station_overlaps(&closed, (day + 86_399.0, day + 86_399.0)));
+        assert!(raob_station_overlaps(
+            &closed,
+            (day + 86_399.0, day + 86_399.0)
+        ));
         assert!(!raob_station_overlaps(&closed, (day - 1.0, day - 1.0)));
-        assert!(!raob_station_overlaps(&closed, (day + 86_400.0, day + 86_400.0)));
+        assert!(!raob_station_overlaps(
+            &closed,
+            (day + 86_400.0, day + 86_400.0)
+        ));
         assert!(raob_station_overlaps(&closed, (day - 43_200.0, day)));
 
         for unknown in [

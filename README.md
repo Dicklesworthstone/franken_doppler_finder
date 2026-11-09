@@ -950,6 +950,13 @@ and warns when it does. Going offline therefore preserves the altitude reference
 
 ### Data sources
 
+Weather profiles retain the original hourly rows that bracket the requested time window. Missing
+temperature, pressure or winds in unrelated hours no longer discard usable weather for a short recording.
+Every selected interpolation endpoint must still be usable, and grid locations must share the same intact
+hourly time axis. A window ending after 23:00 UTC requests the following midnight too; an offline run needs
+that covering response cached. If required data are missing, the existing fallback sources and warnings
+still apply. The atmosphere description counts retained hours, rather than every downloaded day hour.
+
 | Data | Source | Notes |
 |---|---|---|
 | ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing |
