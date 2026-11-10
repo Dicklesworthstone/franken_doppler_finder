@@ -4667,7 +4667,7 @@ mod tests {
             warnings,
             [
                 "prior pipeline warning",
-                "curve match ADS-B 2026-09-08: no mlatonly release, so aircraft located only by multilateration (transponders without ADS-B Out) are missing"
+                "curve match ADS-B 2026-09-08: no mlatonly data in this catalogue, so aircraft located only by multilateration (transponders without ADS-B Out) are missing"
             ]
         );
         assert_eq!(result.n_tracks, 1);

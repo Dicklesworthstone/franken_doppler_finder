@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve completed main ADS-B feeds after MLAT failure
+
+- Keep a completely ingested prod or staging feed when another requested feed fails,
+  regardless of completion order. Build it through the existing raw-data reconciliation
+  and atomically cache it under its actual feedset. Never promote an MLAT-only remainder
+  to a main catalogue.
+- Preserve strict online failure behavior. Explicitly permissive callers retain the
+  surviving day with a warning; ordinary offline searches can reuse the partial cache
+  and report its missing MLAT data. Cache-write failures remain fatal.
+- Online retries still rebuild the requested feeds together, preserving cross-feed
+  altitude and type reconciliation. This does not provide incremental online completion.
+- Add regressions for both main feeds and arrival orders, durable cache reads and offline
+  reuse, missing-feed provenance, strict/permissive policy and full-feedset rejection.
+  Retain the bounded-channel publication and unrelated-day recovery checks. Update the
+  dependent pipeline warning assertion and user documentation.
+- Independent source review found no blocker. Native formatting, compilation, tests,
+  selftest and reference replays could not run because the execution host is unavailable.
+
 ### Keep distant admissible flights in the ADS-B catalogue
 
 - Size the `locate` catalogue from the largest retained event's fitted upper distance

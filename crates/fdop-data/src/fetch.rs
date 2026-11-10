@@ -362,18 +362,20 @@ fn feedset_name(main: Feed, mlat: bool) -> String {
     format!("{}{}", main.tag_word(), if mlat { "+mlatonly" } else { "" })
 }
 
-/// Feedset of a store built from release `tags` (e.g. `v2026.11.02-planes-readsb-prod-0`).
-fn feedset_of_tags(tags: &[String]) -> String {
+/// Feedset of completed release tags. MLAT alone cannot stand in for a main feed.
+fn feedset_of_tags(tags: &[String]) -> Option<String> {
     let has = |f: Feed| {
         tags.iter()
             .any(|t| t.contains(&format!("-{}-", f.tag_word())))
     };
     let main = if has(Feed::Prod) {
         Feed::Prod
-    } else {
+    } else if has(Feed::Staging) {
         Feed::Staging
+    } else {
+        return None;
     };
-    feedset_name(main, has(Feed::Mlatonly))
+    Some(feedset_name(main, has(Feed::Mlatonly)))
 }
 
 /// Best feedset obtainable from `rels` (None without a prod or staging release).
@@ -391,7 +393,7 @@ fn feedset_available(rels: &[DayRelease], include_mlat: bool) -> Option<String> 
     ))
 }
 
-const NO_MLATONLY: &str = "no mlatonly release, so aircraft located only by multilateration \
+const NO_MLATONLY: &str = "no mlatonly data in this catalogue, so aircraft located only by multilateration \
                            (transponders without ADS-B Out) are missing";
 
 /// What a day built from feedset `fs` lacks, for warnings (`label` is the day).
@@ -507,37 +509,57 @@ struct StreamedDayFailures {
     caches: Vec<(usize, String)>,
 }
 
-/// Publish a day as soon as all of its requested feeds have arrived. A failed feed
-/// discards that day's other raw parts immediately, without holding up usable days.
-/// The caller drains a bounded channel while download workers are still running.
+impl StreamedDayFailures {
+    fn report(&self, opts: &FetchOptions, notes: &mut Vec<String>) -> Result<(), DataError> {
+        if self.feeds.is_empty() && self.caches.is_empty() {
+            return Ok(());
+        }
+        let msg = format!(
+            "ADS-B fetch failed (rerun to retry incomplete feeds or caches): {}",
+            self.feeds
+                .iter()
+                .chain(&self.caches)
+                .map(|(_, e)| e.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        // Strict searches still fail on a missing feed. A cache write failure remains
+        // fatal even when the caller explicitly allows incomplete archive coverage.
+        if !opts.allow_missing || !self.caches.is_empty() {
+            return Err(DataError(msg));
+        }
+        opts.say(&format!("[adsb] WARNING {msg}"));
+        notes.push(msg);
+        Ok(())
+    }
+}
+
+/// Publish completed feeds after every requested feed for the day has finished. Preserve
+/// a successful main feed when MLAT fails, but never publish an MLAT-only remainder as a
+/// main catalogue. The caller drains a bounded channel while workers are still running.
 fn collect_streamed_days(
     results: impl IntoIterator<Item = JobResult>,
     mut remaining: Vec<usize>,
-    mut finish: impl FnMut(usize, Vec<Part>, Vec<String>) -> Result<(), DataError>,
+    mut finish: impl FnMut(usize, Vec<Part>, Vec<String>, String) -> Result<(), DataError>,
 ) -> StreamedDayFailures {
     let mut pending: BTreeMap<usize, (Vec<Part>, Vec<String>)> = BTreeMap::new();
-    let mut failed_days = vec![false; remaining.len()];
     let mut failures = StreamedDayFailures::default();
     for (di, tag, result) in results {
         remaining[di] -= 1;
         match result {
-            Ok(part) if !failed_days[di] => {
+            Ok(part) => {
                 let (parts, tags) = pending.entry(di).or_default();
                 parts.push(part);
                 tags.push(tag);
             }
-            Ok(_) => {}
-            Err(e) => {
-                failed_days[di] = true;
-                pending.remove(&di);
-                failures.feeds.push((di, e.0));
-            }
+            Err(e) => failures.feeds.push((di, e.0)),
         }
         if remaining[di] == 0
             && let Some((parts, mut tags)) = pending.remove(&di)
+            && let Some(feedset) = feedset_of_tags(&tags)
         {
             tags.sort();
-            if let Err(e) = finish(di, parts, tags) {
+            if let Err(e) = finish(di, parts, tags, feedset) {
                 failures.caches.push((di, e.0));
             }
         }
@@ -601,7 +623,7 @@ pub fn fetch_window(
                 && let Some((p, s)) = find_cached(&dir, fs, &want, &label, opts, required_context)
             {
                 opts.say(&format!(
-                    "[adsb] {label}: cached {} ({} legs; {fs} only, nothing better is published)",
+                    "[adsb] {label}: cached {} ({} legs; {fs} only)",
                     p.display(),
                     s.leg_count
                 ));
@@ -729,11 +751,19 @@ pub fn fetch_window(
                 });
             }
             drop(tx);
-            collect_streamed_days(rx, remaining, |di, parts, tags| {
+            collect_streamed_days(rx, remaining, |di, parts, tags, fs| {
                 let day = days[di];
-                // Name the cache by what was actually streamed, so a missing feed
-                // cannot make a partial day look complete on a later run.
-                let fs = feedset_of_tags(&tags);
+                // Only completely ingested feeds reach this cache. Its actual feedset
+                // lets offline runs use a surviving main feed with the existing warning;
+                // an online retry rebuilds the requested feeds together for altitude/type
+                // reconciliation instead of merging independently built day stores.
+                if opts.include_mlat && !fs.contains("mlatonly") {
+                    let label = format!("{:04}-{:02}-{:02}", day.0, day.1, day.2);
+                    let note = format!("{label}: {NO_MLATONLY}");
+                    if !notes.contains(&note) {
+                        notes.push(note);
+                    }
+                }
                 let store = build_day_store(parts, &day_spec(day), tags, day_context(day));
                 let dir = day_dir(cache_dir, day);
                 let path = dir.join(format!("{fs}_{key}.fdtrk"));
@@ -759,25 +789,7 @@ pub fn fetch_window(
         });
     }
 
-    if !failed.feeds.is_empty() || !failed.caches.is_empty() {
-        let msg = format!(
-            "ADS-B fetch failed (finished days were cached; rerun to retry the rest): {}",
-            failed
-                .feeds
-                .iter()
-                .chain(&failed.caches)
-                .map(|(_, e)| e.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-        // A missing release may be skipped explicitly; inability to persist a completed
-        // day remains fatal, after giving the other completed days their save attempts.
-        if !opts.allow_missing || !failed.caches.is_empty() {
-            return Err(DataError(msg));
-        }
-        opts.say(&format!("[adsb] WARNING {msg}"));
-        notes.push(msg);
-    }
+    failed.report(opts, &mut notes)?;
 
     // ---- combine ----
     let stores: Vec<CachedDay> = day_stores.into_iter().flatten().collect();
@@ -965,6 +977,36 @@ mod tests {
         );
     }
 
+    fn synthetic_tag(feed: Feed) -> String {
+        crate::adsblol::tag_for(2026, 9, 8, feed, 0)
+    }
+
+    #[test]
+    fn completed_feedset_requires_a_main_release() {
+        let prod = synthetic_tag(Feed::Prod);
+        let staging = synthetic_tag(Feed::Staging);
+        let mlat = synthetic_tag(Feed::Mlatonly);
+        assert_eq!(feedset_of_tags(&[]), None);
+        assert_eq!(feedset_of_tags(std::slice::from_ref(&mlat)), None);
+        assert_eq!(feedset_of_tags(&["mlat".into()]), None);
+        assert_eq!(
+            feedset_of_tags(std::slice::from_ref(&prod)).as_deref(),
+            Some("prod")
+        );
+        assert_eq!(
+            feedset_of_tags(std::slice::from_ref(&staging)).as_deref(),
+            Some("staging")
+        );
+        assert_eq!(
+            feedset_of_tags(&[prod, mlat.clone()]).as_deref(),
+            Some("prod+mlatonly")
+        );
+        assert_eq!(
+            feedset_of_tags(&[staging, mlat]).as_deref(),
+            Some("staging+mlatonly")
+        );
+    }
+
     #[test]
     fn streamed_days_are_cached_before_unrelated_downloads_finish() {
         use crate::ingest::tests::spec;
@@ -979,10 +1021,14 @@ mod tests {
             .map(|di| dir.join(format!("day-{di}.fdtrk")))
             .collect();
         let arrivals: Vec<JobResult> = vec![
-            (0, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
-            (1, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
-            (0, "mlat".into(), Ok(synthetic_part(&sp, "mlat"))),
-            (2, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
+            (0, synthetic_tag(Feed::Prod), Ok(synthetic_part(&sp, "prod"))),
+            (1, synthetic_tag(Feed::Prod), Ok(synthetic_part(&sp, "prod"))),
+            (
+                0,
+                synthetic_tag(Feed::Mlatonly),
+                Ok(synthetic_part(&sp, "mlat")),
+            ),
+            (2, synthetic_tag(Feed::Prod), Ok(synthetic_part(&sp, "prod"))),
         ];
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let (cached_tx, cached_rx) = std::sync::mpsc::sync_channel(0);
@@ -1001,14 +1047,18 @@ mod tests {
                     .recv_timeout(std::time::Duration::from_secs(10))
                     .unwrap();
                 let first = TrackStore::load(&paths[0]).unwrap();
-                assert_eq!(first.meta.sources, ["mlat", "prod"]);
+                assert_eq!(
+                    first.meta.sources,
+                    [synthetic_tag(Feed::Mlatonly), synthetic_tag(Feed::Prod)]
+                );
                 assert_eq!(first.legs.len(), 1);
                 assert!(!first.legs[0].points.is_empty());
                 assert!(paths[1].is_file());
                 assert!(!paths[2].exists());
                 tx.send(arrivals.next().unwrap()).unwrap();
             });
-            collect_streamed_days(rx, vec![2, 1, 1], |di, parts, tags| {
+            collect_streamed_days(rx, vec![2, 1, 1], |di, parts, tags, fs| {
+                assert_eq!(fs, if di == 0 { "prod+mlatonly" } else { "prod" });
                 let store = build_store(parts, &sp, tags);
                 retained[di] = Some(CachedDay::publish(store, &paths[di])?);
                 published.push(di);
@@ -1025,32 +1075,55 @@ mod tests {
         assert_eq!(published, [1, 0, 2]);
         let last = TrackStore::load(&paths[2]).unwrap();
         assert_eq!(last.legs.len(), 1);
-        assert_eq!(last.meta.sources, ["prod"]);
+        assert_eq!(last.meta.sources, [synthetic_tag(Feed::Prod)]);
         let selected = load_selected_stores(retained.into_iter().flatten().collect(), &sp).unwrap();
         assert_eq!(selected.len(), 3);
         assert!(selected.iter().all(|store| store.legs.len() == 1));
-        assert_eq!(selected[0].meta.sources, ["mlat", "prod"]);
-        assert_eq!(selected[1].meta.sources, ["prod"]);
-        assert_eq!(selected[2].meta.sources, ["prod"]);
+        assert_eq!(
+            selected[0].meta.sources,
+            [synthetic_tag(Feed::Mlatonly), synthetic_tag(Feed::Prod)]
+        );
+        assert_eq!(selected[1].meta.sources, [synthetic_tag(Feed::Prod)]);
+        assert_eq!(selected[2].meta.sources, [synthetic_tag(Feed::Prod)]);
     }
 
     #[test]
-    fn streamed_day_failures_do_not_publish_partial_feeds_or_lose_other_days() {
+    fn streamed_day_failures_preserve_main_feeds_and_other_days() {
         use crate::ingest::tests::spec;
         let sp = spec();
         let arrivals = vec![
-            (0, "prod".into(), Err(DataError("early failed feed".into()))),
-            (1, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
-            (0, "mlat".into(), Ok(synthetic_part(&sp, "mlat"))),
-            (1, "mlat".into(), Err(DataError("late failed feed".into()))),
-            (2, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
-            (3, "prod".into(), Ok(synthetic_part(&sp, "prod"))),
+            (
+                0,
+                synthetic_tag(Feed::Prod),
+                Err(DataError("early failed main".into())),
+            ),
+            (1, synthetic_tag(Feed::Prod), Ok(synthetic_part(&sp, "prod"))),
+            (
+                0,
+                synthetic_tag(Feed::Mlatonly),
+                Ok(synthetic_part(&sp, "mlat")),
+            ),
+            (
+                1,
+                synthetic_tag(Feed::Mlatonly),
+                Err(DataError("late failed MLAT".into())),
+            ),
+            (
+                2,
+                synthetic_tag(Feed::Mlatonly),
+                Err(DataError("early failed MLAT".into())),
+            ),
+            (2, synthetic_tag(Feed::Prod), Ok(synthetic_part(&sp, "prod"))),
+            (3, synthetic_tag(Feed::Prod), Ok(synthetic_part(&sp, "prod"))),
+            (4, synthetic_tag(Feed::Prod), Ok(synthetic_part(&sp, "prod"))),
         ];
         let mut completed = Vec::new();
         let mut usable = Vec::new();
-        let failures = collect_streamed_days(arrivals, vec![2, 2, 1, 1], |di, parts, tags| {
+        let failures = collect_streamed_days(arrivals, vec![2, 2, 2, 1, 1], |di, parts, tags, fs| {
             completed.push(di);
-            if di == 2 {
+            assert_eq!(fs, "prod", "MLAT-only remainder must not be published");
+            assert_eq!(tags, [synthetic_tag(Feed::Prod)]);
+            if di == 3 {
                 return Err(DataError("cache write failed".into()));
             }
             let store = build_store(parts, &sp, tags);
@@ -1058,16 +1131,143 @@ mod tests {
             usable.push(di);
             Ok(())
         });
-        assert_eq!(completed, [2, 3]);
-        assert_eq!(usable, [3]);
+        assert_eq!(completed, [1, 2, 3, 4]);
+        assert_eq!(usable, [1, 2, 4]);
         assert_eq!(
             failures.feeds,
             [
-                (0, "early failed feed".to_string()),
-                (1, "late failed feed".to_string()),
+                (0, "early failed main".to_string()),
+                (1, "late failed MLAT".to_string()),
+                (2, "early failed MLAT".to_string()),
             ]
         );
-        assert_eq!(failures.caches, [(2, "cache write failed".to_string())]);
+        assert_eq!(failures.caches, [(3, "cache write failed".to_string())]);
+        let permissive = FetchOptions {
+            allow_missing: true,
+            ..Default::default()
+        };
+        let mut notes = Vec::new();
+        let error = failures.report(&permissive, &mut notes).unwrap_err();
+        assert!(error.to_string().contains("cache write failed"));
+        assert!(notes.is_empty(), "failed persistence must remain fatal");
+    }
+
+    #[test]
+    fn failed_mlat_preserves_main_cache_for_permissive_and_offline_reuse() {
+        use crate::ingest::tests::{T0, spec};
+        let want = spec();
+        let day = (2026, 9, 8);
+        let (bbox, key) = bbox_key(&want.bbox);
+        let cache_spec = IngestSpec {
+            bbox,
+            t_start: T0 - DAY_CACHE_PAD_S,
+            t_end: T0 + 86_400.0 + DAY_CACHE_PAD_S,
+            ..want
+        };
+        for main in [Feed::Prod, Feed::Staging] {
+            for failed_first in [false, true] {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let cache = std::env::temp_dir().join(format!(
+                    "fdop-partial-feed-{}-{nonce}-{}-{failed_first}",
+                    std::process::id(),
+                    main.tag_word()
+                ));
+                let part = synthetic_part(&cache_spec, main.label());
+                let expected = build_day_store(
+                    vec![part.clone()],
+                    &cache_spec,
+                    vec![synthetic_tag(main)],
+                    day_context(day),
+                );
+                let mut arrivals = vec![
+                    (0, synthetic_tag(main), Ok(part)),
+                    (
+                        0,
+                        synthetic_tag(Feed::Mlatonly),
+                        Err(DataError("synthetic MLAT outage".into())),
+                    ),
+                ];
+                if failed_first {
+                    arrivals.reverse();
+                }
+                let mut retained = None;
+                let failures = collect_streamed_days(arrivals, vec![2], |di, parts, tags, fs| {
+                    assert_eq!(di, 0);
+                    assert_eq!(fs, main.tag_word());
+                    let store = build_day_store(parts, &cache_spec, tags, day_context(day));
+                    let path = day_dir(&cache, day).join(format!("{fs}_{key}.fdtrk"));
+                    retained = Some(CachedDay::publish(store, &path)?);
+                    Ok(())
+                });
+                assert_eq!(failures.feeds, [(0, "synthetic MLAT outage".to_string())]);
+                assert!(failures.caches.is_empty());
+                let saved = retained.as_ref().expect("successful main feed was discarded");
+                assert_eq!(saved.meta.sources, [synthetic_tag(main)]);
+                assert_eq!(saved.meta.bbox, cache_spec.bbox);
+                assert_eq!(saved.meta.t_start, cache_spec.t_start);
+                assert_eq!(saved.meta.t_end, cache_spec.t_end);
+                assert_eq!(saved.meta.geoid_n_m, cache_spec.geoid_n_m);
+                assert!(
+                    DayContext::from_stats(&saved.meta.stats)
+                        .is_some_and(|c| c.includes(day_context(day)))
+                );
+                let published = TrackStore::load(&saved.path).unwrap();
+                assert_eq!(published.n_points(), expected.n_points());
+                assert_eq!(published.legs[0].points, expected.legs[0].points);
+
+                // Saving progress does not turn a failed strict online fetch into success.
+                let strict = FetchOptions::default();
+                let mut notes = Vec::new();
+                let error = failures.report(&strict, &mut notes).unwrap_err();
+                assert!(error.to_string().contains("synthetic MLAT outage"));
+                assert!(notes.is_empty());
+                // Explicitly permissive callers keep the successful day and the warning.
+                let permissive = FetchOptions {
+                    allow_missing: true,
+                    ..strict.clone()
+                };
+                failures.report(&permissive, &mut notes).unwrap();
+                assert_eq!(notes.len(), 1);
+                assert!(notes[0].contains("synthetic MLAT outage"));
+                let selected =
+                    load_selected_stores(vec![retained.take().unwrap()], &want).unwrap();
+                assert_eq!(selected.len(), 1);
+                assert!(!selected[0].legs.is_empty());
+
+                // The ordinary offline path already accepts a truthful lesser feedset,
+                // reports its gap, and must now be able to reuse this durable main store.
+                let offline = FetchOptions {
+                    offline: true,
+                    ..strict
+                };
+                let cached = fetch_window(&want, &cache, &offline).unwrap();
+                assert_eq!(cached.meta.stats["cache_hits"], 1);
+                assert_eq!(cached.meta.sources, [synthetic_tag(main)]);
+                assert!(!cached.legs.is_empty());
+                assert!(
+                    cached.meta.stats["notes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|note| note.as_str().unwrap().contains(NO_MLATONLY))
+                );
+                assert!(
+                    find_cached(
+                        &day_dir(&cache, day),
+                        &feedset_name(main, true),
+                        &want,
+                        "2026-09-08",
+                        &offline,
+                        Some(day_context(day))
+                    )
+                    .is_none(),
+                    "partial cache must never satisfy the full-feedset lookup"
+                );
+            }
+        }
     }
 
     #[test]

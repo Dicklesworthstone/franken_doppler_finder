@@ -931,9 +931,13 @@ backoff.
 
 For uncached multi-day searches, each UTC day is built and atomically cached as soon as all of its
 requested feeds finish, while the remaining days continue downloading. Completed raw feeds pass through
-a bounded queue instead of accumulating until the last download. A failed feed prevents publication
-of its own day; other completed days remain reusable. Cache-write failures remain errors, after the
-other days receive their save attempts. After publication, a completed day keeps its actual open cache
+a bounded queue instead of accumulating until the last download. If MLAT fails, a completed prod or
+staging feed is still cached under its actual partial feedset; an MLAT-only remainder is never published
+as a main catalogue. The online request still reports the feed failure. Offline runs can reuse the
+surviving main feed with an explicit missing-MLAT warning. An online retry rebuilds the requested feeds
+together so their raw altitude and aircraft-type information can be reconciled correctly.
+Cache-write failures remain errors, after other days receive their save attempts. After publication,
+a completed day keeps its actual open cache
 file, original metadata and aircraft bounds; its point arrays are released while other downloads run.
 Fresh bounds come directly from the built reports, and selected fresh files are decoded once when all
 days are ready for the final merge. The saved handle stays attached to that day's data if another writer
@@ -1527,6 +1531,15 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Completed main feeds survive a failed MLAT download
+
+The archive regressions now cover both prod and staging, either completion order, actual atomic
+cache publication, offline reuse with a warning, rejection of MLAT-only remnants, and partial
+caches failing full-feedset lookups. They retain the bounded-channel publication handshake and
+verify that strict feed failures and all cache-write failures remain errors. The new and updated
+tests are authored but unrun because the execution host is unavailable; source review is not
+native validation.
 
 ### Archive coverage for wide distance gates
 
@@ -2943,7 +2956,7 @@ audio or video recorded somewhere sensitive:
 | Warning `the audio has little energy below 100 Hz (45-95 Hz is N dB below 150-600 Hz)` | A high-pass filter does this, removing the fundamentals of slower propellers and weakening those near the cut. Speech-heavy audio can also read low | Use the unfiltered recording if you have one. Otherwise expect fewer usable flyovers, and do not read a failed search as evidence about the place |
 | Warning `the answer lies in CT, outside the searched state NY` (or `appears to lie in`, when the state is a gazetteer estimate) | A state search covers the state's bounding box, which takes in parts of its neighbours | If you know the recording was made in the searched state, distrust the answer whatever its grade, unless its radius reaches back across the border. A narrower `--near`, such as a county, takes in less of the neighbours |
 | `needs network or a cached file: Census gazetteer ...` | No usable cached table: it is absent, unreadable, malformed or empty | Run once without `--offline` to fetch and validate a replacement, or use a state, point or box region |
-| `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days are cached. A day missing from adsb.lol cannot be searched |
+| `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days and completed main feeds are cached when their writes succeed. A saved partial main feed can be reused offline with a missing-feed warning. A day without any main-feed data cannot be searched |
 | A download pauses for a minute, then carries on | The server stopped sending with the connection still open. After 60 s with no data, `fdop` reconnects and resumes with an HTTP `Range` request | Nothing. Resumed `206` responses are checked for their byte offset, range boundary and total length before new bytes are accepted. Capped ranges continue until the full object is proved complete; a range's body length is never treated as the archive length. After repeated failures with no new bytes it stops |
 | Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears some hours after it ends | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |
 | Answer graded **low** | One or more gates failed | Read the gates in `report.html`. A margin marked `provisional, comparison truncated` failed because a comparison was cut: an unchecked rival could still win, so the answer is unconfirmed, not refuted. Otherwise, a small margin means other flights explain the curves almost as well, possibly at nearly the same place: `margin.next_distinct_km` in `result.json` says how far away |
@@ -2951,7 +2964,7 @@ audio or video recorded somewhere sensitive:
 | An event reads `trace follows only N % of the central frequency drop: no ridge through the CPA` | The fit joins two steady tones with nothing between them, or the pass is too faint to trace through its steepest part | Nothing to change: the event can neither drive nor confirm an answer, though it still counts as heard |
 | A search runs for an hour or more | A busy recording and a wide region: every rival is compared, at 50–70 ms of CPU per fine cell, and `fine grid N/M` on stderr shows how far it has got | Narrow `--near` to a county, a point or a box |
 | Warning `joined N of M event pairs before the quick-check budget (...)`, `N quick-check survivors > 2000000; scoring the best 2000000` or `confirmation budget: checking 2000000 of N fine candidates; rival comparison is incomplete` | The search outgrew a comparison budget | The margin gate fails and the answer grades **low**; a numerical margin is labelled provisional. Narrow the region or the dates and rerun |
-| Warning `ADS-B <day>: no mlatonly release, so aircraft located only by multilateration ... are missing` (or `prod release missing, using staging`) | adsb.lol did not publish that release for the day | Rerun later if the day is recent. Aircraft missing from the data can neither match nor count as unheard passes |
+| Warning `ADS-B <day>: no mlatonly data in this catalogue, so aircraft located only by multilateration ... are missing` (or `prod release missing, using staging`) | The cache lacks a feed because its release was unavailable or its download failed | Rerun online to obtain any now-available feeds. Aircraft missing from the data can neither match nor count as unheard passes |
 | Disk filling up | Many cached regions and days | Delete old `adsb/<date>/` folders under the cache root |
 
 ---
