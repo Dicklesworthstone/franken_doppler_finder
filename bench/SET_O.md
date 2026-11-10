@@ -108,3 +108,20 @@ from the start, inside the local date (`src/pipeline.rs`, `DECOY_STEPS`), so a c
 release. So the capture ends at 2026-11-11T20:30:00Z (12:30 at the site), and the last file that can pass step 1
 starts by 20:10Z. To make the change the capture was stopped and restarted; the file being written then ends early,
 as any connection may. No file had been screened or listened to. Nothing else changes.
+
+## 2026-11-10: `fdop`'s rows keep their ADS-B stores on the benchmark volume, before any row ran
+
+The benchmark machine's boot disk has 3.4 GiB free, and the `fdop` cache the earlier sets used is on it. Set O has
+up to 32 rows per build, and each searches its own circle. A row builds a store for each UTC day it reads unless a
+cached store already covers it. Stores for days since 2026-11-01 in that cache run from 9 to 826 MB each. Together
+the rows could fill the disk partway through a batch. So set O's `fdop` rows use a cache of their own on the
+benchmark volume, which has over 700 GiB free (`cache/fdop_o`, set in each job script).
+
+No input changes:
+- The Census gazetteer tables were copied from the old cache, sha256 checked.
+- The ADS-B stores and weather for these days are new to either cache.
+- Terrain tiles and geoid heights are fixed data, fetched again where needed.
+
+`fdop doctor` passes with that cache, including the run ledger's write and read-back. `fdop` skips the volume's
+AppleDouble files, because it reads only stores named for their feed. The screen keeps its own cache.
+`dopplerprint` and `dopplertrack` keep theirs.
