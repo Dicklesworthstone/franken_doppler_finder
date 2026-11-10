@@ -175,3 +175,29 @@ rare: sets K and M's 14 cases came from two recordists, and two further searches
 answer, `m_ftwadsworth`, came from the trace search; its wrong one, `m_washsq`, came from the curve match alone). Its
 15 development runs and 33 no-answer runs have none. The development replays on sets J and K were still running when
 the screens closed; the decision is recorded in a later section when they end.
+
+## 2026-11-10: the variant's landing
+
+No set N row exists, so the second half of the landing rule decided. Every run of `11313ba`'s code on record was read
+for an answer that came from the curve match alone (its verdict and the warning "The answer comes from the curve
+match"), and for whether it lay inside its case's limit:
+
+| Runs | Where | Right answers asserted | Answers from the curve match alone |
+|---|---|---|---|
+| set M, 6 cases and 6 nulls | `runs_m/r2_fdop_11313ba` | 1 (`m_ftwadsworth`, high, from the trace search) | 1, wrong (`m_washsq`, medium) |
+| 15 development runs | `dev15_tail1` | 5 | none |
+| 33 no-answer runs | `n33_tail1` | none possible | none |
+| set K's `k_weehawken` and its null | `setk_dev/tail1` | 1 (high) | none |
+| sets J and K, their other 8 cases | `fdop_replay/dev_jk_main` (development replays begun 23:46Z on 2026-11-09) | none (two low answers lay inside their limits: `k_riversidesouth` 129 m, `k_boyleheights` 330 m) | none; the curve match stood on none of the 8 |
+
+So no run of `11313ba`'s code on record has a right answer from the curve match alone, and `8d672af` is merged into
+`main`. It is a merge, not a rebase, so the tree that lands has `8d672af`'s code, the code built and tested on the
+benchmark machine. On this record the change costs no right answer and removes one wrong medium (`m_washsq`). On older
+code, `9087ec4`'s two right answers on set K came from this path. Whether the current code would ever be right there
+is not known, and set N could not test it.
+
+The replays' nulls were still running when this was written. A null has no right place, so they cannot change the
+rule's answer.
+
+The replays of sets J and K are development runs: those sets were read on 2026-11-09, and this question was asked
+after. They can only say what `11313ba`'s code does there, not test the change.

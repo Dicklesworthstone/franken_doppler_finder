@@ -476,6 +476,9 @@ fn curve_match_skip_reason(
     })
 }
 
+/// Why an answer from the curve match alone is low (`CurveCall::Adopts`), as its verdict says it.
+const CURVE_ALONE_LOW: &str = "Graded low: nothing but the curve match supports this place, and its decoy clocks test the recording's clock, not its place, so on the right date a place near the aircraft heard can beat every decoy without being where the recording was made";
+
 /// Metadata is only a hint: a chance trace candidate must not hide the rest of the dates.
 /// Judge both searches and the decoy clocks before deciding whether that hint located anything.
 fn metadata_needs_fallback(meta_window: bool, confidence: &str) -> bool {
@@ -550,14 +553,21 @@ enum CurveCall {
     Conflicts,
     /// Trace answer low, curve match stands at the same place: asserted at medium, trace position.
     Confirms,
-    /// Trace answer low or absent, curve match stands elsewhere: asserted at medium, its position.
+    /// Trace answer low or absent, curve match stands elsewhere: its position, at low. Its decoys
+    /// are other clocks, and they test the clock, not the place: on the right date the real window
+    /// holds real aircraft, so a place near them can beat every decoy clock without being where the
+    /// recording was made. On the benchmark's set M this path put Washington Square 5.9 km off at
+    /// medium, 0.2 nats over the best of 48 decoys (README "Known issues"). Here nothing else
+    /// supports the place, so it is not asserted. `Confirms` has the trace search's place as well.
     Adopts,
     /// Trace answer medium, and the curve match ran with enough decoy clocks to judge but stands
     /// nowhere: lowered to low. The medium grade's margin has no calibrated false-alarm rate, and
     /// it has named wrong-date places (`nd_o31_1101` under 069c971, 9087ec4 and 6914ab7). The curve
-    /// match's decoy test has one: with a wrong date or place the real window is one of at least
+    /// match's decoy test has one for a wrong date: the real window is then one of at least
     /// `MIN_DECOYS` + 1 interchangeable clocks, so it stands by chance at most about once in 41,
-    /// whatever the trace margin did. A high answer passed every gate and keeps its grade; where
+    /// whatever the trace margin did. With the right date and a wrong place the windows are not
+    /// interchangeable (see `Adopts`), so this rate does not cover that case. A high answer passed
+    /// every gate and keeps its grade; where
     /// the curve match did not run or had too few decoys, nothing changes.
     Unsupported,
 }
@@ -729,8 +739,8 @@ impl AnswerAssessment {
             added,
         );
         answer.confidence = match answer.call {
-            CurveCall::Adopts | CurveCall::Confirms => "medium",
-            CurveCall::Conflicts | CurveCall::Unsupported => "low",
+            CurveCall::Confirms => "medium",
+            CurveCall::Adopts | CurveCall::Conflicts | CurveCall::Unsupported => "low",
             CurveCall::Silent if answer.unchecked => "low",
             _ => answer.trace_confidence,
         };
@@ -2318,7 +2328,7 @@ fn locate_with_clock(
             confidence: confidence.into(),
             verdict: if let (false, Some(v), Some(r)) = (on_trace, standing, curve.as_ref()) {
                 format!(
-                    "from the curve match, not the trace search, which graded its own answer {trace_confidence} {:.1} km away. Logged Doppler curves of {} at one place and one recording clock (start {}): {}",
+                    "from the curve match, not the trace search, which graded its own answer {trace_confidence} {:.1} km away. Logged Doppler curves of {} at one place and one recording clock (start {}): {}. {CURVE_ALONE_LOW}",
                     fdop_types::geo::haversine_m(top.lat, top.lon, v.lat, v.lon) / 1000.0,
                     curve_flights(r),
                     iso_utc(v.clock_unix),
@@ -2479,8 +2489,8 @@ fn locate_with_clock(
         found = true;
         curve_used = CurveCall::Adopts;
         log.say(&format!(
-            "winner {:.6},{:.6} radius {:.0} m from the curve match alone, confidence medium",
-            v.lat, v.lon, v.radius_m
+            "winner {:.6},{:.6} radius {:.0} m from the curve match alone, confidence {}",
+            v.lat, v.lon, v.radius_m, assessment.confidence
         ));
         let place = fdop_geo::geocode::describe_location(
             net.as_ref().filter(|_| extras),
@@ -2503,9 +2513,9 @@ fn locate_with_clock(
                 curvematch::TIED_NATS,
                 v.radius_m
             ),
-            confidence: "medium".into(),
+            confidence: assessment.confidence.into(),
             verdict: format!(
-                "from the curve match; the trace search found no candidate ({} usable flyover events). Logged Doppler curves of {} at one place and one recording clock (start {}): {}",
+                "from the curve match; the trace search found no candidate ({} usable flyover events). Logged Doppler curves of {} at one place and one recording clock (start {}): {}. {CURVE_ALONE_LOW}",
                 sevs.len(),
                 curve_flights(r),
                 iso_utc(v.clock_unix),
@@ -4076,7 +4086,7 @@ mod tests {
     }
 
     #[test]
-    fn a_standing_curve_match_rescues_an_empty_metadata_trace_search() {
+    fn a_standing_curve_match_on_an_empty_metadata_trace_search_is_low_and_widens() {
         let good = stands_at(40.876466, -73.524951, true);
         let weak = stands_at(40.876466, -73.524951, false);
         let mut empty = assessment_result();
@@ -4084,10 +4094,12 @@ mod tests {
         empty.refine = None;
         let added = std::collections::HashSet::new();
         // A usable metadata clock must reach the independent matcher even when no trace
-        // survived measurement. Its standing answer follows the existing adoption gates.
-        let rescued = AnswerAssessment::new(&empty, &[], Some(&good), true, &added);
-        assert!(!metadata_needs_fallback(true, rescued.confidence));
-        assert_eq!(rescued.call, CurveCall::Adopts);
+        // survived measurement. Standing alone, its place is graded low (`CurveCall::Adopts`),
+        // so the metadata attempt has located nothing and the full date window is searched.
+        let alone = AnswerAssessment::new(&empty, &[], Some(&good), true, &added);
+        assert_eq!(alone.call, CurveCall::Adopts);
+        assert_eq!(alone.confidence, "low");
+        assert!(metadata_needs_fallback(true, alone.confidence));
         for curve in [None, Some(&weak)] {
             let absent = AnswerAssessment::new(&empty, &[], curve, true, &added);
             assert!(metadata_needs_fallback(true, absent.confidence));
@@ -4101,6 +4113,32 @@ mod tests {
             curve_call("medium", Some((40.876466, -73.524951)), Some(&weak), judged),
             CurveCall::Silent
         );
+    }
+
+    /// A low trace answer that the curve match confirms in place is raised to medium: two readings
+    /// of the recording agree on the place. Where the curve match stands somewhere the trace search
+    /// does not support, or the trace search found nothing, its place is reported at low.
+    #[test]
+    fn only_a_place_the_trace_search_supports_is_raised_to_medium() {
+        let added = std::collections::HashSet::new();
+        let mut low = assessment_result();
+        low.candidates[0].events[1].core = false;
+        let mut empty = assessment_result();
+        empty.candidates.clear();
+        empty.refine = None;
+        let here = stands_at(40.876466, -73.524951, true);
+        let away = stands_at(40.876466, -73.3, true);
+        let grade = |r: &search::SearchResult, v: &curvematch::CurveVerdict| {
+            let a = AnswerAssessment::new(r, &[], Some(v), true, &added);
+            (a.call, a.confidence)
+        };
+        assert_eq!(
+            AnswerAssessment::new(&low, &[], None, true, &added).confidence,
+            "low"
+        );
+        assert_eq!(grade(&low, &here), (CurveCall::Confirms, "medium"));
+        assert_eq!(grade(&low, &away), (CurveCall::Adopts, "low"));
+        assert_eq!(grade(&empty, &here), (CurveCall::Adopts, "low"));
     }
 
     #[test]

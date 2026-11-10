@@ -19,6 +19,34 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Report an answer from the curve match alone at low
+
+- Where the trace search's answer is low or absent and the curve match stands somewhere else (`CurveCall::Adopts`),
+  the curve match's place is now reported at **low**, not medium, and its verdict says why
+  (`pipeline::CURVE_ALONE_LOW`). A low trace answer that the curve match confirms in place (`Confirms`) is still
+  raised to medium. With a `creation_time` window, a curve-alone answer no longer keeps that window, so the full date
+  window is searched, as for any low answer.
+- **Observed defect:** on the benchmark's set M, `11313ba` (then `main`) put Washington Square 5.9 km off at medium
+  from the curve match alone: 21.4 nats, 0.2 over the best of 48 decoy clocks, six passes heard (`bench/SET_M.md`).
+  The decoy clocks test the recording's clock, not its place. On the right date the real window holds real aircraft
+  tones, so a place near them can beat every decoy. The lead over the best decoy does not separate right places from
+  wrong ones on the 25 benchmark runs where it stood (README "Known issues"), so no line on it was set.
+- **The trade, and how it was decided:** the change is commit `8d672af` (parent `1f7b612`, `src/pipeline.rs` only),
+  registered with `bench/SET_N.md` before its search, with a landing rule fixed there. Set N's screens found no case,
+  so its second clause decided: it lands only if no run of `11313ba`'s code on record has a right answer from the
+  curve match alone. None has: its 12 set M rows (one right answer, from the trace search; one wrong, the one above),
+  its 15 development and 33 no-answer runs, and development replays on sets J and K (on their eight cases besides
+  `k_weehawken` it asserted nothing, and the curve match stood on none). `9087ec4`, older code, had two right answers
+  on set K from this path; on `11313ba`'s code those two recordings are high from the trace search (`k_weehawken`)
+  and low with the curve match not standing (`k_riversidesouth`).
+- **Tests:** `a_standing_curve_match_rescues_an_empty_metadata_trace_search` is now
+  `a_standing_curve_match_on_an_empty_metadata_trace_search_is_low_and_widens` (the answer is `Adopts`, low, and the
+  metadata attempt falls back to the full window); new `only_a_place_the_trace_search_supports_is_raised_to_medium`
+  (`Confirms` medium; `Adopts` low, with a trace answer elsewhere or none). On the benchmark machine, from `git
+  archive` of `8d672af`: build, `clippy` and `fdop selftest` pass; `cargo test --workspace` fails only `main`'s four
+  known `fdop-core` tests (267 passed, 4 failed, 8 ignored), and every other suite passes. `cargo fmt --check` reports
+  only files this change does not touch.
+
 ### Stop the fitted null tail three orders of magnitude past its sample
 
 - `EventNull::trace_nats` now stops the fitted lower tail at ln(n+1) + `NULL_TAIL_EXTRA_NATS` nats, where n is
