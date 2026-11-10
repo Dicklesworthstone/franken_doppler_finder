@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Require an unambiguous strong validator before resuming streamed bytes
+
+- Complete the archive-identity protection by refusing a resume after bytes were delivered
+  without a valid strong initial ETag. The preceding conditional-resume change still allowed
+  untagged or weakly tagged responses to join a different same-length object's suffix.
+  Fail before issuing another request; a streaming archive consumer cannot retract its prefix.
+  Uninterrupted complete responses without a tag and retries before any delivery still work.
+- Treat duplicate ETag fields as ambiguous, including identical duplicates and fields with
+  different capitalization. Trim only HTTP space and tab around a tag, preserving the opaque
+  value and rejecting malformed validators. Existing tagged resumption and terminal `416`
+  identity checks remain in place.
+- Add focused regressions for missing, weak, malformed and duplicate initial validators,
+  complete untagged responses and preservation of an existing cache after an interrupted
+  unvalidated download. Update the existing successful-resumption fixtures with a stable
+  strong tag so their range, idle-timeout and retry-budget assertions still exercise resumption.
+- Validation is limited to source review. The native baseline build was killed under shared
+  host memory pressure, then the execution environment became unavailable. These new tests,
+  formatting, Clippy, the workspace suite and selftest have not run; no live-download or
+  real-recording validation is claimed.
+
 ### Recover usable weather after an incomplete response was cached
 
 - Validate Open-Meteo's requested hourly profiles and each radiosonde sounding before

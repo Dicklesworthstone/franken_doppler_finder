@@ -148,7 +148,15 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
 /// A strong entity tag identifies the exact representation across resumed ranges.
 /// Weak tags and Last-Modified alone cannot prove byte-for-byte identity.
 fn strong_etag(headers: &[(String, String)]) -> Option<&str> {
-    let tag = header_of(headers, "etag")?.trim();
+    // ETag is a singleton field. Even equal duplicates are ambiguous metadata,
+    // not one strong validator; only HTTP optional whitespace may surround it.
+    let mut tags = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("etag"));
+    let tag = tags.next()?.1.trim_matches([' ', '\t']);
+    if tags.next().is_some() {
+        return None;
+    }
     let opaque = tag.strip_prefix('"')?.strip_suffix('"')?;
     opaque
         .bytes()
@@ -162,22 +170,25 @@ struct StreamIdentity {
 }
 
 impl StreamIdentity {
+    fn resume_etag(&self) -> Result<&str, String> {
+        self.etag.as_deref().ok_or_else(|| {
+            "cannot safely resume without a single strong initial ETag; restart the download"
+                .to_string()
+        })
+    }
+
     fn accept(&mut self, start_at: u64, headers: &[(String, String)]) -> Result<(), String> {
         let current = strong_etag(headers);
         if start_at == 0 {
             // No byte from an earlier response reached the sink, so this response
             // can establish a new identity even after a failed initial request.
             self.etag = current.map(str::to_owned);
-        } else if let Some(expected) = self.etag.as_deref()
-            && current != Some(expected)
-        {
+        } else if current != Some(self.resume_etag()?) {
             // The sink may already be an ingesting tar reader: it cannot rewind
             // the delivered prefix. Refuse before forwarding any replacement bytes,
             // including a full 200 response after an If-Range mismatch.
             return Err("response ETag changed or disappeared during resume".into());
         }
-        // Servers without a strong initial tag retain the length/range checks.
-        // A tag first seen after the prefix cannot authenticate that prefix.
         Ok(())
     }
 }
@@ -420,7 +431,8 @@ impl Net {
     /// `cancel` aborts between chunks. Returns the total body length delivered.
     /// Caller-supplied `Range` and `If-Range` headers are ignored: resumption owns them.
     /// A strong initial ETag is pinned with If-Range and checked before resumed bytes
-    /// reach the sink. Without one, only the existing length/range checks are possible.
+    /// reach the sink. Without one, a complete response is usable but an interrupted
+    /// or partial response fails: a later tag cannot authenticate an earlier prefix.
     pub fn stream(
         &self,
         url: &str,
@@ -441,10 +453,13 @@ impl Net {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             if delivered > 0 {
+                // The consumer cannot retract its prefix. Do not even request an
+                // unverified suffix; 499 is the existing terminal client-error marker.
+                let tag = identity
+                    .resume_etag()
+                    .map_err(|m| HttpError::new(url, Some(499), m))?;
                 hdrs.push(("Range".into(), format!("bytes={delivered}-")));
-                if let Some(tag) = &identity.etag {
-                    hdrs.push(("If-Range".into(), tag.clone()));
-                }
+                hdrs.push(("If-Range".into(), tag.to_string()));
             }
             let client = self.stream_client.clone();
             let u = url.to_string();
@@ -704,14 +719,31 @@ mod tests {
     fn stream_identity_uses_only_strong_initial_etags() {
         let headers = |tag: &str| vec![("eTaG".to_string(), tag.to_string())];
         for tag in ["\"v1\"", "\"\"", " \t\"v1\"\t "] {
-            assert_eq!(strong_etag(&headers(tag)), Some(tag.trim()));
+            assert_eq!(strong_etag(&headers(tag)), Some(tag.trim_matches([' ', '\t'])));
         }
-        for tag in ["W/\"v1\"", "v1", "\"unfinished", "\"a b\"", "\"a\"b\"", "\"a\nb\""] {
+        for tag in [
+            "W/\"v1\"",
+            "v1",
+            "\"unfinished",
+            "\"a b\"",
+            "\"a\"b\"",
+            "\"a\nb\"",
+            "\u{00a0}\"v1\"",
+            "\"v1\"\u{2003}",
+            "\"v1\", \"v2\"",
+        ] {
             assert!(strong_etag(&headers(tag)).is_none(), "{tag:?}");
         }
         let mut identity = StreamIdentity::default();
         identity.accept(0, &headers("\"v1\"")).unwrap();
         identity.accept(10, &headers("\"v1\"")).unwrap();
+        for other in ["\"v1\"", "\"v2\""] {
+            let mut duplicates = headers("\"v1\"");
+            duplicates.push(("ETAG".to_string(), other.to_string()));
+            assert!(strong_etag(&duplicates).is_none());
+            assert!(identity.accept(10, &duplicates).is_err());
+            assert_eq!(identity.etag.as_deref(), Some("\"v1\""));
+        }
         for tags in [headers("\"v2\""), headers("W/\"v1\""), Vec::new()] {
             assert!(identity.accept(10, &tags).is_err());
             assert_eq!(identity.etag.as_deref(), Some("\"v1\""));
@@ -720,8 +752,71 @@ mod tests {
         identity.accept(0, &headers("\"v2\"")).unwrap();
         assert_eq!(identity.etag.as_deref(), Some("\"v2\""));
         identity.accept(0, &[]).unwrap();
-        identity.accept(10, &headers("\"v3\"")).unwrap();
+        assert!(identity.accept(10, &headers("\"v3\"")).is_err());
         assert!(identity.etag.is_none());
+    }
+
+    #[test]
+    fn streams_without_a_strong_initial_validator_cannot_resume() {
+        for extra in [
+            "",
+            "ETag: W/\"v1\"\r\n",
+            "ETag: bare\r\n",
+            "ETag: \"v1\"\r\neTaG: \"v1\"\r\n",
+            "ETag: \"v1\"\r\nETag: \"v2\"\r\n",
+            "ETag: \"v1\", \"v2\"\r\n",
+            "Last-Modified: Tue, 08 Sep 2026 12:00:00 GMT\r\n",
+        ] {
+            // A complete untagged body stays usable. Neither a dropped 200 nor a
+            // complete 206 covering only a prefix may append a later response.
+            for (status, length, complete) in
+                [(200, 10, true), (200, 100, false), (206, 10, false)]
+            {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = std::thread::spawn(move || {
+                    let (mut sock, _) = listener.accept().unwrap();
+                    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let request = read_head(&mut sock);
+                    assert!(!request.contains("range:"), "{request}");
+                    let reason = if status == 206 { "Partial Content" } else { "OK" };
+                    let range = if status == 206 {
+                        "Content-Range: bytes 0-9/100\r\n"
+                    } else {
+                        ""
+                    };
+                    write!(
+                        sock,
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {length}\r\n{extra}{range}Connection: close\r\n\r\n0123456789"
+                    )
+                    .unwrap();
+                    // This fixture accepts exactly one request and closes its listener;
+                    // a correctly refused resume must not leave a server waiting.
+                });
+                let mut got = Vec::new();
+                let result = Net::new().unwrap().with_retries(0).stream(
+                    &format!("http://{addr}/blob"),
+                    &[],
+                    &AtomicBool::new(false),
+                    &mut |chunk| {
+                        got.extend_from_slice(chunk);
+                        Ok(())
+                    },
+                );
+                server.join().unwrap();
+                assert_eq!(got, b"0123456789");
+                if complete {
+                    assert_eq!(result.unwrap(), 10);
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(
+                        error.message.contains("strong initial ETag"),
+                        "{extra:?}: {error}"
+                    );
+                    assert!(!error.transient());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1033,7 +1128,10 @@ mod tests {
                 .unwrap_err();
             server.join().unwrap();
             assert_eq!(validated, !truncated);
-            if !truncated {
+            if truncated {
+                assert!(error.message.contains("strong initial ETag"), "{error}");
+                assert!(!error.transient());
+            } else {
                 assert!(error.message.contains("not a valid table"), "{error}");
             }
             assert_eq!(std::fs::read(path).unwrap(), b"previous valid cache");
@@ -1081,7 +1179,7 @@ mod tests {
             let (mut first, _) = listener.accept().expect("accept 1");
             let _ = read_head(&mut first);
             first
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+                .write_all(b"HTTP/1.1 200 OK\r\nETag: \"stable\"\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
                 .expect("head 1");
             first.write_all(&served[..10]).expect("part 1");
             first.flush().expect("flush 1");
@@ -1111,26 +1209,27 @@ mod tests {
             .expect_err("invalid resume must fail");
         let h2 = server.join().expect("server");
         assert!(h2.contains("range: bytes=10-"), "resume request: {h2}");
+        assert!(h2.contains("if-range: \"stable\""), "resume request: {h2}");
         (err.to_string(), got)
     }
 
     #[test]
     fn resume_rejects_wrong_content_range_start() {
-        let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 91\r\nContent-Range: bytes 9-99/100\r\nConnection: close\r\n\r\n", (9u8..100).collect());
+        let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nETag: \"stable\"\r\nContent-Length: 91\r\nContent-Range: bytes 9-99/100\r\nConnection: close\r\n\r\n", (9u8..100).collect());
         assert!(err.contains("started at byte 9, expected 10"), "{err}");
         assert_eq!(got, (0u8..10).collect::<Vec<_>>());
     }
 
     #[test]
     fn resume_rejects_changed_total_length() {
-        let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 90\r\nContent-Range: bytes 10-99/101\r\nConnection: close\r\n\r\n", (10u8..100).collect());
+        let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nETag: \"stable\"\r\nContent-Length: 90\r\nContent-Range: bytes 10-99/101\r\nConnection: close\r\n\r\n", (10u8..100).collect());
         assert!(err.contains("total changed from 100 to 101 bytes"), "{err}");
         assert_eq!(got, (0u8..10).collect::<Vec<_>>());
     }
 
     #[test]
     fn resume_rejects_partial_length_mismatch() {
-        let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 89\r\nContent-Range: bytes 10-99/100\r\nConnection: close\r\n\r\n", (10u8..99).collect());
+        let (err, got) = serve_truncated_then_partial(b"HTTP/1.1 206 Partial Content\r\nETag: \"stable\"\r\nContent-Length: 89\r\nContent-Range: bytes 10-99/100\r\nConnection: close\r\n\r\n", (10u8..99).collect());
         assert!(
             err.contains("disagrees with Content-Range length 90"),
             "{err}"
@@ -1144,7 +1243,7 @@ mod tests {
         body.extend(10u8..21);
         body.extend_from_slice(b"\r\n0\r\n\r\n");
         let (err, got) = serve_truncated_then_partial(
-            b"HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nContent-Range: bytes 10-19/100\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 206 Partial Content\r\nETag: \"stable\"\r\nTransfer-Encoding: chunked\r\nContent-Range: bytes 10-19/100\r\nConnection: close\r\n\r\n",
             body,
         );
         assert!(err.contains("exceeds declared end at byte 20"), "{err}");
@@ -1167,11 +1266,11 @@ mod tests {
                 if known_length {
                     first
                         .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+                            b"HTTP/1.1 200 OK\r\nETag: \"stable\"\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
                         )
                         .expect("head first");
                 } else {
-                    first.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\na\r\n").expect("head first");
+                    first.write_all(b"HTTP/1.1 200 OK\r\nETag: \"stable\"\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\na\r\n").expect("head first");
                 }
                 first.write_all(&served[..10]).expect("first bytes");
                 if !known_length {
@@ -1187,7 +1286,7 @@ mod tests {
                         request.contains(&format!("range: bytes={start}-")),
                         "{request}"
                     );
-                    write!(sock, "HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\nContent-Range: bytes {start}-{}/*\r\nConnection: close\r\n\r\n", start + 9).expect("range head");
+                    write!(sock, "HTTP/1.1 206 Partial Content\r\nETag: \"stable\"\r\nContent-Length: 10\r\nContent-Range: bytes {start}-{}/*\r\nConnection: close\r\n\r\n", start + 9).expect("range head");
                     sock.write_all(&served[start..start + 10])
                         .expect("range bytes");
                 }
@@ -1195,7 +1294,7 @@ mod tests {
                     let (mut sock, _) = listener.accept().expect("accept final probe");
                     let request = read_head(&mut sock);
                     assert!(request.contains("range: bytes=100-"), "{request}");
-                    sock.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */100\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("complete length");
+                    sock.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nETag: \"stable\"\r\nContent-Range: bytes */100\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("complete length");
                 }
             });
             let net = Net::new().expect("net").with_retries(0);
@@ -1231,7 +1330,7 @@ mod tests {
                     assert!(request.contains("range: bytes=10-"), "{request}");
                 }
                 sock.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+                    b"HTTP/1.1 200 OK\r\nETag: \"stable\"\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
                 )
                 .expect("head");
                 sock.write_all(&served[..n]).expect("bytes");
@@ -1268,7 +1367,7 @@ mod tests {
             let (mut first, _) = listener.accept().expect("accept 1");
             let h1 = read_head(&mut first);
             first
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .write_all(b"HTTP/1.1 200 OK\r\nETag: \"stable\"\r\nContent-Length: 100\r\n\r\n")
                 .expect("head 1");
             first.write_all(&served[..10]).expect("part 1");
             first.flush().expect("flush 1");
@@ -1277,7 +1376,7 @@ mod tests {
             let h2 = read_head(&mut second);
             second
                 .write_all(
-                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 90\r\n\
+                    b"HTTP/1.1 206 Partial Content\r\nETag: \"stable\"\r\nContent-Length: 90\r\n\
                       Content-Range: bytes 10-99/100\r\n\r\n",
                 )
                 .expect("head 2");
@@ -1335,10 +1434,10 @@ mod tests {
                 conns += 1;
                 let from = range_start(&read_head(&mut s)) as usize;
                 let head = if from == 0 {
-                    "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n".to_string()
+                    "HTTP/1.1 200 OK\r\nETag: \"stable\"\r\nContent-Length: 100\r\n\r\n".to_string()
                 } else {
                     format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+                        "HTTP/1.1 206 Partial Content\r\nETag: \"stable\"\r\nContent-Length: {}\r\n\
                          Content-Range: bytes {from}-99/100\r\n\r\n",
                         100 - from
                     )

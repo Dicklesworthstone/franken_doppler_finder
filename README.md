@@ -952,14 +952,17 @@ part even if every listed part downloaded successfully. Existing day stores cann
 older ingester accepted an incomplete source archive; recovering such missing data requires fresh
 ingestion.
 
-A streamed download that begins with a strong HTTP ETag keeps that exact version across retries:
-resumed requests send `If-Range`, and the response must carry the same strong tag before any further
-bytes are accepted. A changed, missing or weak replacement tag fails the download, including a
-same-length replacement or a full response after the server ignores the range. A final `416`
-length probe must also repeat the pinned tag; a missing tag cannot prove a complete download. The already streamed
-prefix cannot be rewound safely during archive ingestion; rerun to fetch the current object afresh.
-Responses without a strong initial ETag retain the existing byte-range and length checks, which
-cannot detect a same-length replacement.
+A streamed download resumes only when its initial response supplied exactly one valid strong HTTP
+ETag. Resumed requests send `If-Range`, and the response must carry the same strong tag before any
+further bytes are accepted. Changed, missing, weak, malformed or duplicate tags fail the download,
+including a same-length replacement or a full response after the server ignores the range. A final
+`416` length probe must also repeat the pinned tag. The already streamed prefix cannot be rewound
+safely during archive ingestion; rerun to fetch the current object afresh.
+
+A complete download without a strong ETag still works. If it is interrupted after delivering bytes,
+or requires another partial response, it fails explicitly before making an unverifiable resume
+request. Weak ETags and `Last-Modified` alone do not establish the byte identity required here.
+Retries before any bytes have been delivered can still start afresh.
 
 Day caches retain aircraft with unknown types. For data API callers using
 `IngestSpec.keep_unknown = false`, that policy is applied after cross-day legs are merged:
