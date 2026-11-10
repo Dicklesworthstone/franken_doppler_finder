@@ -98,3 +98,13 @@ significance is claimed. A delayed stream or a misplaced map point would make a 
 alike.
 
 Recordings, coordinates and aircraft identifiers stay out of this repository.
+
+## 2026-11-10: the capture ends at 20:30Z, before any file was screened
+
+The end above was meant to keep every row off UTC 2026-11-12, and it does not. `fdop`'s decoy clocks lie up to 4 h
+from the start, inside the local date (`src/pipeline.rs`, `DECOY_STEPS`), so a case starting after about 20:38Z reads
+11-12 for its +2 h decoy. Set N's rule for `dopplerprint`'s days adds the next UTC day when a row's span ends within
+2 h of midnight, which the last file would do. Those rows would wait a day longer than every other row for 11-12's
+release. So the capture ends at 2026-11-11T20:30:00Z (12:30 at the site), and the last file that can pass step 1
+starts by 20:10Z. To make the change the capture was stopped and restarted; the file being written then ends early,
+as any connection may. No file had been screened or listened to. Nothing else changes.
