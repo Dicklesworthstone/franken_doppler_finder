@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover usable weather after an incomplete response was cached
+
+- Validate Open-Meteo's requested hourly profiles and each radiosonde sounding before
+  trusting a cached response. A parseable JSON document with missing required hours or
+  empty/insufficient sounding levels previously remained cached indefinitely and prevented
+  a later online run from recovering winds aloft. Such a cached response now permits one
+  refresh through the existing HTTP request/retry policy.
+- Reuse the existing time-axis, hourly coverage, pressure-level, wind and sounding-height
+  requirements. Validate a replacement before publishing it atomically; a failed refresh
+  preserves the old file, which may still serve earlier or narrower windows. Valid cache
+  hits make no request, and offline reads keep the current validation/fallback behavior.
+- Keep semantic validation outside the transport/provider failure-backoff path. Missing
+  data for one hour must not block a different hour served by the same full-day query for
+  30 minutes. Existing transport/provider failures still use that backoff. Cache keys,
+  atmosphere calculations and fallback order are unchanged.
+- Add three native loopback regressions covering surface/pressure-level recovery, empty
+  and insufficient sounding recovery, offline preservation, valid-cache reuse, and
+  unusable replacements preserving earlier valid hours without a query-wide failure marker.
+  These regressions were not executed because the session's execution environment is
+  unavailable. Formatting, Clippy, the workspace suite and selftest are unverified;
+  no field-weather or location-accuracy improvement is claimed.
+
 ### Reuse identical short spectrograms while following a fitted ridge
 
 - Guided measurement rounds now keep one normalized short-window spectrogram together

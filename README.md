@@ -919,6 +919,14 @@ empty table only after downloading and parsing a valid replacement. A failed dow
 leaves the published cache intact. Offline searches report the unusable cache path and how to repair
 it; a valid cache is reused without any request.
 
+Open-Meteo hourly responses and radiosonde soundings also pass the requested weather checks before
+their cached JSON is reused. Online runs refresh an incomplete cached response once through the
+existing request/retry policy, and publish the replacement only if it is usable. Offline runs retain
+the validation error and normal fallback behavior. A failed refresh leaves the earlier response
+intact, including any hours it can still serve. Missing hours or an unusable profile do not create
+a failure marker for the whole query; transport and provider errors retain the existing 30-minute
+backoff.
+
 For uncached multi-day searches, each UTC day is built and atomically cached as soon as all of its
 requested feeds finish, while the remaining days continue downloading. Completed raw feeds pass through
 a bounded queue instead of accumulating until the last download. A failed feed prevents publication

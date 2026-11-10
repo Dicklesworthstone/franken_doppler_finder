@@ -73,6 +73,18 @@ fn get_cached(
     max_age_s: Option<f64>,
     retries: u32,
 ) -> Result<serde_json::Value, DataError> {
+    get_cached_validated(url, cache, offline, (timeout_s, max_age_s, retries), Ok)
+}
+
+/// Validate the requested weather before trusting or replacing its cache. A response may
+/// contain useful hours outside this request, so a failed refresh preserves the old bytes.
+fn get_cached_validated<T>(
+    url: &str,
+    cache: &Path,
+    offline: bool,
+    (timeout_s, max_age_s, retries): (u64, Option<f64>, u32),
+    validate: impl Fn(serde_json::Value) -> Result<T, DataError>,
+) -> Result<T, DataError> {
     let dir = cache.join("weather");
     let path = dir.join(format!("{:016x}.json", fnv(url)));
     let fresh = |p: &Path| {
@@ -84,14 +96,18 @@ fn get_cached(
                 .is_some_and(|e| e.as_secs_f64() < age)
         })
     };
+    let mut cached_error = None;
     if fresh(&path)
         && let Ok(b) = std::fs::read(&path)
         && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b)
     {
-        return Ok(v);
+        match validate(v) {
+            Ok(parsed) => return Ok(parsed),
+            Err(e) => cached_error = Some(e),
+        }
     }
     if offline {
-        return Err(DataError::new("offline and not cached"));
+        return Err(cached_error.unwrap_or_else(|| DataError::new("offline and not cached")));
     }
     // a service that just failed for this exact query is not retried for 30 minutes
     let fail = path.with_extension("fail");
@@ -126,8 +142,11 @@ fn get_cached(
             return Err(e);
         }
     };
+    // A response can be unusable only for these hours. Do not turn that into a
+    // URL-wide failure marker that would block another window's valid weather.
+    let parsed = validate(v)?;
     fdop_http::write_atomic(&path, &body)?;
-    Ok(v)
+    Ok(parsed)
 }
 
 fn arr(h: &serde_json::Value, key: &str, i: usize) -> f64 {
@@ -325,14 +344,27 @@ fn om_grid(
         date_str((t_end / 3600.0).ceil() * 3600.0),
         vars.join(",")
     );
-    let v = get_cached(
+    get_cached_validated(
         &url,
         cache,
         offline,
-        if levels { PRESSURE_LEVEL_TIMEOUT_S } else { 45 },
-        None,
-        if levels { 0 } else { 1 },
-    )?;
+        (
+            if levels { PRESSURE_LEVEL_TIMEOUT_S } else { 45 },
+            None,
+            if levels { 0 } else { 1 },
+        ),
+        |v| parse_om_grid(v, &lats, &lons, t_start, t_end, levels),
+    )
+}
+
+fn parse_om_grid(
+    v: serde_json::Value,
+    lats: &[f64],
+    lons: &[f64],
+    t_start: f64,
+    t_end: f64,
+    levels: bool,
+) -> Result<GriddedAtmosphere, DataError> {
     let locs: Vec<serde_json::Value> = match v {
         serde_json::Value::Array(a) => a,
         o => vec![o],
@@ -370,8 +402,8 @@ fn om_grid(
         "Open-Meteo ERA5 archive (surface + standard lapse)"
     };
     GriddedAtmosphere::new(
-        lats,
-        lons,
+        lats.to_vec(),
+        lons.to_vec(),
         times[hours.start],
         times[1] - times[0],
         &profiles,
@@ -527,6 +559,22 @@ fn parse_raob(profile: &serde_json::Value) -> Vec<Level> {
     out
 }
 
+fn parse_raob_response(v: serde_json::Value) -> Result<Vec<Level>, DataError> {
+    let profile = v
+        .get("profiles")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| DataError::new("RAOB: no sounding profile"))?;
+    let levels = parse_raob(&profile["profile"]);
+    if levels.len() >= 5 && levels.last().is_some_and(|l| l.z_msl > 5000.0) {
+        Ok(levels)
+    } else {
+        Err(DataError::new(
+            "RAOB: sounding lacks usable levels through 5 km",
+        ))
+    }
+}
+
 fn raob_url(t: f64, station: &str) -> String {
     let (y, m, d) = utc_date(t);
     let hh = ((t.rem_euclid(86400.0)) / 3600.0).round() as u32;
@@ -575,17 +623,15 @@ fn raob_atmosphere(
         let mut t = t0;
         while t <= t1 + 1.0 {
             n_tried += 1;
-            if let Ok(v) = get_cached(&raob_url(t, id), cache, offline, 20, None, 1)
-                && let Some(p) = v
-                    .get("profiles")
-                    .and_then(|p| p.as_array())
-                    .and_then(|a| a.first())
-            {
-                let lv = parse_raob(&p["profile"]);
-                if lv.len() >= 5 && lv.last().is_some_and(|l| l.z_msl > 5000.0) {
-                    series.push((t, lv));
-                    n_ok += 1;
-                }
+            if let Ok(lv) = get_cached_validated(
+                &raob_url(t, id),
+                cache,
+                offline,
+                (20, None, 1),
+                parse_raob_response,
+            ) {
+                series.push((t, lv));
+                n_ok += 1;
             }
             t += 43200.0;
         }
@@ -1116,6 +1162,175 @@ mod tests {
         );
         let path = dir.join("weather").join(format!("{:016x}.json", fnv(&url)));
         std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+    }
+
+    fn weather_test_cache(url: &str, label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-weather-recovery-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("weather")).unwrap();
+        let path = dir.join("weather").join(format!("{:016x}.json", fnv(url)));
+        (dir, path)
+    }
+
+    fn serve_weather_once(value: &serde_json::Value) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let body = serde_json::to_vec(value).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/weather", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "no weather refresh");
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(e) => panic!("weather accept: {e}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 8192, "oversized weather request");
+                let mut byte = [0u8];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(request.starts_with(b"GET /weather HTTP/1.1\r\n"));
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(&body).unwrap();
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn cached_hourly_weather_refreshes_missing_required_rows() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        for levels in [false, true] {
+            let complete = open_meteo_fixture(day as i64, 24);
+            let (url, server) = serve_weather_once(&complete);
+            let (dir, path) = weather_test_cache(&url, "hourly");
+            let mut incomplete = complete.clone();
+            incomplete["hourly"]["temperature_2m"][5] = serde_json::Value::Null;
+            let prior = serde_json::to_vec(&incomplete).unwrap();
+            std::fs::write(&path, &prior).unwrap();
+            let parse = |v| {
+                parse_om_grid(
+                    v,
+                    &[lat],
+                    &[lon],
+                    day + 4.25 * 3600.0,
+                    day + 5.75 * 3600.0,
+                    levels,
+                )
+            };
+            let read = |offline| {
+                get_cached_validated(&url, &dir, offline, (2, None, 0), parse)
+            };
+            let error = read(true).err().expect("offline must refuse the missing hour");
+            assert!(error.0.contains("missing surface temperature"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), prior);
+            let recovered = read(false).expect("refresh restores the required hour");
+            server.join().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec(&complete).unwrap());
+            let expected = parse(complete).unwrap();
+            let sample = |a: &GriddedAtmosphere| {
+                a.medium(lat, lon, day + 4.5 * 3600.0, 30.0, 5000.0)
+            };
+            assert_eq!(sample(&recovered), sample(&expected));
+            // The one-shot server is gone: both online and offline reads reuse the good cache.
+            assert_eq!(sample(&read(false).unwrap()), sample(&expected));
+            assert_eq!(sample(&read(true).unwrap()), sample(&expected));
+        }
+    }
+
+    #[test]
+    fn invalid_weather_refresh_preserves_earlier_usable_hours() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let (url, server) = serve_weather_once(&serde_json::json!({"hourly": {}}));
+        let (dir, path) = weather_test_cache(&url, "preserve");
+        let mut partial = open_meteo_fixture(day as i64, 24);
+        partial["hourly"]["temperature_2m"][6] = serde_json::Value::Null;
+        let prior = serde_json::to_vec(&partial).unwrap();
+        std::fs::write(&path, &prior).unwrap();
+        let parse = |v, hour| {
+            parse_om_grid(
+                v,
+                &[lat],
+                &[lon],
+                day + hour * 3600.0,
+                day + hour * 3600.0,
+                true,
+            )
+        };
+        let error = get_cached_validated(&url, &dir, false, (2, None, 0), |v| parse(v, 6.0))
+            .err()
+            .expect("an unusable replacement must fail");
+        server.join().unwrap();
+        assert!(error.0.contains("no time axis"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), prior);
+        assert!(!path.with_extension("fail").exists());
+        // An error for one hour must not block the old response's usable hours.
+        let old = get_cached_validated(&url, &dir, false, (2, None, 0), |v| parse(v, 2.0))
+            .unwrap();
+        assert_eq!(
+            old.medium(lat, lon, day + 7200.0, 30.0, 5000.0),
+            parse(partial, 2.0).unwrap().medium(lat, lon, day + 7200.0, 30.0, 5000.0)
+        );
+    }
+
+    #[test]
+    fn cached_empty_soundings_refresh_when_a_usable_profile_arrives() {
+        let profile: Vec<_> = (0..6)
+            .map(|i| {
+                serde_json::json!({
+                    "hght": 100.0 + 1200.0 * f64::from(i),
+                    "tmpc": 15.0 - 6.0 * f64::from(i),
+                    "dwpc": 5.0 - 6.0 * f64::from(i),
+                    "drct": 270.0,
+                    "sknt": 20.0,
+                })
+            })
+            .collect();
+        let complete = serde_json::json!({"profiles": [{"profile": profile}]});
+        for incomplete in [
+            serde_json::json!({"profiles": []}),
+            serde_json::json!({"profiles": [{"profile": []}]}),
+        ] {
+            let (url, server) = serve_weather_once(&complete);
+            let (dir, path) = weather_test_cache(&url, "sounding");
+            let prior = serde_json::to_vec(&incomplete).unwrap();
+            std::fs::write(&path, &prior).unwrap();
+            let read = |offline| {
+                get_cached_validated(&url, &dir, offline, (2, None, 0), parse_raob_response)
+            };
+            assert!(read(true).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), prior);
+            let levels = read(false).unwrap();
+            server.join().unwrap();
+            assert_eq!(levels.len(), 6);
+            assert!(levels.iter().all(|l| (l.wind_e - 20.0 * KT).abs() < 1e-12));
+            assert_eq!(read(false).unwrap(), levels);
+            assert_eq!(read(true).unwrap(), levels);
+            assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec(&complete).unwrap());
+        }
     }
 
     #[test]
