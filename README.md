@@ -1006,10 +1006,17 @@ and warns when it does. Going offline therefore preserves the altitude reference
 
 Weather profiles retain the original hourly rows that bracket the requested time window. Missing
 temperature, pressure or winds in unrelated hours no longer discard usable weather for a short recording.
-Every selected interpolation endpoint must still be usable, and grid locations must share the same intact
-hourly time axis. A window ending after 23:00 UTC requests the following midnight too; an offline run needs
-that covering response cached. If required data are missing, the existing fallback sources and warnings
-still apply. The atmosphere description counts retained hours, rather than every downloaded day hour.
+Every retained grid cell must have all required interpolation endpoints. If some cells are unusable,
+complete cells remain available through the existing inverse-distance-squared spatial interpolation
+and harmonic averaging of sound speed; complete grids keep their original interpolation. The source
+description and report warnings identify partial coverage. A wrong location count, mismatched intact
+hourly axes, or no complete cell still invokes the existing fallback sources and warnings.
+
+Partial cached grids remain usable offline and still trigger an online repair attempt. A failed or
+unusable refresh preserves the cached partial response, as does another partial response with no more
+complete cells. This counts coverage, not geographic accuracy. New partial responses are cached too.
+A window ending after 23:00 UTC requests the following midnight; an offline run needs that covering
+response cached. Complete-grid descriptions count retained hours rather than every downloaded hour.
 
 Radiosonde selection first keeps the existing nearby-station blend. If none of those stations
 has a usable sounding, it tries the next-nearest stations within 700 km until one supplies usable
@@ -1512,6 +1519,21 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Partial weather grids: recovery implemented, native validation pending
+
+`partial_model_grids_recover_complete_columns_without_changing_full_grids` checks
+complete-grid equality against the original interpolation, independently calculated partial-grid
+wind/slowness weights, missing required endpoints, one-cell recovery, total failure and warning
+propagation through preferred, provisional and combined sources. A second test uses an actual
+loopback HTTP server to check partial-cache repair, preservation after an unusable replacement
+or failure cooldown, and caching for offline reuse. These tests are authored but have not run.
+
+The exact pinned native data build was terminated by SIGKILL in `asupersync 0.6.2`
+before compiling `fdop-data`. A subsequent metadata-only Clippy attempt failed on shared
+disk exhaustion before project code, then the executor disconnected. Changed-range formatting,
+whitespace checks and source review completed. No native weather, real-service, location-accuracy
+or full-workspace pass is claimed.
 
 ### An interior fast pass supplies the second aircraft needed for a location
 

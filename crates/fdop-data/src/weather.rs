@@ -85,6 +85,26 @@ fn get_cached_validated<T>(
     (timeout_s, max_age_s, retries): (u64, Option<f64>, u32),
     validate: impl Fn(serde_json::Value) -> Result<T, DataError>,
 ) -> Result<T, DataError> {
+    get_cached_recoverable(
+        url,
+        cache,
+        offline,
+        (timeout_s, max_age_s, retries),
+        validate,
+        |_| None,
+    )
+}
+
+/// A partial response can still be useful while an online refresh attempts to repair it.
+/// `quality` is `None` for complete data, otherwise the number of usable grid cells.
+fn get_cached_recoverable<T>(
+    url: &str,
+    cache: &Path,
+    offline: bool,
+    (timeout_s, max_age_s, retries): (u64, Option<f64>, u32),
+    validate: impl Fn(serde_json::Value) -> Result<T, DataError>,
+    quality: impl Fn(&T) -> Option<usize>,
+) -> Result<T, DataError> {
     let dir = cache.join("weather");
     let path = dir.join(format!("{:016x}.json", fnv(url)));
     let fresh = |p: &Path| {
@@ -97,12 +117,14 @@ fn get_cached_validated<T>(
         })
     };
     let mut cached_error = None;
+    let mut recovery = None;
     if fresh(&path)
         && let Ok(b) = std::fs::read(&path)
         && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b)
     {
         match validate(v) {
-            Ok(parsed) => return Ok(parsed),
+            Ok(parsed) if offline || quality(&parsed).is_none() => return Ok(parsed),
+            Ok(parsed) => recovery = Some(parsed),
             Err(e) => cached_error = Some(e),
         }
     }
@@ -114,10 +136,12 @@ fn get_cached_validated<T>(
     if let Ok(m) = std::fs::metadata(&fail).and_then(|m| m.modified())
         && m.elapsed().is_ok_and(|e| e.as_secs() < 1800)
     {
-        return Err(DataError::new(format!(
-            "failed recently ({}); retried after 30 min",
-            std::fs::read_to_string(&fail).unwrap_or_default().trim()
-        )));
+        return recovery.ok_or_else(|| {
+            DataError::new(format!(
+                "failed recently ({}); retried after 30 min",
+                std::fs::read_to_string(&fail).unwrap_or_default().trim()
+            ))
+        });
     }
     let res = (|| -> Result<(serde_json::Value, Vec<u8>), DataError> {
         let net =
@@ -139,14 +163,51 @@ fn get_cached_validated<T>(
         Err(e) => {
             let msg: String = e.to_string().chars().take(200).collect();
             let _ = fdop_http::write_atomic(&fail, msg.as_bytes());
-            return Err(e);
+            return recovery.ok_or(e);
         }
     };
     // A response can be unusable only for these hours. Do not turn that into a
     // URL-wide failure marker that would block another window's valid weather.
-    let parsed = validate(v)?;
+    let parsed = match validate(v) {
+        Ok(parsed) => parsed,
+        Err(e) => return recovery.ok_or(e),
+    };
+    if let Some(previous) = recovery
+        && let Some(usable) = quality(&parsed)
+        && quality(&previous).is_some_and(|kept| kept >= usable)
+    {
+        return Ok(previous);
+    }
     fdop_http::write_atomic(&path, &body)?;
     Ok(parsed)
+}
+
+/// A fetched atmosphere with source-specific recovery warnings. A partial grid retains
+/// complete hourly columns, never invented hours; its quality also requests cache repair.
+struct WeatherSource {
+    atmo: Arc<dyn Atmosphere>,
+    warnings: Vec<String>,
+    partial_cells: Option<usize>,
+}
+
+impl WeatherSource {
+    fn complete(atmo: impl Atmosphere + 'static) -> Self {
+        Self {
+            atmo: Arc::new(atmo),
+            warnings: Vec::new(),
+            partial_cells: None,
+        }
+    }
+}
+
+impl Atmosphere for WeatherSource {
+    fn medium(&self, lat: f64, lon: f64, t: f64, z_a: f64, z_b: f64) -> fdop_types::atmo::Medium {
+        self.atmo.medium(lat, lon, t, z_a, z_b)
+    }
+
+    fn describe(&self) -> String {
+        self.atmo.describe()
+    }
 }
 
 fn arr(h: &serde_json::Value, key: &str, i: usize) -> f64 {
@@ -308,7 +369,7 @@ fn om_grid(
     cache: &Path,
     offline: bool,
     levels: bool,
-) -> Result<GriddedAtmosphere, DataError> {
+) -> Result<WeatherSource, DataError> {
     if !t_start.is_finite() || !t_end.is_finite() || t_start > t_end {
         return Err(DataError::new("open-meteo: invalid requested time window"));
     }
@@ -344,7 +405,7 @@ fn om_grid(
         date_str((t_end / 3600.0).ceil() * 3600.0),
         vars.join(",")
     );
-    get_cached_validated(
+    get_cached_recoverable(
         &url,
         cache,
         offline,
@@ -354,6 +415,7 @@ fn om_grid(
             if levels { 0 } else { 1 },
         ),
         |v| parse_om_grid(v, &lats, &lons, t_start, t_end, levels),
+        |a| a.partial_cells,
     )
 }
 
@@ -364,12 +426,12 @@ fn parse_om_grid(
     t_start: f64,
     t_end: f64,
     levels: bool,
-) -> Result<GriddedAtmosphere, DataError> {
+) -> Result<WeatherSource, DataError> {
     let locs: Vec<serde_json::Value> = match v {
         serde_json::Value::Array(a) => a,
         o => vec![o],
     };
-    if locs.len() != lats.len() * lons.len() {
+    if locs.is_empty() || locs.len() != lats.len() * lons.len() {
         return Err(DataError(format!(
             "open-meteo: {} locations returned, {} asked",
             locs.len(),
@@ -378,29 +440,68 @@ fn parse_om_grid(
     }
     let mut times: Option<Vec<f64>> = None;
     let mut per_loc = Vec::with_capacity(locs.len());
-    for l in &locs {
-        let t = times_of(&l["hourly"])?;
+    let mut missing = Vec::new();
+    for (index, l) in locs.iter().enumerate() {
+        let t = match times_of(&l["hourly"]) {
+            Ok(t) => t,
+            Err(e) => {
+                missing.push(format!("cell {}: {e}", index + 1));
+                continue;
+            }
+        };
         if times.as_ref().is_some_and(|t0| *t0 != t) {
             return Err(DataError::new("open-meteo: mismatched time axes"));
         }
         let hours = hours_for_window(&t, t_start, t_end)?;
-        let p = parse_location(l, levels, hours)?;
         times.get_or_insert(t);
-        per_loc.push(p);
-    }
-    let times = times.unwrap_or_default();
-    let hours = hours_for_window(&times, t_start, t_end)?;
-    let mut profiles = Vec::with_capacity(hours.len() * locs.len());
-    for it in 0..hours.len() {
-        for p in &per_loc {
-            profiles.push(p[it].clone());
+        match parse_location(l, levels, hours) {
+            Ok(p) => per_loc.push((index, p)),
+            Err(e) => missing.push(format!("cell {}: {e}", index + 1)),
         }
     }
+    if per_loc.is_empty() {
+        return Err(DataError::new(format!(
+            "open-meteo: no usable grid cells ({})",
+            missing.join("; ")
+        )));
+    }
+    let times = times.expect("a usable profile has a validated time axis");
+    let hours = hours_for_window(&times, t_start, t_end)?;
     let src = if levels {
         "Open-Meteo historical forecast (pressure levels)"
     } else {
         "Open-Meteo ERA5 archive (surface + standard lapse)"
     };
+    if !missing.is_empty() {
+        let usable = per_loc.len();
+        let stations = per_loc
+            .into_iter()
+            .map(|(index, profiles)| {
+                (
+                    lats[index / lons.len()],
+                    lons[index % lons.len()],
+                    times[hours.clone()].iter().copied().zip(profiles).collect(),
+                )
+            })
+            .collect();
+        let source = format!("{src}, partial grid: {usable} of {} cells", locs.len());
+        let atmo = ScatteredAtmosphere::new(stations, source).map_err(DataError)?;
+        return Ok(WeatherSource {
+            atmo: Arc::new(atmo),
+            warnings: vec![format!(
+                "{src}: only {usable} of {} grid cells cover the requested window; using complete cells with inverse-distance interpolation ({})",
+                locs.len(),
+                missing.join("; ")
+            )],
+            partial_cells: Some(usable),
+        });
+    }
+    let mut profiles = Vec::with_capacity(hours.len() * locs.len());
+    for it in 0..hours.len() {
+        for (_, p) in &per_loc {
+            profiles.push(p[it].clone());
+        }
+    }
     GriddedAtmosphere::new(
         lats.to_vec(),
         lons.to_vec(),
@@ -409,6 +510,7 @@ fn parse_om_grid(
         &profiles,
         src.to_string(),
     )
+    .map(WeatherSource::complete)
     .map_err(DataError)
 }
 
@@ -693,7 +795,7 @@ fn join_weather<T>(h: std::thread::JoinHandle<Result<T, DataError>>) -> Result<T
 /// The atmosphere a run uses, with what it lacks.
 pub struct Weather {
     pub atmo: Arc<dyn Atmosphere>,
-    /// Every fallback taken; empty only when Open-Meteo pressure levels answered.
+    /// Every fallback taken; empty only when all Open-Meteo pressure-level cells answered.
     pub warnings: Vec<String>,
     /// Winds aloft are modelled, from pressure levels or radiosondes. Without them fitted speeds
     /// are not corrected for wind, so callers widen their speed gates.
@@ -736,7 +838,7 @@ pub fn fetch_atmosphere_with_progress(
     )
 }
 
-type AtmosphereResult = Result<Arc<dyn Atmosphere>, DataError>;
+type AtmosphereResult = Result<WeatherSource, DataError>;
 
 // The final adjustment and a provisional result share immutable profiles. Keep the
 // public AdjustedAtmosphere interface unchanged while retaining them in both places.
@@ -753,24 +855,25 @@ impl Atmosphere for SharedAtmosphere {
 }
 
 fn publish_fallback(
-    result: Result<impl Atmosphere + 'static, DataError>,
+    result: AtmosphereResult,
     preferred_failure: &str,
     winds_aloft: bool,
     on_fallback: &dyn Fn(Weather),
 ) -> AtmosphereResult {
-    let result = result.map(|a| Arc::new(a) as Arc<dyn Atmosphere>);
     if let Ok(a) = &result {
+        let mut warnings = vec![preferred_failure.into()];
+        warnings.extend(a.warnings.iter().cloned());
+        warnings.push(
+            if winds_aloft {
+                "hourly surface temperatures not applied; boundary layer from the 12-hourly soundings"
+            } else {
+                "no upper-air data: standard lapse above the surface and no winds aloft"
+            }
+            .into(),
+        );
         on_fallback(Weather {
-            atmo: Arc::clone(a),
-            warnings: vec![
-                preferred_failure.into(),
-                if winds_aloft {
-                    "hourly surface temperatures not applied; boundary layer from the 12-hourly soundings"
-                } else {
-                    "no upper-air data: standard lapse above the surface and no winds aloft"
-                }
-                .into(),
-            ],
+            atmo: Arc::clone(&a.atmo),
+            warnings,
             winds_aloft,
         });
     }
@@ -778,8 +881,8 @@ fn publish_fallback(
 }
 
 fn fetch_with_fallbacks(
-    om: Result<GriddedAtmosphere, DataError>,
-    surface: impl FnOnce() -> Result<GriddedAtmosphere, DataError> + Send + 'static,
+    om: AtmosphereResult,
+    surface: impl FnOnce() -> AtmosphereResult + Send + 'static,
     raob: impl FnOnce() -> Result<ScatteredAtmosphere, DataError> + Send + 'static,
     on_fallback: impl Fn(Weather) + Send + Sync + 'static,
 ) -> Weather {
@@ -795,14 +898,19 @@ fn fetch_with_fallbacks(
             publish_fallback(surface(), &surface_failure, false, &*surface_update)
         });
         let h_rb = std::thread::spawn(move || {
-            publish_fallback(raob(), &raob_failure, true, &*on_fallback)
+            publish_fallback(
+                raob().map(WeatherSource::complete),
+                &raob_failure,
+                true,
+                &*on_fallback,
+            )
         });
         (join_weather(h_sf), join_weather(h_rb))
     })
 }
 
 fn choose_atmosphere(
-    om: Result<GriddedAtmosphere, DataError>,
+    om: AtmosphereResult,
     fallbacks: impl FnOnce(&str) -> (AtmosphereResult, AtmosphereResult),
 ) -> Weather {
     let weather = |atmo: Arc<dyn Atmosphere>, warnings: Vec<String>, winds_aloft: bool| Weather {
@@ -812,29 +920,33 @@ fn choose_atmosphere(
     };
     let mut warn = Vec::new();
     match om {
-        Ok(a) => return weather(Arc::new(a), warn, true),
+        Ok(a) => return weather(a.atmo, a.warnings, true),
         Err(e) => warn.push(format!("Open-Meteo pressure levels unavailable ({e})")),
     }
     let (surface, raob) = fallbacks(&warn[0]);
     match raob {
         Ok(r) => {
+            warn.extend(r.warnings);
             // radiosondes give real temperature and wind profiles; with hourly surface
             // temperatures the boundary layer follows the diurnal cycle too
             return match surface {
-                Ok(s) => weather(
-                    Arc::new(AdjustedAtmosphere {
-                        base: Box::new(SharedAtmosphere(r)),
-                        surface: Box::new(SharedAtmosphere(s)),
-                        depth: 1500.0,
-                    }),
-                    warn,
-                    true,
-                ),
+                Ok(s) => {
+                    warn.extend(s.warnings);
+                    weather(
+                        Arc::new(AdjustedAtmosphere {
+                            base: Box::new(SharedAtmosphere(r.atmo)),
+                            surface: Box::new(SharedAtmosphere(s.atmo)),
+                            depth: 1500.0,
+                        }),
+                        warn,
+                        true,
+                    )
+                }
                 Err(e) => {
                     warn.push(format!(
                         "hourly surface temperatures unavailable ({e}); boundary layer from the 12-hourly soundings"
                     ));
-                    weather(r, warn, true)
+                    weather(r.atmo, warn, true)
                 }
             };
         }
@@ -842,10 +954,11 @@ fn choose_atmosphere(
     }
     match surface {
         Ok(a) => {
+            warn.extend(a.warnings);
             warn.push(
                 "no upper-air data: standard lapse above the surface and no winds aloft".into(),
             );
-            return weather(a, warn, false);
+            return weather(a.atmo, warn, false);
         }
         Err(e) => warn.push(format!("surface weather unavailable ({e})")),
     }
@@ -884,16 +997,18 @@ mod tests {
         }
     }
 
-    fn test_grid(source: &str, t_c: f64) -> GriddedAtmosphere {
-        GriddedAtmosphere::new(
-            vec![0.0],
-            vec![0.0],
-            0.0,
-            3600.0,
-            &[standard_levels(t_c, 0.0, 0.5, 1.0, 2.0)],
-            source.into(),
+    fn test_grid(source: &str, t_c: f64) -> WeatherSource {
+        WeatherSource::complete(
+            GriddedAtmosphere::new(
+                vec![0.0],
+                vec![0.0],
+                0.0,
+                3600.0,
+                &[standard_levels(t_c, 0.0, 0.5, 1.0, 2.0)],
+                source.into(),
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 
     fn test_soundings() -> ScatteredAtmosphere {
@@ -1033,8 +1148,8 @@ mod tests {
             winds_aloft,
         } = choose_atmosphere(Err(DataError::new("pressure failed")), |_| {
             (
-                Ok(Arc::new(test_grid("test surface", 26.0))),
-                Ok(Arc::new(test_soundings())),
+                Ok(test_grid("test surface", 26.0)),
+                Ok(WeatherSource::complete(test_soundings())),
             )
         });
         assert_eq!(a.describe(), expected.describe());
@@ -1061,7 +1176,7 @@ mod tests {
         } = choose_atmosphere(Err(DataError::new("pressure failed")), |_| {
             (
                 Err(DataError::new("surface failed")),
-                Ok(Arc::new(test_soundings())),
+                Ok(WeatherSource::complete(test_soundings())),
             )
         });
         assert_eq!(a.describe(), expected.describe());
@@ -1088,7 +1203,7 @@ mod tests {
             winds_aloft,
         } = choose_atmosphere(Err(DataError::new("pressure failed")), |_| {
             (
-                Ok(Arc::new(test_grid("test surface", 26.0))),
+                Ok(test_grid("test surface", 26.0)),
                 Err(DataError::new("soundings failed")),
             )
         });
@@ -1212,6 +1327,209 @@ mod tests {
         (dir, path)
     }
 
+    #[test]
+    fn partial_model_grids_recover_complete_columns_without_changing_full_grids() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (t0, t1) = (day + 4.25 * 3600.0, day + 5.75 * 3600.0);
+        for levels in [false, true] {
+            let left = open_meteo_fixture(day as i64, 24);
+            let mut right = left.clone();
+            for (name, values) in right["hourly"].as_object_mut().unwrap() {
+                let delta = if name.starts_with("temperature_") {
+                    8.0
+                } else if name.starts_with("wind_speed_") {
+                    6.0
+                } else {
+                    continue;
+                };
+                for value in values.as_array_mut().unwrap() {
+                    *value = serde_json::json!(value.as_f64().unwrap() + delta);
+                }
+            }
+            let complete = serde_json::json!([left, left, right]);
+            let parse = |value| parse_om_grid(value, &[0.0], &[0.0, 1.0, 2.0], t0, t1, levels);
+            let all = parse(complete.clone()).unwrap();
+            let columns: Vec<_> = complete
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|loc| parse_location(loc, levels, 4..7).unwrap())
+                .collect();
+            let profiles: Vec<_> = (0..3)
+                .flat_map(|hour| columns.iter().map(move |column| column[hour].clone()))
+                .collect();
+            let expected = GriddedAtmosphere::new(
+                vec![0.0],
+                vec![0.0, 1.0, 2.0],
+                day + 4.0 * 3600.0,
+                3600.0,
+                &profiles,
+                "complete".into(),
+            )
+            .unwrap();
+            assert!(all.warnings.is_empty());
+            assert!(all.partial_cells.is_none());
+            for lon in [0.0, 0.37, 1.0, 1.89, 2.0] {
+                for t in [t0, day + 5.0 * 3600.0, t1] {
+                    assert_eq!(
+                        all.medium(0.0, lon, t, 30.0, 5000.0),
+                        expected.medium(0.0, lon, t, 30.0, 5000.0)
+                    );
+                }
+            }
+            let mut partial = complete.clone();
+            partial[1]["hourly"]["temperature_2m"][5] = serde_json::Value::Null;
+            let recovered = parse(partial.clone()).unwrap();
+            assert_eq!(recovered.partial_cells, Some(2));
+            assert_eq!(recovered.warnings.len(), 1);
+            assert!(recovered.warnings[0].contains("2 of 3 grid cells"));
+            assert!(recovered.warnings[0].contains("cell 2"));
+            assert!(recovered.describe().contains("partial grid: 2 of 3 cells"));
+            let cell = |index| {
+                GriddedAtmosphere::new(
+                    vec![0.0],
+                    vec![index as f64],
+                    day + 4.0 * 3600.0,
+                    3600.0,
+                    &columns[index],
+                    "cell".into(),
+                )
+                .unwrap()
+            };
+            let (a, b) = (cell(0), cell(2));
+            // At the equator these distances are 1:3 or 1:1. Check the existing
+            // inverse-square spatial weights and harmonic sound speed independently.
+            for (lon, wa) in [(0.5, 0.9), (1.0, 0.5)] {
+                for t in [t0, day + 5.5 * 3600.0, t1] {
+                    let (a, b) = (
+                        a.medium(0.0, lon, t, 30.0, 5000.0),
+                        b.medium(0.0, lon, t, 30.0, 5000.0),
+                    );
+                    let got = recovered.medium(0.0, lon, t, 30.0, 5000.0);
+                    assert!((got.c - 1.0 / (wa / a.c + (1.0 - wa) / b.c)).abs() < 1e-10);
+                    assert!((got.wind_e - (wa * a.wind_e + (1.0 - wa) * b.wind_e)).abs() < 1e-10);
+                    assert!((got.wind_n - (wa * a.wind_n + (1.0 - wa) * b.wind_n)).abs() < 1e-10);
+                }
+            }
+            // A missing interpolation endpoint removes its entire cell; one intact
+            // cell remains usable, but there is no recovery when none covers the window.
+            partial[2]["hourly"]["temperature_2m"][6] = serde_json::Value::Null;
+            assert_eq!(parse(partial.clone()).unwrap().partial_cells, Some(1));
+            partial[0]["hourly"]["temperature_2m"][4] = serde_json::Value::Null;
+            assert!(parse(partial).is_err());
+            if levels {
+                let weather = fetch_with_fallbacks(
+                    Ok(recovered),
+                    || panic!("usable pressure cells must not fetch surface weather"),
+                    || panic!("usable pressure cells must not fetch radiosondes"),
+                    |_| panic!("pressure recovery is the final source"),
+                );
+                assert!(weather.winds_aloft);
+                assert_eq!(weather.warnings.len(), 1);
+            } else {
+                let warning = recovered.warnings[0].clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let weather = fetch_with_fallbacks(
+                    Err(DataError::new("pressure failed")),
+                    move || Ok(recovered),
+                    || Ok(test_soundings()),
+                    move |weather| tx.send(weather).unwrap(),
+                );
+                assert!(weather.winds_aloft);
+                assert!(weather.atmo.describe().contains("boundary layer adjusted"));
+                assert_eq!(
+                    weather.warnings.iter().filter(|w| **w == warning).count(),
+                    1
+                );
+                let provisional = rx.try_iter().find(|w| !w.winds_aloft).unwrap();
+                assert!(provisional.warnings.contains(&warning));
+            }
+        }
+    }
+
+    #[test]
+    fn partial_model_cache_repairs_online_and_survives_unusable_refreshes() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let first = open_meteo_fixture(day as i64, 24);
+        let complete = serde_json::json!([first, first]);
+        let mut partial = complete.clone();
+        partial[1]["hourly"]["temperature_2m"][5] = serde_json::Value::Null;
+        let mut none = partial.clone();
+        none[0]["hourly"]["temperature_2m"][5] = serde_json::Value::Null;
+        for replacement in [complete.clone(), none] {
+            let (url, server) = serve_weather_once(&replacement);
+            let (dir, path) = weather_test_cache(&url, "partial-grid");
+            let prior = serde_json::to_vec(&partial).unwrap();
+            std::fs::write(&path, &prior).unwrap();
+            let parse = |v| {
+                parse_om_grid(
+                    v,
+                    &[0.0],
+                    &[0.0, 1.0],
+                    day + 4.25 * 3600.0,
+                    day + 5.75 * 3600.0,
+                    true,
+                )
+            };
+            let read = |offline| {
+                get_cached_recoverable(&url, &dir, offline, (2, None, 0), parse, |a| {
+                    a.partial_cells
+                })
+            };
+            let offline = read(true).unwrap();
+            assert_eq!(offline.partial_cells, Some(1));
+            let repaired = read(false).unwrap();
+            server.join().unwrap();
+            if replacement == complete {
+                assert!(repaired.partial_cells.is_none());
+                assert!(repaired.warnings.is_empty());
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    serde_json::to_vec(&complete).unwrap()
+                );
+                assert!(read(false).unwrap().partial_cells.is_none());
+            } else {
+                assert_eq!(repaired.partial_cells, Some(1));
+                assert_eq!(std::fs::read(&path).unwrap(), prior);
+                assert_eq!(
+                    repaired.medium(0.0, 0.5, day + 5.0 * 3600.0, 30.0, 5000.0),
+                    offline.medium(0.0, 0.5, day + 5.0 * 3600.0, 30.0, 5000.0)
+                );
+                // A recent transport failure also preserves the usable cached cells
+                // without opening another connection to the now-closed server.
+                std::fs::write(path.with_extension("fail"), b"synthetic transport failure")
+                    .unwrap();
+                assert_eq!(read(false).unwrap().partial_cells, Some(1));
+            }
+            assert_eq!(read(true).unwrap().partial_cells, repaired.partial_cells);
+        }
+        // A first response with incomplete spatial coverage is still worth caching.
+        let (url, server) = serve_weather_once(&partial);
+        let (dir, path) = weather_test_cache(&url, "first-partial-grid");
+        let parse = |v| {
+            parse_om_grid(
+                v,
+                &[0.0],
+                &[0.0, 1.0],
+                day + 4.25 * 3600.0,
+                day + 5.75 * 3600.0,
+                true,
+            )
+        };
+        let read = |offline| {
+            get_cached_recoverable(&url, &dir, offline, (2, None, 0), parse, |a| {
+                a.partial_cells
+            })
+        };
+        assert_eq!(read(false).unwrap().partial_cells, Some(1));
+        server.join().unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            serde_json::to_vec(&partial).unwrap()
+        );
+        assert_eq!(read(true).unwrap().partial_cells, Some(1));
+    }
+
     fn serve_weather_once(value: &serde_json::Value) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let body = serde_json::to_vec(value).unwrap();
@@ -1284,7 +1602,7 @@ mod tests {
             server.join().unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), serde_json::to_vec(&complete).unwrap());
             let expected = parse(complete).unwrap();
-            let sample = |a: &GriddedAtmosphere| {
+            let sample = |a: &WeatherSource| {
                 a.medium(lat, lon, day + 4.5 * 3600.0, 30.0, 5000.0)
             };
             assert_eq!(sample(&recovered), sample(&expected));

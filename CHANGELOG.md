@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep complete weather columns when part of the model grid is missing
+
+- Retain every Open-Meteo cell that covers all required hourly interpolation endpoints
+  instead of discarding the whole pressure-level or surface source when one cell is
+  incomplete. Partial grids use the existing scattered inverse-distance-squared
+  interpolation and harmonic sound-speed averaging; complete grids retain the original
+  gridded path. Wrong location counts, mismatched intact time axes and zero usable cells
+  still fail into the existing weather fallback chain.
+- Identify retained coverage in the source and warning text. Carry the warning through
+  preferred pressure-level success, provisional surface results and the final
+  radiosonde/surface adjustment. No hourly values are invented.
+- Refresh partial cache hits online, preserving their usable columns if the request
+  fails or the replacement is unusable or has no more complete cells. Save first partial
+  responses for offline reuse. Cell count is a coverage comparison, not an accuracy claim.
+- Add two regressions for original-grid equality, independently calculated spatial
+  weights, required-hour and all-cell failures, warning propagation, and actual loopback
+  cache repair/preservation. Changed-range rustfmt, whitespace checks and source review
+  completed; the tests did not execute.
+- Native validation remains blocked before project compilation: the exact pinned,
+  one-job unoptimized data build received SIGKILL in asupersync 0.6.2. Metadata-only
+  Clippy then failed on shared disk exhaustion, followed by executor loss. No native
+  weather, service-response, location-accuracy or full-workspace pass is claimed.
+
 ### Recover interior fast flyovers hidden by refused detections
 
 - When ordinary measurement leaves fewer than two independent aircraft, keep the
