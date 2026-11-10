@@ -765,7 +765,9 @@ This caches the ADS-B day stores that `locate` will need, which is useful before
 several runs. It prints `<legs> legs, <points> points cached under <cache>`. Like `locate`, it fetches only the
 published part of the archive. When the dates run into a UTC day adsb.lol has not published yet, it warns
 which days are pending and stops before them. If no published day is left, it exits with an error: rerun after
-the release.
+the release. The `locate` footprint follows the largest retained event's upper distance gate plus
+15 km of track context; for wider ranges, prefetch with a sufficiently large `--pad-km`.
+The default 30 km prefetch footprint may not cover every `locate` request.
 
 ### `fdop runs`: the run ledger
 
@@ -1074,6 +1076,12 @@ Design notes:
   moment of the flight is a candidate CPA: the recorder then sits on the perpendicular to the path through that
   point, at a distance that fits the measured CPA distance, and the moment fixes the recording start. A hash join
   on (east, north, recording start) finds the places two events share in O(N) time.
+- **Archive coverage follows the fitted distance gates.** The `locate` pipeline fetches
+  aircraft out to the largest retained event's upper distance gate, with a 5 km minimum
+  and the existing additional 15 km of track context. The former 30 km cap could discard
+  flights that the search itself permits. Larger ranges now request larger cached
+  footprints and can retain more tracks. This removes that cap; the fixed context
+  padding is not a proof of complete coverage for arbitrary wind or curved paths.
 - **Wind delay is included before the recording-clock join.** After a candidate ground point
   passes the existing geometry gates, its source-to-observer propagation uses the path-averaged
   atmosphere at that observer, with wind in the observer's frame. The same moving-medium travel
@@ -1519,6 +1527,15 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Archive coverage for wide distance gates
+
+`archive_catalogue_keeps_wide_distance_gates_and_track_support` exercises offline day-cache
+loading and real track interpolation for flights within 31.25 km and 43.75 km fitted gates
+that the old 30 km footprint excludes. It also checks a distant negative control and
+unchanged smaller footprints. The regression is authored but has not run: the execution
+host is unavailable. Native formatting, compilation, selftest and reference replays remain
+unverified for this change.
 
 ### Partial weather grids: recovery implemented, native validation pending
 

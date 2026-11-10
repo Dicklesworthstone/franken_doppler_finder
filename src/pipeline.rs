@@ -191,6 +191,13 @@ fn media_metadata_start_window(
     metadata_start_window(full, creation, duration, tolerance)
 }
 
+/// The distance profile can extend beyond 30 km even when the fitted CPA passes measurement's
+/// 25 km gate. Preserve that full range and the existing 15 km of surrounding track support.
+fn search_data_bounds(region: BBox, events: &[search::SearchEvent]) -> (f64, BBox) {
+    let d_max = events.iter().map(|e| e.d_gate[1]).fold(5000.0, f64::max);
+    (d_max, region.padded_km(d_max / 1000.0 + 15.0))
+}
+
 struct PublishedWindow {
     clock: (f64, f64),
     adsb_end: f64,
@@ -1660,13 +1667,7 @@ fn locate_with_clock(
         base_events.len()
     ));
     let heard: Vec<f64> = dets.iter().map(|d| d.t0r).collect();
-    let d_max = base_events
-        .iter()
-        .map(|e| e.d_gate[1])
-        .fold(5000.0, f64::max)
-        .min(30_000.0);
-    // Aircraft within d_gate of an observer, plus ~2 minutes on each side of the CPA.
-    let fetch_box = region.bbox.padded_km((d_max / 1000.0 + 15.0).min(30.0));
+    let (d_max, fetch_box) = search_data_bounds(region.bbox, &base_events);
     let t = Instant::now();
     let (geoid_n, geoid_src) =
         fdop_data::geoid_height_with_options(&a.cache, region.center.0, region.center.1, a.offline);
@@ -3472,6 +3473,128 @@ mod tests {
                 .join(format!("prod+mlatonly_{key}.fdtrk")),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn archive_catalogue_keeps_wide_distance_gates_and_track_support() {
+        use fdop_types::geo::{Enu, geodetic_to_ecef};
+        use fdop_types::store::{FlightLeg, TrackPoint, alt_src};
+
+        let (lat, lon) = (40.876466, -73.524951);
+        let region = BBox::new(lat - 0.001, lon - 0.001, lat + 0.001, lon + 0.001);
+        let mut event = search::SearchEvent {
+            id: "synthetic".into(),
+            t_rec: 180.0,
+            t_tol: 3.0,
+            v_gate: [90.0, 110.0],
+            d_gate: [200.0, 5000.0],
+            f0: 100.0,
+            f0_tol: 4.0,
+            sigma_hz: 0.12,
+            n_eff: 20.0,
+            quality: 100.0,
+            misfit: false,
+            c_fit: 343.0,
+            tr_t: Vec::new(),
+            tr_f: Vec::new(),
+            q_t: Vec::new(),
+            q_f: Vec::new(),
+        };
+        assert_eq!(
+            search_data_bounds(region, &[]),
+            (5000.0, region.padded_km(20.0))
+        );
+        // Ordinary requests retain the previous minimum range and padding exactly.
+        for upper in [3000.0, 9000.0, 15_000.0] {
+            event.d_gate[1] = upper;
+            let distance = upper.max(5000.0);
+            assert_eq!(
+                search_data_bounds(region, std::slice::from_ref(&event)),
+                (distance, region.padded_km(distance / 1000.0 + 15.0))
+            );
+        }
+
+        // A quality-passing 25 km fit has at least a 31.25 km generous upper gate; a
+        // severe model warning raises that floor to 43.75 km. Neither is a 30 km gate.
+        for upper in [31_250.0, 43_750.0] {
+            event.d_gate[1] = upper;
+            let (distance, fetch_box) = search_data_bounds(region, std::slice::from_ref(&event));
+            assert_eq!(distance, upper);
+            assert_eq!(fetch_box, region.padded_km(upper / 1000.0 + 15.0));
+            let a = offline_test_args("wide-distance-catalogue");
+            let day = unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+            let start = day + 43_200.0;
+            let cpa_time = start + 60.0;
+            let enu = Enu::new(lat, lon, fdop_types::MIC_HEIGHT_M);
+            let leg = |icao: &str, north: f64| FlightLeg {
+                key: format!("synthetic_{icao}"),
+                icao: icao.into(),
+                reg: String::new(),
+                typ: "C172".into(),
+                source: "synthetic".into(),
+                engine: fdop_types::engine::EngineClass::Piston,
+                points: [-60.0, 0.0, 60.0]
+                    .into_iter()
+                    .map(|dt| {
+                        let (lat, lon, alt) = enu.to_geodetic([100.0 * dt, north, 1000.0]);
+                        TrackPoint {
+                            t: cpa_time + dt,
+                            lat,
+                            lon,
+                            alt_m: alt as f32,
+                            gs_mps: f32::NAN,
+                            track_deg: f32::NAN,
+                            vrate_mps: f32::NAN,
+                            alt_src: alt_src::GEOM,
+                            flags: 0,
+                        }
+                    })
+                    .collect(),
+            };
+            let near = leg("000001", upper - 250.0);
+            cache_test_day(
+                &a,
+                region.padded_km(100.0),
+                (2026, 9, 8),
+                vec![near, leg("000002", 80_000.0)],
+            );
+            let window = PublishedWindow {
+                clock: (start, start),
+                adsb_end: day + 86_400.0,
+                pending: Vec::new(),
+            };
+            let spec = window.track_spec(fetch_box, 300.0, fdop_data::geoid::DEFAULT_GEOID_M);
+            let opts = fdop_data::FetchOptions {
+                offline: true,
+                ..Default::default()
+            };
+            // Exercise cache scanning, aircraft selection, final slicing and interpolation.
+            let store = fdop_data::fetch_window(&spec, &a.cache, &opts).unwrap();
+            assert_eq!(store.legs.len(), 1, "the distant control must remain excluded");
+            assert_eq!(store.legs[0].icao, "000001");
+            let models = track::build(&store.legs[0], &track::BuildParams::default());
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].t, vec![cpa_time - 60.0, cpa_time, cpa_time + 60.0]);
+            let observer = geodetic_to_ecef(lat, lon, fdop_types::MIC_HEIGHT_M);
+            let cpa = models[0].cpa_near(observer, cpa_time, 60.0).unwrap();
+            assert!(cpa.interior);
+            assert!(cpa.d > 30_000.0 && cpa.d <= event.d_gate[1], "{cpa:?}");
+            assert!(
+                models[0].gap_at(cpa.t_e)
+                    <= SearchParams::new(start, start, 300.0, region).max_gap_s
+            );
+            let legacy = fdop_data::IngestSpec {
+                bbox: region.padded_km(30.0),
+                ..spec
+            };
+            assert!(
+                fdop_data::fetch_window(&legacy, &a.cache, &opts)
+                    .unwrap()
+                    .legs
+                    .is_empty(),
+                "the old catalogue bound discarded this permitted pass"
+            );
+        }
     }
 
     #[test]

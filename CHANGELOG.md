@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep distant admissible flights in the ADS-B catalogue
+
+- Size the `locate` catalogue from the largest retained event's fitted upper distance
+  gate plus the existing 15 km of track context, removing both 30 km clamps. Keep the
+  5 km minimum and use the same uncapped range for coarse-terrain prefetch.
+- Add an offline archive regression using real day stores and track models: flights
+  admitted by 31.25 km and 43.75 km gates survive the new footprint while the previous
+  30 km footprint excludes them. Check a distant negative control and unchanged
+  ordinary footprints.
+- The regression is authored but unrun because the execution host is unavailable.
+  Source review and GitHub content verification do not establish a native build,
+  selftest, reference-recording result or field accuracy. Fixed context padding and
+  arbitrary wind/curvature completeness remain limitations.
+
 ### Keep complete weather columns when part of the model grid is missing
 
 - Retain every Open-Meteo cell that covers all required hourly interpolation endpoints
