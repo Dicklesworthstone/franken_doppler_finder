@@ -118,3 +118,60 @@ significance is claimed. A start time is the recordist's word, and a wrong one m
 alike. Few runs reach the curve match alone, so set N may not separate `8d672af` from `11313ba` at all.
 
 Recordings, coordinates and aircraft identifiers stay out of this repository.
+
+## 2026-11-10: screens closed, no case
+
+The searches were taken from 00:12:18Z to 00:15:48Z on 2026-11-10, starting 18 s after this file's commit (the 78
+result lists `data/set_n/screen/search/q01.json` to `q78.json`, sha256 of the lists in order `4439c4e83c588154`). Every
+row, with the step it stopped at, is in the benchmark machine's `data/set_n/screen/screen_final.tsv` (sha256
+`e18eb4cee9e69c32`; no coordinates there), and every step 3 decision is in `data/set_n/tools/desc_n.tsv`
+(`a66f6fc8d627ddb3`).
+
+| Step | Outcome | Rows |
+|---|---|---|
+| 1 | rows: 3,029 from the 78 searches, then 259 from channel lists | 3,288 |
+| 1 | out, among set K's rows | 274 |
+| 2 | out, under 20 minutes | 1,604 |
+| 3 | out, no recording date from 2023 on (mechanical) | 1,280 |
+| 3 | out, no start time (mechanical) | 46 |
+| 3 | out, read: a walk 16, an approximate start 13, indoors 9, another moving take 8, edited, mixed or a compilation 7, outside the contiguous US 4, no named site or no day 4, added music or footage 4, no start time 1, a start to the hour only 1 | 67 |
+| 5 | truths fixed, all with a ground height | 17 |
+| 6 | out, within 1 km of an earlier set N pass (none within 5 km of an earlier set's case) | 16 |
+| 7 | out, a tract under 1,000 people per square mile | 1 |
+| 10 | case | 0 |
+
+Cloud Forest Walks and The Ambient Archive had uploaded nothing since set K's screen: all 116 of their uploads that
+the searches did not meet, and the 3 they did, were among set K's rows. Of the search rows, one upload passed step 3:
+a recording at Disneyland Park in Anaheim (Los Angeles metro), from the channel Park Sensory. It passed step 6 and
+fell at step 7, on a tract of 28 people per square mile. Step 4 then screened Park Sensory's 144 uploads. Sixteen
+passed step 3, all at the Disneyland Resort, and all fell at step 6, 0.01 to 0.66 km from the first. No upload reached
+step 8.
+
+Nothing was captured and no row was run. `tools/score.py` was not patched, as no set N row exists to score.
+
+### Readings of the rules, made during the screens
+
+- Step 4 for Cloud Forest Walks and The Ambient Archive was run once the search rows' metadata was partly in, as
+  their place in the order is first whatever passes later.
+- A start given as a whole hour without minutes ("at 8pm", "starting at 7 AM") is not a start to the minute, nor is
+  one marked approximate ("approximately", "around", "starting around"). Set K's only precedent was "just before
+  2am".
+- A theme park open to the public on a ticket is a named public outdoor site, and so are a hotel's outdoor grounds
+  open to the public (a pool area, a villa's exterior). A restaurant's bar not shown to be outdoors is not.
+- Venue sound at a theme park (area music played through its speakers, a show, a band on a bandstand) is not added
+  music, as set K's fireworks reading. Songs the recordist mixed in are.
+- Where a description gives no coordinates, the geocoding query was chosen before any truth was fixed. The first
+  query for the Disneyland Park recording had no Nominatim match and was changed to the area's name. The Disneyland
+  Resort queries came from one batch of 22 Nominatim lookups, 1.1 s apart; "Town Square" had no match, so that
+  recording uses Main Street U.S.A.
+
+### What this leaves
+
+Set N gives no evidence for or against any tool. With set L (radio aporee, no case) it shows that public uploads
+stating a public outdoor site, a date and a start to the minute, at one spot in a dense tract of a large US metro, are
+rare: sets K and M's 14 cases came from two recordists, and two further searches found none. No set N row can tell
+`8d672af` from `11313ba`, so the second half of the landing rule decides: the variant lands only if no run of
+`11313ba`'s code on record has a right answer from the curve match alone. Its set M rows have none (its one right
+answer, `m_ftwadsworth`, came from the trace search; its wrong one, `m_washsq`, came from the curve match alone). Its
+15 development runs and 33 no-answer runs have none. The development replays on sets J and K were still running when
+the screens closed; the decision is recorded in a later section when they end.
