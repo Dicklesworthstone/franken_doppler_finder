@@ -145,6 +145,43 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     Some((start, end, total))
 }
 
+/// A strong entity tag identifies the exact representation across resumed ranges.
+/// Weak tags and Last-Modified alone cannot prove byte-for-byte identity.
+fn strong_etag(headers: &[(String, String)]) -> Option<&str> {
+    let tag = header_of(headers, "etag")?.trim();
+    let opaque = tag.strip_prefix('"')?.strip_suffix('"')?;
+    opaque
+        .bytes()
+        .all(|b| b == 0x21 || (0x23..=0x7e).contains(&b) || b >= 0x80)
+        .then_some(tag)
+}
+
+#[derive(Default)]
+struct StreamIdentity {
+    etag: Option<String>,
+}
+
+impl StreamIdentity {
+    fn accept(&mut self, start_at: u64, headers: &[(String, String)]) -> Result<(), String> {
+        let current = strong_etag(headers);
+        if start_at == 0 {
+            // No byte from an earlier response reached the sink, so this response
+            // can establish a new identity even after a failed initial request.
+            self.etag = current.map(str::to_owned);
+        } else if let Some(expected) = self.etag.as_deref()
+            && current != Some(expected)
+        {
+            // The sink may already be an ingesting tar reader: it cannot rewind
+            // the delivered prefix. Refuse before forwarding any replacement bytes,
+            // including a full 200 response after an If-Range mismatch.
+            return Err("response ETag changed or disappeared during resume".into());
+        }
+        // Servers without a strong initial tag retain the length/range checks.
+        // A tag first seen after the prefix cannot authenticate that prefix.
+        Ok(())
+    }
+}
+
 /// Exclusive byte offsets in the representation, not HTTP message-body lengths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StreamExtent {
@@ -381,7 +418,9 @@ impl Net {
 
     /// Stream a GET body into `sink`, resuming with `Range` after transport errors.
     /// `cancel` aborts between chunks. Returns the total body length delivered.
-    /// Any caller-supplied `Range` header is ignored: resumption owns that header.
+    /// Caller-supplied `Range` and `If-Range` headers are ignored: resumption owns them.
+    /// A strong initial ETag is pinned with If-Range and checked before resumed bytes
+    /// reach the sink. Without one, only the existing length/range checks are possible.
     pub fn stream(
         &self,
         url: &str,
@@ -391,15 +430,21 @@ impl Net {
     ) -> Result<u64, HttpError> {
         let mut delivered: u64 = 0;
         let mut expected_total: Option<u64> = None;
+        let mut identity = StreamIdentity::default();
         let mut attempt = 0u32;
         loop {
             let mut hdrs: Vec<(String, String)> = headers
                 .iter()
-                .filter(|(k, _)| !k.eq_ignore_ascii_case("range"))
+                .filter(|(k, _)| {
+                    !k.eq_ignore_ascii_case("range") && !k.eq_ignore_ascii_case("if-range")
+                })
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             if delivered > 0 {
                 hdrs.push(("Range".into(), format!("bytes={delivered}-")));
+                if let Some(tag) = &identity.etag {
+                    hdrs.push(("If-Range".into(), tag.clone()));
+                }
             }
             let client = self.stream_client.clone();
             let u = url.to_string();
@@ -419,9 +464,12 @@ impl Net {
                     status,
                     &resp.head.headers,
                     start_at,
-                    expected_total,
+                    if start_at == 0 { None } else { expected_total },
                 )
                 .map_err(|m| HttpError::new(&u, Some(status), m))?;
+                identity
+                    .accept(start_at, &resp.head.headers)
+                    .map_err(|m| HttpError::new(&u, Some(status), m))?;
                 expected_total = extent.total;
                 if status == 416 {
                     return Ok(true); // validated bytes */N proves that the prefix is complete
@@ -653,6 +701,155 @@ mod tests {
     }
 
     #[test]
+    fn stream_identity_uses_only_strong_initial_etags() {
+        let headers = |tag: &str| vec![("eTaG".to_string(), tag.to_string())];
+        for tag in ["\"v1\"", "\"\"", " \t\"v1\"\t "] {
+            assert_eq!(strong_etag(&headers(tag)), Some(tag.trim()));
+        }
+        for tag in ["W/\"v1\"", "v1", "\"unfinished", "\"a b\"", "\"a\"b\"", "\"a\nb\""] {
+            assert!(strong_etag(&headers(tag)).is_none(), "{tag:?}");
+        }
+        let mut identity = StreamIdentity::default();
+        identity.accept(0, &headers("\"v1\"")).unwrap();
+        identity.accept(10, &headers("\"v1\"")).unwrap();
+        for tags in [headers("\"v2\""), headers("W/\"v1\""), Vec::new()] {
+            assert!(identity.accept(10, &tags).is_err());
+            assert_eq!(identity.etag.as_deref(), Some("\"v1\""));
+        }
+        // A failed attempt which delivered nothing has no prefix to protect.
+        identity.accept(0, &headers("\"v2\"")).unwrap();
+        assert_eq!(identity.etag.as_deref(), Some("\"v2\""));
+        identity.accept(0, &[]).unwrap();
+        identity.accept(10, &headers("\"v3\"")).unwrap();
+        assert!(identity.etag.is_none());
+    }
+
+    #[test]
+    fn resumed_streams_keep_the_original_representation() {
+        for (status, tag, succeeds) in [
+            (206, Some("\"Version-One\""), true),
+            (200, Some("\"Version-One\""), true),
+            (206, Some("\"version-one\""), false),
+            (200, Some("\"v2\""), false),
+            (206, None, false),
+            (206, Some("W/\"Version-One\""), false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut first, _) = listener.accept().unwrap();
+                let h1 = read_raw_head(&mut first);
+                first
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nETag: \"Version-One\"\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                first.write_all(&(0u8..10).collect::<Vec<_>>()).unwrap();
+                drop(first);
+                let (mut second, _) = listener.accept().unwrap();
+                let h2 = read_raw_head(&mut second);
+                let start = if status == 206 { 10u8 } else { 0u8 };
+                let reason = if status == 206 { "Partial Content" } else { "OK" };
+                let mut reply = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    100 - start
+                );
+                if status == 206 {
+                    reply.push_str("Content-Range: bytes 10-99/100\r\n");
+                }
+                if let Some(tag) = tag {
+                    reply.push_str(&format!("ETag: {tag}\r\n"));
+                }
+                reply.push_str("\r\n");
+                let mut reply = reply.into_bytes();
+                reply.extend((start..100).map(|n| if succeeds { n } else { 255 }));
+                // A refused identity may close the socket before its body is sent.
+                let _ = second.write_all(&reply);
+                (h1, h2)
+            });
+            let mut got = Vec::new();
+            let result = Net::new()
+                .unwrap()
+                .with_retries(0)
+                .stream(
+                    &format!("http://{addr}/blob"),
+                    &[("rAnGe", "bytes=42-"), ("If-Range", "\"unrelated\"")],
+                    &AtomicBool::new(false),
+                    &mut |chunk| {
+                        got.extend_from_slice(chunk);
+                        Ok(())
+                    },
+                );
+            let (h1, h2) = server.join().unwrap();
+            assert!(!h1.to_ascii_lowercase().contains("range:"), "{h1}");
+            assert!(h2.to_ascii_lowercase().contains("range: bytes=10-\r\n"), "{h2}");
+            let conditions: Vec<_> = h2
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(name, _)| name.eq_ignore_ascii_case("if-range"))
+                .map(|(_, value)| value.trim())
+                .collect();
+            assert_eq!(conditions, ["\"Version-One\""], "{h2}");
+            if succeeds {
+                assert_eq!(result.unwrap(), 100);
+                assert_eq!(got, (0u8..100).collect::<Vec<_>>());
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.message.contains("ETag"), "{error}");
+                assert_eq!(got, (0u8..10).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn range_completion_requires_the_pinned_etag() {
+        for tag in [
+            Some("\"Version-One\""),
+            None,
+            Some("\"other\""),
+            Some("W/\"Version-One\""),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut first, _) = listener.accept().unwrap();
+                read_head(&mut first);
+                first
+                    .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\nContent-Range: bytes 0-9/*\r\nETag: \"Version-One\"\r\nConnection: close\r\n\r\n0123456789")
+                    .unwrap();
+                drop(first);
+                let (mut second, _) = listener.accept().unwrap();
+                let request = read_head(&mut second);
+                assert!(request.contains("range: bytes=10-"), "{request}");
+                let mut reply = String::from(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */10\r\nContent-Length: 0\r\nConnection: close\r\n",
+                );
+                if let Some(tag) = tag {
+                    reply.push_str(&format!("ETag: {tag}\r\n"));
+                }
+                reply.push_str("\r\n");
+                let _ = second.write_all(reply.as_bytes());
+            });
+            let mut got = Vec::new();
+            let result = Net::new().unwrap().stream(
+                &format!("http://{addr}/blob"),
+                &[],
+                &AtomicBool::new(false),
+                &mut |chunk| {
+                    got.extend_from_slice(chunk);
+                    Ok(())
+                },
+            );
+            server.join().unwrap();
+            assert_eq!(got, b"0123456789");
+            if tag == Some("\"Version-One\"") {
+                assert_eq!(result.unwrap(), 10);
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.message.contains("ETag"), "{error}");
+            }
+        }
+    }
+
+    #[test]
     fn partial_ranges_keep_object_length_separate_from_body_length() {
         for previous in [None, Some(100)] {
             let extent = StreamExtent::from_response(
@@ -730,6 +927,10 @@ mod tests {
 
     /// Read one request head; return it lower-cased.
     fn read_head(sock: &mut std::net::TcpStream) -> String {
+        read_raw_head(sock).to_ascii_lowercase()
+    }
+
+    fn read_raw_head(sock: &mut std::net::TcpStream) -> String {
         let mut head = Vec::new();
         let mut b = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
@@ -738,7 +939,7 @@ mod tests {
                 _ => break,
             }
         }
-        String::from_utf8_lossy(&head).to_ascii_lowercase()
+        String::from_utf8_lossy(&head).into_owned()
     }
 
     fn test_cache_path(label: &str) -> PathBuf {

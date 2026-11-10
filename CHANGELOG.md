@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve archive identity when a download resumes
+
+- Pin a strong initial HTTP ETag and send it in `If-Range` on every retry. Check the
+  returned identity before forwarding more bytes or accepting a terminal range response.
+  A same-length replacement could previously join one archive's prefix to another's suffix
+  and pass all transport length checks. Changed, missing or weakened tags now fail explicitly;
+  the streamed ingest sink cannot safely rewind. An unchanged full response still discards
+  only its already delivered prefix.
+- Ignore caller-supplied `Range` and `If-Range` values so resumption owns both. A retry with
+  zero delivered bytes can establish a new identity and length. Servers without a strong
+  initial ETag retain the previous range/length validation; that fallback still cannot
+  distinguish same-length replacements.
+- Add native regressions for strong/weak/malformed tags, zero-byte replacement, and a tag
+  first appearing after delivery. A loopback server exercises unchanged and changed 200/206
+  responses, missing and weak resumed tags, exact delivered bytes and outgoing conditional
+  headers, with a case-sensitive opaque tag. A terminal `416` length probe must also keep
+  the pinned tag; loopback coverage checks matching, changed, weak and absent tags.
+  These tests were authored but not executed: the session's execution environment
+  became unavailable. Formatting, Clippy, the workspace suite and selftest are unverified;
+  no live archive or real-recording validation is claimed.
+
 ### Report an answer from the curve match alone at low
 
 - Where the trace search's answer is low or absent and the curve match stands somewhere else (`CurveCall::Adopts`),
