@@ -1227,7 +1227,7 @@ pub(crate) fn measure_recording(
     let ordinary_aircraft = search::independent_measured_events(&events, 0.0).len();
     if ordinary_aircraft < 2 && dets.len() < dp.max_detections && remaining_candidates > 0 {
         log.say(&format!(
-            "{ordinary_aircraft} independent aircraft measured; checking unclaimed recording edges with a shorter fast-pass survey"
+            "{ordinary_aircraft} independent aircraft measured; checking unclaimed recording edges and refused detections with a shorter fast-pass survey"
         ));
         let owners: Vec<_> = events
             .iter()
@@ -1247,14 +1247,20 @@ pub(crate) fn measure_recording(
                 }
             })
             .collect();
+        let refused: Vec<_> = events
+            .iter()
+            .filter(|event| !event.is_aircraft_like())
+            .map(|event| &dets[event.detection.id])
+            .collect();
         let recovery_started = Instant::now();
-        let recovery = detect::recover_fast_edges_with_owners(
+        let recovery = detect::recover_fast_passes_with_owners(
             x,
             sr,
             &dp,
             dp.max_detections - dets.len(),
             remaining_candidates,
             &owners,
+            &refused,
         );
         recovery_detect_s = recovery_started.elapsed().as_secs_f64();
         detect_s += recovery_detect_s;
@@ -1306,7 +1312,7 @@ pub(crate) fn measure_recording(
                 events.append(&mut recovered_events);
                 if recovered_count > 0 || ordinary_aircraft == 0 {
                     warnings.push(format!(
-                        "short-window fast-pass recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; a shorter survey of the recording's true edges, excluding its measured ridges and harmonic families, supplied {recovered_count} candidates within the remaining detection budget; all use the existing measurement gates and count as measured past the old line",
+                        "short-window fast-pass recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; a shorter survey of the recording's true edges and refused detections, excluding its measured ridges and harmonic families, supplied {recovered_count} candidates within the remaining detection budget; all use the existing measurement gates and count as measured past the old line",
                     ));
                 }
                 if recovery_cut > 0 {
@@ -1330,7 +1336,7 @@ pub(crate) fn measure_recording(
         e.id = id;
     }
     log.say(&format!(
-        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, found only on the contrast image, from the fast bank or shorter edge survey, or recovered from a harmonic)",
+        "{} of them measured past the old line (detection score under {:.1}, past the strongest {max_measured}, found only on the contrast image, from the fast bank or shorter recovery survey, or recovered from a harmonic)",
         added.len(),
         dp.thr_db
     ));
@@ -2645,10 +2651,18 @@ mod tests {
     use super::*;
 
     fn fast_edge_recording((f0, v, d, t0r): (f64, f64, f64, f64), amplitude: f64) -> Vec<f32> {
+        fast_recording(30, (f0, v, d, t0r), amplitude)
+    }
+
+    fn fast_recording(
+        duration_s: usize,
+        (f0, v, d, t0r): (f64, f64, f64, f64),
+        amplitude: f64,
+    ) -> Vec<f32> {
         let (sr, c) = (4000.0, 343.0);
         let t0e = t0r - d / c;
         let mut seed = 4242u64;
-        (0..30 * 4000)
+        (0..duration_s * 4000)
             .map(|i| {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
@@ -2785,13 +2799,18 @@ mod tests {
         let dp = DetectParams::default();
         let mp = MeasureParams::default();
         // A separate, slower aircraft is audible above the fast pass's entire frequency
-        // range. The existing ordinary bank measures it accurately at both strengths; the
-        // steep 83 Hz pass still needs the short-window edge bank.
-        for ordinary_amplitude in [0.08, 0.04] {
-            let mut x = fast_edge_recording((83.0, 245.0, 700.0, 19.37), 0.32);
+        // range. The existing bank measures it; the fast pass still needs the shorter
+        // survey, either at a true recording edge or at a refused interior detection.
+        for (duration, fast, ordinary_heard, ordinary_amplitude) in [
+            (30, (83.0, 245.0, 700.0, 19.37), 9.13, 0.08),
+            (30, (83.0, 245.0, 700.0, 19.37), 9.13, 0.04),
+            (180, (118.0, 215.0, 900.0, 80.13), 40.13, 0.08),
+        ] {
+            let mut x = fast_recording(duration, fast, 0.32);
             for (i, sample) in x.iter_mut().enumerate() {
                 let t = i as f64 / 4000.0;
-                let tau = physics::retarded_tau(t, 9.13 - 900.0 / 343.0, 90.0, 900.0, 343.0);
+                let tau =
+                    physics::retarded_tau(t, ordinary_heard - 900.0 / 343.0, 90.0, 900.0, 343.0);
                 let range = physics::cv_radial(tau, 90.0, 900.0).0;
                 *sample += (ordinary_amplitude * 900.0 / range
                     * (std::f64::consts::TAU * 450.0 * tau).sin())
@@ -2828,7 +2847,7 @@ mod tests {
                 (b.f0 - 450.0).abs() < 0.3
                     && (b.v - 90.0).abs() < 4.0
                     && (b.d / 900.0 - 1.0).abs() < 0.08
-                    && (b.t0r - 9.13).abs() < 0.3,
+                    && (b.t0r - ordinary_heard).abs() < 0.3,
                 "{b:?}"
             );
 
@@ -2868,10 +2887,10 @@ mod tests {
                 .unwrap();
             let b = recovered.fit.as_ref().unwrap().best;
             eprintln!("second aircraft, ordinary amplitude {ordinary_amplitude}: {b:?}");
-            assert!((b.f0 - 83.0).abs() < 0.3, "{b:?}");
-            assert!((b.v - 245.0).abs() < 4.0, "{b:?}");
-            assert!((b.d / 700.0 - 1.0).abs() < 0.08, "{b:?}");
-            assert!((b.t0r - 19.37).abs() < 0.3, "{b:?}");
+            assert!((b.f0 - fast.0).abs() < 0.3, "{b:?}");
+            assert!((b.v - fast.1).abs() < 4.0, "{b:?}");
+            assert!((b.d / fast.2 - 1.0).abs() < 0.08, "{b:?}");
+            assert!((b.t0r - fast.3).abs() < 0.3, "{b:?}");
             assert!(measured.added.contains(&recovered.id));
             assert!(measured.warnings.iter().any(|warning| {
                 warning.contains("ordinary measurement found 1 independent aircraft")
@@ -2884,8 +2903,8 @@ mod tests {
                 let enu = fdop_types::geo::Enu::new(lat, lon, fdop_types::MIC_HEIGHT_M);
                 let mut tracks = Vec::new();
                 for (key, speed, distance, heard, northbound) in [
-                    ("ordinary", 90.0f64, 900.0f64, 9.13, false),
-                    ("recovered", 245.0, 700.0, 19.37, true),
+                    ("ordinary", 90.0f64, 900.0f64, ordinary_heard, false),
+                    ("recovered", fast.1, fast.2, fast.3, true),
                 ] {
                     let lateral = (distance * distance - 500.0f64.powi(2)).sqrt();
                     let (position, velocity) = if northbound {
@@ -2899,7 +2918,7 @@ mod tests {
                         velocity,
                         start + heard - distance / 343.0,
                         start - 100.0,
-                        start + 130.0,
+                        start + duration as f64 + 100.0,
                         2.0,
                     );
                     track.key = key.into();
@@ -2912,7 +2931,7 @@ mod tests {
                 let params = search::SearchParams::new(
                     start,
                     start,
-                    30.0,
+                    duration as f64,
                     fdop_types::BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01),
                 );
                 let located = search::run(

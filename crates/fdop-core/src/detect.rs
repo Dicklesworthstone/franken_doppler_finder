@@ -909,12 +909,24 @@ pub fn recover_fast_edges_with_owners(
     sr: u32,
     p: &DetectParams,
     slots: usize,
-    mut remaining_candidates: usize,
+    remaining_candidates: usize,
     owners: &[RecoveryOwner<'_>],
 ) -> Result<(Vec<Detection>, usize), String> {
+    recover_fast_edges_impl(x, sr, p, slots, remaining_candidates, owners)
+        .map(|(detections, cut, _)| (detections, cut))
+}
+
+fn recover_fast_edges_impl(
+    x: &[f32],
+    sr: u32,
+    p: &DetectParams,
+    slots: usize,
+    mut remaining_candidates: usize,
+    owners: &[RecoveryOwner<'_>],
+) -> Result<(Vec<Detection>, usize, usize), String> {
     let slots = slots.min(p.max_detections);
     if slots == 0 || remaining_candidates == 0 || !p.fast_templates {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, remaining_candidates));
     }
     let short = DetectParams {
         win_s: 0.5,
@@ -923,12 +935,12 @@ pub fn recover_fast_edges_with_owners(
     };
     let templates = build_fast_edge_templates(&short, short.hop_s);
     if templates.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, remaining_candidates));
     }
     let base_half = p.min_half_s.min(p.max_half_s);
     let edge_samples = ((2.0 * base_half).min(48.0) * f64::from(sr)) as usize;
     if edge_samples == 0 || x.len() < (short.win_s * f64::from(sr)) as usize {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, remaining_candidates));
     }
     let chunks = if x.len() <= 2 * edge_samples {
         vec![(0, x.len())]
@@ -987,6 +999,126 @@ pub fn recover_fast_edges_with_owners(
         detection.id = id;
     }
     group_harmonics(&mut out, p);
+    Ok((out, cut, remaining_candidates))
+}
+
+/// Preserve true-edge recovery, then revisit the CPA neighbourhoods of refused detections
+/// with full fast templates. An unmeasurable slow seed must not permanently own the audio
+/// that a faster pass needs. Accepted measurements own only their observed ridges, as above.
+/// The original candidate allowance and detection slots cover both stages together.
+#[allow(clippy::too_many_arguments)]
+pub fn recover_fast_passes_with_owners(
+    x: &[f32],
+    sr: u32,
+    p: &DetectParams,
+    slots: usize,
+    remaining_candidates: usize,
+    owners: &[RecoveryOwner<'_>],
+    refused: &[&Detection],
+) -> Result<(Vec<Detection>, usize), String> {
+    let (mut out, mut cut, mut remaining_candidates) =
+        recover_fast_edges_impl(x, sr, p, slots, remaining_candidates, owners)?;
+    let slots = slots.min(p.max_detections);
+    if out.len() >= slots || remaining_candidates == 0 || !p.fast_templates {
+        return Ok((out, cut));
+    }
+    let short = DetectParams {
+        win_s: 0.5,
+        hop_s: 0.5,
+        ..p.clone()
+    };
+    let templates = build_fast_templates(&short, short.hop_s);
+    let support = templates.iter().map(|t| t.half).fold(0.0, f64::max);
+    let duration = x.len() as f64 / f64::from(sr);
+    let base_half = p.min_half_s.min(p.max_half_s);
+    let mut windows: Vec<_> = refused
+        .iter()
+        .filter(|d| d.t0r.is_finite() && d.v.is_finite() && d.v > 0.0 && d.d.is_finite())
+        .filter_map(|d| {
+            // Use the refused seed's time scale and the detector's ten-second suppression
+            // floor. Only this bounded CPA neighbourhood is revisited.
+            let half = (0.5 * d.d / d.v).max(10.0);
+            let lo = (d.t0r - half).max(base_half);
+            let hi = (d.t0r + half).min(duration - base_half);
+            (lo <= hi).then_some((lo, hi))
+        })
+        .collect();
+    if templates.is_empty() || windows.is_empty() {
+        return Ok((out, cut));
+    }
+    windows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (lo, hi) in windows {
+        if let Some(last) = merged.last_mut()
+            && lo <= last.1
+        {
+            last.1 = last.1.max(hi);
+        } else {
+            merged.push((lo, hi));
+        }
+    }
+    let first = out.len();
+    let accepted_limit = p.max_detections * 3 - (p.max_detections - slots);
+    let threshold = p.thr_db.max(p.thr_silence_db);
+    for (lo, hi) in merged {
+        if remaining_candidates == 0 || out.len() >= accepted_limit {
+            break;
+        }
+        // Include each full template and its STFT window on both sides of the scored
+        // centres. A crop seam cannot shorten a template or become a recording edge.
+        let start = ((lo - support - short.win_s).max(0.0) * f64::from(sr)) as usize;
+        let end = (((hi + support + short.win_s) * f64::from(sr)).ceil() as usize).min(x.len());
+        let (mut ls, _) = survey(&x[start..end], sr, &short)?;
+        for t in &mut ls.t {
+            *t += start as f64 / f64::from(sr);
+        }
+        let (nt, nr) = (ls.nt(), ls.nr());
+        if nt < 8 || nr < 8 {
+            continue;
+        }
+        let centres = [(
+            ls.t.partition_point(|&t| t < lo),
+            ls.t.partition_point(|&t| t <= hi),
+        )];
+        let mut known = vec![false; nr * nt];
+        mark_observed_ridges(&ls, owners, &mut known);
+        for detection in &out {
+            mark_detection_ridge(&ls, &short, detection, &mut known);
+        }
+        let mut residual = ls.data.clone();
+        zero_known(&mut residual, &known);
+        let (bs, bi) = score_bank(&ls, &templates, &residual, &centres);
+        let mut candidates: Vec<_> = (0..nr * nt)
+            .filter(|&k| bs[k] as f64 >= threshold)
+            .collect();
+        candidates.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
+        candidates.truncate(remaining_candidates);
+        remaining_candidates -= candidates.len();
+        for k in candidates {
+            if out.len() >= accepted_limit {
+                break;
+            }
+            accept_candidates(
+                &ls,
+                &short,
+                &templates,
+                (&bs, &bi),
+                &[k],
+                threshold,
+                &mut known,
+                &mut out,
+            );
+        }
+    }
+    let mut added = out.split_off(first);
+    added.sort_by(|a, b| b.score.total_cmp(&a.score));
+    cut += added.len().saturating_sub(slots - first);
+    added.truncate(slots - first);
+    out.extend(added);
+    for (id, detection) in out.iter_mut().enumerate() {
+        detection.id = id;
+    }
+    group_harmonics_after(&mut out, p, first);
     Ok((out, cut))
 }
 
@@ -1183,7 +1315,7 @@ fn accept_candidates(
     known: &mut [bool],
     out: &mut Vec<Detection>,
 ) {
-    let (nt, nr) = (ls.nt(), ls.nr());
+    let nt = ls.nt();
     let bpo = p.bins_per_octave as f64;
     for &k in cand {
         if out.len() >= p.max_detections * 3 {
@@ -1223,22 +1355,26 @@ fn accept_candidates(
         if (ra.min(rr) as f64) < threshold {
             continue;
         }
-        // mark this curve
-        let (j0, j1) = (
-            ls.t.partition_point(|&x| x < t0r - half),
-            ls.t.partition_point(|&x| x <= t0r + half),
-        );
-        for j in j0..j1 {
-            let fr = f0 * cv_ratio_rel_t0r(ls.t[j] - t0r, tm.v, tm.d, p.c);
-            let row = ((fr / ls.freqs[0]).log2() * bpo).round() as i64;
-            for rr2 in (row - RIDGE_HALF_ROWS).max(0)..=(row + RIDGE_HALF_ROWS).min(nr as i64 - 1) {
-                known[rr2 as usize * nt + j] = true;
-            }
-        }
+        mark_detection_ridge(ls, p, &candidate, known);
         candidate.score = ra.min(rr) as f64;
         candidate.score_approach = ra as f64;
         candidate.score_recede = rr as f64;
         out.push(candidate);
+    }
+}
+
+fn mark_detection_ridge(ls: &LogSpec, p: &DetectParams, d: &Detection, known: &mut [bool]) {
+    let (nt, nr) = (ls.nt(), ls.nr());
+    let (j0, j1) = (
+        ls.t.partition_point(|&t| t < d.t0r - d.half_s),
+        ls.t.partition_point(|&t| t <= d.t0r + d.half_s),
+    );
+    for j in j0..j1 {
+        let fr = d.f0 * cv_ratio_rel_t0r(ls.t[j] - d.t0r, d.v, d.d, p.c);
+        let row = ((fr / ls.freqs[0]).log2() * p.bins_per_octave as f64).round() as i64;
+        for r in (row - RIDGE_HALF_ROWS).max(0)..=(row + RIDGE_HALF_ROWS).min(nr as i64 - 1) {
+            known[r as usize * nt + j] = true;
+        }
     }
 }
 
@@ -1271,8 +1407,12 @@ fn residual_halves(ls: &LogSpec, r: usize, i: usize, tm: &Template, known: &[boo
 /// Mark detections that are harmonics of a stronger one (same t0r within 4 s, same shape,
 /// small-integer frequency ratio within 1.5 %).
 fn group_harmonics(dets: &mut [Detection], p: &DetectParams) {
+    group_harmonics_after(dets, p, 0);
+}
+
+fn group_harmonics_after(dets: &mut [Detection], p: &DetectParams, first: usize) {
     let n = dets.len();
-    for j in 0..n {
+    for j in first..n {
         for i in 0..j {
             if dets[i].harmonic_of.is_some() {
                 continue;
@@ -1725,6 +1865,305 @@ mod tests {
             assert!((b.t0r - pass.3).abs() < 0.3, "{b:?}");
             let limited = recover_fast_edges(&x, 4000, &p, 1, 1).unwrap();
             assert!(limited.0.len() <= 1 && limited.1 == 0);
+        }
+    }
+
+    #[test]
+    fn interior_fast_recovery_revisits_refused_detections() {
+        let p = DetectParams::default();
+        let mut recovered = 0;
+        for pass in [(83.0, 245.0, 700.0, 79.37), (118.0, 215.0, 900.0, 80.13)] {
+            for quieter_db in (0..=12).step_by(3) {
+                let x = fast_pass_scene(pass, 0.32 * 10.0f64.powf(-f64::from(quieter_db) / 20.0));
+                let (ls, lin) = survey(&x, 4000, &p).unwrap();
+                let (ordinary, cut, budget) = detect_counted_with_budget(&ls, &p);
+                assert_eq!(cut, 0);
+                let events = measure_edge_families(&x, &lin, &ordinary);
+                let accepted = crate::search::independent_measured_events(&events, 0.0).len();
+                let refused: Vec<_> = events
+                    .iter()
+                    .filter(|event| !event.is_aircraft_like())
+                    .map(|event| &ordinary[event.detection.id])
+                    .collect();
+                let owners: Vec<_> = events
+                    .iter()
+                    .filter(|event| event.is_aircraft_like())
+                    .map(|event| RecoveryOwner {
+                        trace: &event.trace,
+                        harmonics: Vec::new(),
+                    })
+                    .collect();
+                let slots = p.max_detections - ordinary.len();
+                let (new, recovery_cut) =
+                    recover_fast_passes_with_owners(&x, 4000, &p, slots, budget, &owners, &refused)
+                        .unwrap();
+                assert_eq!(recovery_cut, 0);
+                let mut added = measure_edge_families(&x, &lin, &new);
+                for (rank, event) in added.iter_mut().enumerate() {
+                    event.id = format!("interior-{rank}");
+                }
+                eprintln!(
+                    "interior fast {pass:?}, {quieter_db} dB: ordinary {} accepted {accepted}, refused {}, new {new:?}; measurements {:?}",
+                    ordinary.len(),
+                    refused.len(),
+                    added
+                        .iter()
+                        .map(|e| (&e.quality, e.fit.as_ref().map(|f| f.best)))
+                        .collect::<Vec<_>>()
+                );
+                for event in added.iter().filter(|e| e.is_aircraft_like()) {
+                    let b = event.fit.as_ref().unwrap().best;
+                    assert!((b.f0 - pass.0).abs() < 0.3, "{b:?}");
+                    assert!((b.v - pass.1).abs() < 4.0, "{b:?}");
+                    assert!((b.d / pass.2 - 1.0).abs() < 0.08, "{b:?}");
+                    assert!((b.t0r - pass.3).abs() < 0.3, "{b:?}");
+                }
+                let mut all = events;
+                all.extend(added);
+                let independent = crate::search::independent_measured_events(&all, 0.0).len();
+                assert!(
+                    independent <= 1,
+                    "one physical pass supplied {independent} events"
+                );
+                if accepted == 0 && independent == 1 {
+                    recovered += 1;
+                }
+            }
+        }
+        assert!(
+            recovered > 0,
+            "no previously refused interior pass recovered"
+        );
+    }
+
+    #[test]
+    fn interior_fast_recovery_supplies_a_second_independent_aircraft() {
+        let (fast, ordinary) = ((118.0, 215.0, 900.0, 80.13), (450.0, 90.0, 900.0, 40.13));
+        let mut x = fast_pass_scene(fast, 0.32);
+        for (i, sample) in x.iter_mut().enumerate() {
+            let t = i as f64 / 4000.0;
+            let tau = crate::physics::retarded_tau(
+                t,
+                ordinary.3 - ordinary.2 / 343.0,
+                ordinary.1,
+                ordinary.2,
+                343.0,
+            );
+            let range = crate::physics::cv_radial(tau, ordinary.1, ordinary.2).0;
+            *sample += (0.08 * ordinary.2 / range
+                * (std::f64::consts::TAU * ordinary.0 * tau).sin()) as f32;
+        }
+        let p = DetectParams::default();
+        let (ls, lin) = survey(&x, 4000, &p).unwrap();
+        let (detections, cut, budget) = detect_counted_with_budget(&ls, &p);
+        assert_eq!(cut, 0);
+        let mut events = measure_edge_families(&x, &lin, &detections);
+        assert_eq!(
+            crate::search::independent_measured_events(&events, 0.0).len(),
+            1
+        );
+        let owners: Vec<_> = events
+            .iter()
+            .filter(|event| event.is_aircraft_like())
+            .map(|event| {
+                assert!((event.fit.as_ref().unwrap().best.f0 - ordinary.0).abs() < 0.3);
+                RecoveryOwner {
+                    trace: &event.trace,
+                    harmonics: Vec::new(),
+                }
+            })
+            .collect();
+        let refused: Vec<_> = events
+            .iter()
+            .filter(|event| !event.is_aircraft_like())
+            .map(|event| &detections[event.detection.id])
+            .collect();
+        let (added, cut) = recover_fast_passes_with_owners(
+            &x,
+            4000,
+            &p,
+            p.max_detections - detections.len(),
+            budget,
+            &owners,
+            &refused,
+        )
+        .unwrap();
+        assert_eq!(cut, 0);
+        let mut recovered = measure_edge_families(&x, &lin, &added);
+        for (rank, event) in recovered.iter_mut().enumerate() {
+            event.id = format!("recovered-{rank}");
+            if event.is_aircraft_like() {
+                let b = event.fit.as_ref().unwrap().best;
+                eprintln!("interior second aircraft: {b:?}");
+                assert!((b.f0 - fast.0).abs() < 0.3, "{b:?}");
+                assert!((b.v - fast.1).abs() < 4.0, "{b:?}");
+                assert!((b.d / fast.2 - 1.0).abs() < 0.08, "{b:?}");
+                assert!((b.t0r - fast.3).abs() < 0.3, "{b:?}");
+            }
+        }
+        events.extend(recovered);
+        let independent = crate::search::independent_measured_events(&events, 0.0);
+        assert_eq!(independent.len(), 2, "{added:?}");
+
+        let (lat, lon, start) = (40.876466, -73.524951, 1_788_895_000.0);
+        let enu = fdop_types::geo::Enu::new(lat, lon, fdop_types::MIC_HEIGHT_M);
+        let mut tracks = Vec::new();
+        for (key, pass, northbound) in [("ordinary", ordinary, false), ("recovered", fast, true)] {
+            let lateral = (pass.2 * pass.2 - 500.0f64.powi(2)).sqrt();
+            let (position, velocity) = if northbound {
+                ([lateral, 0.0, 500.0], [0.0, pass.1, 0.0])
+            } else {
+                ([0.0, lateral, 500.0], [pass.1, 0.0, 0.0])
+            };
+            let mut track = crate::track::straight_track(
+                &enu,
+                position,
+                velocity,
+                start + pass.3 - pass.2 / 343.0,
+                start - 100.0,
+                start + 280.0,
+                2.0,
+            );
+            track.key = key.into();
+            track.icao = key.into();
+            tracks.push(track);
+        }
+        let dem = fdop_types::FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let located = crate::search::run(
+            &crate::search::SearchInputs {
+                events: independent,
+                tracks: &tracks,
+                heard_times: detections.iter().chain(&added).map(|d| d.t0r).collect(),
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            },
+            &crate::search::SearchParams::new(
+                start,
+                start,
+                180.0,
+                fdop_types::BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01),
+            ),
+            &|message| eprintln!("interior recovered search: {message}"),
+        );
+        let best = located
+            .candidates
+            .first()
+            .expect("two measured passes must locate");
+        for flight in ["ordinary", "recovered"] {
+            assert!(
+                best.events.iter().any(|e| e.flight == flight && e.core),
+                "{best:?}"
+            );
+        }
+        let refined = located
+            .refine
+            .as_ref()
+            .expect("two-pass location must refine");
+        let error = fdop_types::geo::haversine_m(lat, lon, refined.lat, refined.lon);
+        eprintln!(
+            "interior two-pass location: {error}m, clock={}s",
+            refined.t_start_utc - start
+        );
+        assert!(error < 75.0, "{refined:?}");
+        assert!((refined.t_start_utc - start).abs() < 0.2, "{refined:?}");
+        assert!(located.funnel.truncated.is_empty());
+    }
+
+    #[test]
+    fn interior_fast_recovery_respects_owners_limits_and_refusals() {
+        let pass = (118.0, 215.0, 900.0, 80.13);
+        let p = DetectParams::default();
+        let noise = fast_pass_scene(pass, 0.0);
+        let physical = fast_pass_scene(pass, 0.32);
+        let (ls, original_survey) = survey(&physical, 4000, &p).unwrap();
+        let (detections, _, budget) = detect_counted_with_budget(&ls, &p);
+        let events = measure_edge_families(&physical, &original_survey, &detections);
+        assert!(events.iter().all(|event| !event.is_aircraft_like()));
+        let refused: Vec<_> = events
+            .iter()
+            .map(|event| &detections[event.detection.id])
+            .collect();
+        assert!(!refused.is_empty());
+        let slots = p.max_detections - detections.len();
+        for (room, allowance) in [(0, budget), (slots, 0)] {
+            assert!(
+                recover_fast_passes_with_owners(
+                    &physical, 4000, &p, room, allowance, &[], &refused,
+                )
+                .unwrap()
+                .0
+                .is_empty()
+            );
+        }
+        let edge = recover_fast_edges_with_owners(&physical, 4000, &p, slots, budget, &[]).unwrap();
+        let no_refusal =
+            recover_fast_passes_with_owners(&physical, 4000, &p, slots, budget, &[], &[]).unwrap();
+        assert_eq!(
+            serde_json::to_value(edge).unwrap(),
+            serde_json::to_value(no_refusal).unwrap()
+        );
+        // Hold the physically detected, refused seeds fixed while removing or reversing
+        // their sound. Even this prior guidance must not manufacture an aircraft from the
+        // changed observations. Each changed recording supplies its own measurement spectrum.
+        for mode in ["physical", "missing drop", "reversed", "noise and hum"] {
+            let mut x = if mode == "noise and hum" {
+                noise.clone()
+            } else {
+                physical.clone()
+            };
+            if mode == "missing drop" {
+                let a = ((pass.3 - 12.0) * 4000.0) as usize;
+                let b = ((pass.3 + 12.0) * 4000.0) as usize;
+                x[a..b].copy_from_slice(&noise[a..b]);
+            } else if mode == "reversed" {
+                x.reverse();
+            }
+            let (_, lin) = survey(&x, 4000, &p).unwrap();
+            let (added, _) =
+                recover_fast_passes_with_owners(&x, 4000, &p, slots, budget, &[], &refused)
+                    .unwrap();
+            eprintln!(
+                "interior control {mode}: measuring {} retry candidates",
+                added.len()
+            );
+            let measured = measure_edge_families(&x, &lin, &added);
+            eprintln!(
+                "interior control {mode}: {} refused seeds, {} recovered candidates; {:?}",
+                refused.len(),
+                added.len(),
+                measured.iter().map(|e| &e.quality).collect::<Vec<_>>()
+            );
+            if mode != "physical" {
+                assert!(
+                    measured.iter().all(|event| !event.is_aircraft_like()),
+                    "{mode}"
+                );
+                continue;
+            }
+            assert!(!refused.is_empty());
+            let accepted: Vec<_> = measured
+                .iter()
+                .filter(|event| event.is_aircraft_like())
+                .collect();
+            assert_eq!(accepted.len(), 1);
+            let owners = [RecoveryOwner {
+                trace: &accepted[0].trace,
+                harmonics: Vec::new(),
+            }];
+            let (again, _) =
+                recover_fast_passes_with_owners(&x, 4000, &p, slots, budget, &owners, &refused)
+                    .unwrap();
+            eprintln!(
+                "interior owner control: measuring {} retry candidates",
+                again.len()
+            );
+            let measured_again = measure_edge_families(&x, &lin, &again);
+            assert!(
+                measured_again.iter().all(|event| !event.is_aircraft_like()),
+                "the already measured ridge manufactured another aircraft"
+            );
         }
     }
 

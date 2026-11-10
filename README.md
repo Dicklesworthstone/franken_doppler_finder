@@ -1182,11 +1182,14 @@ Design notes:
   recovery with no baseline event; it does not establish recovery of a real field miss. The new
   fast-edge PCM recovery assertion still fails in the native baseline: its early 215 m/s case adds
   no fast-edge seed. The contrast-edge change does not repair or weaken that separate assertion (Testing).
-- **A shorter edge survey can supply the missing second aircraft.** A steep fast pass can smear
+- **A shorter survey can supply the missing second aircraft.** A steep fast pass can smear
   across frequency in the ordinary one-second survey. If fewer than two independent aircraft
-  survive ordinary measurement, a half-second survey searches only fast edge templates at the
-  recording's true ends, using at most 48 seconds of audio from each end. Crop seams cannot supply
-  artificial edge detections. An accepted aircraft keeps its original measurement and owns its
+  survive ordinary measurement, a half-second survey first searches fast edge templates at the
+  recording's true ends, using at most 48 seconds of audio from each end. It then retries full
+  fast templates around detections that actually failed measurement, within bounded neighborhoods
+  using their time scales and the existing ten-second suppression floor. These interior crops
+  include complete template support; their seams cannot supply artificial edge detections.
+  An accepted aircraft keeps its original measurement and owns its
   observed ridge and detected harmonic family, even when its fitted geometry is inaccurate.
   Ownership interpolates only across traced gaps of at most three seconds and never extrapolates;
   occupied samples contribute zero without shortening the scoring denominator. The retry shares
@@ -1194,7 +1197,8 @@ Design notes:
   its seeds through ordinary refinement and family measurement. Original and recovered aircraft
   share the 24-event limit. Every retry event counts as measured past the old line, including one
   whose fitted speed falls. Warnings record added candidates and any cut. Recordings with two
-  independent aircraft already measured keep their original path.
+  independent aircraft already measured keep their original path. Interior recovery needs an
+  ordinary detection to identify the retry window and cannot replenish an exhausted budget.
 - **STFT working storage stays bounded as recordings grow.** Frames transform into a reusable block of
   at most 256 columns and 4 MiB of frequency values, then copy into the final row-major spectrogram.
   A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
@@ -1508,6 +1512,30 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### An interior fast pass supplies the second aircraft needed for a location
+
+`interior_fast_recovery_supplies_a_second_independent_aircraft` synthesizes 180 seconds
+of PCM containing a 450 Hz, 90 m/s flyover and a separate 118 Hz, 215 m/s flyover. Ordinary
+measurement accepts only the slower aircraft. The shorter targeted retry recovers the
+fast pass while honoring the accepted aircraft's observed ridge. Actual flight association,
+search and refinement then recover both core flights, with **0.234547 m** position error,
+zero clock error, a 75 m reported radius and no truncation. The recovered fast fit is
+118.000989 Hz, 214.994167 m/s and 899.983993 m against 118 Hz, 215 m/s and 900 m.
+
+This native core regression and a separate ten-row physical-PCM ladder pass on the pinned
+nightly. The ladder restores one previously refused 215 m/s row and checks every new accepted
+fit and the one-aircraft-per-source limit. Its five 245 m/s rows remain unrecovered. These
+are synthetic capability checks, not real-recording accuracy or confidence calibration.
+
+The separate owner/null/budget control was interrupted after six minutes without an assertion
+failure; it is not a pass. A narrower version keeps the physically refused seeds fixed while
+removing or reversing their sound, preserving the original refusal and ownership assertions.
+That version and the extended root-pipeline integration test remain unrun after executor loss.
+The standalone and release selftests, full workspace checks, and reference/field replays
+were not completed in this continuation. Production detector code did not change after
+the two positive regressions passed. Separated retry windows can repeat surrounding FFT
+work, and no end-to-end runtime improvement is claimed.
 
 ### Wind-scaled ranges and early source times: native search recovery
 
@@ -2909,6 +2937,8 @@ audio or video recorded somewhere sensitive:
 - **Detection envelope:** 35–1100 Hz and 250 m–12 km, with the decode at 4 kHz. The primary speed bank
   spans 40–175 m/s; a final strong-only bank adds faster subsonic templates, about 194–263 m/s at the
   default sound speed. Earlier detections can still mask a faster curve before that final bank runs.
+  With fewer than two measured aircraft and budget remaining, a shorter survey revisits refused
+  detections' neighborhoods; a pass with no ordinary seed or no remaining budget is still lost.
 - **Atmosphere:** a straight-ray, height-averaged speed of sound with horizontal wind only. No refraction.
 - **Data volume:** each new UTC day costs about 4 GB of download, and adsb.lol archives cannot be fetched
   partially. adsb.lol has gaps on some days.

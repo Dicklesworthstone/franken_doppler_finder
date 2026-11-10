@@ -19,6 +19,34 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover interior fast flyovers hidden by refused detections
+
+- When ordinary measurement leaves fewer than two independent aircraft, keep the
+  existing short-window edge recovery first, then try full fast templates around
+  actual refused detections. Earlier unmeasurable seeds no longer permanently own
+  those neighborhoods. Merge overlapping windows and include full template context,
+  so crop seams cannot act as recording edges.
+- Mask accepted observed ridges and harmonic families, retain original measurements,
+  and share the existing remaining candidate/detection budgets and 24-event limit.
+  All recovered candidates use the ordinary refinement, physical measurement gates
+  and expanded-search provenance; confidence thresholds do not change.
+- The native ten-row physical-PCM regression recovers a previously refused interior
+  118 Hz, 215 m/s, 900 m pass at 80.13 s, with tone error under 0.002 Hz, speed error
+  under 0.006 m/s and distance error under 0.02 m. Every newly accepted fit must meet
+  the original accuracy bounds, and one source must remain one independent aircraft.
+  The five 245 m/s, 700 m rows remain unrecovered; this is not universal fast-pass recovery.
+- A second native regression combines it with an already measured 450 Hz aircraft.
+  Recovery supplies the missing second independent event, and actual search/refinement
+  recovers both core flights within 0.235 m, at the correct clock, with a 75 m radius
+  and no truncation. Both positive regressions passed on the exact pinned nightly.
+- The owner/null control was interrupted after six minutes without an assertion failure.
+  Its narrowed version and the extended root-pipeline test are authored but unrun after
+  executor loss. Production is unchanged since the positive runs. Edited Rust formatting
+  and whitespace checks passed locally; independent source review found no blocker.
+  Full-workspace checks, selftest and real-recording replays remain unverified.
+- Additional FFT/template work is confined to refused-seed neighborhoods and original
+  budgets. No real-recording recovery or end-to-end timing improvement is claimed.
+
 ### Let wind-scaled flight distances reach seeding and confirmation
 
 - Expand the coarse spatial reach with the same sampled medium scale already used
