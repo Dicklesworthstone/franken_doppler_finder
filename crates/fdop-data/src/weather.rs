@@ -600,16 +600,20 @@ fn raob_atmosphere(
         fdop_types::geo::haversine_m(clat, clon, x.1, x.2)
             .total_cmp(&fdop_types::geo::haversine_m(clat, clon, y.1, y.2))
     });
-    // the nearest station plus any other within 1.6x its distance (max 4) inside 700 km
+    // The preferred blend is unchanged: the nearest station plus any other within
+    // 1.6x its distance (or the region's half-diagonal), at most four inside 700 km.
+    // Keep the next-nearest candidates too: a nearby station with no usable archive
+    // must not hide soundings farther away. Recovery shares the four-station budget.
     let d0 = st.first().map_or(f64::INFINITY, |s| {
         fdop_types::geo::haversine_m(clat, clon, s.1, s.2)
     });
     let half_diag = fdop_types::geo::haversine_m(b.south, b.west, b.north, b.east) / 2.0;
+    let preferred_distance = (1.6 * d0).max(d0 + half_diag);
     let chosen: Vec<_> = st
         .into_iter()
         .filter(|s| {
             let d = fdop_types::geo::haversine_m(clat, clon, s.1, s.2);
-            d <= 700_000.0 && d <= (1.6 * d0).max(d0 + half_diag)
+            d <= 700_000.0
         })
         .take(4)
         .collect();
@@ -617,8 +621,17 @@ fn raob_atmosphere(
         return Err(DataError::new("no upper-air station within 700 km"));
     }
     let mut stations = Vec::new();
+    let mut attempted = Vec::new();
+    let mut used = Vec::new();
+    let mut recovered = false;
     let (mut n_ok, mut n_tried) = (0, 0);
     for (id, la, lo, _) in &chosen {
+        let outside_preferred =
+            fdop_types::geo::haversine_m(clat, clon, *la, *lo) > preferred_distance;
+        if outside_preferred && n_ok > 0 {
+            break;
+        }
+        attempted.push(id.as_str());
         let mut series = Vec::new();
         let mut t = t0;
         while t <= t1 + 1.0 {
@@ -635,17 +648,38 @@ fn raob_atmosphere(
             }
             t += 43200.0;
         }
-        stations.push((*la, *lo, series));
+        if !series.is_empty() {
+            used.push(id.as_str());
+            stations.push((*la, *lo, series));
+            if outside_preferred {
+                recovered = true;
+                break;
+            }
+        }
     }
     if n_ok == 0 {
         return Err(DataError::new("no radiosonde soundings retrieved"));
     }
-    let names: Vec<&str> = chosen.iter().map(|c| c.0.as_str()).collect();
+    let station_note = if attempted.len() > used.len() {
+        format!(
+            "; {} of {} stations usable, tried {}{}",
+            used.len(),
+            attempted.len(),
+            attempted.join(", "),
+            if recovered {
+                "; preferred stations had no usable soundings, recovered from the nearest usable station"
+            } else {
+                ""
+            },
+        )
+    } else {
+        String::new()
+    };
     ScatteredAtmosphere::new(
         stations,
         format!(
-            "NWS radiosondes {} (IEM RAOB archive, {n_ok} of {n_tried} soundings usable)",
-            names.join(", ")
+            "NWS radiosondes {} (IEM RAOB archive, {n_ok} of {n_tried} soundings usable{station_note})",
+            used.join(", ")
         ),
     )
     .map_err(DataError)
@@ -1865,6 +1899,186 @@ mod tests {
             assert!((medium.c - sound_speed(10.0, 1.0)).abs() < 1e-8);
             assert!((medium.wind_e - 20.0 * KT).abs() < 1e-8);
             assert!(medium.wind_n.abs() < 1e-8);
+        }
+    }
+
+    #[test]
+    fn radiosondes_recover_usable_nearby_archives_within_the_station_budget() {
+        #[derive(Clone, Copy)]
+        enum Profile {
+            Empty,
+            Short,
+            Stale,
+            Valid,
+        }
+        use Profile::{Empty, Short, Stale, Valid};
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let bbox = BBox::new(lat - 0.001, lon - 0.001, lat + 0.001, lon + 0.001);
+        let ids = ["KAAA", "KBBB", "KCCC", "KDDD", "KEEE"];
+        for (label, profiles, offsets, expected, tried) in [
+            (
+                "recovery",
+                [Empty, Short, Valid, Valid, Valid],
+                [0.1, 0.3, 0.5, 0.6, 0.7],
+                Some(2),
+                3,
+            ),
+            (
+                "preferred",
+                [Valid; 5],
+                [0.1, 0.3, 0.5, 0.6, 0.7],
+                Some(0),
+                1,
+            ),
+            (
+                "preferred-blend",
+                [Valid; 5],
+                [0.1, 0.15, 0.5, 0.6, 0.7],
+                Some(0),
+                2,
+            ),
+            (
+                "stale-day",
+                [Empty, Stale, Valid, Valid, Valid],
+                [0.1, 0.3, 0.5, 0.6, 0.7],
+                Some(2),
+                3,
+            ),
+            (
+                "budget",
+                [Empty, Short, Empty, Short, Valid],
+                [0.1, 0.3, 0.5, 0.6, 0.7],
+                None,
+                4,
+            ),
+            (
+                "distance",
+                [Empty, Valid, Valid, Valid, Valid],
+                [0.1, 7.0, 7.2, 7.4, 7.6],
+                None,
+                1,
+            ),
+            (
+                "unavailable",
+                [Empty; 5],
+                [0.1, 0.3, 0.5, 0.6, 0.7],
+                None,
+                4,
+            ),
+        ] {
+            let (dir, _) = weather_test_cache(IEM_RAOB_NETWORK, label);
+            let put = |url: &str, value: serde_json::Value| {
+                let path = dir.join("weather").join(format!("{:016x}.json", fnv(url)));
+                std::fs::write(path, value.to_string()).unwrap();
+            };
+            let mut features: Vec<_> = ids
+                .iter()
+                .zip(offsets)
+                .map(|(id, offset)| {
+                    serde_json::json!({
+                        "id": id, "properties": {"country": "US"},
+                        "geometry": {"coordinates": [lon, lat + offset]},
+                    })
+                })
+                .collect();
+            // An even nearer, well-populated station closed before the requested date.
+            features.push(serde_json::json!({
+                "id": "KOLD", "properties": {"country": "US", "archive_end": "2026-09-07"},
+                "geometry": {"coordinates": [lon, lat + 0.01]},
+            }));
+            put(IEM_RAOB_NETWORK, serde_json::json!({"features": features}));
+            for (i, (id, profile)) in ids
+                .iter()
+                .zip(profiles)
+                .chain([(&"KOLD", Valid)])
+                .enumerate()
+            {
+                for hour in [0.0, 43_200.0] {
+                    let levels: Vec<_> = (0..match profile {
+                        Empty => 0,
+                        Short => 3,
+                        _ => 6,
+                    })
+                        .map(|k| {
+                            serde_json::json!({
+                                "hght": 100.0 + 1200.0 * f64::from(k),
+                                "tmpc": 10.0, "dwpc": 10.0, "drct": 270.0,
+                                "sknt": 20.0 + 10.0 * i as f64 + hour / 4320.0,
+                            })
+                        })
+                        .collect();
+                    let t = day + hour
+                        - if matches!(profile, Stale) {
+                            86_400.0
+                        } else {
+                            0.0
+                        };
+                    put(
+                        &raob_url(t, id),
+                        serde_json::json!({"profiles": [{"profile": levels}]}),
+                    );
+                }
+            }
+            let result = raob_atmosphere(&bbox, day + 3600.0, day + 39_600.0, &dir, true);
+            let Some(index) = expected else {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("no radiosonde soundings"),
+                    "{label}"
+                );
+                continue;
+            };
+            let atmosphere = result.unwrap_or_else(|e| panic!("{label}: {e}"));
+            let source = atmosphere.describe();
+            let (names, usable, expected_wind) = if label == "preferred-blend" {
+                // The two stations are on the same meridian at a 2:3 distance ratio.
+                ("KAAA, KBBB", 4, (25.0 * 9.0 + 35.0 * 4.0) / 13.0 * KT)
+            } else {
+                (ids[index], 2, (25.0 + 10.0 * index as f64) * KT)
+            };
+            assert!(
+                source.starts_with(&format!("NWS radiosondes {names} (")),
+                "{label}: {source}"
+            );
+            assert!(
+                source.contains(&format!("{usable} of {} soundings usable", 2 * tried)),
+                "{label}: {source}"
+            );
+            assert_eq!(
+                source.contains("recovered from the nearest usable station"),
+                index > 0,
+                "{label}: {source}"
+            );
+            assert!(
+                !source.contains("KOLD") && !source.contains("KDDD"),
+                "{label}: {source}"
+            );
+            let medium = atmosphere.medium(lat, lon, day + 21_600.0, 100.0, 5000.0);
+            assert!(
+                (medium.wind_e - expected_wind).abs() < 1e-8,
+                "{label}: {medium:?}"
+            );
+            assert!(medium.wind_n.abs() < 1e-8, "{label}: {medium:?}");
+            // Exercise the actual fallback chain too: recovered winds must reach locate.
+            let weather = fetch_atmosphere(&bbox, day + 3600.0, day + 39_600.0, &dir, true);
+            assert!(weather.winds_aloft, "{label}: {:?}", weather.warnings);
+            assert_eq!(weather.atmo.describe(), source);
+            assert!(
+                weather
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("Open-Meteo pressure levels unavailable"))
+            );
+            assert!(
+                weather
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("hourly surface temperatures unavailable"))
+            );
         }
     }
 

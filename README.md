@@ -1011,6 +1011,14 @@ hourly time axis. A window ending after 23:00 UTC requests the following midnigh
 that covering response cached. If required data are missing, the existing fallback sources and warnings
 still apply. The atmosphere description counts retained hours, rather than every downloaded day hour.
 
+Radiosonde selection first keeps the existing nearby-station blend. If none of those stations
+has a usable sounding, it tries the next-nearest stations within 700 km until one supplies usable
+profiles. Preferred and recovery attempts share the existing limit of four stations; a working
+preferred blend is never mixed with these farther recovery stations. This also works offline
+when the alternative profiles are cached. The atmosphere description names the stations actually
+used, counts failed attempts, and identifies recovery from an unavailable preferred station.
+Missing temporal brackets retain the existing radiosonde interpolation policy.
+
 | Data | Source | Notes |
 |---|---|---|
 | ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing |

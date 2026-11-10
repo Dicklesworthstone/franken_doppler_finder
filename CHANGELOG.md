@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover winds aloft when the nearest radiosonde archive is unavailable
+
+- Keep the established preferred-station blend, but retain the next-nearest candidates
+  inside the existing 700 km and four-station limits. If every preferred station yields
+  no usable sounding, try those candidates in distance order and stop at the first
+  usable recovery. An empty or unusable nearby archive can no longer hide valid
+  profiles already cached at another station. A working preferred blend is unchanged.
+- The atmosphere source now names the stations actually used and reports attempted
+  and usable stations/soundings, including when a farther station supplied the recovery.
+  Existing weather warnings and the temporal interpolation policy remain in force.
+- Add one offline regression with seven cases covering recovery, normal preferred
+  selection, independently calculated two-station wind weights, stale-date caches,
+  the four-station budget, the 700 km limit and completely unavailable soundings.
+  Each successful case also exercises the real `fetch_atmosphere` fallback chain;
+  a nearer station closed before the requested date must not participate.
+- Validation: the edited Rust ranges passed pinned-nightly rustfmt and whitespace
+  checks before the execution environment disconnected; source review found no blocker.
+  The new native test could not start after the environment became unavailable.
+  Baseline core builds had already been killed by SIGKILL in `syn` and then `wide`,
+  including a one-job unoptimized retry. Full-workspace formatting reports existing
+  differences; Clippy, the workspace tests, selftest and real-recording replays did
+  not run. No measured location-accuracy or timing improvement is claimed.
+
 ### Recover hillside hypotheses even when the same track has other valid visits
 
 - Replace the whole-track empty-cloud condition with an ordinary-first terrain retry at
