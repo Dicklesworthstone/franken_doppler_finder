@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Let wind-scaled flight distances reach seeding and confirmation
+
+- Expand the coarse spatial reach with the same sampled medium scale already used
+  by the distance gate, preserving the original padded region and sampling. Apply
+  the change to both ordinary samples and intervening narrow-region probes.
+- Use confirmation's raw fitted-distance shortcut only for an explicitly uniform
+  matching still-air atmosphere. Other media reach the unchanged exact CPA, speed,
+  distance, recording-clock, trace and distinct-pass checks. No confidence threshold
+  or search budget changes; the existing confirmation time windows remain in place.
+- Add a two-flight regression whose wind-supported 12 km lateral pass lies outside
+  both previous spatial shortcuts. The preceding production code fails its first
+  hypothesis assertion natively. The regression also checks direct confirmation,
+  an undeclared atmosphere, wrong range/clock and exclusion of an already used pass,
+  and runs the full search at zero and Unix epochs.
+- Native validation on the pinned nightly: the new regression passes, recovering
+  both intended core flights within 0.163 m with no truncation; the still-air control
+  preserves both complete result fingerprints. Seven neighboring wind, terrain and
+  confirmation regressions pass, as do all 30 shared-type tests. The edited search
+  file passes rustfmt and whitespace checks. Clippy, selftest and real-recording
+  replays are not established by this focused check.
+- Variable weather can now require CPA checks for more time-overlapping tracks.
+  No end-to-end timing or real-recording accuracy improvement is claimed.
+
 ### Retain wind-delayed flyovers before the still-air time crop
 
 - Preserve the original hypothesis scan and sampling phase, then inspect the omitted

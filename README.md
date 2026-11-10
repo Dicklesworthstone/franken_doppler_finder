@@ -1085,6 +1085,15 @@ Design notes:
   reach or establish complete terrain coverage. Extra coarse work can be substantial
   for late events on long retained flight tracks; the catalogue's 1200 s pre-padding
   is relative to recording start, not a per-event work limit.
+- **Wind-scaled distances survive the spatial shortcuts.** The coarse search retains its
+  original padded region and expands it using the same local sound-speed/wind scale as
+  its distance gate, including when checking a narrow region between sampling times.
+  Additional-flight confirmation uses the raw fitted-distance shortcut only for an
+  explicitly uniform matching still-air medium; otherwise exact CPA, speed, distance,
+  clock and trace checks decide. This can recover a flight that the corrected gates
+  permit but the uncorrected distance excluded. Weather-dependent confirmation can
+  require more CPA evaluations. Its existing emission-time windows and the coarse
+  terrain approximation remain unchanged; this is not complete coverage of all media.
 - **Hillside rejections can reach the observer's exact closest approach.** The initial CPA line
   uses terrain beneath the aircraft. A climb or descent over a slope can therefore imply the
   wrong distance or recording start at a candidate observer, even when the real pass fits. If that point
@@ -1500,7 +1509,20 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
-### Wind-delay and radiosonde recovery: native validation pending
+### Wind-scaled ranges and early source times: native search recovery
+
+`wind_scaled_distances_reach_the_pair_join_and_confirmers` places a 230 m/s flight
+12 km laterally from the observer in a synthetic 120 m/s east wind. Its exact medium-scaled
+gates pass, but both preceding raw-distance shortcuts exclude it. The preceding code fails
+the first hypothesis assertion. The repair recovers both intended core flights at zero and
+Unix epochs within 0.163 m and 0.2 s, with no truncation. Direct confirmation also passes;
+wrong distance, wrong clock and an already-used pass remain refused. An undeclared provider
+gives the same confirmer score. Both complete still-air result fingerprints are unchanged.
+
+The new regression, the still-air controls and seven adjacent wind, terrain, track-bound and
+confirmation regressions pass on the pinned nightly. The edited search file passes rustfmt
+and whitespace checks. These synthetic tests do not establish real-recording accuracy or
+the runtime cost of admitting more weather-dependent CPA evaluations.
 
 The source-time recovery regression constructs two physical flight traces, including a
 20 km lateral pass in 75 m/s wind whose valid closest approach lies before the previous
@@ -1512,15 +1534,11 @@ A separate 12-flight control compares every retained calm hypothesis bit for bit
 additional atmosphere evaluations, and checks that differing fitting sound speeds disable
 the still-air shortcut. A types regression checks the exact uniform-medium declaration.
 
-These assertions have been added and independently source-reviewed; they have not run.
-The radiosonde recovery regression also remains unrun. Two baseline core-build attempts
-received SIGKILL in dependencies (`syn`, then `wide` after a one-job unoptimized retry).
-The executor subsequently disconnected, briefly returned with its original compiler/cache
-missing, and disconnected again before focused tests could start with a recovered compiler.
-No new native recovery accuracy, work count, runtime or real-recording result is claimed.
-The search/atmosphere changes still need rustfmt, Clippy, the focused tests, selftest and
-the reference/field replays. The weather edit's changed-range formatting and whitespace
-checks passed before the first disconnection.
+The source-time assertions now pass natively: the four declared/undeclared-medium runs
+recover within 3.918 m and 0.042 s. The twelve-flight cloud comparison and all 30 shared-type
+tests pass too. Earlier dependency builds and one subsequent core rebuild received SIGKILL;
+a sequential retry completed on the exact pinned toolchain. The radiosonde test, Clippy,
+selftest and reference/field replays remain pending at this search commit.
 
 ### Hillside recovery survives other valid visits by the same track
 

@@ -317,6 +317,13 @@ fn prop_for(atmo: &dyn Atmosphere, o: &Obs, tr: &TrackModel, t_e: f64) -> Prop {
     )
 }
 
+fn matching_still_air(ev: &SearchEvent, p: &SearchParams, atmo: &dyn Atmosphere) -> bool {
+    p.c.is_finite()
+        && p.c > 0.0
+        && ev.c_fit == p.c
+        && atmo.uniform_medium() == Some(fdop_types::atmo::Medium::still(p.c))
+}
+
 /// An event's hypothesis cloud: stored when within the budget, always counted exactly, and a
 /// deterministic ~1/1024 sample for the chance-match calibration.
 struct HypSet {
@@ -576,17 +583,23 @@ fn hypotheses(
     cap: usize,
 ) -> HypSet {
     let count = AtomicUsize::new(0);
-    // Keep the established spatial reach. The earlier time prefix below covers delays
-    // that the still-air crop cannot bound; it does not change the approximate CPA locus.
+    // Keep the established reach, expanding it when the same local scale used by the
+    // distance gate permits a farther pass. Testing the unscaled box first loses that pass
+    // before its atmosphere can be evaluated. This remains an approximate CPA locus.
     let reach = p.region.padded_km(1.1 * ev.d_gate[1] / 1000.0 + 0.5);
+    let in_reach = |lat, lon, d_hi: f64| {
+        reach.contains(lat, lon)
+            || (d_hi.is_finite()
+                && d_hi > ev.d_gate[1]
+                && p.region
+                    .padded_km(1.1 * d_hi / 1000.0 + 0.5)
+                    .contains(lat, lon))
+    };
     let t_lo_all = p.start_lo + ev.t_rec - ev.t_tol - 1.1 * ev.d_gate[1] / p.c - 5.0;
     // Preserve the established calm path only at the same sound speed used by the fit.
     // A nominal speed or one sampled weather column cannot bound a moving medium, nor
     // the actual ECEF range of a terrain-dependent coarse point. Unknown means scan.
-    let ordinary_still_air = p.c.is_finite()
-        && p.c > 0.0
-        && ev.c_fit == p.c
-        && atmo.uniform_medium() == Some(fdop_types::atmo::Medium::still(p.c));
+    let ordinary_still_air = matching_still_air(ev, p, atmo);
     let parts = tracks
         .par_iter()
         .enumerate()
@@ -599,12 +612,21 @@ fn hypotheses(
                 let (la, lo, h) = ecef_to_geodetic(pos);
                 let ve = Enu::new(la, lo, 0.0).vec_from_ecef(vel);
                 let vh = ve[0].hypot(ve[1]);
-                if vh <= 12.0 || !reach.contains(la, lo) || tr.gap_at(t) > p.max_gap_s {
+                if vh <= 12.0
+                    || (ordinary_still_air && !reach.contains(la, lo))
+                    || tr.gap_at(t) > p.max_gap_s
+                {
+                    return None;
+                }
+                let z0 = dem.elev_m(la, lo);
+                let med = atmo.medium(la, lo, t, z0 + MIC_HEIGHT_M, h);
+                let lam = (med.c + (ve[0] * med.wind_e + ve[1] * med.wind_n) / med.c) / ev.c_fit;
+                if !in_reach(la, lo, ev.d_gate[1] * lam) {
                     return None;
                 }
                 let (mlat, mlon) = fdop_types::geo::m_per_deg(la);
                 let (ux, uy) = (ve[0] / vh, ve[1] / vh);
-                let a0 = (h - dem.elev_m(la, lo) - MIC_HEIGHT_M) * ve[2] / vh;
+                let a0 = (h - z0 - MIC_HEIGHT_M) * ve[2] / vh;
                 Some(region_along_projection(
                     &p.region,
                     (la + a0 * uy / mlat, lo + a0 * ux / mlon),
@@ -619,7 +641,7 @@ fn hypotheses(
                 let ve = local.vec_from_ecef(vel);
                 let vh = ve[0].hypot(ve[1]);
                 let dt = (p.along_step_m / vh.max(1.0)).clamp(0.2, p.along_dt_max);
-                if !reach.contains(la, lo) {
+                if ordinary_still_air && !reach.contains(la, lo) {
                     // A close fast pass can enter and leave this entire box in ten seconds.
                     // Keep the usual along-track sampling outside too, so entry is not skipped.
                     return (dt, None);
@@ -631,6 +653,9 @@ fn hypotheses(
                 let c = med.c;
                 let lam = (c + (ve[0] * med.wind_e + ve[1] * med.wind_n) / c) / ev.c_fit;
                 let (d_lo, d_hi) = (ev.d_gate[0] * lam, ev.d_gate[1] * lam);
+                if !in_reach(la, lo, d_hi) {
+                    return (dt, None);
+                }
                 if speed >= ev.v_gate[0] * lam
                     && speed <= ev.v_gate[1] * lam
                     && vh > 12.0
@@ -2071,13 +2096,21 @@ fn best_confirmer(
 ) -> Option<(f64, EventMatch, u32)> {
     let c = p.c;
     let t_heard = t_start + ev.t_rec;
+    // A still-air fitted distance is not a physical radius in a moving or varying medium.
+    // Keep that shortcut only when its scale is exactly one; otherwise the existing exact
+    // CPA gates below decide the range. The established emission-time window stays intact.
+    let reach = if matching_still_air(ev, p, atmo) {
+        1.15 * ev.d_gate[1]
+    } else {
+        f64::INFINITY
+    };
     let mut best: Option<(f64, EventMatch, u32)> = None;
     let mut scratch = TraceScratch::default();
     for ti in tix.overlapping_near(
         t_heard - 1.2 * ev.d_gate[1] / c - 120.0,
         t_heard + 30.0,
         o.x,
-        1.15 * ev.d_gate[1],
+        reach,
     ) {
         let tr = &tracks[ti as usize];
         if p.tonal_only && !tr.engine.tonal() {
@@ -2087,7 +2120,7 @@ fn best_confirmer(
         // pass may be at the wrong recording time while a farther return explains this event.
         let guess = t_heard - 1.1 * ev.d_gate[1].min(12_000.0) / c * 0.5;
         for cpa in tr.local_cpas(o.x, guess - 200.0, guess + 200.0) {
-            if cpa.d > 1.15 * ev.d_gate[1] {
+            if cpa.d > reach {
                 continue;
             }
             let prop = prop_for(atmo, o, tr, cpa.t_e);
@@ -6660,6 +6693,100 @@ mod tests {
         medium: fdop_types::atmo::Medium,
         advertise: bool,
         calls: AtomicUsize,
+    }
+
+    fn wind_scaled_reach_case(med: fdop_types::atmo::Medium, start: f64) -> TwoCase {
+        let mut case = wind_delayed_case(med, start);
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let prop = Prop::from_medium(&med, &enu);
+        case.tracks[0] = straight_track(
+            &enu,
+            [0.0, 12_000.0, 1200.0],
+            [230.0, 0.0, 0.0],
+            start + 120.0,
+            start - 200.0,
+            start + 800.0,
+            5.0,
+        );
+        case.tracks[0].key = "A".into();
+        for (i, (id, dt, f0)) in [("A", 120.0, 112.7), ("B", 360.0, 149.3)]
+            .into_iter()
+            .enumerate()
+        {
+            let tr = &case.tracks[i];
+            let cpa = tr.cpa_nearest_time(x, start + dt, 30.0).unwrap();
+            let scale = prop.fit_scale(cpa.vel, 343.0);
+            let mut ev = synth_event(id, tr, x, start, f0, 343.0, start + dt, &prop);
+            ev.t_tol = 1.0;
+            ev.v_gate = [0.99 * cpa.speed / scale, 1.01 * cpa.speed / scale];
+            ev.d_gate = [0.99 * cpa.d / scale, 1.01 * cpa.d / scale];
+            assert!(gates_ok(&ev, &cpa, &prop, 0.0));
+            if i == 0 {
+                let ((lat, lon, _), _) = tr.geo_at(cpa.t_e);
+                let old_reach = case.p.region.padded_km(1.1 * ev.d_gate[1] / 1000.0 + 0.5);
+                assert!(!old_reach.contains(lat, lon));
+                assert!(cpa.d > 1.15 * ev.d_gate[1]);
+            }
+            case.events[i] = ev;
+        }
+        case
+    }
+
+    #[test]
+    fn wind_scaled_distances_reach_the_pair_join_and_confirmers() {
+        let med = fdop_types::atmo::Medium {
+            c: 343.0,
+            wind_e: 120.0,
+            wind_n: 0.0,
+        };
+        for start in [0.0, 1_788_895_000.0] {
+            let case = wind_scaled_reach_case(med, start);
+            let dem = FlatElevation(0.0);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let atmo = fdop_types::atmo::UniformAtmosphere(med);
+            let frame = Frame::new(&case.p.region);
+            let tix = TimeIndex::new(&case.tracks);
+            let event = &case.events[0];
+            let cloud = hypotheses(
+                event,
+                &case.tracks,
+                &case.p,
+                &frame,
+                &dem,
+                &atmo,
+                start - 86_400.0,
+                10_000,
+            );
+            assert!(
+                cloud.stored.as_ref().unwrap().iter().any(|h| h.trk == 0),
+                "the wind-scaled range must be tested before rejecting this flight"
+            );
+            let explain = |event: &SearchEvent, atmo: &dyn Atmosphere, exclude: &[(u32, f64)]| {
+                best_confirmer(&o, start, event, &case.tracks, &tix, &case.p, atmo, exclude)
+            };
+            let (chi, matched, ti) = explain(event, &atmo, &[])
+                .expect("the same valid flight must also be available as a confirmer");
+            assert_eq!(ti, 0);
+            assert_eq!(matched.flight, "A");
+            assert!(chi < 1.0);
+            let unknown = CountedAtmosphere {
+                medium: med,
+                advertise: false,
+                calls: AtomicUsize::new(0),
+            };
+            let (other_chi, _, other_ti) = explain(event, &unknown, &[]).unwrap();
+            assert_eq!(other_ti, ti);
+            assert_eq!(other_chi.to_bits(), chi.to_bits());
+            assert!(explain(event, &atmo, &[(0, start + 120.0)]).is_none());
+            let mut wrong_range = event.clone();
+            wrong_range.d_gate = [event.d_gate[0] * 0.5, event.d_gate[1] * 0.5];
+            assert!(explain(&wrong_range, &atmo, &[]).is_none());
+            let mut wrong_clock = event.clone();
+            wrong_clock.t_rec += 30.0;
+            assert!(explain(&wrong_clock, &atmo, &[]).is_none());
+            check_wind_delayed_case(&case, med, run_case(&case, med));
+        }
     }
 
     impl Atmosphere for CountedAtmosphere {
