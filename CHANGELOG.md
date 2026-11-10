@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Calibrate accepted fast-pass continuations on their own raw spectrum
+
+- Share the existing accepted-aircraft raw-vertex refinement with fitted continuations. A
+  recovered pass now calibrates against its actual spectrum and row background, including a
+  renewed spectral band, instead of bypassing the calibration stage that ran before recovery.
+  Every original aircraft gate and both continuous sides remain required; failed calibration
+  preserves the already accepted continuation. No detection threshold or search cap changes.
+- The independent emission-phase PCM regression
+  `continued_aircraft_use_raw_frequencies_from_their_own_spectrum` fails with the added stage
+  disabled: the early 118 Hz pass is measured at 117.855916 Hz, outside the unchanged 0.05 Hz
+  bound. With calibration it measures 117.994546 Hz, 215.024854 m/s and 900.708249 m against
+  118 Hz, 215 m/s and 900 m. A late 83 Hz, 245 m/s, 700 m pass measures 82.998994 Hz,
+  245.000374 m/s and 700.376658 m. Both received CPA times are within 1 ms of truth.
+  The new regression and ten neighboring measurement regressions pass, including unchanged
+  accepted/refused outputs, missing audio, noise, steady tones, reversed passes and eager/deferred
+  diagnostic equivalence. The edited Rust file passes formatting and whitespace checks.
+  This is pinned-nightly x86-64 Linux synthetic validation; no reference or field replay is claimed.
+
 ### Require an unambiguous strong validator before resuming streamed bytes
 
 - Complete the archive-identity protection by refusing a resume after bytes were delivered

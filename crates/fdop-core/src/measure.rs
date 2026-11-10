@@ -770,6 +770,44 @@ fn passes(g: &Guided, det_t0r: f64, span: f64, p: &MeasureParams) -> bool {
         })
 }
 
+/// Refine an accepted aircraft using only locally supported raw spectral vertices. Discovery
+/// may use a normalised peak without such a vertex, but that point cannot provide an unbiased
+/// frequency. A failed calibration leaves the accepted trace available to the caller.
+fn raw_calibrated_rounds(
+    fr: &Frames,
+    accepted: &Guided,
+    det_t0r: f64,
+    span: f64,
+    p: &MeasureParams,
+    fit_trace: &mut impl FnMut(&[f64], &[f64], f64, Side) -> Result<PreparedFit, String>,
+) -> Option<Guided> {
+    if !passes(accepted, det_t0r, span, p) {
+        return None;
+    }
+    let b = accepted.prepared.as_ref()?.best();
+    if !aircraft_geometry(&b) {
+        return None;
+    }
+    let calibrated = guided_rounds(
+        &Frames {
+            raw_only: true,
+            ..*fr
+        },
+        (b.f0, b.v, b.d, b.t0r),
+        (3.0 * b.rmse).clamp(1.0, (0.04 * b.f0).clamp(3.0, 12.0)),
+        peak_received_chirp(b.f0, b.v, b.d, p.c),
+        p,
+        None,
+        fit_trace,
+    );
+    (passes(&calibrated, det_t0r, span, p)
+        && calibrated
+            .prepared
+            .as_ref()
+            .is_some_and(|f| aircraft_geometry(&f.best())))
+    .then_some(calibrated)
+}
+
 /// A second start for an event whose guided rounds the gates refused. The detection's curve can
 /// meet the pass's ridge over one stretch and leave it elsewhere by more than the band: a detection
 /// at the edge of the template bank, or one that rates the speed and distance together wrongly,
@@ -895,7 +933,7 @@ fn continued_rounds(
             background,
             ..*fr
         });
-    let continued = guided_rounds(
+    let mut continued = guided_rounds(
         frames.as_ref().unwrap_or(fr),
         (b.f0, b.v, b.d, b.t0r),
         if lacks_drop {
@@ -916,7 +954,25 @@ fn continued_rounds(
     let supported = continued.prepared.as_ref().is_some_and(|f| {
         contiguous_side_support(f.inlier_times(), f.best().t0r).complete(p.min_side_s)
     });
-    (passes(&continued, det_t0r, span, p) && supported).then_some((continued, spec))
+    if !passes(&continued, det_t0r, span, p) || !supported {
+        return None;
+    }
+    // A recovered pass becomes an aircraft only here, after the ordinary calibration point.
+    // Use this continuation's own spectrum and row offsets, including a renewed approach
+    // band, so its physical parameters receive the same metrology as an ordinary pass.
+    if let Some(calibrated) = raw_calibrated_rounds(
+        frames.as_ref().unwrap_or(fr),
+        &continued,
+        det_t0r,
+        span,
+        p,
+        fit_trace,
+    ) && calibrated.prepared.as_ref().is_some_and(|f| {
+        contiguous_side_support(f.inlier_times(), f.best().t0r).complete(p.min_side_s)
+    }) {
+        continued = calibrated;
+    }
+    Some((continued, spec))
 }
 
 fn measurement_band(f0: f64, v: f64, sr: u32, c: f64) -> (f64, f64) {
@@ -1019,35 +1075,10 @@ fn measure_with_fit(
         chosen = second;
         quality.reseeded = true;
     }
-    // Discovery can retain a normalised peak whose local raw frequency is unresolved.
-    // Once that path supplies an accepted aircraft curve, refine its metrology using only
-    // locally supported raw vertices. The replacement must pass every gate on its own
-    // retained observations and the existing aircraft bounds; a failed calibration keeps
-    // the accepted measurement.
-    if passes(&chosen, det.t0r, span, p)
-        && let Some(b) = chosen.prepared.as_ref().map(PreparedFit::best)
-        && aircraft_geometry(&b)
+    if let Some(calibrated) =
+        raw_calibrated_rounds(&frames, &chosen, det.t0r, span, p, &mut fit_trace)
     {
-        let calibrated = guided_rounds(
-            &Frames {
-                raw_only: true,
-                ..frames
-            },
-            (b.f0, b.v, b.d, b.t0r),
-            (3.0 * b.rmse).clamp(1.0, (0.04 * b.f0).clamp(3.0, 12.0)),
-            peak_received_chirp(b.f0, b.v, b.d, c),
-            p,
-            None,
-            &mut fit_trace,
-        );
-        if passes(&calibrated, det.t0r, span, p)
-            && calibrated
-                .prepared
-                .as_ref()
-                .is_some_and(|f| aircraft_geometry(&f.best()))
-        {
-            chosen = calibrated;
-        }
+        chosen = calibrated;
     }
     if p.free_reseed
         && !quality.reseeded
@@ -1124,13 +1155,7 @@ mod tests {
         let build = |win_s| stft_band_db(&x, sr, win_s, 0.1, 30.0, 400.0, 2.0, 17.25);
         let mut cache = None;
         let mut builds = 0;
-        for (win_s, expected_builds) in [
-            (0.25, 1),
-            (0.25, 1),
-            (0.375, 2),
-            (0.375, 2),
-            (0.25, 3),
-        ] {
+        for (win_s, expected_builds) in [(0.25, 1), (0.25, 1), (0.375, 2), (0.375, 2), (0.25, 3)] {
             let (actual, offsets) = short_spectrum(&mut cache, win_s, |window| {
                 builds += 1;
                 build(window)
@@ -1167,7 +1192,10 @@ mod tests {
             })
             .is_none()
         );
-        assert!(cache.is_none(), "the previous short allocation must be released");
+        assert!(
+            cache.is_none(),
+            "the previous short allocation must be released"
+        );
     }
 
     #[test]
@@ -2358,6 +2386,76 @@ mod tests {
         assert!((b.v - pass.1).abs() < 4.0, "{b:?}");
         assert!((b.d / pass.2 - 1.0).abs() < 0.08, "{b:?}");
         assert!((b.t0r - pass.3).abs() < 0.3, "{b:?}");
+    }
+
+    #[test]
+    fn continued_aircraft_use_raw_frequencies_from_their_own_spectrum() {
+        let (sr, c) = (4000u32, 343.0);
+        let dp = DetectParams::default();
+        let p = MeasureParams::default();
+        for (f0, v, d, t0r, duration) in [
+            (118.0, 215.0, 900.0, 10.13, 30.0),
+            (83.0, 245.0, 700.0, 169.37, 180.0),
+        ] {
+            let t0e = t0r - d / c;
+            let mut seed = 4242u64;
+            let x: Vec<f32> = (0..(f64::from(sr) * duration) as usize)
+                .map(|i| {
+                    let t = i as f64 / f64::from(sr);
+                    let arrival = t - t0e;
+                    // Solve the emission time independently of the production Doppler
+                    // functions, then synthesize phase and spherical spreading from it.
+                    let mut emitted = arrival - d / c;
+                    for _ in 0..12 {
+                        let range = d.hypot(v * emitted);
+                        emitted -=
+                            (emitted + range / c - arrival) / (1.0 + v * v * emitted / (c * range));
+                    }
+                    let range = d.hypot(v * emitted);
+                    if i % 10_000 == 0 {
+                        assert!((emitted + range / c - arrival).abs() < 1e-10);
+                    }
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let noise = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+                    (0.32 * d / range * (std::f64::consts::TAU * f0 * emitted).sin()
+                        + noise
+                        + 0.03 * (std::f64::consts::TAU * 250.0 * t).sin())
+                        as f32
+                })
+                .collect();
+            let (ls, survey) = survey(&x, sr, &dp).unwrap();
+            let detections = detect(&ls, &dp);
+            let primary = detections
+                .iter()
+                .find(|det| det.harmonic_of.is_none() && det.score >= dp.thr_silence_db)
+                .expect("physical pass must be detected");
+            let detection = refine(&survey, primary, c);
+            let first = measure_with_fit(
+                &x,
+                sr,
+                &detection,
+                "raw_continuation",
+                &p,
+                false,
+                prepare_constant_velocity,
+            );
+            assert!(
+                !first.is_aircraft_like(),
+                "{duration}s: {:?}",
+                first.quality
+            );
+            let event = measure(&x, sr, &detection, "raw_continuation", &p);
+            assert!(event.is_aircraft_like(), "{duration}s: {:?}", event.quality);
+            assert!(event.quality.reseeded);
+            let b = event.fit.as_ref().unwrap().best;
+            eprintln!("raw continuation {duration}s: {b:?}; {:?}", event.quality);
+            assert!((b.f0 - f0).abs() < 0.05, "{duration}s: {b:?}");
+            assert!((b.v - v).abs() < 1.0, "{duration}s: {b:?}");
+            assert!((b.d / d - 1.0).abs() < 0.02, "{duration}s: {b:?}");
+            assert!((b.t0r - t0r).abs() < 0.1, "{duration}s: {b:?}");
+        }
     }
 
     #[test]

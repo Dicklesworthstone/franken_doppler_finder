@@ -1188,11 +1188,13 @@ Design notes:
   it made Livermore distances worse and raised the evidence of wrong-date runs. No extra full
   spectrogram is retained.
 - **Accepted aircraft can improve their frequency and geometry without changing discovery.** After
-  the ordinary or free-trace path supplies a usable aircraft event, an optional refinement uses only
+  the ordinary, free-trace or fitted-continuation path supplies a usable aircraft event, an optional refinement uses only
   qualified peaks whose local three-bin raw profile supports the measured vertex. A displaced normalized
   peak with no local raw vertex cannot bias this fit. The candidate must independently pass every
   original quality gate and aircraft bound on its own retained observations; otherwise the original
-  accepted measurement stands. Refused events and fitted-ridge continuation keep their existing paths.
+  accepted measurement stands. A recovered continuation uses its own spectrum and restored row
+  background, including any renewed spectral band, and must also retain continuous support on
+  both sides of the closest approach. Refused events keep their existing paths.
   Final coverage, uncertainty and diagnostics use the selected trace and fit together. This adds at most
   one ordinary budget of guided rounds to an accepted event; real-recording runtime has not been measured.
 - **Steep passes get a matched window.** A 0.5 s main window stops holding a chirp at 1/win² = 4 Hz/s. Frames
@@ -1527,6 +1529,24 @@ four-event, two-flight result through real FFmpeg. These checks use synthetic re
 wrong-date and field recordings have not been replayed. The mapping is exact for the frequency
 shape under its local model, not for the bank's amplitude weighting or curved/changing-medium paths.
 
+### Calibrating the frequency of recovered fast passes
+
+Accepted fitted continuations now receive the same local raw-vertex calibration as ordinary
+accepted aircraft. `continued_aircraft_use_raw_frequencies_from_their_own_spectrum` synthesizes
+phase using an independent numerical emission-time solve, then runs detection, refinement and
+measurement on an early 30-second pass and a late 180-second pass. The early pass renews its
+spectrum; the late pass continues on its original spectrum. Both must retain the original
+aircraft gates and continuous approach/recede observations.
+
+| Synthetic pass | Tone truth / measured | Speed truth / measured | Distance truth / measured | CPA truth / measured |
+|---|---|---|---|---|
+| Early, 30 s recording | 118 / 117.994546 Hz | 215 / 215.024854 m/s | 900 / 900.708249 m | 10.13 / 10.130923 s |
+| Late, 180 s recording | 83 / 82.998994 Hz | 245 / 245.000374 m/s | 700 / 700.376658 m | 169.37 / 169.370471 s |
+
+With only the continuation calibration disabled, the unchanged test fails on the early pass's
+117.855916 Hz tone, outside its 0.05 Hz requirement. The corrected path passes on pinned-nightly
+x86-64 Linux. These are synthetic parameter-recovery results, not new field-accuracy evidence.
+
 ### Following a detected fast pass through its missing central drop
 
 The fixed 180-second tail recording now reaches an accepted measurement from its actual detected
@@ -1536,7 +1556,9 @@ same fit and narrowed band for three further rounds, without redoing the first t
 91.56% of the drop and retains a continuous ridge through the CPA with at least eight seconds on
 each side. All original physical and quality gates remain required.
 
-| Quantity | Synthetic truth | Recovered |
+The following measurements were recorded before the raw-vertex continuation calibration above.
+
+| Quantity | Synthetic truth | Recovered at that change |
 |---|---:|---:|
 | Emitted tone | 83 Hz | 83.084086 Hz |
 | Speed | 245 m/s | 244.897978 m/s |
