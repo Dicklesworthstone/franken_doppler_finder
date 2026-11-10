@@ -1071,14 +1071,16 @@ Design notes:
   wrong distance or recording start at a candidate observer, even when the real pass fits. If that point
   passes the coarse geometry and region checks but fails the clock check, and the observer's
   terrain differs, the search retries the nearest exact CPA in its existing 150 s window.
-  A geometry rejection can use that same retry when the original sampling and all its fallbacks
-  leave the track with no hypotheses. This second pass also clips the approximate cross-track
-  ray to the requested box, so a narrow region can supply a candidate even when the approximate
-  distances all fail. Discovery in the first pass never adds a new point or suppresses an old
-  successful fallback; any original nonempty cloud is retained unchanged.
+  A geometry rejection can use that same retry even when another point or a later visit by
+  that track already supplies a hypothesis. Each source-time sample retains its ordinary
+  points and successful fallbacks before retrying rejected geometry. The retry also clips the
+  approximate cross-track ray to the requested box, so a narrow region can supply a candidate
+  even when the approximate distances all fail. Nearby points with different recording-clock
+  evidence remain eligible; proximity alone does not make their hypotheses interchangeable.
   The exact pass must still pass the original clock, speed, distance, track-gap, interior-CPA
   and terrain-clearance gates. Already accepted hypotheses keep their original arithmetic;
-  hypothesis budgets and confidence rules are unchanged. This retry does not replace the
+  recovered points count against the existing hypothesis budgets, and confidence rules are
+  unchanged. The extra exact-CPA work can increase search cost. This retry does not replace the
   approximate terrain projection or guarantee complete coverage of a hillside.
   The native `known_clock_hillside_flyovers_reach_the_hypothesis_join` regression now runs
   through search and refinement. Before the retry, grades +0.1, +0.2 and -0.2 produced no
@@ -1479,7 +1481,35 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Hillside recovery survives other valid visits by the same track
+
+`hillside_recovery_survives_other_ordinary_visits` extends two climbing/descending trajectories
+with later level returns at incompatible recording clocks. The earlier hillside passes still
+explain the same observed curves, but the preceding whole-track guard keeps only the returns:
+there are no joined seeds and no location. Retrying rejected geometry per source sample retains
+both visits and recovers the synthetic observer within 0.547703 m, with a -0.005003 s clock error
+and no truncation. A separate wider-region control keeps the valid hillside point when an
+ordinary point lies farther across the same sampling slice.
+
+All three hillside regressions and six neighboring budget/region controls pass natively on the
+pinned nightly. Two existing scenes now correctly retain two hypotheses instead of one: the
+points lie within 50 m but carry different coarse clocks. The tests require the explicit counts,
+exact zero-slack physical validity of every point, the original location and clock bounds, and
+the existing wrong-clock, gap, clearance, speed and range refusals. Zero, one and exactly enough
+storage budgets report the same total count. This is synthetic search validation; additional
+exact evaluations may increase search cost, and no reference or field replay is claimed.
+
+The unchanged production `src/selftest.rs`, compiled against the combined rebuilt core and
+type libraries, also passes its real FFmpeg decode → detect → measure → search → refine chain:
+1.673779 m error, 75 m radius, +0.019586 s clock error, four measured events and both intended
+flights. This validates the engine integration; the full release CLI build is not established
+by that standalone entry point.
+
 ### A terrain distance rejection no longer hides an otherwise valid pair
+
+The following records the earlier empty-cloud-only retry. The mixed-cloud repair above adds
+valid hypotheses in two of its positive scenes; the cloud-preservation and timing comparisons
+below describe that earlier version.
 
 `hillside_cpa_survives_an_approximate_distance_rejection` uses two crossing flights about 6 km
 above the observer, climbing and descending at 15 m/s, with the normal three-second timing

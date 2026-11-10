@@ -605,7 +605,7 @@ fn hypotheses(
                 ))
             };
             let needs_terrain_retry = std::cell::Cell::new(false);
-            let sample = |t, retry_geometry: bool, out: &mut HypBuilder| {
+            let sample = |t, retry: bool, out: &mut HypBuilder| {
                 let (pos, vel) = tr.pv(t);
                 let (la, lo, h) = ecef_to_geodetic(pos);
                 let local = Enu::new(la, lo, 0.0);
@@ -672,7 +672,8 @@ fn hypotheses(
                             let ts = cpa.t_r_p(&prop) - ev.t_rec;
                             in_clock(ts).then_some((cpa.t_e, ts))
                         };
-                        let (t_e, t_s) = if hh >= p.min_agl_m && d >= d_lo && d <= d_hi {
+                        let ordinary_geometry = hh >= p.min_agl_m && d >= d_lo && d <= d_hi;
+                        let (t_e, t_s) = if ordinary_geometry {
                             let observer_z = h - hh;
                             let path = atmo.medium(ola, olo, t, observer_z, h);
                             let travel = if path.wind_e == 0.0 && path.wind_n == 0.0 {
@@ -693,7 +694,7 @@ fn hypotheses(
                                 exact_terrain_cpa()?
                             }
                         } else {
-                            if !retry_geometry {
+                            if !retry {
                                 let z = dem.elev_m(ola, olo);
                                 if z.is_finite() && z != z0 && ve[2] != 0.0 {
                                     needs_terrain_retry.set(true);
@@ -703,13 +704,16 @@ fn hypotheses(
                             exact_terrain_cpa()?
                         };
                         let (e, n) = frame.en(ola, olo);
-                        Some(Hyp {
-                            trk: ti as u32,
-                            t_e: (t_e - t_base) as f32,
-                            e: e as f32,
-                            n: n as f32,
-                            t_s: (t_s - t_base) as f32,
-                        })
+                        Some((
+                            Hyp {
+                                trk: ti as u32,
+                                t_e: (t_e - t_base) as f32,
+                                e: e as f32,
+                                n: n as f32,
+                                t_s: (t_s - t_base) as f32,
+                            },
+                            !ordinary_geometry,
+                        ))
                     };
                     let center = cross_point(1.0, 0.0);
                     projection = Some(region_along_projection(
@@ -718,6 +722,11 @@ fn hypotheses(
                         (uy * mlat, ux * mlon),
                     ));
                     let center_ok = to_hyp(center).is_some();
+                    let mut retain = |hyp: Hyp, recovered: bool| {
+                        if !retry || recovered {
+                            out.push(hyp, ti, cap, &count);
+                        }
+                    };
                     for side in [1.0f64, -1.0] {
                         // The central grid point is shared by both sides.
                         let mut has_hypothesis = center_ok;
@@ -730,9 +739,9 @@ fn hypotheses(
                             };
                             // Rising terrain can bring a later point back inside the distance
                             // gate. Only the horizontal reach bounds this cross-track ray.
-                            if let Some(hyp) = to_hyp(point) {
+                            if let Some((hyp, recovered)) = to_hyp(point) {
                                 has_hypothesis = true;
-                                out.push(hyp, ti, cap, &count);
+                                retain(hyp, recovered);
                             }
                             b += p.cross_step_m;
                         }
@@ -769,12 +778,11 @@ fn hypotheses(
                                     (side * ny / mlat, side * nx / mlon),
                                 )?;
                                 let point = cross_point(side, 0.5 * (lo + hi));
-                                if retry_geometry {
+                                if retry {
                                     to_hyp(point)
                                 } else {
-                                    // Discovery must not add a new point to an already
-                                    // successful cloud. Only the otherwise-empty track
-                                    // can use this midpoint on the second sampling pass.
+                                    // Preserve the ordinary cloud before checking this
+                                    // rejected point's actual terrain-dependent CPA.
                                     let z = dem.elev_m(point.0, point.1);
                                     if z.is_finite() && z != z0 && ve[2] != 0.0 {
                                         needs_terrain_retry.set(true);
@@ -782,43 +790,48 @@ fn hypotheses(
                                     None
                                 }
                             });
-                            if let Some(hyp) = fallback {
-                                out.push(hyp, ti, cap, &count);
+                            if let Some((hyp, recovered)) = fallback {
+                                retain(hyp, recovered);
                             }
                         }
                     }
                 }
                 (dt, projection)
             };
-            for retry_geometry in [false, true] {
-                if retry_geometry && (out.count > 0 || !needs_terrain_retry.get()) {
-                    break;
-                }
+            let sample_at = |t, out: &mut HypBuilder| {
+                needs_terrain_retry.set(false);
+                let sampled = sample(t, false, out);
                 // A newly accepted regular point must not suppress an older successful
-                // interior fallback. Complete the original cloud first; retry geometry
-                // only for a track that otherwise supplies no hypothesis at all.
-                let mut t = te_lo;
-                let mut previous = None;
-                while t <= te_hi {
-                    let (dt, projection) = sample(t, retry_geometry, &mut out);
-                    if let (Some(left), Some(right)) = (previous, projection)
-                        && let Some(extra) = skipped_region_time(left, (t, right), project)
-                    {
-                        sample(extra, retry_geometry, &mut out);
-                    }
-                    previous = projection.map(|span| (t, span));
-                    let next = t + dt;
-                    // The final partial interval has no regular sample at its far endpoint.
-                    // Probe that endpoint only to recover a region crossed before the clock ends.
-                    if next > te_hi
-                        && t < te_hi
-                        && let (Some(left), Some(right)) = (previous, project(te_hi))
-                        && let Some(extra) = skipped_region_time(left, (te_hi, right), project)
-                    {
-                        sample(extra, retry_geometry, &mut out);
-                    }
-                    t = next;
+                // interior fallback. Keep this sample's ordinary points first, then recover
+                // its rejected geometry. Even nearby ordinary points can carry a different
+                // clock; only exact physical gates can reject the recovery. No deferred-point
+                // buffer is needed, and both kinds of points share the same counted budget.
+                if needs_terrain_retry.get() {
+                    sample(t, true, out);
                 }
+                sampled
+            };
+            let mut t = te_lo;
+            let mut previous = None;
+            while t <= te_hi {
+                let (dt, projection) = sample_at(t, &mut out);
+                if let (Some(left), Some(right)) = (previous, projection)
+                    && let Some(extra) = skipped_region_time(left, (t, right), project)
+                {
+                    sample_at(extra, &mut out);
+                }
+                previous = projection.map(|span| (t, span));
+                let next = t + dt;
+                // The final partial interval has no regular sample at its far endpoint.
+                // Probe that endpoint only to recover a region crossed before the clock ends.
+                if next > te_hi
+                    && t < te_hi
+                    && let (Some(left), Some(right)) = (previous, project(te_hi))
+                    && let Some(extra) = skipped_region_time(left, (te_hi, right), project)
+                {
+                    sample_at(extra, &mut out);
+                }
+                t = next;
             }
             out.finish(cap, &count)
         })
@@ -6223,8 +6236,40 @@ mod tests {
                 };
                 for (i, ev) in events.iter().enumerate() {
                     let cloud = generate(ev, &p, 10_000);
-                    assert_eq!(cloud.count, 1, "offset {across}, slope {grade}, {}", ev.id);
-                    assert_eq!(cloud.stored.as_ref().unwrap()[0].trk as usize, i);
+                    // At these two lattice-aligned offsets the original in-box fallback
+                    // survives alongside the exact recovery of the central grid point.
+                    // The former whole-track retry guard silently omitted that second
+                    // valid point, although its recording-clock hypothesis is different.
+                    let expected = if i == 0 && grade == 0.2 && across != 6500.0 {
+                        2
+                    } else {
+                        1
+                    };
+                    assert_eq!(
+                        cloud.count, expected,
+                        "offset {across}, slope {grade}, {}",
+                        ev.id
+                    );
+                    let kept = cloud.stored.as_ref().unwrap();
+                    for h in kept {
+                        assert_eq!(h.trk as usize, i);
+                        let (la, lo) = frame.latlon(f64::from(h.e), f64::from(h.n));
+                        let o = observer(la, lo, &dem);
+                        let tr = &tracks[i];
+                        let cpa = tr
+                            .cpa_nearest_time(o.x, t_base + f64::from(h.t_e), 150.0)
+                            .unwrap();
+                        let prop = prop_for(&atmo, &o, tr, cpa.t_e);
+                        let (_, _, height) = ecef_to_geodetic(tr.pos_at(cpa.t_e));
+                        assert!(gates_ok(ev, &cpa, &prop, 0.0));
+                        assert!(height - o.z - MIC_HEIGHT_M >= p.min_agl_m);
+                        assert!(tr.gap_at(cpa.t_e) <= p.max_gap_s);
+                        assert!((cpa.t_r_p(&prop) - ev.t_rec - start).abs() <= ev.t_tol);
+                    }
+                    if expected == 2 {
+                        assert!((kept[0].e - kept[1].e).hypot(kept[0].n - kept[1].n) < 50.0);
+                        assert!((kept[0].t_s - kept[1].t_s).abs() > 1.0);
+                    }
                     if grade == 0.4 {
                         let limited = generate(ev, &p, 0);
                         assert_eq!(limited.count, cloud.count);
@@ -6277,6 +6322,243 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hillside_recovery_survives_other_ordinary_visits() {
+        struct Slope {
+            lat: f64,
+            lon: f64,
+        }
+        impl Elevation for Slope {
+            fn elev_m(&self, lat: f64, lon: f64) -> f64 {
+                let (mlat, mlon) = fdop_types::geo::m_per_deg(self.lat);
+                1000.0 + 0.4 * ((lon - self.lon) * mlon + (lat - self.lat) * mlat)
+            }
+            fn describe(&self) -> String {
+                "synthetic planar hillside".into()
+            }
+        }
+        let (lat, lon) = (40.876466, -73.524951);
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+        let start = 1_788_895_000.0;
+        let enu = Enu::new(lat, lon, 1000.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let dem = Slope { lat, lon };
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        for (key, pos, vel, dt, f0) in [
+            (
+                "A",
+                [-1000.0, 6500.0, 6000.0 + MIC_HEIGHT_M],
+                [90.0, 0.0, 15.0],
+                120.0,
+                112.7,
+            ),
+            (
+                "B",
+                [6500.0, 6000.0 * 15.0 / 95.0, 6000.0 + MIC_HEIGHT_M],
+                [0.0, 95.0, -15.0],
+                360.0,
+                149.3,
+            ),
+        ] {
+            let mut tr = straight_track(
+                &enu,
+                pos,
+                vel,
+                start + dt,
+                start - 200.0,
+                start + 800.0,
+                5.0,
+            );
+            tr.key = key.into();
+            let mut ev = synth_event(
+                key,
+                &tr,
+                x,
+                start,
+                f0,
+                343.0,
+                start + dt,
+                &Prop::still(343.0),
+            );
+            let cpa = tr.cpa_nearest_time(x, start + dt, 100.0).unwrap();
+            ev.d_gate = [cpa.d * 1.001 / (1.25 * 1.25), cpa.d * 1.001];
+            tracks.push(tr);
+            events.push(ev);
+        }
+        let mut p = SearchParams::new(
+            start,
+            start,
+            600.0,
+            BBox::new(
+                lat - 25.0 / mlat,
+                lon - 25.0 / mlon,
+                lat + 25.0 / mlat,
+                lon + 25.0 / mlon,
+            ),
+        );
+        p.refine_half_m = 100.0;
+        let check_location = |tracks: &[TrackModel], p: &SearchParams| {
+            let result = run(
+                &SearchInputs {
+                    events: events.clone(),
+                    tracks,
+                    heard_times: events.iter().map(|ev| ev.t_rec).collect(),
+                    coarse_dem: &dem,
+                    fine_dem: &dem,
+                    atmo: &atmo,
+                },
+                p,
+                &|_| {},
+            );
+            let top = result.candidates.first().unwrap_or_else(|| {
+                panic!("hillside visits lost the location; {:?}", result.funnel)
+            });
+            let error = haversine_m(lat, lon, top.lat, top.lon);
+            eprintln!(
+                "location error {error} m, clock {} s",
+                top.t_start_utc - start
+            );
+            assert!(error < 75.0, "location error {error} m");
+            assert!((top.t_start_utc - start).abs() < 0.2);
+            assert!(result.funnel.truncated.is_empty());
+        };
+        check_location(&tracks, &p);
+        // An ordinary point on the same cross-track slice can be hundreds of metres
+        // from an eligible rejected point. Local coverage must not discard that hole.
+        let farther = straight_track(
+            &enu,
+            [-1000.0, 6650.0, 6000.0 + MIC_HEIGHT_M],
+            [90.0, 0.0, 15.0],
+            start + 120.0,
+            start - 200.0,
+            start + 800.0,
+            5.0,
+        );
+        let mut ev = synth_event(
+            "far",
+            &farther,
+            x,
+            start,
+            112.7,
+            343.0,
+            start + 120.0,
+            &Prop::still(343.0),
+        );
+        let cpa = farther.cpa_nearest_time(x, start + 120.0, 100.0).unwrap();
+        ev.d_gate = [cpa.d * 1.001 / (1.25 * 1.25), cpa.d * 1.001];
+        let mut wide = p.clone();
+        wide.region = BBox::new(
+            lat - 25.0 / mlat,
+            lon - 25.0 / mlon,
+            lat + 2000.0 / mlat,
+            lon + 2000.0 / mlon,
+        );
+        let frame = Frame::new(&wide.region);
+        let cloud = hypotheses(
+            &ev,
+            &[farther],
+            &wide,
+            &frame,
+            &dem,
+            &atmo,
+            start - 86_400.0,
+            10_000,
+        );
+        let kept = cloud.stored.unwrap();
+        let (_, truth_north) = frame.en(lat, lon);
+        assert!(
+            kept.iter().any(|near| {
+                (f64::from(near.n) - truth_north).abs() < 25.0
+                    && kept.iter().any(|far| {
+                        (near.e - far.e).abs() < 1.0
+                            && (f64::from(far.n) - truth_north).abs() > p.cross_step_m * 0.5
+                    })
+            }),
+            "a different cross-track point at the same source sample must not cover the observer: {kept:?}"
+        );
+        // Extend each catalogue trajectory with a level return at a different recording
+        // clock. The original heard passes and the observer are unchanged. Each return
+        // supplies ordinary hypotheses, but they cannot explain the two heard events at
+        // one shared clock and must not erase the earlier hillside hypotheses.
+        for (i, tr) in tracks.iter_mut().enumerate() {
+            let dt = [120.0, 360.0][i];
+            let cutoff = tr.t.partition_point(|&t| t <= start + dt + 120.0);
+            tr.t.truncate(cutoff);
+            tr.pos.truncate(cutoff);
+            tr.vel.truncate(cutoff);
+            let return_cpa = start + dt + [1200.0, 2400.0][i];
+            let (pos, vel) = if i == 0 {
+                ([0.0, 6500.0, 6000.0 + MIC_HEIGHT_M], [90.0, 0.0, 0.0])
+            } else {
+                ([6500.0, 0.0, 6000.0 + MIC_HEIGHT_M], [0.0, 95.0, 0.0])
+            };
+            let next = straight_track(
+                &enu,
+                pos,
+                vel,
+                return_cpa,
+                return_cpa - 120.0,
+                return_cpa + 120.0,
+                5.0,
+            );
+            let bridge = TrackModel {
+                t: vec![tr.t1(), next.t0()],
+                pos: vec![*tr.pos.last().unwrap(), next.pos[0]],
+                vel: vec![*tr.vel.last().unwrap(), next.vel[0]],
+                ..tr.clone()
+            };
+            let mut time = tr.t1() + 10.0;
+            while time < next.t0() {
+                let (pos, vel) = bridge.pv(time);
+                tr.t.push(time);
+                tr.pos.push(pos);
+                tr.vel.push(vel);
+                time += 10.0;
+            }
+            tr.t.extend(next.t);
+            tr.pos.extend(next.pos);
+            tr.vel.extend(next.vel);
+        }
+        p.start_hi = start + 3600.0;
+        let frame = Frame::new(&p.region);
+        for (i, ev) in events.iter().enumerate() {
+            let cloud = hypotheses(
+                ev,
+                &tracks,
+                &p,
+                &frame,
+                &dem,
+                &atmo,
+                start - 86_400.0,
+                10_000,
+            );
+            let clocks: Vec<_> = cloud
+                .stored
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|h| h.trk as usize == i)
+                .map(|h| h.t_s as f64 - 86_400.0)
+                .collect();
+            eprintln!("returning {} clocks: {clocks:?}", ev.id);
+            assert!(clocks.iter().any(|clock| clock.abs() < 0.5));
+            assert!(
+                clocks
+                    .iter()
+                    .any(|clock| (*clock - [1200.0, 2400.0][i]).abs() < 0.5)
+            );
+            for cap in [0, 1, cloud.count] {
+                let limited =
+                    hypotheses(ev, &tracks, &p, &frame, &dem, &atmo, start - 86_400.0, cap);
+                assert_eq!(limited.count, cloud.count);
+                assert_eq!(limited.stored.is_some(), cap >= cloud.count);
+            }
+        }
+        check_location(&tracks, &p);
     }
 
     fn wind_delayed_case(med: fdop_types::atmo::Medium, start: f64) -> TwoCase {

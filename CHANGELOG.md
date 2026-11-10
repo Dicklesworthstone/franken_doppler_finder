@@ -19,6 +19,30 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover hillside hypotheses even when the same track has other valid visits
+
+- Replace the whole-track empty-cloud condition with an ordinary-first terrain retry at
+  each source-time sample. A later level visit or a different cross-track point can no longer
+  suppress the exact closest approach of an earlier climbing or descending hillside pass.
+  Keep each original ordinary point and successful fallback; emit only newly recovered
+  geometry from the retry. No proximity or clock-padding heuristic discards a valid recovery.
+- Every addition must pass the existing exact CPA, zero-slack speed and range, terrain
+  clearance, track-gap and recording-clock checks. All hypotheses use the original counted
+  storage budget, without a deferred-point buffer. Additional exact evaluations and retained
+  hypotheses can increase search cost; sampling, search caps and confidence gates are unchanged.
+- The returning-flight regression produces no joined seeds and no location with
+  the preceding whole-track guard. The repair recovers the synthetic observer within
+  0.547703 m and -0.005003 s, retaining both original return clocks and the earlier hillside
+  hypotheses. A wider-region control also preserves a rejected point beside an ordinary one
+  on the same sampling slice. All three hillside tests and six adjacent budget/region controls
+  pass on pinned-nightly x86-64 Linux. Two intentionally expanded clouds require an explicit
+  count of two, exact physical validity of each point and distinct clocks; no location bound
+  or refusal gate is relaxed. No reference or field replay is claimed.
+- The unchanged production selftest module, linked to the combined rebuilt engine, passes
+  the real FFmpeg decode, detection, measurement, search and refinement chain: 1.673779 m
+  error, 75 m radius, +0.019586 s clock error, four events and both intended flights. This
+  standalone integration run does not establish a full release CLI build.
+
 ### Calibrate accepted fast-pass continuations on their own raw spectrum
 
 - Share the existing accepted-aircraft raw-vertex refinement with fitted continuations. A
