@@ -494,6 +494,31 @@ struct Frames<'a> {
     tb: f64,
 }
 
+/// One guided run keeps its audio, band and sampling fixed. Reuse its normalized short
+/// spectrum when the fitted chirp selects the exact same window, commonly the 0.25 s floor.
+/// Release the old allocation before a replacement, or when the main window suffices.
+fn short_spectrum(
+    cache: &mut Option<(Spec, Vec<f32>)>,
+    win_s: f64,
+    build: impl FnOnce(f64) -> Result<Spec, String>,
+) -> Option<(&Spec, &[f32])> {
+    if cache
+        .as_ref()
+        .is_some_and(|(spec, _)| spec.meta.win_s != win_s)
+        || win_s >= MIN_MAIN_WIN_S
+    {
+        *cache = None;
+    }
+    if cache.is_none() && win_s < MIN_MAIN_WIN_S {
+        let mut spec = build(win_s).ok()?;
+        let background = spec.normalize_rows_with_offsets(None);
+        *cache = Some((spec, background));
+    }
+    cache
+        .as_ref()
+        .map(|(spec, background)| (spec, background.as_slice()))
+}
+
 /// What a run of guided rounds produced: the last fitted trace (or, without a fit, the trace that
 /// failed to fit), its fit, and why the rounds stopped short.
 struct Guided {
@@ -585,33 +610,25 @@ fn guided_rounds(
         p.rounds
     };
     let ordinary_rounds = p.rounds.min(rounds);
+    let mut short = None;
     for round in 0..rounds {
         let steep_win = window_for_roc(fitted_roc);
-        let steep = (steep_win < MIN_MAIN_WIN_S)
-            .then(|| {
-                stft_band_db(
-                    &fr.x[s0..s1],
-                    fr.sr,
-                    steep_win,
-                    p.hop_s,
-                    fr.fmin,
-                    fr.fmax,
-                    p.df_max,
-                    fr.ca,
-                )
-                .ok()
-            })
-            .flatten()
-            .map(|mut short| {
-                let background = short.normalize_rows_with_offsets(None);
-                (short, background)
-            });
+        let steep = short_spectrum(&mut short, steep_win, |win_s| {
+            stft_band_db(
+                &fr.x[s0..s1],
+                fr.sr,
+                win_s,
+                p.hop_s,
+                fr.fmin,
+                fr.fmax,
+                p.df_max,
+                fr.ca,
+            )
+        });
         let tr = guided_trace_with_background(
             fr.spec,
             Some(fr.background),
-            steep
-                .as_ref()
-                .map(|(short, offsets)| (short, Some(offsets.as_slice()))),
+            steep.map(|(spec, offsets)| (spec, Some(offsets))),
             &*model,
             fr.ta,
             fr.tb,
@@ -1091,6 +1108,94 @@ mod tests {
     use super::*;
     use crate::detect::{DetectParams, detect, refine, survey};
     use crate::fit::fit_constant_velocity;
+
+    #[test]
+    fn repeated_short_windows_reuse_the_fresh_spectrum_exactly() {
+        let sr = 1000;
+        let mut phase = 0.0f64;
+        let x: Vec<f32> = (0..4000)
+            .map(|i| {
+                let t = i as f64 / f64::from(sr);
+                let f = cv_curve(t, 83.0, 245.0, 700.0, 2.0 - 700.0 / 343.0, 343.0);
+                phase += std::f64::consts::TAU * f / f64::from(sr);
+                (phase.sin() + 0.1 * (std::f64::consts::TAU * 41.0 * t).sin()) as f32
+            })
+            .collect();
+        let build = |win_s| stft_band_db(&x, sr, win_s, 0.1, 30.0, 400.0, 2.0, 17.25);
+        let mut cache = None;
+        let mut builds = 0;
+        for (win_s, expected_builds) in [
+            (0.25, 1),
+            (0.25, 1),
+            (0.375, 2),
+            (0.375, 2),
+            (0.25, 3),
+        ] {
+            let (actual, offsets) = short_spectrum(&mut cache, win_s, |window| {
+                builds += 1;
+                build(window)
+            })
+            .unwrap();
+            assert_eq!(builds, expected_builds);
+            let mut fresh = build(win_s).unwrap();
+            let fresh_offsets = fresh.normalize_rows_with_offsets(None);
+            assert_eq!(actual.t, fresh.t);
+            assert_eq!(actual.f, fresh.f);
+            assert_eq!(
+                serde_json::to_vec(&actual.meta).unwrap(),
+                serde_json::to_vec(&fresh.meta).unwrap()
+            );
+            assert_eq!(actual.db.len(), fresh.db.len());
+            assert!(
+                actual
+                    .db
+                    .iter()
+                    .zip(&fresh.db)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+            assert_eq!(offsets.len(), fresh_offsets.len());
+            assert!(
+                offsets
+                    .iter()
+                    .zip(&fresh_offsets)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
+        assert!(
+            short_spectrum(&mut cache, MIN_MAIN_WIN_S, |_| {
+                panic!("the main window needs no short transform")
+            })
+            .is_none()
+        );
+        assert!(cache.is_none(), "the previous short allocation must be released");
+    }
+
+    #[test]
+    fn a_failed_short_window_never_reuses_or_caches_a_previous_spectrum() {
+        // A quarter-second transform fits, but a 0.375 s transform really fails.
+        let sr = 1000;
+        let x: Vec<f32> = (0..300)
+            .map(|i| (std::f64::consts::TAU * 83.0 * i as f64 / f64::from(sr)).sin() as f32)
+            .collect();
+        let mut cache = None;
+        let mut builds = 0;
+        for (win_s, succeeds) in [(0.25, true), (0.375, false), (0.375, false), (0.25, true)] {
+            let got = short_spectrum(&mut cache, win_s, |window| {
+                builds += 1;
+                stft_band_db(&x, sr, window, 0.1, 30.0, 400.0, 2.0, 0.0)
+            });
+            assert_eq!(got.is_some(), succeeds);
+            assert_eq!(cache.is_some(), succeeds);
+        }
+        assert_eq!(builds, 4, "a failed window must be retried, not cached");
+        assert!(
+            short_spectrum(&mut cache, f64::NAN, |_| {
+                panic!("an invalid window needs no short transform")
+            })
+            .is_none()
+        );
+        assert!(cache.is_none());
+    }
 
     /// A pass of `f0` in noise, its tone silent while the curve is between `silent` of its way down.
     fn measured_pass(

@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Reuse identical short spectrograms while following a fitted ridge
+
+- Guided measurement rounds now keep one normalized short-window spectrogram together
+  with its removed row background. When the fitted chirp selects the exact same window,
+  reuse those observations instead of repeating the FFTs and row normalization over the
+  unchanged recording context. Fast passes commonly select the 0.25 s floor across several
+  rounds, so this removes redundant transforms from measurement.
+- The cache belongs to one run of guided rounds: audio slice, sample rate, band, hop,
+  frequency resolution and time origin cannot change underneath it. Drop the old allocation
+  before changing windows, release it when the main spectrum suffices, and never cache
+  a failed transform. Different reseeding/calibration/continuation calls do not share it.
+  No detection limit, fit budget, trace gate or confidence threshold changes.
+- Add native synthetic-PCM regressions comparing every normalized spectral sample and row
+  offset bit for bit with fresh transforms, counting real builds across repeated and changed
+  windows, and checking main-window release and actual too-short-input failures.
+  Native execution is unavailable in this session, so these regressions, formatting,
+  Clippy, the workspace suite and selftest are unverified. No timing, complete-event
+  equivalence or real-recording accuracy result is claimed.
+
 ### Preserve archive identity when a download resumes
 
 - Pin a strong initial HTTP ETag and send it in `If-Range` on every retry. Check the

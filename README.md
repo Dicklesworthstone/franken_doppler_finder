@@ -2917,8 +2917,12 @@ audio or video recorded somewhere sensitive:
   code (`r_ny_r5`). One it refuses, at 13 %, was a confirmer in a correct county answer; whether that event was a real
   pass is not settled.
 - Measurement took 205 s of a 509 s run on a 3 h recording. Full uncertainty profiles and manoeuvre
-  diagnostics now run once for the final accepted trace, instead of in every ridge-refinement round. The
-  point fits and final diagnostics are retained; the wall-clock improvement has not yet been measured.
+  diagnostics now run once for the final accepted trace, instead of in every ridge-refinement round. Guided
+  rounds also reuse the same normalized short spectrogram and row background while their exact analysis
+  window stays unchanged. Only one short spectrum is retained per run of rounds; a different window rebuilds
+  it and a return to the main window releases it. The point fits, final diagnostics and gates are retained.
+  These changes have no measured end-to-end timing improvement yet. The short-spectrum reuse regressions
+  were added during an execution-environment outage and have not run.
 - `--near <state>` searches the state's bounding box, which takes in parts of neighbouring states, so a wrong
   (low) answer can land outside the state (Connecticut for a New York search). The report warns when the
   answer's reverse geocode is in another state.
