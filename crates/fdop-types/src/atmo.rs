@@ -183,6 +183,11 @@ impl Column {
 pub trait Atmosphere: Send + Sync {
     fn medium(&self, lat: f64, lon: f64, t: f64, z_a: f64, z_b: f64) -> Medium;
     fn describe(&self) -> String;
+    /// The exact medium returned for every path, if the provider is spatially,
+    /// temporally and vertically constant. Unknown or varying providers return `None`.
+    fn uniform_medium(&self) -> Option<Medium> {
+        None
+    }
 }
 
 /// ICAO-style standard atmosphere from a surface temperature: 6.5 K/km lapse to 11 km, no
@@ -224,6 +229,9 @@ impl Atmosphere for UniformAtmosphere {
             "uniform c={:.1} m/s, wind ({:.1}, {:.1}) m/s",
             self.0.c, self.0.wind_e, self.0.wind_n
         )
+    }
+    fn uniform_medium(&self) -> Option<Medium> {
+        Some(self.0)
     }
 }
 
@@ -497,6 +505,33 @@ impl Atmosphere for AdjustedAtmosphere {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_constant_providers_advertise_a_uniform_medium() {
+        for medium in [
+            Medium::still(343.0),
+            Medium::still(310.0),
+            Medium {
+                c: 343.0,
+                wind_e: 48.0,
+                wind_n: -64.0,
+            },
+        ] {
+            let atmo = UniformAtmosphere(medium);
+            assert_eq!(atmo.uniform_medium(), Some(medium));
+            for (lat, lon, t, za, zb) in [
+                (0.0, 0.0, 0.0, 0.0, 1000.0),
+                (45.0, -100.0, 1_788_895_000.0, -1000.0, 25_000.0),
+            ] {
+                assert_eq!(atmo.medium(lat, lon, t, za, zb), medium);
+            }
+        }
+        assert!(
+            StandardAtmosphere::new(15.0, 0.0, 0.5)
+                .uniform_medium()
+                .is_none()
+        );
+    }
 
     #[test]
     fn sound_speed_values() {

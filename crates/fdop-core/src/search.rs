@@ -576,10 +576,17 @@ fn hypotheses(
     cap: usize,
 ) -> HypSet {
     let count = AtomicUsize::new(0);
-    // fitted v and d are in units of the fit's still-air sound speed; the true values are
-    // lambda times larger, lambda = (c_path + v.w / c_path) / c_fit (at most ~ +-8 %)
+    // Keep the established spatial reach. The earlier time prefix below covers delays
+    // that the still-air crop cannot bound; it does not change the approximate CPA locus.
     let reach = p.region.padded_km(1.1 * ev.d_gate[1] / 1000.0 + 0.5);
     let t_lo_all = p.start_lo + ev.t_rec - ev.t_tol - 1.1 * ev.d_gate[1] / p.c - 5.0;
+    // Preserve the established calm path only at the same sound speed used by the fit.
+    // A nominal speed or one sampled weather column cannot bound a moving medium, nor
+    // the actual ECEF range of a terrain-dependent coarse point. Unknown means scan.
+    let ordinary_still_air = p.c.is_finite()
+        && p.c > 0.0
+        && ev.c_fit == p.c
+        && atmo.uniform_medium() == Some(fdop_types::atmo::Medium::still(p.c));
     let parts = tracks
         .par_iter()
         .enumerate()
@@ -811,27 +818,37 @@ fn hypotheses(
                 }
                 sampled
             };
-            let mut t = te_lo;
-            let mut previous = None;
-            while t <= te_hi {
-                let (dt, projection) = sample_at(t, &mut out);
-                if let (Some(left), Some(right)) = (previous, projection)
-                    && let Some(extra) = skipped_region_time(left, (t, right), project)
-                {
-                    sample_at(extra, &mut out);
+            let scan = |lo, hi, exclusive_end, out: &mut HypBuilder| {
+                let mut t = lo;
+                let mut previous = None;
+                while t <= hi && !(exclusive_end && t == hi) {
+                    let (dt, projection) = sample_at(t, out);
+                    if let (Some(left), Some(right)) = (previous, projection)
+                        && let Some(extra) = skipped_region_time(left, (t, right), project)
+                    {
+                        sample_at(extra, out);
+                    }
+                    previous = projection.map(|span| (t, span));
+                    let next = t + dt;
+                    // The final partial interval has no regular sample at its far endpoint.
+                    // Probe that endpoint only to recover a region crossed before the clock ends.
+                    if (next > hi || (exclusive_end && next == hi))
+                        && t < hi
+                        && let (Some(left), Some(right)) = (previous, project(hi))
+                        && let Some(extra) = skipped_region_time(left, (hi, right), project)
+                    {
+                        sample_at(extra, out);
+                    }
+                    t = next;
                 }
-                previous = projection.map(|span| (t, span));
-                let next = t + dt;
-                // The final partial interval has no regular sample at its far endpoint.
-                // Probe that endpoint only to recover a region crossed before the clock ends.
-                if next > te_hi
-                    && t < te_hi
-                    && let (Some(left), Some(right)) = (previous, project(te_hi))
-                    && let Some(extra) = skipped_region_time(left, (te_hi, right), project)
-                {
-                    sample_at(extra, &mut out);
-                }
-                t = next;
+            };
+            // Keep the established sampling phase and every ordinary point first. Wind can
+            // delay a valid pass past the still-air crop; inspect that omitted prefix too.
+            // A windy or varying medium retains the track's full early span, not a guessed
+            // factor. The extra work grows with retained track span and event recording time.
+            scan(te_lo, te_hi, false, &mut out);
+            if !ordinary_still_air && tr.t0() < te_lo {
+                scan(tr.t0(), te_lo.min(te_hi), te_lo <= te_hi, &mut out);
             }
             out.finish(cap, &count)
         })
@@ -6637,6 +6654,193 @@ mod tests {
             result.funnel
         );
         result
+    }
+
+    struct CountedAtmosphere {
+        medium: fdop_types::atmo::Medium,
+        advertise: bool,
+        calls: AtomicUsize,
+    }
+
+    impl Atmosphere for CountedAtmosphere {
+        fn medium(&self, _: f64, _: f64, _: f64, _: f64, _: f64) -> fdop_types::atmo::Medium {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.medium
+        }
+        fn describe(&self) -> String {
+            "synthetic counted atmosphere".into()
+        }
+        fn uniform_medium(&self) -> Option<fdop_types::atmo::Medium> {
+            self.advertise.then_some(self.medium)
+        }
+    }
+
+    #[test]
+    fn wind_delayed_flyovers_before_the_still_air_crop_reach_the_join() {
+        let med = fdop_types::atmo::Medium {
+            c: 343.0,
+            wind_e: 0.0,
+            wind_n: 75.0,
+        };
+        for start in [0.0, 1_788_895_000.0] {
+            let mut case = wind_delayed_case(med, start);
+            let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+            let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+            let prop = Prop::from_medium(&med, &enu);
+            case.tracks[0] = straight_track(
+                &enu,
+                [0.0, 20_000.0, 2000.0],
+                [90.0, 0.0, 0.0],
+                start + 120.0,
+                start - 200.0,
+                start + 800.0,
+                5.0,
+            );
+            case.tracks[0].key = "A".into();
+            for (i, (id, dt, f0)) in [("A", 120.0, 112.7), ("B", 360.0, 149.3)]
+                .into_iter()
+                .enumerate()
+            {
+                let tr = &case.tracks[i];
+                let cpa = tr.cpa_nearest_time(x, start + dt, 30.0).unwrap();
+                let scale = prop.fit_scale(cpa.vel, 343.0);
+                let mut ev = synth_event(id, tr, x, start, f0, 343.0, start + dt, &prop);
+                ev.t_tol = 1.0;
+                ev.v_gate = [0.99 * cpa.speed / scale, 1.01 * cpa.speed / scale];
+                ev.d_gate = [0.99 * cpa.d / scale, 1.01 * cpa.d / scale];
+                assert!(gates_ok(&ev, &cpa, &prop, 0.0));
+                if i == 0 {
+                    let old_lo = start + ev.t_rec - ev.t_tol - 1.1 * ev.d_gate[1] / 343.0 - 5.0;
+                    assert!(
+                        old_lo > cpa.t_e + 2.0,
+                        "the old crop must start after the 100 m region's CPA crossing"
+                    );
+                }
+                case.events[i] = ev;
+            }
+            check_wind_delayed_case(&case, med, run_case(&case, med));
+            // A custom provider with no global declaration must recover the same pair.
+            let atmo = CountedAtmosphere {
+                medium: med,
+                advertise: false,
+                calls: AtomicUsize::new(0),
+            };
+            let dem = FlatElevation(0.0);
+            let inputs = SearchInputs {
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                heard_times: case.events.iter().map(|ev| ev.t_rec).collect(),
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            check_wind_delayed_case(&case, med, run(&inputs, &case.p, &|_| {}));
+            let frame = Frame::new(&case.p.region);
+            let cloud = hypotheses(
+                &case.events[0],
+                &case.tracks,
+                &case.p,
+                &frame,
+                &dem,
+                &atmo,
+                start - 86_400.0,
+                10_000,
+            );
+            assert!(cloud.stored.as_ref().unwrap().iter().any(|h| h.trk == 0));
+            let limited = hypotheses(
+                &case.events[0],
+                &case.tracks,
+                &case.p,
+                &frame,
+                &dem,
+                &atmo,
+                start - 86_400.0,
+                0,
+            );
+            assert_eq!(limited.count, cloud.count);
+            assert!(limited.stored.is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_atmospheres_preserve_calm_clouds_and_count_the_extra_work() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let start = 1_788_895_000.0;
+        let mut case = wind_delayed_case(med, start);
+        case.p.start_lo = start - 120.0;
+        case.p.start_hi = start + 120.0;
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        // Match the pipeline's 1200 s pre-padding. Earlier flights pass the same place,
+        // so the work comparison includes genuine geometry/atmosphere evaluations.
+        for i in 0..10 {
+            let mut tr = straight_track(
+                &enu,
+                [0.0, 8000.0, 1200.0],
+                [90.0, 0.0, 0.0],
+                start - 1100.0 + 100.0 * i as f64,
+                case.p.start_lo - 1200.0,
+                case.p.start_hi + case.p.duration + 1200.0,
+                5.0,
+            );
+            tr.key = format!("earlier{i}");
+            case.tracks.push(tr);
+        }
+        let dem = FlatElevation(0.0);
+        let frame = Frame::new(&case.p.region);
+        let bits = |set: &HypSet| {
+            set.stored
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|h| {
+                    (
+                        h.trk,
+                        h.t_e.to_bits(),
+                        h.e.to_bits(),
+                        h.n.to_bits(),
+                        h.t_s.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for c_fit in [343.0, 300.0] {
+            let mut ev = case.events[0].clone();
+            ev.c_fit = c_fit;
+            let evaluate = |advertise| {
+                let atmo = CountedAtmosphere {
+                    medium: med,
+                    advertise,
+                    calls: AtomicUsize::new(0),
+                };
+                let started = std::time::Instant::now();
+                let set = hypotheses(
+                    &ev,
+                    &case.tracks,
+                    &case.p,
+                    &frame,
+                    &dem,
+                    &atmo,
+                    start - 86_400.0,
+                    100_000,
+                );
+                (set, atmo.calls.load(Ordering::Relaxed), started.elapsed())
+            };
+            let (known, known_calls, known_time) = evaluate(true);
+            let (unknown, unknown_calls, unknown_time) = evaluate(false);
+            assert_eq!(known.count, unknown.count);
+            assert_eq!(bits(&known), bits(&unknown));
+            if c_fit == 343.0 {
+                assert!(known.count > 0);
+                assert!(unknown_calls > known_calls);
+            } else {
+                // A different fitting speed must not take the nominal still-air shortcut.
+                assert_eq!(unknown_calls, known_calls);
+            }
+            eprintln!(
+                "fit c={c_fit}: known {known_calls} atmosphere evaluations in {known_time:?}; unknown {unknown_calls} in {unknown_time:?}; {} identical hypotheses",
+                known.count
+            );
+        }
     }
 
     #[test]

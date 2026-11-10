@@ -19,6 +19,34 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain wind-delayed flyovers before the still-air time crop
+
+- Preserve the original hypothesis scan and sampling phase, then inspect the omitted
+  earlier track span for windy, varying, unknown or different-fitting-speed atmospheres.
+  A valid pass must no longer disappear solely because its received-time delay exceeds
+  the preliminary still-air estimate. The original geometry, clock, track-gap, terrain
+  and storage-budget checks still apply; the original scan runs before the added prefix.
+- Add an optional `Atmosphere::uniform_medium` declaration with a default of `None`.
+  Only an exactly uniform calm medium with the same finite positive search and fitting
+  speed takes the established crop alone. Existing providers need no implementation
+  changes, and no propagation arithmetic, fit thresholds or confidence gates change.
+- Handle the split endpoint without sampling it twice, including a narrow region
+  crossed on the final exact-length prefix interval and a track entirely before the
+  original crop. Source review rejected a proposed finite wind-delay bound because
+  terrain-dependent coarse geometry and the existing CPA retry invalidate that proof.
+- Add physical two-flight recovery regressions at zero and Unix epochs, including an
+  undeclared provider and zero-budget counting, plus a 12-flight calm-cloud comparison
+  and a uniform-provider contract test. The search assertions retain the existing
+  chi, 75 m position, 0.2 s clock and no-truncation requirements.
+- Cost: real weather providers now inspect the full retained earlier track span.
+  This can increase coarse work substantially for long recordings. The 1200 s catalogue
+  pre-padding is relative to recording start, not an upper bound per event. The work-count
+  regression is unrun, so neither a measured overhead nor an end-to-end timing is claimed.
+- Validation: independent source review found no blocker. Native tests, rustfmt, Clippy,
+  selftest and reference/field replays did not run after repeated executor loss; initial
+  dependency builds had already been killed. This repairs the early time exclusion,
+  not the approximate spatial reach, full terrain coverage or confidence calibration.
+
 ### Recover winds aloft when the nearest radiosonde archive is unavailable
 
 - Keep the established preferred-station blend, but retain the next-nearest candidates

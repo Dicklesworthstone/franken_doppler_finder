@@ -1074,6 +1074,17 @@ Design notes:
   specified recording clock instead of being discarded by a still-air travel-time seed. Calm
   paths first use the original clock arithmetic. The coarse geometry remains approximate;
   search budgets and confidence gates are unchanged.
+- **Wind-delayed passes survive the early source-time crop.** The search first keeps its
+  existing scan and sampling phase, then also examines the earlier retained track span
+  when the atmosphere is windy, varying or unknown. Only an explicitly uniform calm
+  medium with the same finite positive sound speed as the search and event fit retains
+  the original crop alone. All recovered points still meet the original geometry,
+  recording-clock, track-gap and terrain checks and use the same hypothesis budgets.
+  This prevents a still-air time estimate from excluding a distant pass before its
+  moving-medium travel time is evaluated. It does not replace the approximate spatial
+  reach or establish complete terrain coverage. Extra coarse work can be substantial
+  for late events on long retained flight tracks; the catalogue's 1200 s pre-padding
+  is relative to recording start, not a per-event work limit.
 - **Hillside rejections can reach the observer's exact closest approach.** The initial CPA line
   uses terrain beneath the aircraft. A climb or descent over a slope can therefore imply the
   wrong distance or recording start at a candidate observer, even when the real pass fits. If that point
@@ -1488,6 +1499,28 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Wind-delay and radiosonde recovery: native validation pending
+
+The source-time recovery regression constructs two physical flight traces, including a
+20 km lateral pass in 75 m/s wind whose valid closest approach lies before the previous
+still-air crop. It requires the existing search/refinement helpers to recover both core
+flights with chi below 1, position error below 75 m and clock error below 0.2 s, at both
+zero and Unix epochs. It repeats the search with an undeclared custom atmosphere and
+checks that a zero hypothesis-storage budget retains the exact count while storing no cloud.
+A separate 12-flight control compares every retained calm hypothesis bit for bit, counts
+additional atmosphere evaluations, and checks that differing fitting sound speeds disable
+the still-air shortcut. A types regression checks the exact uniform-medium declaration.
+
+These assertions have been added and independently source-reviewed; they have not run.
+The radiosonde recovery regression also remains unrun. Two baseline core-build attempts
+received SIGKILL in dependencies (`syn`, then `wide` after a one-job unoptimized retry).
+The executor subsequently disconnected, briefly returned with its original compiler/cache
+missing, and disconnected again before focused tests could start with a recovered compiler.
+No new native recovery accuracy, work count, runtime or real-recording result is claimed.
+The search/atmosphere changes still need rustfmt, Clippy, the focused tests, selftest and
+the reference/field replays. The weather edit's changed-range formatting and whitespace
+checks passed before the first disconnection.
 
 ### Hillside recovery survives other valid visits by the same track
 
