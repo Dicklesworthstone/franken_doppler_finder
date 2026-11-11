@@ -1178,7 +1178,8 @@ pub(crate) fn measure_recording(
     let t = Instant::now();
     let dp = DetectParams::default();
     let (ls, lin) = detect::survey(x, sr, &dp)?;
-    let (mut dets, det_cut, remaining_candidates) = detect::detect_counted_with_budget(&ls, &dp);
+    let (mut dets, det_cut, mut remaining_candidates) =
+        detect::detect_counted_with_budget(&ls, &dp);
     let n_strong = dets
         .iter()
         .filter(|d| d.score >= dp.thr_db && d.harmonic_of.is_none())
@@ -1255,106 +1256,133 @@ pub(crate) fn measure_recording(
         log.say(&format!(
             "{ordinary_aircraft} independent aircraft measured; checking unclaimed recording edges, refused detections and brief interior passes with a shorter fast-pass survey"
         ));
-        let owners: Vec<_> = events
-            .iter()
-            .filter(|event| event.is_aircraft_like())
-            .map(|event| {
-                let measured = &dets[event.detection.id];
-                let family = measured.harmonic_of.unwrap_or(measured.id);
-                detect::RecoveryOwner {
-                    trace: &event.trace,
-                    harmonics: dets
-                        .iter()
-                        .filter(|d| {
-                            d.id != measured.id && (d.id == family || d.harmonic_of == Some(family))
-                        })
-                        .map(|d| d.f0 / measured.f0)
-                        .collect(),
-                }
-            })
-            .collect();
-        let refused: Vec<_> = events
-            .iter()
-            .filter(|event| !event.is_aircraft_like())
-            .map(|event| &dets[event.detection.id])
-            .collect();
-        let recovery_started = Instant::now();
-        let recovery = detect::recover_fast_passes_counted_with_owners(
-            x,
-            sr,
-            &dp,
-            dp.max_detections - dets.len(),
-            remaining_candidates,
-            &owners,
-            &refused,
-        );
-        recovery_detect_s = recovery_started.elapsed().as_secs_f64();
-        detect_s += recovery_detect_s;
-        match recovery {
-            Ok((mut recovered, recovery_cut, interior_incomplete)) => {
-                let first_detection = dets.len();
-                let recovered_count = recovered.len();
-                for d in &mut recovered {
-                    d.id += first_detection;
-                    d.harmonic_of = d.harmonic_of.map(|id| id + first_detection);
-                }
-                dets.extend(recovered);
-                let recovery_prim: Vec<&Detection> = dets[first_detection..]
-                    .iter()
-                    .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
-                    .collect();
-                let first_event = events.len();
-                let remaining_events = max_measured.saturating_sub(ordinary_aircraft);
-                let mut recovered_events = measure::measure_ranked_counted(
-                    recovery_prim.len(),
-                    remaining_events,
-                    |ranks| {
-                        recovery_prim[ranks.clone()]
-                            .par_iter()
-                            .enumerate()
-                            .map(|(i, d)| {
-                                measure::measure_family(
-                                    x,
-                                    sr,
-                                    &lin,
-                                    d,
-                                    &dets,
-                                    &format!("e{}", first_event + ranks.start + i + 1),
-                                    &mp,
-                                )
+        let first_recovery = dets.len();
+        let mut recovery_cut = 0;
+        let mut interior_incomplete = false;
+        for stage in [
+            detect::FastRecoveryStage::EdgeAndRefused,
+            detect::FastRecoveryStage::ShortInterior,
+        ] {
+            let measured_aircraft = search::independent_measured_events(&events, 0.0).len();
+            if measured_aircraft >= 2 {
+                break;
+            }
+            // Measure the earlier recovery before it may own evidence in the short bank.
+            // Failed seeds still consume their detection slots and proposal allowance;
+            // only an accepted observed ridge (and its harmonics) can hide later sound.
+            let owners: Vec<_> = events
+                .iter()
+                .filter(|event| event.is_aircraft_like())
+                .map(|event| {
+                    let measured = &dets[event.detection.id];
+                    let family = measured.harmonic_of.unwrap_or(measured.id);
+                    detect::RecoveryOwner {
+                        trace: &event.trace,
+                        harmonics: dets
+                            .iter()
+                            .filter(|d| {
+                                d.id != measured.id
+                                    && (d.id == family || d.harmonic_of == Some(family))
                             })
-                            .collect()
-                    },
-                    |events| search::independent_measured_events(events, 0.0).len(),
-                );
-                if recovery_prim.len() > recovered_events.len() {
-                    warnings.push(format!(
+                            .map(|d| d.f0 / measured.f0)
+                            .collect(),
+                    }
+                })
+                .collect();
+            let refused: Vec<_> = events
+                .iter()
+                .filter(|event| !event.is_aircraft_like())
+                .map(|event| &dets[event.detection.id])
+                .collect();
+            let recovery_started = Instant::now();
+            let recovery = detect::recover_fast_passes_stage_with_owners(
+                x,
+                sr,
+                &dp,
+                dp.max_detections - dets.len(),
+                remaining_candidates,
+                &owners,
+                &refused,
+                stage,
+            );
+            let stage_detect_s = recovery_started.elapsed().as_secs_f64();
+            recovery_detect_s += stage_detect_s;
+            detect_s += stage_detect_s;
+            match recovery {
+                Ok(batch) => {
+                    remaining_candidates = batch.remaining_candidates;
+                    recovery_cut += batch.cut;
+                    interior_incomplete |= batch.interior_incomplete;
+                    let mut recovered = batch.detections;
+                    let first_detection = dets.len();
+                    for d in &mut recovered {
+                        d.id += first_detection;
+                        d.harmonic_of = d.harmonic_of.map(|id| id + first_detection);
+                    }
+                    dets.extend(recovered);
+                    let recovery_prim: Vec<&Detection> = dets[first_detection..]
+                        .iter()
+                        .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_db)
+                        .collect();
+                    let first_event = events.len();
+                    let remaining_events = max_measured.saturating_sub(measured_aircraft);
+                    let mut recovered_events = measure::measure_ranked_counted(
+                        recovery_prim.len(),
+                        remaining_events,
+                        |ranks| {
+                            recovery_prim[ranks.clone()]
+                                .par_iter()
+                                .enumerate()
+                                .map(|(i, d)| {
+                                    measure::measure_family(
+                                        x,
+                                        sr,
+                                        &lin,
+                                        d,
+                                        &dets,
+                                        &format!("e{}", first_event + ranks.start + i + 1),
+                                        &mp,
+                                    )
+                                })
+                                .collect()
+                        },
+                        |events| search::independent_measured_events(events, 0.0).len(),
+                    );
+                    if recovery_prim.len() > recovered_events.len() {
+                        warnings.push(format!(
                         "short-window fast-pass recovery measured {} of {} families, reaching the limit of {max_measured} independent aircraft events; the rest only mark passes as heard",
                         recovered_events.len(), recovery_prim.len(),
                     ));
+                    }
+                    // Provenance belongs to the recovery stage even if refinement lowers speed.
+                    added_ranks.extend(recovered_events.iter().map(|e| e.id.clone()));
+                    events.append(&mut recovered_events);
                 }
-                // Provenance belongs to the recovery stage even if refinement lowers speed.
-                added_ranks.extend(recovered_events.iter().map(|e| e.id.clone()));
-                events.append(&mut recovered_events);
-                if recovered_count > 0 || ordinary_aircraft == 0 {
+                Err(error) => {
                     warnings.push(format!(
-                        "short-window fast-pass recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; a shorter survey of the recording's true edges and refused detections, followed by fully supported short interior templates, excluded its measured ridges and harmonic families and supplied {recovered_count} candidates within the remaining detection budget; all use the existing measurement gates and count as measured past the old line",
-                    ));
-                }
-                if interior_incomplete {
-                    warnings.push(
-                        "short-window fast-pass recovery left interior audio unsearched after the existing candidate allowance or detection slots ran out; other fast flyovers may remain undetected".into(),
-                    );
-                }
-                if recovery_cut > 0 {
-                    warnings.push(format!(
-                        "short-window fast-pass recovery discarded at least {recovery_cut} candidate curves at the remaining detection limit; discarded curves neither explain events nor mark passes as heard",
-                    ));
+                    "short-window fast-pass recovery failed: {error}; retaining the measurements collected so far",
+                ));
+                    // A failed scan may have consumed proposals before returning its error.
+                    // Do not retry another stage with an unaccounted allowance.
+                    break;
                 }
             }
-            Err(error) => warnings.push(format!(
-                "short-window fast-pass recovery failed: {error}; retaining the original measurements",
-            )),
+        }
+        let recovered_count = dets.len() - first_recovery;
+        if recovered_count > 0 || ordinary_aircraft == 0 {
+            warnings.push(format!(
+                "short-window fast-pass recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; a shorter survey of the recording's true edges and refused detections, measured before any needed short interior scan, supplied {recovered_count} candidates within the remaining detection budget; only accepted measured ridges and harmonic families own evidence between stages; all use the existing measurement gates and count as measured past the old line",
+            ));
+        }
+        if interior_incomplete {
+            warnings.push(
+                "short-window fast-pass recovery left interior audio unsearched after the existing candidate allowance or detection slots ran out; other fast flyovers may remain undetected".into(),
+            );
+        }
+        if recovery_cut > 0 {
+            warnings.push(format!(
+                "short-window fast-pass recovery discarded at least {recovery_cut} candidate curves at the remaining detection limit; discarded curves neither explain events nor mark passes as heard",
+            ));
         }
     }
     events.sort_by(|p, q| q.quality.score.total_cmp(&p.quality.score));
@@ -2819,6 +2847,57 @@ mod tests {
         assert!((best.t0r - 10.13).abs() < 0.3, "{best:?}");
         assert!((best.v - 215.0).abs() < 4.0, "{best:?}");
         assert!((best.d / 900.0 - 1.0).abs() < 0.08, "{best:?}");
+        assert_measurement_bookkeeping(&measured);
+    }
+
+    #[test]
+    fn short_window_recovery_releases_refused_legacy_evidence() {
+        let x = fast_recording(
+            180,
+            (350.0, 215.0, 900.0, 80.13),
+            0.32 * 10.0_f64.powf(-3.0 / 20.0),
+        );
+        let log = Log::new(true);
+        let measured = measure_recording(&x, 4000, &log, None).unwrap();
+        let independent = search::independent_measured_events(&measured.events, 0.0);
+        assert_eq!(independent.len(), 1, "{:?}", log.lines());
+        let event = measured
+            .events
+            .iter()
+            .find(|event| event.id == independent[0].id)
+            .unwrap();
+        let best = event.fit.as_ref().unwrap().best;
+        eprintln!("short recovery after a refused legacy seed: {best:?}");
+        assert!((best.f0 - 350.0).abs() < 0.3, "{best:?}");
+        assert!((best.v - 215.0).abs() < 4.0, "{best:?}");
+        assert!((best.d / 900.0 - 1.0).abs() < 0.08, "{best:?}");
+        assert!((best.t0r - 80.13).abs() < 0.3, "{best:?}");
+        assert_eq!(measured.detections[event.detection.id].half_s, 10.0);
+        assert!(measured.added.contains(&event.id));
+        // The failed full-template retry remains counted and reported, but cannot hide
+        // this shorter candidate or make it a child that is never independently measured.
+        let legacy = measured
+            .events
+            .iter()
+            .find(|earlier| {
+                !earlier.is_aircraft_like()
+                    && earlier.detection.id < event.detection.id
+                    && measured.detections[earlier.detection.id].v > 175.0
+                    && measured.detections[earlier.detection.id].half_s >= 24.0
+            })
+            .expect("the refused legacy recovery must still consume its detection slot");
+        assert!(measured.added.contains(&legacy.id));
+        assert!(
+            measured.detections[event.detection.id]
+                .harmonic_of
+                .is_none()
+        );
+        assert!(
+            measured
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("left interior audio unsearched"))
+        );
         assert_measurement_bookkeeping(&measured);
     }
 

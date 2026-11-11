@@ -1039,6 +1039,57 @@ pub fn recover_fast_passes_counted_with_owners(
     recover_fast_passes_impl(x, sr, p, slots, remaining_candidates, owners, refused, true)
 }
 
+/// Recovery stages separated by ordinary measurement at the caller. A proposal that later
+/// fails physical measurement must not own the evidence needed by the shorter bank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FastRecoveryStage {
+    EdgeAndRefused,
+    ShortInterior,
+}
+
+/// One recovery stage's detections and its use of the original shared limits.
+#[derive(Debug)]
+pub struct FastRecoveryBatch {
+    pub detections: Vec<Detection>,
+    /// Accepted detections discarded by the available detection-slot limit.
+    pub cut: usize,
+    /// Unused proposal allowance to pass unchanged to the next stage.
+    pub remaining_candidates: usize,
+    /// Short-bank evidence left unsearched because proposal or detection limits stopped it.
+    /// Always false for `EdgeAndRefused`, which does not attempt that bank.
+    pub interior_incomplete: bool,
+}
+
+/// Run just one recovery stage, retaining its unused proposal allowance for the next.
+///
+/// `EdgeAndRefused` preserves the true-edge and refused-seed searches. `ShortInterior` ignores
+/// `refused` and does not rerun either earlier search. Only the supplied accepted measurements
+/// and detections made within this stage own its evidence. After measuring the earlier stage,
+/// callers pass its accepted observed ridges as `owners`; its refused detections still consume
+/// detection slots and proposal allowance, but cannot hide a new short-template candidate.
+#[allow(clippy::too_many_arguments)]
+pub fn recover_fast_passes_stage_with_owners(
+    x: &[f32],
+    sr: u32,
+    p: &DetectParams,
+    slots: usize,
+    remaining_candidates: usize,
+    owners: &[RecoveryOwner<'_>],
+    refused: &[&Detection],
+    stage: FastRecoveryStage,
+) -> Result<FastRecoveryBatch, String> {
+    recover_fast_stages_impl(
+        x,
+        sr,
+        p,
+        slots,
+        remaining_candidates,
+        owners,
+        refused,
+        Some(stage),
+    )
+}
+
 // Keep the established edge/refused-seed path available for native recovery comparisons.
 #[allow(clippy::too_many_arguments)]
 fn recover_fast_passes_impl(
@@ -1051,8 +1102,39 @@ fn recover_fast_passes_impl(
     refused: &[&Detection],
     scan_short: bool,
 ) -> Result<(Vec<Detection>, usize, bool), String> {
+    let batch = recover_fast_stages_impl(
+        x,
+        sr,
+        p,
+        slots,
+        remaining_candidates,
+        owners,
+        refused,
+        (!scan_short).then_some(FastRecoveryStage::EdgeAndRefused),
+    )?;
+    Ok((batch.detections, batch.cut, batch.interior_incomplete))
+}
+
+// None retains the combined API's original stage ownership and output order. The pipeline
+// selects each stage separately so only measurements accepted between them become owners.
+#[allow(clippy::too_many_arguments)]
+fn recover_fast_stages_impl(
+    x: &[f32],
+    sr: u32,
+    p: &DetectParams,
+    slots: usize,
+    remaining_candidates: usize,
+    owners: &[RecoveryOwner<'_>],
+    refused: &[&Detection],
+    stage: Option<FastRecoveryStage>,
+) -> Result<FastRecoveryBatch, String> {
     let (mut out, mut cut, mut remaining_candidates) =
-        recover_fast_edges_impl(x, sr, p, slots, remaining_candidates, owners)?;
+        if stage == Some(FastRecoveryStage::ShortInterior) {
+            (Vec::new(), 0, remaining_candidates)
+        } else {
+            recover_fast_edges_impl(x, sr, p, slots, remaining_candidates, owners)?
+        };
+    let scan_short = stage != Some(FastRecoveryStage::EdgeAndRefused);
     let slots = slots.min(p.max_detections);
     let short = DetectParams {
         win_s: 0.5,
@@ -1077,7 +1159,12 @@ fn recover_fast_passes_impl(
         })
         .collect();
     if templates.is_empty() || !duration.is_finite() {
-        return Ok((out, cut, false));
+        return Ok(FastRecoveryBatch {
+            detections: out,
+            cut,
+            remaining_candidates,
+            interior_incomplete: false,
+        });
     }
     let interior = if compact.is_empty() {
         Vec::new()
@@ -1085,7 +1172,12 @@ fn recover_fast_passes_impl(
         short_recovery_windows(p.edge_half_s, duration)
     };
     if out.len() >= slots || remaining_candidates == 0 {
-        return Ok((out, cut, scan_short && !interior.is_empty()));
+        return Ok(FastRecoveryBatch {
+            detections: out,
+            cut,
+            remaining_candidates,
+            interior_incomplete: scan_short && !interior.is_empty(),
+        });
     }
     let mut windows: Vec<_> = refused
         .iter()
@@ -1116,7 +1208,10 @@ fn recover_fast_passes_impl(
     for (short_stage, windows, templates) in
         [(false, &merged, &templates), (true, &interior, &compact)]
     {
-        if templates.is_empty() || (short_stage && !scan_short) {
+        if templates.is_empty()
+            || (short_stage && !scan_short)
+            || (!short_stage && stage == Some(FastRecoveryStage::ShortInterior))
+        {
             continue;
         }
         let first = out.len();
@@ -1197,7 +1292,12 @@ fn recover_fast_passes_impl(
         }
         group_harmonics_after(&mut out, p, first);
     }
-    Ok((out, cut, incomplete))
+    Ok(FastRecoveryBatch {
+        detections: out,
+        cut,
+        remaining_candidates,
+        interior_incomplete: incomplete,
+    })
 }
 
 /// Complete short-template support, tiled into at most two minutes of centres. Each default
@@ -1789,6 +1889,28 @@ mod tests {
                     .unwrap();
             assert!(added.is_empty() && cut == 0);
             assert!(incomplete, "unvisited interior must be reported");
+            for stage in [
+                FastRecoveryStage::EdgeAndRefused,
+                FastRecoveryStage::ShortInterior,
+            ] {
+                let batch = recover_fast_passes_stage_with_owners(
+                    &x,
+                    4000,
+                    &p,
+                    slots,
+                    allowance,
+                    &[],
+                    &[],
+                    stage,
+                )
+                .unwrap();
+                assert!(batch.detections.is_empty() && batch.cut == 0);
+                assert_eq!(batch.remaining_candidates, allowance);
+                assert_eq!(
+                    batch.interior_incomplete,
+                    stage == FastRecoveryStage::ShortInterior
+                );
+            }
         }
         let disabled = DetectParams {
             fast_templates: false,
@@ -1797,6 +1919,118 @@ mod tests {
         let (added, cut, incomplete) =
             recover_fast_passes_counted_with_owners(&x, 4000, &disabled, 0, 0, &[], &[]).unwrap();
         assert!(added.is_empty() && cut == 0 && !incomplete);
+    }
+
+    #[test]
+    fn short_recovery_after_refused_legacy_measurement_finds_physical_pass() {
+        let pass = (350.0, 215.0, 900.0, 80.13);
+        let x = fast_pass_scene(pass, 0.32 * 10.0f64.powf(-3.0 / 20.0));
+        let p = DetectParams::default();
+        let (ls, lin) = survey(&x, 4000, &p).unwrap();
+        let (ordinary, cut, budget) = detect_counted_with_budget(&ls, &p);
+        assert_eq!(cut, 0);
+        let events = measure_edge_families(&x, &lin, &ordinary);
+        assert!(events.iter().all(|e| !e.is_aircraft_like()));
+        let refused: Vec<_> = events.iter().map(|e| &ordinary[e.detection.id]).collect();
+        let slots = p.max_detections - ordinary.len();
+
+        // The prior combined path lets its full-length candidate own the short bank before
+        // knowing that ordinary physical measurement will reject that candidate.
+        let (combined, cut, incomplete) =
+            recover_fast_passes_counted_with_owners(&x, 4000, &p, slots, budget, &[], &refused)
+                .unwrap();
+        assert_eq!(cut, 0);
+        assert!(!incomplete);
+        assert!(!combined.is_empty());
+        let legacy_events = measure_edge_families(&x, &lin, &combined);
+        assert!(legacy_events.iter().all(|e| !e.is_aircraft_like()));
+
+        let legacy = recover_fast_passes_stage_with_owners(
+            &x,
+            4000,
+            &p,
+            slots,
+            budget,
+            &[],
+            &refused,
+            FastRecoveryStage::EdgeAndRefused,
+        )
+        .unwrap();
+        assert_eq!(legacy.cut, 0);
+        assert!(!legacy.interior_incomplete);
+        assert!(legacy.remaining_candidates < budget);
+        assert_eq!(
+            serde_json::to_value(&legacy.detections).unwrap(),
+            serde_json::to_value(&combined).unwrap(),
+            "the old short stage supplied no alternative behind its refused owner"
+        );
+        // Derive ownership from the actual measurement results, not from which seeds were
+        // accepted by the detector. Failed seeds still spend their original slots and budget.
+        let owners: Vec<_> = events
+            .iter()
+            .chain(&legacy_events)
+            .filter(|e| e.is_aircraft_like())
+            .map(|e| RecoveryOwner {
+                trace: &e.trace,
+                harmonics: Vec::new(),
+            })
+            .collect();
+        let short = recover_fast_passes_stage_with_owners(
+            &x,
+            4000,
+            &p,
+            slots - legacy.detections.len(),
+            legacy.remaining_candidates,
+            &owners,
+            &refused,
+            FastRecoveryStage::ShortInterior,
+        )
+        .unwrap();
+        assert_eq!(short.cut, 0);
+        assert!(!short.interior_incomplete);
+        assert!(short.remaining_candidates < legacy.remaining_candidates);
+        assert!(
+            ordinary.len() + legacy.detections.len() + short.detections.len() <= p.max_detections
+        );
+        assert!(
+            short.detections.iter().all(|d| {
+                d.half_s == p.edge_half_s && d.score >= p.thr_db.max(p.thr_silence_db)
+            })
+        );
+        let measured = measure_edge_families(&x, &lin, &short.detections);
+        let accepted: Vec<_> = measured.iter().filter(|e| e.is_aircraft_like()).collect();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(
+            crate::search::independent_measured_events(&measured, 0.0).len(),
+            1
+        );
+        let b = accepted[0].fit.as_ref().unwrap().best;
+        eprintln!("short recovery after refused legacy measurement: {b:?}");
+        assert!((b.f0 - pass.0).abs() < 0.3, "{b:?}");
+        assert!((b.v - pass.1).abs() < 4.0, "{b:?}");
+        assert!((b.d / pass.2 - 1.0).abs() < 0.08, "{b:?}");
+        assert!((b.t0r - pass.3).abs() < 0.3, "{b:?}");
+
+        let owned = recover_fast_passes_stage_with_owners(
+            &x,
+            4000,
+            &p,
+            slots - legacy.detections.len(),
+            legacy.remaining_candidates,
+            &[RecoveryOwner {
+                trace: &accepted[0].trace,
+                harmonics: Vec::new(),
+            }],
+            &refused,
+            FastRecoveryStage::ShortInterior,
+        )
+        .unwrap();
+        assert_eq!(owned.cut, 0);
+        assert!(!owned.interior_incomplete);
+        assert!(
+            owned.detections.is_empty(),
+            "accepted observed ridge must retain ownership"
+        );
     }
 
     #[test]

@@ -734,8 +734,9 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 Detects flyovers using the same recording analysis as `locate`: detections are measured strongest
 first within each stage until 24 independent aircraft events survive. If ordinary measurement
 finds fewer than two independent aircraft, a bounded half-second survey retries the recording's
-true edges and refused detections, then scans fully supported short interior paths for a missing
-fast pass. The observed ridges and detected harmonic families
+true edges and refused detections. Those candidates are measured before a fully supported short
+interior scan looks for any still-missing fast pass. Failed earlier candidates retain their slots
+and proposal costs but do not hide sound from that later scan. The observed ridges and detected harmonic families
 of accepted aircraft are excluded from that recovery. Every recovered candidate must pass the
 unchanged measurement and aircraft checks; warnings identify added candidates and any cap.
 Final events are ranked by measured quality and numbered
@@ -1272,7 +1273,11 @@ Design notes:
   fast templates around detections that actually failed measurement, within bounded neighborhoods
   using their time scales and the existing ten-second suppression floor. These interior crops
   include complete template support; their seams cannot supply artificial edge detections.
-  A final interior bank uses ten-second halves for fast transitions whose natural shortest
+  These earlier recovery candidates are measured before deciding whether the final bank is
+  needed. Only accepted measurements own evidence between stages: a failed full-template seed
+  remains in the detections and spends its original slots and proposals, but cannot hide a
+  valid shorter path or make it an unmeasured harmonic child. If fewer than two independent
+  aircraft remain, a final interior bank uses ten-second halves for fast transitions whose natural shortest
   support fits that interval. It scans complete paths on the half-second survey, including
   centers with no ordinary seed and neighborhoods the longer bank already tried. Every scored
   center has actual STFT support on both sides. Tiles cover at most 120 seconds of centers,
@@ -1607,6 +1612,49 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Failed recovery seeds leave shorter physical curves eligible
+
+`short_recovery_after_refused_legacy_measurement_finds_physical_pass` uses fixed 180-second
+synthetic PCM with a 350 Hz pass at 215 m/s and 900 m, heard closest at 80.13 seconds,
+at amplitude `0.32 * 10^(-3/20)`, with seeded noise and a steady 250 Hz interferer.
+Ordinary measurement supplies no aircraft. The former combined recovery returns a
+24-second-half seed whose measurement is one-sided, traverses none of the central drop
+and fails the speed gate. Its predicted ridge used to mask the later short bank.
+
+The staged recovery measures that earlier seed before forming the short bank's owners,
+retains its detection and proposal costs, and supplies a ten-second-half seed for ordinary
+physical measurement. The matching pipeline regression,
+`short_window_recovery_releases_refused_legacy_evidence`, requires the refused candidate
+to remain counted and reported, the successful short candidate to retain expanded-measurement
+provenance, and exactly one independent aircraft. Accepted observed ridges still own their
+sound; original proposal, detection and event limits and all measurement gates remain.
+
+The native core regression passes with 350.00314 Hz, 214.99825 m/s, 900.00779 m and
+80.12993 seconds, at 0.03317 Hz fit RMSE. Its accepted-ridge control yields no duplicate
+candidate, and the budget/coverage checks pass. The exact `measure_recording` function,
+its real helper items and the new pipeline test also pass in a temporary native
+test binary linked to the same core. Replacing only that function with its pre-change
+body fails the same assertion with zero independent aircraft. This tests the actual
+measurement orchestration; it is not a full root-crate build or release CLI run.
+
+Four existing pipeline controls also pass in that same native binary: noise, steady tones
+and reversed audio produce no aircraft; accepted harmonic families and partial ridges
+retain their measurements without duplication; all four missing-second-aircraft cases
+pass. Their three search/refinement subcases, with the recording start supplied, recover
+the synthetic observer within 1.77001 m, 0.23455 m and 0.05090 m, with both correct core
+flights and no truncation. The fixed tests retain their original assertions.
+
+The unchanged `src/selftest.rs` module also passes again against this core in a native
+runner: its original 1300-second audio, ffmpeg decode and +/-6-hour clock search recover
+the synthetic observer within 1.674 m, with a 75 m radius, 0.020 s clock error and both
+intended flights. That selftest uses its own measurement path rather than the recovery
+orchestration tested above.
+
+Core all-targets clippy and changed-file formatting pass. The full native workspace build
+was again killed with `SIGKILL` in pinned `asupersync` before root compilation, and the
+workspace formatting check still finds unrelated pre-existing differences. These are
+synthetic results, not evidence of field accuracy.
+
 ### Brief interior fast passes can reach physical measurement
 
 `short_interior_fast_recovery_finds_physical_passes` compares the complete earlier recovery
@@ -1628,8 +1676,9 @@ central-drop-removed, reversed-audio, noise-plus-hum and exhausted-limit control
 
 The pipeline retains the existing detection and measurement budgets, records recovered events
 as measured past the old line, and requires the same quality and confidence gates. Its matching
-two-aircraft bookkeeping regression is added but has not run: workspace clippy stopped with
-`SIGKILL` while compiling pinned `asupersync`, before root-crate checks. Core all-targets clippy,
+two-aircraft bookkeeping regression now passes through the exact-source native orchestration
+described above. Full root-crate checks remain blocked: compilation stopped with `SIGKILL`
+in pinned `asupersync`. Core all-targets clippy,
 the focused native regressions, and formatting of the changed Rust files pass. The workspace
 formatting check still reports pre-existing differences in other files.
 

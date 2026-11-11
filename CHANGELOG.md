@@ -19,6 +19,38 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Measure recovery seeds before they can hide shorter flyovers
+
+- Separate true-edge/refused-seed recovery from the final short interior bank in the
+  shared `detect`/`locate` measurement path. Measure the earlier candidates first;
+  only accepted observed ridges and their harmonic families own later evidence.
+  A failed candidate remains counted and reported instead of hiding a potentially
+  valid shorter curve or making it an unmeasured harmonic child.
+- Carry the unused original proposal allowance between stages and retain every earlier
+  detection slot. Original and recovered aircraft share the unchanged 24-event limit;
+  skip the final short scan if earlier recovery supplies two independent aircraft.
+  Preserve incomplete coverage/cut warnings, ID rebasing and expanded-measurement provenance. Existing
+  combined detector APIs retain their behavior; the pipeline uses the staged API.
+- Add a fixed 350 Hz, 215 m/s, 900 m, -3 dB synthetic regression that the old combined
+  recovery cannot measure. It checks the same legacy seed, remaining proposal/slot
+  accounting, physical short-template measurement and accepted-ridge ownership. Add
+  the corresponding actual pipeline regression retaining the failed legacy detection.
+- Native core regression and budget/coverage controls pass: 350.00314 Hz,
+  214.99825 m/s, 900.00779 m, CPA 80.12993 s, RMSE 0.03317 Hz, exactly one
+  independent aircraft. The actual pipeline function/helpers and new test, extracted
+  verbatim into a temporary native binary, also pass; replacing only that function
+  with its old body fails with zero aircraft against the same core. Four original
+  pipeline controls also pass: null audio, accepted harmonics, accepted partial ridges,
+  and all four missing-second-aircraft cases. Their three actual search/refinement
+  subcases recover the synthetic observer within 1.77001 m, 0.23455 m and 0.05090 m,
+  with both core flights and no truncation. Core all-targets
+  clippy and changed-file formatting pass. The actual unchanged selftest module also
+  passes natively against this core: 1.674 m error, 75 m radius, 0.020 s clock error,
+  both intended flights, original audio and +/-6-hour clock search. This component
+  uses its own measurement path. A renewed full native workspace build was
+  killed by `SIGKILL` in pinned `asupersync`; workspace formatting still has unrelated
+  existing differences. No full-root, release-CLI or field-accuracy pass is claimed.
+
 ### Rebuild interrupted ADS-B day catalogues offline
 
 - When no processed full or partial day cache is usable, reconstruct the day from
