@@ -1072,6 +1072,26 @@ impl Prop {
     pub fn fit_scale(&self, v: V3, c_fit: f64) -> f64 {
         (self.c + dot(v, self.w) / self.c) / c_fit
     }
+
+    /// Convert a still-air fit's tone to the emitted tone in this moving medium.
+    /// For constant velocity, reception time is `alpha * t_e + beta + sqrt(quadratic)`.
+    /// With `a = c² - |w|²`, `alpha = 1 + v.w/a`; rescaling emission time by alpha gives
+    /// the still-air curve, whose fitted tone is therefore `f_source / alpha`.
+    /// A turning track uses its local CPA velocity, as do the existing geometric gates.
+    /// Invalid media or nonpositive time scales cannot supply a source-tone constraint.
+    #[inline]
+    pub fn source_tone_scale(&self, v: V3) -> f64 {
+        let a = self.c * self.c - dot(self.w, self.w);
+        if !(self.c > 0.0 && a > 0.0 && a.is_finite()) || v.iter().any(|x| !x.is_finite()) {
+            return f64::NAN;
+        }
+        let alpha = 1.0 + dot(v, self.w) / a;
+        if alpha.is_finite() && alpha > 0.0 {
+            alpha
+        } else {
+            f64::NAN
+        }
+    }
 }
 
 /// Straight constant-velocity synthetic track (tests and self-checks).
@@ -1192,6 +1212,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn source_tone_scale_matches_independent_wind_asymptotes() {
+        let emitted = 350.0;
+        let rotate = |v: V3| [v[2], v[0], v[1]];
+        for c in [300.0, 343.0, 360.0] {
+            for speed in [70.0, 175.0, 245.0] {
+                for wind in [-35.0, 0.0, 35.0] {
+                    // Along the flight, sound travels at c +/- wind in the ground frame.
+                    // A still-air fit's f0 is the harmonic mean of its two asymptotes.
+                    let approach = emitted / (1.0 - speed / (c + wind));
+                    let recede = emitted / (1.0 + speed / (c - wind));
+                    let measured = 2.0 * approach * recede / (approach + recede);
+                    let v = [speed, 0.0, 0.0];
+                    let w = [wind, 0.0, 0.0];
+                    let factor = Prop { c, w }.source_tone_scale(v);
+                    assert!((measured * factor - emitted).abs() < 1e-10);
+                    assert_eq!(
+                        Prop { c, w: rotate(w) }.source_tone_scale(rotate(v)),
+                        factor
+                    );
+                    if wind == 0.0 {
+                        assert_eq!(factor, 1.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_medium_or_velocity_cannot_supply_source_tone_bounds() {
+        for prop in [
+            Prop::still(0.0),
+            Prop::still(-343.0),
+            Prop::still(f64::NAN),
+            Prop::still(f64::INFINITY),
+            Prop {
+                c: 343.0,
+                w: [343.0, 0.0, 0.0],
+            },
+            Prop {
+                c: 343.0,
+                w: [f64::NAN, 0.0, 0.0],
+            },
+        ] {
+            assert!(prop.source_tone_scale([175.0, 0.0, 0.0]).is_nan());
+        }
+        assert!(
+            Prop::still(343.0)
+                .source_tone_scale([f64::NAN, 0.0, 0.0])
+                .is_nan()
+        );
+        assert!(
+            Prop {
+                c: 343.0,
+                w: [300.0, 0.0, 0.0],
+            }
+            .source_tone_scale([-500.0, 0.0, 0.0])
+            .is_nan()
+        );
     }
 
     #[test]

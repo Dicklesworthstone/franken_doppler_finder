@@ -36,6 +36,7 @@ pub struct SearchEvent {
     pub t_tol: f64,
     pub v_gate: [f64; 2],
     pub d_gate: [f64; 2],
+    /// Tone (Hz) fitted in still air; wind converts this to a candidate's emitted tone.
     pub f0: f64,
     pub f0_tol: f64,
     /// Trace noise scale used to normalise residuals (Hz).
@@ -1225,6 +1226,8 @@ struct TraceScratch {
 
 /// Fit of one event's trace against a model ratio curve at clock t_s. The tone is fitted in
 /// closed form; misfit events may also change tone once (searched over every split).
+/// `tone_scale` converts the still-air tone constraints into this candidate's emitted-frequency
+/// frame. It changes neither their relative width nor the noise and trimming in observed Hz.
 #[allow(clippy::too_many_arguments)]
 fn trace_chi(
     tt: &[f64],
@@ -1232,12 +1235,29 @@ fn trace_chi(
     ratio: &impl Fn(f64) -> f64,
     t_s: f64,
     ev: &SearchEvent,
+    tone_scale: f64,
     sigma: f64,
     cap_sigma: f64,
     robust: bool,
     scratch: &mut TraceScratch,
 ) -> TraceFit {
     let n = tt.len();
+    let source_f0 = ev.f0 * tone_scale;
+    let source_tol = ev.f0_tol * tone_scale;
+    if !tone_scale.is_finite()
+        || tone_scale <= 0.0
+        || !source_f0.is_finite()
+        || !source_tol.is_finite()
+        || source_tol < 0.0
+    {
+        return TraceFit {
+            chi: f64::INFINITY,
+            f0: f64::NAN,
+            rms: f64::NAN,
+            cov: 0.0,
+            brk: None,
+        };
+    }
     let TraceScratch {
         ratios: rr,
         deviations: ad,
@@ -1265,7 +1285,7 @@ fn trace_chi(
             brk: None,
         };
     }
-    let clamp_f0 = |f: f64| f.clamp(ev.f0 - ev.f0_tol, ev.f0 + ev.f0_tol);
+    let clamp_f0 = |f: f64| f.clamp(source_f0 - source_tol, source_f0 + source_tol);
     let mut f0 = clamp_f0(sfr / srr);
     let mut lim = f64::INFINITY;
     if robust {
@@ -1375,7 +1395,7 @@ fn trace_chi(
             pb[k + 1] = pb[k] + r2;
             pc[k + 1] = pc[k] + f2;
         }
-        let seg_clamp = |f: f64| f.clamp(0.85 * ev.f0, 1.15 * ev.f0);
+        let seg_clamp = |f: f64| f.clamp(0.85 * source_f0, 1.15 * source_f0);
         let min_side = (n / 6).max(10);
         let mut best: Option<(f64, usize, f64, f64)> = None;
         for k in min_side..n.saturating_sub(min_side) {
@@ -1695,6 +1715,7 @@ fn eval_point_weighted(
                     &|tu| g.at(tu),
                     t_s,
                     ev,
+                    props[k].source_tone_scale(cpas[k].vel),
                     ev.sigma_hz.max(0.6),
                     p.cap_sigma,
                     false,
@@ -1707,6 +1728,7 @@ fn eval_point_weighted(
                     &|tu| g.at(tu),
                     t_s,
                     ev,
+                    props[k].source_tone_scale(cpas[k].vel),
                     ev.sigma_hz,
                     p.cap_sigma,
                     true,
@@ -1985,6 +2007,7 @@ fn calibrate(
                         &|tu| g.at(tu),
                         ts,
                         ev,
+                        prop.source_tone_scale(cpa.vel),
                         ev.sigma_hz,
                         p.cap_sigma,
                         true,
@@ -2165,6 +2188,7 @@ fn best_confirmer(
                 &|tu| g.at(tu),
                 t_start,
                 ev,
+                prop.source_tone_scale(cpa.vel),
                 ev.sigma_hz,
                 p.cap_sigma,
                 true,
@@ -3070,6 +3094,7 @@ fn free_clocks(
                     &|tu| g.at(tu),
                     ts,
                     ev,
+                    prop.source_tone_scale(cpa.vel),
                     ev.sigma_hz,
                     p.cap_sigma,
                     true,
@@ -3156,6 +3181,7 @@ fn refresh_refined_candidate(
                 &|tu| grid.at(tu),
                 fresh.t_start_utc,
                 ev,
+                prop.source_tone_scale(cpa.vel),
                 ev.sigma_hz,
                 p.cap_sigma,
                 true,
@@ -3928,8 +3954,10 @@ mod tests {
             t_tol: 3.0,
             v_gate: [cpa.speed * 0.9, cpa.speed * 1.1],
             d_gate: [cpa.d * 0.8, cpa.d * 1.25],
-            f0,
-            f0_tol: 4.0,
+            // The generated samples use emitted f0. SearchEvent carries the tone a still-air
+            // fit measures; transform only this fixture's metadata, not its physical trace.
+            f0: f0 / prop.source_tone_scale(cpa.vel),
+            f0_tol: 4.0 / prop.source_tone_scale(cpa.vel),
             sigma_hz: 0.12,
             n_eff: 20.0,
             quality: 100.0,
@@ -3983,6 +4011,7 @@ mod tests {
                 &ratio,
                 0.0,
                 &plain_event(100.0, false),
+                1.0,
                 0.2,
                 5.0,
                 true,
@@ -4010,6 +4039,7 @@ mod tests {
             &|_| 1.0,
             0.0,
             &event,
+            1.0,
             0.2,
             5.0,
             true,
@@ -4026,6 +4056,7 @@ mod tests {
             &ratio,
             0.0,
             &event,
+            1.0,
             0.2,
             5.0,
             true,
@@ -4047,6 +4078,7 @@ mod tests {
                 &partial_ratio,
                 0.0,
                 &event,
+                1.0,
                 0.2,
                 5.0,
                 true,
@@ -4190,6 +4222,7 @@ mod tests {
                     &ratio,
                     0.125,
                     &plain_event(128.0, matches!(kind, "step" | "short")),
+                    1.0,
                     0.125,
                     5.0,
                     kind != "quick",
@@ -4230,6 +4263,7 @@ mod tests {
             &ratio,
             0.0,
             &plain_event(126.0, false),
+            1.0,
             0.12,
             5.0,
             true,
@@ -4241,6 +4275,7 @@ mod tests {
             &ratio,
             0.0,
             &plain_event(126.0, true),
+            1.0,
             0.12,
             5.0,
             true,
@@ -4266,12 +4301,117 @@ mod tests {
             &ratio,
             0.0,
             &plain_event(126.0, true),
+            1.0,
             0.12,
             5.0,
             true,
             &mut scratch,
         );
         assert!(one.chi < 1e-6, "{one:?}");
+    }
+
+    #[test]
+    fn source_tone_conversion_preserves_bounds_and_invalid_scale_refusal() {
+        let tt: Vec<f64> = (0..200).map(|k| -60.0 + 0.6 * k as f64).collect();
+        let ratio = |t| cv_curve(t, 1.0, 110.0, 2500.0, 0.0, 343.0);
+        let ev = plain_event(100.0, false);
+        let mut scratch = TraceScratch::default();
+        for scale in [0.8, 1.0, 1.2] {
+            let ff: Vec<f64> = tt.iter().map(|&t| scale * 100.0 * ratio(t)).collect();
+            for robust in [false, true] {
+                let fit = trace_chi(
+                    &tt,
+                    &ff,
+                    &ratio,
+                    0.0,
+                    &ev,
+                    scale,
+                    0.2,
+                    5.0,
+                    robust,
+                    &mut scratch,
+                );
+                assert!((fit.f0 - scale * 100.0).abs() < 1e-10);
+                assert!(fit.chi < 1e-15);
+                assert_eq!(fit.cov, 1.0);
+                let outside: Vec<f64> = tt.iter().map(|&t| scale * 120.0 * ratio(t)).collect();
+                let bounded = trace_chi(
+                    &tt,
+                    &outside,
+                    &ratio,
+                    0.0,
+                    &ev,
+                    scale,
+                    0.2,
+                    5.0,
+                    robust,
+                    &mut scratch,
+                );
+                assert!((bounded.f0 - scale * 105.0).abs() < 1e-10);
+                assert_eq!(
+                    bounded.chi, 25.0,
+                    "the unchanged tone interval remains binding"
+                );
+            }
+        }
+        for scale in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let fit = trace_chi(
+                &tt,
+                &tt,
+                &ratio,
+                0.0,
+                &ev,
+                scale,
+                0.2,
+                5.0,
+                true,
+                &mut scratch,
+            );
+            assert!(fit.chi.is_infinite() && fit.f0.is_nan());
+        }
+        let ff: Vec<f64> = tt.iter().map(|&t| 120.0 * ratio(t)).collect();
+        let missing = trace_chi(
+            &tt,
+            &ff,
+            &|_| f64::NAN,
+            0.0,
+            &ev,
+            1.2,
+            0.2,
+            5.0,
+            true,
+            &mut scratch,
+        );
+        assert!(missing.chi.is_infinite());
+        assert_eq!(missing.cov, 0.0);
+    }
+
+    #[test]
+    fn source_tone_conversion_preserves_the_change_point_bounds() {
+        let scale = 1.2;
+        let ratio = |t: f64| 1.0 + 0.05 * (-t / 20.0).tanh();
+        let tt: Vec<f64> = (0..480).map(|k| -60.0 + 0.25 * k as f64).collect();
+        let ff: Vec<f64> = tt
+            .iter()
+            .map(|&t| scale * if t < 10.0 { 121.0 } else { 131.0 } * ratio(t))
+            .collect();
+        let fit = trace_chi(
+            &tt,
+            &ff,
+            &ratio,
+            0.0,
+            &plain_event(126.0, true),
+            scale,
+            0.12,
+            5.0,
+            true,
+            &mut TraceScratch::default(),
+        );
+        let (at, after) = fit.brk.expect("the same permitted RPM change survives conversion");
+        assert!(fit.chi < 1e-15);
+        assert!((at - 10.0).abs() <= 0.25);
+        assert!((fit.f0 - scale * 121.0).abs() < 1e-9);
+        assert!((after - scale * 131.0).abs() < 1e-9);
     }
 
     #[test]
@@ -5051,6 +5191,7 @@ mod tests {
                 &|tu| tr.solve_emission_p(tu, truth.x, &prop, None).unwrap().2,
                 case.t_s,
                 ev,
+                prop.source_tone_scale(cpa.vel),
                 ev.sigma_hz,
                 case.p.cap_sigma,
                 true,
@@ -6039,6 +6180,135 @@ mod tests {
             atmo: &atmo,
         };
         run(&inp, &case.p, &|_s| {})
+    }
+
+    #[test]
+    fn measured_windy_tones_reach_pair_search_and_confirmation() {
+        use crate::fit::{Side, fit_constant_velocity};
+
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        for start in [0.0, 1_788_895_000.0] {
+            for wind in [-35.0, 35.0] {
+                let medium = fdop_types::atmo::Medium {
+                    c: 343.0,
+                    wind_e: wind,
+                    wind_n: 0.0,
+                };
+                let prop = Prop::from_medium(&medium, &enu);
+                let mut tracks = Vec::new();
+                let mut events = Vec::new();
+                // Opposite directions make the two flight constraints independent. Wind is
+                // along both tracks, so their fitted and geometric CPA centres also agree.
+                for (key, position, speed, at, emitted) in [
+                    ("A", [0.0, 3500.0, 1200.0], 175.0, 120.0, 350.0),
+                    ("B", [0.0, -2500.0, 1600.0], -175.0, 360.0, 479.0),
+                ] {
+                    let mut tr = straight_track(
+                        &enu,
+                        position,
+                        [speed, 0.0, 0.0],
+                        start + at,
+                        start - 200.0,
+                        start + 800.0,
+                        5.0,
+                    );
+                    tr.key = key.into();
+                    let mut ev =
+                        synth_event(key, &tr, x, start, emitted, 343.0, start + at, &prop);
+                    // Fit the actual propagated, noisy frequency observations in still air.
+                    // The fixture's source tone must not masquerade as a measured fit value.
+                    let fit = fit_constant_velocity(&ev.tr_t, &ev.tr_f, 343.0, Side::Both)
+                        .expect("a constant-wind straight pass is a still-air curve after rescaling");
+                    ev.f0 = fit.best.f0;
+                    ev.f0_tol = (0.04 * ev.f0).max(4.0);
+                    ev.t_rec = fit.best.t0r;
+                    ev.sigma_hz = (fit.best.rmse.powi(2) + (0.002 * ev.f0).powi(2)).sqrt();
+                    let cpa = tr.cpa_near(x, start + at, 150.0).unwrap();
+                    let factor = prop.source_tone_scale(cpa.vel);
+                    assert!((ev.f0 * factor - emitted).abs() < 0.1);
+                    assert!(
+                        (emitted - ev.f0).abs() > ev.f0_tol,
+                        "the old emitted-tone interval must exclude this real source"
+                    );
+                    let ratio = |t| tr.solve_emission_p(t, x, &prop, None).unwrap().2;
+                    let mut scratch = TraceScratch::default();
+                    for robust in [false, true] {
+                        let old = trace_chi(
+                            &ev.tr_t,
+                            &ev.tr_f,
+                            &ratio,
+                            start,
+                            &ev,
+                            1.0,
+                            ev.sigma_hz,
+                            5.0,
+                            robust,
+                            &mut scratch,
+                        );
+                        let corrected = trace_chi(
+                            &ev.tr_t,
+                            &ev.tr_f,
+                            &ratio,
+                            start,
+                            &ev,
+                            factor,
+                            ev.sigma_hz,
+                            5.0,
+                            robust,
+                            &mut scratch,
+                        );
+                        assert!(old.chi > 12.0, "the old bounds refuse {key}: {old:?}");
+                        assert!(corrected.chi < 0.02, "{key}: {corrected:?}");
+                        assert!((corrected.f0 - emitted).abs() < 0.02);
+                        assert_eq!(corrected.cov, 1.0);
+                    }
+                    tracks.push(tr);
+                    events.push(ev);
+                }
+                let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+                let mut p = SearchParams::new(
+                    start,
+                    start,
+                    600.0,
+                    BBox::new(
+                        lat - 50.0 / mlat,
+                        lon - 50.0 / mlon,
+                        lat + 50.0 / mlat,
+                        lon + 50.0 / mlon,
+                    ),
+                );
+                p.refine_half_m = 100.0;
+                let case = TwoCase {
+                    tracks,
+                    events,
+                    p,
+                    t_s: start,
+                    obs: (lat, lon),
+                };
+                let dem = FlatElevation(0.0);
+                let atmo = fdop_types::atmo::UniformAtmosphere(medium);
+                let o = observer(lat, lon, &dem);
+                let index = TimeIndex::new(&case.tracks);
+                for (i, ev) in case.events.iter().enumerate() {
+                    let (chi, matched, ti) = best_confirmer(
+                        &o,
+                        start,
+                        ev,
+                        &case.tracks,
+                        &index,
+                        &case.p,
+                        &atmo,
+                        &[],
+                    )
+                    .expect("the same source-tone conversion must reach confirmation");
+                    assert_eq!(ti as usize, i);
+                    assert!(chi < 0.02 && matched.coverage >= 0.99);
+                }
+                check_wind_delayed_case(&case, medium, run_case(&case, medium));
+            }
+        }
     }
 
     #[test]
@@ -9519,6 +9789,7 @@ mod tests {
                         &|tu| tr.solve_emission_p(tu, o.x, &prop, None).unwrap().2,
                         case.t_s + offset,
                         ev,
+                        prop.source_tone_scale(tr.pv(te).1),
                         ev.sigma_hz,
                         case.p.cap_sigma,
                         true,

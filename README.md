@@ -295,6 +295,16 @@ when it improves the same capped residual objective. This prevents a minority of
 shifting the fitted tone enough to escape the existing outlier trim. Tone bounds, missing-coverage penalties,
 the raw RMS diagnostic and the core-match thresholds remain in force.
 
+A still-air fit's reference tone can differ from the aircraft's physical source tone in wind.
+For each candidate flight, trace scoring converts the fitted tone and its permitted interval into
+source-frequency units using the same path medium and aircraft velocity as its Doppler prediction.
+The conversion is exact for straight, constant-velocity motion in one homogeneous medium;
+using the local closest-approach velocity on a turning track remains an approximation.
+It applies to quick and exact scoring, chance calibration, confirmation, independent clock checks
+and refined matches, including the allowed tone change for model-misfit events.
+Calm-air intervals stay unchanged. This preserves the existing tolerance instead of discarding
+a physically supported windy pass because its source tone lies outside the unconverted interval.
+
 Between stored Doppler predictions, the search uses a four-point cubic on a finite, monotone stretch,
 bounded by the two bracketing predictions. This reduces curvature bias for close, fast passes without
 additional emission-time solves or a denser table. Boundaries, turns, plateaus and gaps retain the linear

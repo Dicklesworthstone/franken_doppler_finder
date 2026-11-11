@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Match wind-shifted fitted tones in source-frequency units
+
+- Convert a still-air fit's tone interval into physical source-frequency units at each
+  candidate's closest approach, using its propagation medium and aircraft velocity.
+  The homogeneous-wind scale is `1 + v·w / (c² - |w|²)`; calm air gives exactly one.
+  It is exact for constant velocity and a local approximation on turning tracks.
+  A 350 Hz source at 175 m/s with a 35 m/s along-track wind can fit at 332.5 Hz or
+  369.4 Hz, outside the old interval even though its physical prediction is correct.
+- Apply the same conversion to quick/fine scoring, chance calibration, confirmation,
+  independent clock checks and refined-candidate reevaluation. Scale both single-tone
+  and model-misfit change-point bounds while retaining observed-frequency residuals
+  and the existing tolerance.
+- Add propagation, invalid-medium, bounded-tone, actual-fit and known-answer search
+  regressions, including calm controls and both wind directions.
+- Validation: independent propagation arithmetic checked 240 combinations of sound
+  speed, wind, geometry and emission time, agreeing with the mapped curve to relative
+  error below 8e-16. This is an algebra check, not execution of the Rust code.
+  Source/call-site review completed; native tests, workspace checks, release selftest
+  and reference/field replays could not run after the execution host became unavailable.
+
 ### Retain usable weather across uneven hourly coverage
 
 - Select each weather cell's own UTC rows bracketing the recording. Missing leading or
