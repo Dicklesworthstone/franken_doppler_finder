@@ -19,6 +19,30 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Rebuild interrupted ADS-B day catalogues offline
+
+- When no processed full or partial day cache is usable, reconstruct the day from
+  completed raw checkpoints and cached release metadata without creating a network
+  client or opening an archive. Reuse the exact online padded day specification.
+- Prefer a usable prod checkpoint, then staging, and add requested available MLAT.
+  Reconcile all recovered raw parts together before final unknown/jet filtering;
+  preserve partial-feed warnings and refuse MLAT-only data. Existing processed caches
+  retain their priority. Verify repository, day and feed in addition to raw identity.
+- Share online/offline final day publication and retain its fatal write-error policy.
+  Report an unavailable prod feed accurately when offline recovery uses staging.
+- Wire recent-day CLI availability to completed main raw filenames paired with valid
+  same-day release metadata, leaving exact integrity/policy checks to fetch_window.
+  Metadata alone, MLAT-only data and temporary files do not count; unfinished days
+  remain pending.
+- Add seven actual offline-fetch/preflight regressions for fresh-build equality,
+  prod/staging and jet policies, unknown-to-known recovery, cache priority/reuse,
+  partial feeds, corrupt/mismatched inputs, publication failures and recent-day controls.
+- Validation: all changed Rust files pass pinned-nightly rustfmt and whitespace checks;
+  independent bounded source review found no blocker. One-job unoptimized data-crate
+  Clippy exited 255 while compiling synstructure 0.13.2, without a Rust diagnostic and
+  before checking fdop-data. New data tests, full workspace checks, release selftest,
+  live-transfer timings and field replays remain unverified.
+
 ### Resume incomplete ADS-B days from completed raw feeds
 
 - Save completely ingested, filtered raw feeds before joint day building. On a later

@@ -920,6 +920,22 @@ A missing, incompatible or damaged checkpoint causes a fresh download of that fe
 A checkpoint-write failure warns and keeps the current successful ingest; it does not
 change final day-store publication errors.
 
+If no processed full or partial day cache is usable, `--offline` can rebuild it from
+completed raw checkpoints and the cached `releases.json`. It validates that each release
+belongs to the requested day and feed, then applies the same exact raw identity as an
+online retry. A usable prod checkpoint takes priority over staging. Available requested
+MLAT is reconciled with the main feed; if requested MLAT is unavailable, a main-only result
+keeps its missing-feed warning. MLAT alone cannot supply a day. Existing processed-cache
+hits keep their priority.
+
+The rebuilt day is atomically saved for later searches, so this recovery needs a writable
+cache. A final day-store write failure remains an error. No network client or archive
+stream is opened in offline reconstruction. For recent ended days, the CLI's availability
+check recognizes a completed raw main-feed filename paired with valid same-day release
+metadata; full checkpoint integrity and query policy are checked during reconstruction.
+Metadata alone, temporary files and MLAT-only data do not establish that availability,
+and unfinished UTC days remain pending.
+
 These checkpoints add disk usage for the filtered raw reports. They do not save entire
 multi-gigabyte archives, resume an unfinished feed across process restarts, or recover
 raw information from older processed-only caches. No extra flag is required, and ordinary
@@ -1674,6 +1690,29 @@ the three-flight search recovers the synthetic observer within 0.56 m and its cl
 with core all-targets clippy. Native runs use the pinned nightly's Cranelift backend; full
 workspace checks, release selftest and real-recording replays have not completed.
 
+### Rebuild interrupted day catalogues offline
+
+Seven focused regressions call the real offline `fetch_window` entry point with cached
+synthetic raw feeds and release metadata. Reconstructed results must equal a fresh joint
+build, including the main feed's barometric corrections and an initially unknown type
+resolved from MLAT. The cases cover prod and staging, ordinary and jet-inclusive policy,
+repeat processed-cache hits, existing partial-cache priority, absent/disabled MLAT,
+corrupt-prod staging fallback, MLAT-only refusal, mismatched metadata and identities,
+and fatal final-publication failures even when missing days are otherwise permitted.
+
+The recent-day regression also calls `published_until`, as both CLI entry points do,
+before reconstruction. Complete main checkpoints with same-day metadata reach the offline
+fetch for an ended day; metadata alone, MLAT-only data, unfinished temporary files and
+wrong-day listings do not. An unfinished day stays pending even with a raw main checkpoint.
+
+Pinned-nightly formatting of all changed Rust files and `git diff --check` pass.
+Independent bounded source review found no blocker. A one-job, unoptimized
+`cargo clippy -p fdop-data --all-targets --locked -- -D warnings` attempt exited 255
+while compiling `synstructure 0.13.2`, before checking `fdop-data`; its log contains
+no Rust diagnostic explaining that exit. These new data regressions have not executed.
+Full workspace checks, release selftest, live-download timings and field replays remain
+unverified for this change.
+
 ### Resume incomplete archive days from completed raw feeds
 
 Six new regressions cover the raw checkpoint format and its use by the archive worker.
@@ -1690,11 +1729,11 @@ truncation, trailing garbage and replacement while an earlier reader remains ope
 A worker regression covers corrupt-cache refetch and repair, then a raw-checkpoint write
 failure that still permits the successful feed to become a readable day store.
 
-**Native validation is pending.** Source review and GitHub checkpoint verification completed.
-The execution host became unavailable before data-crate Clippy or tests could start. Earlier
-core compilation attempts were killed in dependencies, including `wide` with Cranelift;
-those attempts do not establish a result for these data tests. No live-download timing,
-full-workspace pass, selftest or field-accuracy improvement is claimed.
+**Native validation is pending.** At `16f56eb`, source review and GitHub checkpoint
+verification had completed, but host loss prevented data checks from starting. Subsequent
+pinned formatting passed; the data-crate Clippy attempt described above stopped in dependency
+compilation before checking the crate. These codec and retry regressions remain unexecuted.
+No live-download timing, full-workspace pass, selftest or field-accuracy improvement is claimed.
 
 ### Completed main feeds survive a failed MLAT download
 

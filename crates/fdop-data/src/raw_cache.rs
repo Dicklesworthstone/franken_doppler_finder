@@ -299,27 +299,64 @@ mod tests {
         );
         assert_eq!(
             [
-                a_point.alt_geom_msl, a_point.alt_baro_m, a_point.gs_mps,
-                a_point.track_deg, a_point.vrate_mps,
-            ].map(f32::to_bits),
+                a_point.alt_geom_msl,
+                a_point.alt_baro_m,
+                a_point.gs_mps,
+                a_point.track_deg,
+                a_point.vrate_mps,
+            ]
+            .map(f32::to_bits),
             [
-                b_point.alt_geom_msl, b_point.alt_baro_m, b_point.gs_mps,
-                b_point.track_deg, b_point.vrate_mps,
-            ].map(f32::to_bits)
+                b_point.alt_geom_msl,
+                b_point.alt_baro_m,
+                b_point.gs_mps,
+                b_point.track_deg,
+                b_point.vrate_mps,
+            ]
+            .map(f32::to_bits)
         );
         assert_eq!(
-            (a_point.flags, a_point.new_leg, a_point.retained_break, a_point.retained_end),
-            (b_point.flags, b_point.new_leg, b_point.retained_break, b_point.retained_end)
+            (
+                a_point.flags,
+                a_point.new_leg,
+                a_point.retained_break,
+                a_point.retained_end
+            ),
+            (
+                b_point.flags,
+                b_point.new_leg,
+                b_point.retained_break,
+                b_point.retained_end
+            )
         );
-        let ground_bits = |events: &BoundaryEvents| events.ground.iter()
-            .map(|(lo, hi)| (lo.to_bits(), hi.to_bits())).collect::<Vec<_>>();
-        let leg_bits = |events: &BoundaryEvents| events.new_leg.iter()
-            .map(|t| t.to_bits()).collect::<Vec<_>>();
-        assert_eq!(ground_bits(&a.leg_boundaries), ground_bits(&b.leg_boundaries));
+        let ground_bits = |events: &BoundaryEvents| {
+            events
+                .ground
+                .iter()
+                .map(|(lo, hi)| (lo.to_bits(), hi.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        let leg_bits = |events: &BoundaryEvents| {
+            events
+                .new_leg
+                .iter()
+                .map(|t| t.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ground_bits(&a.leg_boundaries),
+            ground_bits(&b.leg_boundaries)
+        );
         assert_eq!(leg_bits(&a.leg_boundaries), leg_bits(&b.leg_boundaries));
 
         // Missing data and a completely ingested empty feed are distinct states.
-        let empty = (Vec::new(), IngestStats { bytes: 1024, ..Default::default() });
+        let empty = (
+            Vec::new(),
+            IngestStats {
+                bytes: 1024,
+                ..Default::default()
+            },
+        );
         save(&dir, &rel, &spec, context, &empty).unwrap();
         let restored = load(&dir, &rel, &spec, context).unwrap().unwrap();
         assert!(restored.0.is_empty());
@@ -358,7 +395,9 @@ mod tests {
             |r| r.parts[0].name.push_str("-other"),
             |r| r.parts[0].url.push_str("-other"),
             |r| r.parts[0].size += 1,
-            |r| { r.parts.pop(); },
+            |r| {
+                r.parts.pop();
+            },
             |r| r.parts.reverse(),
         ];
         for change in changed_releases {
@@ -372,8 +411,16 @@ mod tests {
         }
         for changed in [
             DayContext::new(f64::from_bits(spec.t_start.to_bits() + 1), 300.0, 3600.0),
-            DayContext::new(spec.t_start, f64::from_bits(300.0_f64.to_bits() + 1), 3600.0),
-            DayContext::new(spec.t_start, 300.0, f64::from_bits(3600.0_f64.to_bits() + 1)),
+            DayContext::new(
+                spec.t_start,
+                f64::from_bits(300.0_f64.to_bits() + 1),
+                3600.0,
+            ),
+            DayContext::new(
+                spec.t_start,
+                300.0,
+                f64::from_bits(3600.0_f64.to_bits() + 1),
+            ),
         ] {
             assert!(load(&dir, &rel, &spec, changed).unwrap().is_none());
         }
@@ -410,9 +457,15 @@ mod tests {
                 identity.version = 0;
             }
             let mut encoder = GzEncoder::new(File::create(&path).unwrap(), Compression::fast());
-            serde_json::to_writer(&mut encoder, &CheckpointRef {
-                identity: &identity, aircraft: &part.0, stats: &part.1,
-            }).unwrap();
+            serde_json::to_writer(
+                &mut encoder,
+                &CheckpointRef {
+                    identity: &identity,
+                    aircraft: &part.0,
+                    stats: &part.1,
+                },
+            )
+            .unwrap();
             encoder.finish().unwrap();
             assert!(load(&dir, &rel, &spec, context).unwrap().is_none());
         }
