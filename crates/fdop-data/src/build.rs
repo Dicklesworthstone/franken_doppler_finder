@@ -35,6 +35,36 @@ struct MPoint {
     feed_bit: u8,
 }
 
+/// Keep the preferred duplicate's position and motion, but retain a complete observed
+/// altitude pair if it agrees on that exact position and the shared altitude. Never
+/// construct a geom-baro offset from two reports with no agreeing height in common.
+fn recover_duplicate_altitude(preferred: &mut MPoint, donor: &MPoint) {
+    let p = &mut preferred.p;
+    let d = &donor.p;
+    if p.lat != d.lat
+        || p.lon != d.lon
+        || d.flags & pt_flags::STALE != 0
+        || !d.alt_geom_msl.is_finite()
+        || !d.alt_baro_m.is_finite()
+    {
+        return;
+    }
+    let recovered = if !p.alt_geom_msl.is_finite() && p.alt_baro_m == d.alt_baro_m {
+        p.alt_geom_msl = d.alt_geom_msl;
+        true
+    } else if !p.alt_baro_m.is_finite() && p.alt_geom_msl == d.alt_geom_msl {
+        p.alt_baro_m = d.alt_baro_m;
+        true
+    } else {
+        false
+    };
+    if recovered {
+        // Position-source flags still describe the preferred report. The leg source
+        // records the feed whose altitude evidence contributed to the correction.
+        preferred.feed_bit |= donor.feed_bit;
+    }
+}
+
 fn feed_of(label: &str) -> Feed {
     Feed::from_label(label).unwrap_or(Feed::Prod)
 }
@@ -390,14 +420,16 @@ fn build_store_inner(
                     if last.p.t != q.p.t {
                         duplicate_times.insert(last.p.t.to_bits(), q.p.t);
                     }
-                    let keep_leg = last.p.new_leg;
+                    let previous = *last;
                     *last = q;
-                    last.p.new_leg |= keep_leg;
+                    last.p.new_leg |= previous.p.new_leg;
+                    recover_duplicate_altitude(last, &previous);
                 } else {
                     if q.p.t != last.p.t {
                         duplicate_times.insert(q.p.t.to_bits(), last.p.t);
                     }
                     last.p.new_leg |= q.p.new_leg;
+                    recover_duplicate_altitude(last, &q);
                 }
                 continue;
             }
@@ -1349,6 +1381,118 @@ mod tests {
         assert_eq!(bb.points[0].alt_src, alt_src::BARO_CORRECTED);
         assert!((bb.points[0].alt_m - (2000.0 * 0.3048 + off) as f32).abs() < 0.05);
         assert_eq!(store.meta.stats["baro_raw"], 0);
+    }
+
+    fn duplicate_altitude_parts(
+        dt: f64,
+        missing_geom: bool,
+    ) -> Vec<(Vec<RawAircraft>, IngestStats)> {
+        let mut rows: Vec<_> = (0..4)
+            .map(|i| {
+                let mut row = seam_row(i as f64 * 10.0, 0.02 + i as f64 * 0.01);
+                row[10] = serde_json::Value::Null;
+                row
+            })
+            .collect();
+        if !missing_geom {
+            rows[1][3] = serde_json::Value::Null;
+            rows[1][10] = serde_json::json!(5000);
+        }
+        let mut donor = seam_row(10.0 + dt, 0.03);
+        donor[4] = serde_json::json!(90);
+        donor[5] = serde_json::json!(270);
+        donor[9] = serde_json::json!("mlat");
+        donor[10] = serde_json::json!(5000);
+        donor[11] = serde_json::json!(500);
+        vec![
+            seam_part(T0, T0, "prod", &rows),
+            seam_part(T0, T0, "mlat", &[donor]),
+        ]
+    }
+
+    #[test]
+    fn duplicate_altitudes_recover_a_coherent_leg_without_replacing_positions() {
+        for missing_geom in [true, false] {
+            for dt in [-0.02, 0.0, 0.02] {
+                for reverse in [false, true] {
+                    let mut parts = duplicate_altitude_parts(dt, missing_geom);
+                    let preferred = parts[0].0[0].points.clone();
+                    if reverse {
+                        parts.reverse();
+                    }
+                    let store = build_store(parts, &seam_spec(T0), vec![]);
+                    assert_eq!(store.legs.len(), 1);
+                    let leg = &store.legs[0];
+                    assert_eq!(leg.points.len(), preferred.len());
+                    for (i, (point, original)) in leg.points.iter().zip(&preferred).enumerate() {
+                        assert_eq!(point.t, original.t);
+                        assert_eq!((point.lat, point.lon), (original.lat, original.lon));
+                        assert_eq!(point.gs_mps, original.gs_mps);
+                        assert_eq!(point.track_deg, original.track_deg);
+                        assert_eq!(point.vrate_mps, original.vrate_mps);
+                        assert_eq!(point.flags, original.flags);
+                        assert_eq!(point.alt_m, (5000.0 * fdop_types::FT_TO_M) as f32);
+                        assert_eq!(
+                            point.alt_src,
+                            if i == 1 {
+                                alt_src::GEOM
+                            } else {
+                                alt_src::BARO_CORRECTED
+                            }
+                        );
+                    }
+                    assert_eq!(leg.source, "prod+mlat");
+                    assert_eq!(store.meta.stats["dedup_dropped"], 1);
+                    assert_eq!(store.meta.stats["alt_geom"], 1);
+                    assert_eq!(store.meta.stats["baro_corrected"], 3);
+                    assert_eq!(store.meta.stats["baro_raw"], 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_altitude_recovery_requires_an_agreeing_complete_observation() {
+        for missing_geom in [true, false] {
+            for rejection in ["latitude", "longitude", "altitude", "no_geom", "no_baro", "stale"] {
+                let mut parts = duplicate_altitude_parts(0.02, missing_geom);
+                let reference = build_store(vec![parts[0].clone()], &seam_spec(T0), vec![]);
+                let donor = &mut parts[1].0[0].points[0];
+                match rejection {
+                    "latitude" => donor.lat += 1e-9,
+                    "longitude" => donor.lon += 1e-9,
+                    "altitude" if missing_geom => donor.alt_baro_m += 1.0,
+                    "altitude" => donor.alt_geom_msl += 1.0,
+                    "no_geom" => donor.alt_geom_msl = f32::NAN,
+                    "no_baro" => donor.alt_baro_m = f32::NAN,
+                    "stale" => donor.flags |= pt_flags::STALE,
+                    _ => unreachable!(),
+                }
+                let store = build_store(parts, &seam_spec(T0), vec![]);
+                assert_eq!(store.legs.len(), 1, "{rejection}");
+                assert_eq!(store.legs[0].source, "prod", "{rejection}");
+                assert_eq!(store.legs[0].points, reference.legs[0].points, "{rejection}");
+            }
+        }
+        // Reports outside the duplicate interval remain separate observations;
+        // they may supply the normal leg offset but cannot donate a GNSS sample.
+        let store = build_store(duplicate_altitude_parts(0.06, true), &seam_spec(T0), vec![]);
+        assert_eq!(store.n_points(), 5);
+        assert_eq!(store.meta.stats["dedup_dropped"], 0);
+        assert_eq!(store.legs[0].points[1].t, T0 + 10.0);
+        assert_eq!(store.legs[0].points[1].alt_src, alt_src::BARO_CORRECTED);
+        assert_eq!(store.legs[0].points[2].t, T0 + 10.06);
+        assert_eq!(store.legs[0].points[2].alt_src, alt_src::GEOM);
+    }
+
+    #[test]
+    fn complete_preferred_altitudes_keep_their_existing_values_and_provenance() {
+        let mut parts = duplicate_altitude_parts(0.02, true);
+        parts[0].0[0].points[1].alt_geom_msl = (4500.0 * fdop_types::FT_TO_M) as f32;
+        let reference = build_store(vec![parts[0].clone()], &seam_spec(T0), vec![]);
+        let store = build_store(parts, &seam_spec(T0), vec![]);
+        assert_eq!(store.legs[0].source, "prod");
+        assert_eq!(store.legs[0].points, reference.legs[0].points);
     }
 
     #[test]

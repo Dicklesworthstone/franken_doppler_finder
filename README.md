@@ -929,6 +929,14 @@ leg-boundary provenance. A later online `locate` or `fetch` can reuse a complete
 when another feed failed, including an MLAT feed whose main feed failed. The archive stream
 is opened only when no usable checkpoint exists.
 
+When building a day from raw reports, duplicate reconciliation keeps the preferred report's
+time, position, motion and position-source flags. A lower-priority duplicate can supply a missing
+GNSS or barometric altitude only when its exact coordinates and one shared altitude agree,
+and it carries a complete, nonstale altitude pair. This retains observed altitude offsets for
+the existing leg and regional barometric corrections, with the contributing feed recorded in
+leg provenance. The rule applies to fresh ingestion and raw-checkpoint reconstruction; an
+existing processed day store must be rebuilt to recover evidence discarded by older ingestion.
+
 Reuse requires the exact release metadata and ordered assets, spatial/time filter, geoid
 reference, unknown/jet policy and midnight-context version. All raw floats and boundary
 times are stored as integer bit patterns, preserving missing-altitude NaNs and exact

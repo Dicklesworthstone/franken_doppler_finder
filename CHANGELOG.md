@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve agreeing altitude evidence from duplicate ADS-B reports
+
+- Keep the preferred duplicate's time, coordinates, motion and position-source flags,
+  while recovering its missing GNSS or barometric altitude from a lower-priority
+  duplicate with an observed complete altitude pair.
+- Require exact coordinates, equality of the shared altitude and a nonstale donor.
+  Conflicting positions or heights, incomplete pairs and out-of-window reports cannot
+  donate altitude. A complete preferred pair remains unchanged.
+- Retain the contributing feed in leg provenance so the existing whole-leg and
+  regional barometric corrections can use the recovered observed offset. This
+  applies during fresh ingestion or rebuilding from raw checkpoints; existing
+  processed stores retain their previously ingested data.
+- Add regressions covering both missing-altitude directions, duplicate ordering,
+  feed ordering, rejection cases, provenance and preservation of preferred motion.
+  Validation: source review and patch whitespace checks completed locally before
+  the execution host failed. The authored Rust regressions and remaining native
+  checks are unverified; no real-recording accuracy improvement is claimed.
+
 ### Recover Doppler predictions when Newton stalls on a turning flight
 
 - Keep converged emission-time solves unchanged. If clamped Newton exhausts its
