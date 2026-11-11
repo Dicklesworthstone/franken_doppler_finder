@@ -61,6 +61,16 @@ impl DayContext {
         }
     }
 
+    /// Exact private checkpoint identity; day-store metadata keeps its existing format.
+    pub(crate) fn cache_identity(&self) -> [u64; 4] {
+        [
+            u64::from(self.version),
+            self.day_start.to_bits(),
+            self.join_gap_s.to_bits(),
+            self.archive_pad_s.to_bits(),
+        ]
+    }
+
     pub fn from_stats(stats: &serde_json::Value) -> Option<Self> {
         let context: Self = serde_json::from_value(stats.get("midnight_context")?.clone()).ok()?;
         (context.version == 1
@@ -123,17 +133,25 @@ impl DayContext {
 
 /// One retained position. Altitudes are kept separately so the store builder can reconcile
 /// geometric and barometric heights.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RawPoint {
+    #[serde(with = "crate::raw_cache::f64_bits")]
     pub t: f64,
+    #[serde(with = "crate::raw_cache::f64_bits")]
     pub lat: f64,
+    #[serde(with = "crate::raw_cache::f64_bits")]
     pub lon: f64,
     /// GNSS height converted to MSL (m), NaN if absent.
+    #[serde(with = "crate::raw_cache::f32_bits")]
     pub alt_geom_msl: f32,
     /// Barometric pressure altitude (m), NaN if absent.
+    #[serde(with = "crate::raw_cache::f32_bits")]
     pub alt_baro_m: f32,
+    #[serde(with = "crate::raw_cache::f32_bits")]
     pub gs_mps: f32,
+    #[serde(with = "crate::raw_cache::f32_bits")]
     pub track_deg: f32,
+    #[serde(with = "crate::raw_cache::f32_bits")]
     pub vrate_mps: f32,
     /// `fdop_types::store::pt_flags` bits.
     pub flags: u8,
@@ -147,7 +165,7 @@ pub struct RawPoint {
 }
 
 /// One aircraft's retained points from one feed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawAircraft {
     /// Lower-case hex address (non-ICAO addresses keep readsb's `~` prefix).
     pub icao: String,
@@ -160,6 +178,7 @@ pub struct RawAircraft {
     pub points: Vec<RawPoint>,
     /// Observed leg boundaries, compacted without changing any split-eligible
     /// gap. Kept separately so source interleaving cannot move an event.
+    #[serde(with = "crate::raw_cache::boundary_bits")]
     pub leg_boundaries: crate::build::BoundaryEvents,
 }
 

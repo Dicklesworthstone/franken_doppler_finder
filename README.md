@@ -889,6 +889,7 @@ Cache layout:
 ~/.cache/fdop/
 ├── adsb/<YYYY-MM-DD>/<feeds>_<S>_<W>_<N>_<E>.fdtrk   regional track store per UTC day (gzip, magic FDOPTRK1)
 ├── adsb/<YYYY-MM-DD>/releases.json                   archive release metadata
+├── adsb/<YYYY-MM-DD>/raw/*.fdopraw.gz                completed filtered raw feeds for retry
 ├── weather/                                          Open-Meteo and radiosonde responses
 ├── geoid/<lat>_<lon>.txt                             NGS geoid height at a region's centre
 ├── terrarium/<z>/<x>/<y>.png                         elevation tiles
@@ -902,6 +903,27 @@ Expanded jet-inclusive stores append `+jets` to the feedset, for example
 `stats.include_jets: true` before an expanded request can reuse them. Renaming an old
 store cannot restore jets discarded during its ingestion. This coverage requirement
 also applies to offline legacy caches and to partial-feed fallback.
+
+Completed raw feed checkpoints live under `adsb/<YYYY-MM-DD>/raw/` as
+`<feed[+jets]>_<S>_<W>_<N>_<E>.fdopraw.gz`. They retain the filtered reports before
+cross-feed reconciliation, including both altitude measurements, duplicate reports and
+leg-boundary provenance. A later online `locate` or `fetch` can reuse a completed feed
+when another feed failed, including an MLAT feed whose main feed failed. The archive stream
+is opened only when no usable checkpoint exists.
+
+Reuse requires the exact release metadata and ordered assets, spatial/time filter, geoid
+reference, unknown/jet policy and midnight-context version. All raw floats and boundary
+times are stored as integer bit patterns, preserving missing-altitude NaNs and exact
+timing. A complete empty feed is reusable; a truncated ingest is never published. This
+private cache is written atomically and checked through the gzip footer when loaded.
+A missing, incompatible or damaged checkpoint causes a fresh download of that feed.
+A checkpoint-write failure warns and keeps the current successful ingest; it does not
+change final day-store publication errors.
+
+These checkpoints add disk usage for the filtered raw reports. They do not save entire
+multi-gigabyte archives, resume an unfinished feed across process restarts, or recover
+raw information from older processed-only caches. No extra flag is required, and ordinary
+completed-day cache hits still take precedence.
 
 Cached day stores are tried from the smallest covering box to the largest. A store is reused only when it
 can be read and its stored box and time interval cover the requested slice of that UTC day. Loading also
@@ -959,9 +981,10 @@ requested feeds finish, while the remaining days continue downloading. Completed
 a bounded queue instead of accumulating until the last download. If MLAT fails, a completed prod or
 staging feed is still cached under its actual partial feedset; an MLAT-only remainder is never published
 as a main catalogue. The online request still reports the feed failure. Offline runs can reuse the
-surviving main feed with an explicit missing-MLAT warning. An online retry rebuilds the requested feeds
-together so their raw altitude and aircraft-type information can be reconciled correctly.
-Cache-write failures remain errors, after other days receive their save attempts. After publication,
+surviving main feed with an explicit missing-MLAT warning. An online retry loads matching completed raw
+feeds and downloads the missing ones, then rebuilds them together so their raw altitude and aircraft-type
+information can be reconciled correctly. Final day-store cache-write failures remain errors, after other
+days receive their save attempts. After publication,
 a completed day keeps its actual open cache
 file, original metadata and aircraft bounds; its point arrays are released while other downloads run.
 Fresh bounds come directly from the built reports, and selected fresh files are decoded once when all
@@ -1651,12 +1674,34 @@ the three-flight search recovers the synthetic observer within 0.56 m and its cl
 with core all-targets clippy. Native runs use the pinned nightly's Cranelift backend; full
 workspace checks, release selftest and real-recording replays have not completed.
 
+### Resume incomplete archive days from completed raw feeds
+
+Six new regressions cover the raw checkpoint format and its use by the archive worker.
+The retry test uses real synthetic tar ingestion, the shared cache-aware worker path,
+the existing day collector, atomic day publication and the normal offline fetch entry point.
+Across prod/staging, either failed feed and both jet policies, it requires the completed feed
+to be opened once and the failed feed twice. Rebuilt flight data and statistics must equal
+a fresh joint ingest exactly, including type resolution and barometric altitude corrections
+supplied by the other feed. Truncating an archive must leave no checkpoint for that feed.
+
+The module tests cover exact point/boundary float bits, empty successful feeds, every
+release/filter/context identity field, renamed jet-policy files, old versions, CRC damage,
+truncation, trailing garbage and replacement while an earlier reader remains open.
+A worker regression covers corrupt-cache refetch and repair, then a raw-checkpoint write
+failure that still permits the successful feed to become a readable day store.
+
+**Native validation is pending.** Source review and GitHub checkpoint verification completed.
+The execution host became unavailable before data-crate Clippy or tests could start. Earlier
+core compilation attempts were killed in dependencies, including `wide` with Cranelift;
+those attempts do not establish a result for these data tests. No live-download timing,
+full-workspace pass, selftest or field-accuracy improvement is claimed.
+
 ### Completed main feeds survive a failed MLAT download
 
 The archive regressions now cover both prod and staging, either completion order, actual atomic
 cache publication, offline reuse with a warning, rejection of MLAT-only remnants, and partial
 caches failing full-feedset lookups. They retain the bounded-channel publication handshake and
-verify that strict feed failures and all cache-write failures remain errors. The new and updated
+verify that strict feed failures and finalized-day cache-write failures remain errors. The new and updated
 tests are authored but unrun because the execution host is unavailable; source review is not
 native validation.
 
@@ -3075,7 +3120,7 @@ audio or video recorded somewhere sensitive:
 | Warning `the audio has little energy below 100 Hz (45-95 Hz is N dB below 150-600 Hz)` | A high-pass filter does this, removing the fundamentals of slower propellers and weakening those near the cut. Speech-heavy audio can also read low | Use the unfiltered recording if you have one. Otherwise expect fewer usable flyovers, and do not read a failed search as evidence about the place |
 | Warning `the answer lies in CT, outside the searched state NY` (or `appears to lie in`, when the state is a gazetteer estimate) | A state search covers the state's bounding box, which takes in parts of its neighbours | If you know the recording was made in the searched state, distrust the answer whatever its grade, unless its radius reaches back across the border. A narrower `--near`, such as a county, takes in less of the neighbours |
 | `needs network or a cached file: Census gazetteer ...` | No usable cached table: it is absent, unreadable, malformed or empty | Run once without `--offline` to fetch and validate a replacement, or use a state, point or box region |
-| `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days and completed main feeds are cached when their writes succeed. A saved partial main feed can be reused offline with a missing-feed warning. A day without any main-feed data cannot be searched |
+| `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days and completed raw feeds are cached when their writes succeed. Online retries reuse matching raw feeds and download missing ones. A saved partial main day can be reused offline with a missing-feed warning. A day without any main-feed data cannot be searched |
 | A download pauses for a minute, then carries on | The server stopped sending with the connection still open. After 60 s with no data, `fdop` reconnects and resumes with an HTTP `Range` request | Nothing. Resumed `206` responses are checked for their byte offset, range boundary and total length before new bytes are accepted. Capped ranges continue until the full object is proved complete; a range's body length is never treated as the archive length. After repeated failures with no new bytes it stops |
 | Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears some hours after it ends | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |
 | Answer graded **low** | One or more gates failed | Read the gates in `report.html`. A margin marked `provisional, comparison truncated` failed because a comparison was cut: an unchecked rival could still win, so the answer is unconfirmed, not refuted. Otherwise, a small margin means other flights explain the curves almost as well, possibly at nearly the same place: `margin.next_distinct_km` in `result.json` says how far away |

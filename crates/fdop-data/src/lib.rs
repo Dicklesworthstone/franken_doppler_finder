@@ -13,6 +13,7 @@ pub mod build;
 pub mod fetch;
 pub mod geoid;
 pub mod ingest;
+mod raw_cache;
 pub mod stream;
 pub mod terrain;
 pub mod weather;

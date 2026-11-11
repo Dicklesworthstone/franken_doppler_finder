@@ -19,6 +19,32 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Resume incomplete ADS-B days from completed raw feeds
+
+- Save completely ingested, filtered raw feeds before joint day building. On a later
+  online retry, reuse matching completed feeds and open archive streams only for misses.
+  Either the main or MLAT feed can survive the other failing; prod, staging and explicit
+  jet catalogues use the same path.
+- Always rebuild cached and new raw parts together through the existing altitude/type,
+  duplicate and leg-boundary reconciliation. Never merge independently finalized feeds
+  to emulate that operation. Existing complete day-cache and offline selection remain.
+- Match the complete declared release/assets, filter/geoid float bits, policy flags and
+  midnight-context identity. Preserve every raw float and boundary timestamp by its bits,
+  including missing-altitude NaNs. Stream borrowed raw data to an exclusive temporary
+  gzip file, finish/flush/sync it, then atomically publish the checkpoint.
+- Refetch missing, mismatched or corrupt checkpoints. A raw-checkpoint write failure
+  warns and retains the successfully ingested feed; final day-store publication errors
+  keep their existing behavior. The cache adds filtered-report disk usage and does not
+  resume an unfinished feed across process restarts or reconstruct older processed data.
+- Add four codec/identity/publication regressions and two worker/retry regressions.
+  Synthetic tar retries cover prod/staging, either failed feed and both jet policies,
+  requiring exact fresh-build equality, correct cross-feed altitude/type correction,
+  only the failed feed reopened, no truncated checkpoint and normal offline reuse.
+- Validation: bounded independent source review and GitHub content verification completed.
+  The host disconnected before data-crate Clippy or tests could start. Earlier core
+  attempts were killed in dependencies, including Cranelift's build of `wide`; no native
+  data-test, full-workspace, selftest, live-transfer timing or field-accuracy pass is claimed.
+
 ### Recover brief fast flyovers inside a recording
 
 - After true-edge and refused-seed recovery, scan complete ten-second halves for fast

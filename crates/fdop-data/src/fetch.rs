@@ -7,6 +7,8 @@
 //! kept; `keep_unknown = false` is applied after cross-day metadata reconciliation.
 //! Explicit jet catalogues append `+jets` to the feedset and certify `include_jets` in
 //! their metadata. Ordinary stores cannot satisfy an expanded catalogue request.
+//! Completed raw feeds are checkpointed under each day's raw/ directory before cross-feed
+//! reconciliation, so retries download only missing releases for an identical ingest policy.
 
 use crate::DataError;
 use crate::adsblol::{DayRelease, Feed, find_day_releases_cached};
@@ -516,6 +518,42 @@ struct Job {
 type Part = (Vec<RawAircraft>, IngestStats);
 type JobResult = (usize, String, Result<Part, DataError>);
 
+/// Reuse only a complete raw ingest, before the day builder reconciles feeds. Opening
+/// the archive belongs inside the callback so a cache hit does no archive I/O.
+fn ingest_cached_release(
+    dir: &Path,
+    release: &DayRelease,
+    spec: &IngestSpec,
+    context: DayContext,
+    opts: &FetchOptions,
+    ingest: impl FnOnce() -> Result<Part, DataError>,
+) -> Result<Part, DataError> {
+    match crate::raw_cache::load(dir, release, spec, context) {
+        Ok(Some(part)) => {
+            opts.say(&format!(
+                "[adsb] {}: reused completed raw feed ({} aircraft, {} points)",
+                release.tag, part.0.len(), part.1.points_kept
+            ));
+            return Ok(part);
+        }
+        Ok(None) => {}
+        Err(e) => opts.say(&format!(
+            "[adsb] WARNING {}: raw checkpoint unreadable ({e}); fetching the feed again",
+            release.tag
+        )),
+    }
+    let part = ingest()?;
+    if let Err(e) = crate::raw_cache::save(dir, release, spec, context, &part) {
+        // Checkpointing saves work on a retry; it must not discard a successfully
+        // ingested feed. Final day-store publication retains its existing policy.
+        opts.say(&format!(
+            "[adsb] WARNING {}: could not checkpoint raw feed ({e}); using the completed ingest",
+            release.tag
+        ));
+    }
+    Ok(part)
+}
+
 #[derive(Debug, Default)]
 struct StreamedDayFailures {
     feeds: Vec<(usize, String)>,
@@ -713,7 +751,7 @@ pub fn fetch_window(
     if !jobs.is_empty() {
         let total: u64 = jobs.iter().map(|j| j.rel.total_bytes()).sum();
         opts.say(&format!(
-            "[adsb] streaming {} release(s), {:.0} MiB, {} at a time",
+            "[adsb] preparing {} release(s), up to {:.0} MiB uncached, {} at a time",
             jobs.len(),
             mib(total),
             opts.parallel.max(1)
@@ -741,7 +779,6 @@ pub fn fetch_window(
                         let Some(job) = job else { break };
                         let label = format!("{:04}-{:02}-{:02} {}", job.day.0, job.day.1, job.day.2, job.rel.feed.tag_word());
                         let size = job.rel.total_bytes();
-                        let reader = crate::stream::BigStreamReader::open(job.rel.urls());
                         let sp = day_spec(job.day);
                         let cb = |p: &IngestProgress| {
                             let rate = if p.elapsed_s > 0.0 { mib(p.bytes) / p.elapsed_s } else { 0.0 };
@@ -756,8 +793,13 @@ pub fn fetch_window(
                                 p.elapsed_s
                             ));
                         };
-                        let res = ingest_day_reader(reader, job.rel.feed.label(), &sp, &cb, day_context(job.day))
-                            .map_err(|e| DataError(format!("{label} ({}): {e}", job.rel.tag)));
+                        let context = day_context(job.day);
+                        let res = ingest_cached_release(
+                            &day_dir(cache_dir, job.day), &job.rel, &sp, context, opts, || {
+                                let reader = crate::stream::BigStreamReader::open(job.rel.urls());
+                                ingest_day_reader(reader, job.rel.feed.label(), &sp, &cb, context)
+                            },
+                        ).map_err(|e| DataError(format!("{label} ({}): {e}", job.rel.tag)));
                         if tx.send((job.day_idx, job.rel.tag.clone(), res)).is_err() {
                             break;
                         }
@@ -769,8 +811,8 @@ pub fn fetch_window(
                 let day = days[di];
                 // Only completely ingested feeds reach this cache. Its actual feedset
                 // lets offline runs use a surviving main feed with the existing warning;
-                // an online retry rebuilds the requested feeds together for altitude/type
-                // reconciliation instead of merging independently built day stores.
+                // an online retry reuses completed raw feeds and rebuilds them together
+                // with new ingests for the same altitude/type reconciliation.
                 if opts.include_mlat && !fs.contains("mlatonly") {
                     let label = format!("{:04}-{:02}-{:02}", day.0, day.1, day.2);
                     let note = format!("{label}: {NO_MLATONLY}");
@@ -1398,6 +1440,205 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn checkpoint_release(feed: Feed, archive: &[u8]) -> DayRelease {
+        let tag = synthetic_tag(feed);
+        DayRelease {
+            feed,
+            repo: crate::adsblol::repo_for_year(2026),
+            parts: vec![crate::adsblol::AssetPart {
+                name: format!("{tag}.tar"),
+                url: format!("https://example.invalid/{tag}.tar"),
+                size: archive.len() as u64,
+            }],
+            tag,
+        }
+    }
+
+    #[test]
+    fn retry_ingests_only_the_missing_feed_and_preserves_joint_reconciliation() {
+        use crate::ingest::tests::{T0, gz, pc12_json, spec, tar_of};
+        use std::cell::Cell;
+
+        let day = (2026, 9, 8);
+        let context = day_context(day);
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                for main_failed in [false, true] {
+                    let want = IngestSpec { include_jets, ..spec() };
+                    let (bbox, key) = bbox_key(&want.bbox);
+                    let sp = IngestSpec {
+                        bbox,
+                        t_start: T0 - DAY_CACHE_PAD_S,
+                        t_end: T0 + 86_400.0 + DAY_CACHE_PAD_S,
+                        ..want
+                    };
+                    let nonce = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                    let cache = std::env::temp_dir().join(format!(
+                        "fdop-feed-retry-{}-{nonce}-{}-{include_jets}-{main_failed}",
+                        std::process::id(), main.tag_word()
+                    ));
+                    let dir = day_dir(&cache, day);
+                    // The main feed has no type or GNSS altitude. MLAT supplies both,
+                    // at different instants, so merging finalized feeds would lose
+                    // cross-feed corrections on the main feed's barometric reports.
+                    let mut main_json: serde_json::Value =
+                        serde_json::from_str(&pc12_json()).unwrap();
+                    main_json["t"] = serde_json::json!("");
+                    for row in main_json["trace"].as_array_mut().unwrap() {
+                        row[10] = serde_json::Value::Null;
+                    }
+                    let mut mlat_json: serde_json::Value =
+                        serde_json::from_str(&pc12_json()).unwrap();
+                    let typ = if include_jets { "B738" } else { "PC12" };
+                    mlat_json["t"] = serde_json::json!(typ);
+                    for row in mlat_json["trace"].as_array_mut().unwrap() {
+                        row[0] = serde_json::json!(row[0].as_f64().unwrap() + 5.0);
+                    }
+                    let archives = [main_json, mlat_json].map(|json| {
+                        tar_of(&[("trace_full_a1b2c3.json", gz(&json.to_string()))])
+                    });
+                    let releases = [
+                        checkpoint_release(main, &archives[0]),
+                        checkpoint_release(Feed::Mlatonly, &archives[1]),
+                    ];
+                    let calls = [Cell::new(0usize), Cell::new(0usize)];
+                    let opts = FetchOptions::default();
+                    let get = |i: usize, truncated: bool| {
+                        ingest_cached_release(&dir, &releases[i], &sp, context, &opts, || {
+                            calls[i].set(calls[i].get() + 1);
+                            let bytes = &archives[i];
+                            let end = if truncated { bytes.len() - 512 } else { bytes.len() };
+                            ingest_day_reader(
+                                &bytes[..end], releases[i].feed.label(), &sp, &|_| {}, context
+                            )
+                        })
+                    };
+                    let failed = if main_failed { 0 } else { 1 };
+                    let mut partial = None;
+                    let first = (0..2).map(|i| (
+                        0, releases[i].tag.clone(), get(i, i == failed)
+                    )).collect::<Vec<_>>();
+                    let failures = collect_streamed_days(first, vec![2], |_, parts, tags, fs| {
+                        let store = build_day_store(parts, &sp, tags, context);
+                        partial = Some(CachedDay::publish(
+                            store,
+                            &dir.join(format!("{}_{key}.fdtrk", cache_feedset(&fs, include_jets))),
+                        )?);
+                        Ok(())
+                    });
+                    assert_eq!(failures.feeds.len(), 1);
+                    assert!(failures.caches.is_empty());
+                    assert!(failures.report(&opts, &mut Vec::new()).is_err());
+                    assert_eq!(partial.is_none(), main_failed);
+                    if let Some(published) = &partial {
+                        let store = TrackStore::load(&published.path).unwrap();
+                        assert!(store.legs.iter().flat_map(|l| &l.points)
+                            .any(|p| p.alt_src == alt_src::BARO_RAW));
+                    }
+                    for (i, release) in releases.iter().enumerate() {
+                        assert_eq!(
+                            crate::raw_cache::load(&dir, release, &sp, context).unwrap().is_some(),
+                            i != failed,
+                            "an incomplete archive must not become a checkpoint"
+                        );
+                    }
+
+                    let fresh = releases.iter().zip(&archives).map(|(release, bytes)| {
+                        ingest_day_reader(
+                            bytes.as_slice(), release.feed.label(), &sp, &|_| {}, context
+                        ).unwrap()
+                    }).collect();
+                    let mut tags: Vec<_> = releases.iter().map(|r| r.tag.clone()).collect();
+                    tags.sort();
+                    let expected = build_day_store(fresh, &sp, tags.clone(), context);
+                    let mut complete = None;
+                    let retried = (0..2).map(|i| (
+                        0, releases[i].tag.clone(), get(i, false)
+                    )).collect::<Vec<_>>();
+                    let failures = collect_streamed_days(retried, vec![2], |_, parts, tags, fs| {
+                        assert_eq!(fs, feedset_name(main, true));
+                        complete = Some(CachedDay::publish(
+                            build_day_store(parts, &sp, tags, context),
+                            &dir.join(format!("{}_{key}.fdtrk", cache_feedset(&fs, include_jets))),
+                        )?);
+                        Ok(())
+                    });
+                    assert!(failures.feeds.is_empty() && failures.caches.is_empty());
+                    assert_eq!(calls[failed].get(), 2);
+                    assert_eq!(calls[1 - failed].get(), 1, "the completed feed was reopened");
+                    let published = TrackStore::load(&complete.unwrap().path).unwrap();
+                    assert_eq!(published.meta.sources, tags);
+                    assert_eq!(published.meta.stats, expected.meta.stats);
+                    assert_eq!(
+                        serde_json::to_value(&published.legs).unwrap(),
+                        serde_json::to_value(&expected.legs).unwrap(),
+                        "cached and fresh raw feeds must build identical reconciled flights"
+                    );
+                    assert!(published.legs.iter().all(|l| l.typ == typ));
+                    assert!(published.legs.iter().flat_map(|l| &l.points)
+                        .any(|p| p.alt_src == alt_src::BARO_CORRECTED));
+                    // The normal offline entry point can now use the completed day.
+                    let offline = fetch_window(&want, &cache, &FetchOptions {
+                        offline: true, ..opts
+                    }).unwrap();
+                    assert_eq!(offline.meta.stats["cache_hits"], 1);
+                    assert_eq!(offline.meta.sources, tags);
+                    assert!(!offline.legs.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_failures_refetch_without_discarding_a_completed_ingest() {
+        use crate::ingest::tests::{gz, pc12_json, spec, tar_of};
+        use std::cell::Cell;
+        let sp = spec();
+        let context = day_context((2026, 9, 8));
+        let archive = tar_of(&[("trace_full_a1b2c3.json", gz(&pc12_json()))]);
+        let release = checkpoint_release(Feed::Prod, &archive);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-feed-checkpoint-failure-{}-{nonce}", std::process::id()
+        ));
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let log = messages.clone();
+        let opts = FetchOptions {
+            progress: Some(Arc::new(move |line| log.lock().unwrap().push(line.to_owned()))),
+            ..Default::default()
+        };
+        let calls = Cell::new(0);
+        let get = |cache: &Path| ingest_cached_release(
+            cache, &release, &sp, context, &opts, || {
+                calls.set(calls.get() + 1);
+                ingest_day_reader(archive.as_slice(), "prod", &sp, &|_| {}, context)
+            }
+        );
+        let first = get(&dir).unwrap();
+        let path = crate::raw_cache::path(&dir, &release, &sp);
+        std::fs::write(&path, b"damaged checkpoint").unwrap();
+        let recovered = get(&dir).unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(recovered.1, first.1);
+        assert!(crate::raw_cache::load(&dir, &release, &sp, context).unwrap().is_some());
+        assert!(messages.lock().unwrap().iter().any(|s| s.contains("raw checkpoint unreadable")));
+        get(&dir).unwrap();
+        assert_eq!(calls.get(), 2, "a repaired checkpoint must avoid opening the archive");
+
+        // A raw-cache write failure must not turn successful ingest into a failed feed.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("raw"), b"not a directory").unwrap();
+        let usable = get(&blocked).unwrap();
+        assert_eq!(usable.1, first.1);
+        assert!(messages.lock().unwrap().iter().any(|s| s.contains("could not checkpoint raw feed")));
+        let store = build_day_store(vec![usable], &sp, vec![release.tag], context);
+        let saved = CachedDay::publish(store, &blocked.join("completed.fdtrk")).unwrap();
+        assert!(!TrackStore::load(&saved.path).unwrap().legs.is_empty());
     }
 
     #[test]

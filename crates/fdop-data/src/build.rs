@@ -203,8 +203,8 @@ fn retained_coverage(group: &[RawAircraft]) -> Vec<RetainedRun> {
 /// their first/last event without changing whether any checked gap contains one.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct BoundaryEvents {
-    ground: Vec<(f64, f64)>,
-    new_leg: Vec<f64>,
+    pub(crate) ground: Vec<(f64, f64)>,
+    pub(crate) new_leg: Vec<f64>,
 }
 
 impl BoundaryEvents {
