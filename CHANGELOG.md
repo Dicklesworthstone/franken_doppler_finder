@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover Doppler predictions when Newton stalls on a turning flight
+
+- Keep converged emission-time solves unchanged. If clamped Newton exhausts its
+  iterations or stalls without a valid solution, retry with a bounded signed bracket
+  over the same track. Both the still-air and moving-medium APIs use the fallback.
+- Preserve strict track-end exclusion, positive reception derivatives and the existing
+  reception-time residual. The fallback updates the sweep's interpolation hint at
+  its returned solution and changes no detection, measurement or confidence threshold.
+- Add synthetic turning-track regressions with known emission times and independent
+  reception/Doppler oracles, including bad warm starts, cold starts, Unix epochs and wind.
+- Validation: source review and an independent JavaScript numerical reproduction
+  completed (32 warm-start cases: original Newton failed 8, fallback failed none).
+  This is not native Rust execution. The authored Rust regressions and remaining
+  native checks are unverified after the execution host failed. No real-recording
+  replay or accuracy-improvement claim is made.
+
 ### Match wind-shifted fitted tones in source-frequency units
 
 - Convert a still-air fit's tone interval into physical source-frequency units at each

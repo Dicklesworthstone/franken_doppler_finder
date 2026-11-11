@@ -678,7 +678,21 @@ impl TrackModel {
         let r = norm(rv);
         let vr = dot(rv, v) / r;
         let g = te + r / c - t_r;
-        (g.abs() < 1e-3 && te > t0 && te < t1).then_some((te, r, vr))
+        if g.abs() < 1e-3 && te > t0 && te < t1 {
+            return Some((te, r, vr));
+        }
+        if !c.is_finite() || c <= 0.0 {
+            return None;
+        }
+        bracketed_emission(t0, t1, 1e-7, |t| {
+            let (p, v) = self.pv(t);
+            let rv = sub(p, x);
+            let r = norm(rv);
+            let vr = dot(rv, v) / r;
+            let rate = 1.0 + vr / c;
+            (rate.is_finite() && rate > 0.0).then_some((t + r / c - t_r, (r, vr)))
+        })
+        .map(|(t, (r, vr))| (t, r, vr))
     }
 
     /// Emission time for reception at `t_r` through medium `m`: (t_e, range, f/f0 ratio).
@@ -741,8 +755,21 @@ impl TrackModel {
         let (travel, rate) = m.travel_and_rate(rv, r, v);
         let g = te + travel - t_r;
         let ratio = 1.0 / (1.0 + rate);
-        (g.abs() < 1e-3 && te > t0 && te < t1 && ratio.is_finite() && ratio > 0.0)
-            .then_some((te, r, ratio))
+        if g.abs() < 1e-3 && te > t0 && te < t1 && ratio.is_finite() && ratio > 0.0 {
+            return Some((te, r, ratio));
+        }
+        bracketed_emission(t0, t1, tol, |t| {
+            *hint = self.seg_near(t, *hint);
+            let (p, v) = self.pv_in(*hint, t);
+            let rv = sub(p, x);
+            let r = norm(rv);
+            let (travel, rate) = m.travel_and_rate(rv, r, v);
+            let received_rate = 1.0 + rate;
+            let ratio = 1.0 / received_rate;
+            (received_rate.is_finite() && received_rate > 0.0 && ratio.is_finite())
+                .then_some((t + travel - t_r, (r, ratio)))
+        })
+        .map(|(t, (r, ratio))| (t, r, ratio))
     }
 
     /// Smallest range to `x` near `t_guess` (emission time). A returning aircraft can have
@@ -980,6 +1007,42 @@ impl TrackModel {
             vel: v,
         }
     }
+}
+
+/// Newton can alternate between distant turns even when reception time increases everywhere.
+/// Preserve its converged answers; only a failed solve pays for this bounded signed bracket.
+/// Callers reject invalid propagation or nonpositive reception derivatives at every probe.
+/// Strict endpoint signs retain the rule that emission outside or at a track end is unavailable.
+fn bracketed_emission<T>(
+    mut lo: f64,
+    mut hi: f64,
+    tol: f64,
+    mut residual: impl FnMut(f64) -> Option<(f64, T)>,
+) -> Option<(f64, T)> {
+    let (start, end) = (lo, hi);
+    let (left, _) = residual(lo)?;
+    let (right, _) = residual(hi)?;
+    if !left.is_finite() || !right.is_finite() || left >= 0.0 || right <= 0.0 {
+        return None;
+    }
+    for _ in 0..64 {
+        let t = lo + 0.5 * (hi - lo);
+        let (g, value) = residual(t)?;
+        if !g.is_finite() {
+            return None;
+        }
+        // At UNIX-epoch magnitudes the representable time spacing can exceed `tol`.
+        // A stalled bracket still has to meet the same reception residual as Newton.
+        if g.abs() < 1e-3 && (hi - lo <= tol || t == lo || t == hi || g == 0.0) {
+            return (t > start && t < end).then_some((t, value));
+        }
+        if g > 0.0 {
+            hi = t;
+        } else {
+            lo = t;
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1324,6 +1387,171 @@ mod tests {
                     assert!((solved - te).abs() < 1e-7, "{solved} vs {te}, wind={w:?}");
                     assert!((r - norm(rv)).abs() < 1e-5);
                     assert!((ratio - expected_ratio).abs() < 1e-8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn turning_emission_recovers_a_newton_two_cycle() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let x = enu.to_ecef([6000.0, 0.0, 0.0]);
+        for base in [0.0, 1_788_895_000.0] {
+            for direction in [-1.0, 1.0] {
+                let state = |t: f64| {
+                    let angle = direction * 0.06 * t;
+                    (
+                        [3000.0 * angle.cos(), 3000.0 * angle.sin(), 900.0],
+                        [
+                            -direction * 180.0 * angle.sin(),
+                            direction * 180.0 * angle.cos(),
+                            0.0,
+                        ],
+                    )
+                };
+                let mut tr = straight_track(
+                    &enu,
+                    [0.0; 3],
+                    [180.0, 0.0, 0.0],
+                    base,
+                    base - 120.0,
+                    base + 120.0,
+                    1.0,
+                );
+                for (i, &time) in tr.t.iter().enumerate() {
+                    let (p, v) = state(time - base);
+                    tr.pos[i] = enu.to_ecef(p);
+                    tr.vel[i] = enu.vec_to_ecef(v);
+                }
+                let emitted = base - 20.0;
+                let (p, v) = state(-20.0);
+                let rv = sub(p, [6000.0, 0.0, 0.0]);
+                for w in [[0.0; 3], [20.0, -15.0 * direction, 0.0]] {
+                    let prop = Prop {
+                        c: 343.0,
+                        w: enu.vec_to_ecef(w),
+                    };
+                    let received = emitted + wavefront_travel(rv, w, prop.c);
+                    // Pin the defect without copying the old solver: these two Newton steps
+                    // repeat forever, despite strictly subsonic 180 m/s motion everywhere.
+                    if w == [0.0; 3] {
+                        let step = |t| {
+                            let (p, v) = tr.pv(t);
+                            let rv = sub(p, x);
+                            let (travel, rate) = prop.travel_and_rate(rv, norm(rv), v);
+                            (t - (t + travel - received) / (1.0 + rate))
+                                .clamp(tr.t0(), tr.t1())
+                        };
+                        let jump = step(tr.t0());
+                        assert!(jump > base + 80.0);
+                        assert_eq!(step(jump), tr.t0());
+                    }
+                    let dt = 1e-3;
+                    let expected_ratio = 1.0
+                        / (1.0
+                            + (wavefront_travel(add(rv, scale(v, dt)), w, prop.c)
+                                - wavefront_travel(sub(rv, scale(v, dt)), w, prop.c))
+                                / (2.0 * dt));
+                    for warm in [None, Some(tr.t0()), Some(tr.t1()), Some(emitted)] {
+                        let mut hint = tr.t.len() - 2;
+                        let (solved, range, ratio) = tr
+                            .solve_emission_sweep(received, x, &prop, warm, &mut hint, 1e-7)
+                            .expect("a unique physical reception must survive a Newton cycle");
+                        assert!((solved - emitted).abs() < 1e-6);
+                        assert!((range - norm(rv)).abs() < 1e-3);
+                        assert!((ratio - expected_ratio).abs() < 1e-7);
+                        assert_eq!(hint, tr.seg(solved));
+                        assert_eq!(
+                            tr.solve_emission_p(received, x, &prop, warm),
+                            Some((solved, range, ratio))
+                        );
+                        if w == [0.0; 3] {
+                            let (still_t, still_r, radial) =
+                                tr.solve_emission(received, x, prop.c, warm).unwrap();
+                            assert!((still_t - emitted).abs() < 1e-6);
+                            assert!((still_r - norm(rv)).abs() < 1e-3);
+                            assert!((radial - dot(rv, v) / norm(rv)).abs() < 1e-3);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn turning_emission_recovers_without_a_warm_start() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let x = enu.to_ecef([40_000.0, 0.0, 0.0]);
+        // A wider, slower turn needs no bad warm hint to lose Newton convergence. The
+        // source stays subsonic at 270 m/s, turning 1.55 degrees/s on a 10 km radius.
+        for base in [0.0, 1_788_895_000.0] {
+            let state = |t: f64| {
+                let angle = 0.027 * t;
+                (
+                    [10_000.0 * angle.cos(), 10_000.0 * angle.sin(), 900.0],
+                    [-270.0 * angle.sin(), 270.0 * angle.cos(), 0.0],
+                )
+            };
+            let mut tr = straight_track(
+                &enu,
+                [0.0; 3],
+                [270.0, 0.0, 0.0],
+                base,
+                base - 120.0,
+                base + 120.0,
+                1.0,
+            );
+            for (i, &time) in tr.t.iter().enumerate() {
+                let (p, v) = state(time - base);
+                tr.pos[i] = enu.to_ecef(p);
+                tr.vel[i] = enu.vec_to_ecef(v);
+            }
+            let emitted = base + 20.0;
+            let (p, v) = state(20.0);
+            let rv = sub(p, [40_000.0, 0.0, 0.0]);
+            let received = emitted + wavefront_travel(rv, [0.0; 3], 343.0);
+            let expected_radial = dot(rv, v) / norm(rv);
+            let (solved, range, ratio) = tr
+                .solve_emission_p(received, x, &Prop::still(343.0), None)
+                .expect("cold emission solve must retain the physical curved pass");
+            assert!((solved - emitted).abs() < 1e-6);
+            assert!((range - norm(rv)).abs() < 1e-3);
+            assert!((ratio - 1.0 / (1.0 + expected_radial / 343.0)).abs() < 1e-7);
+            let (still_t, still_r, radial) = tr.solve_emission(received, x, 343.0, None).unwrap();
+            assert!((still_t - emitted).abs() < 1e-6);
+            assert!((still_r - norm(rv)).abs() < 1e-3);
+            assert!((radial - expected_radial).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn emission_recovery_keeps_track_coverage_boundaries() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let x = enu.to_ecef([0.0; 3]);
+        let tr = straight_track(
+            &enu,
+            [0.0, 2000.0, 1200.0],
+            [180.0, 0.0, 0.0],
+            1000.0,
+            800.0,
+            1200.0,
+            20.0,
+        );
+        for prop in [
+            Prop::still(343.0),
+            Prop {
+                c: 343.0,
+                w: enu.vec_to_ecef([20.0, -15.0, 0.0]),
+            },
+        ] {
+            for emitted in [tr.t0() - 1.0, tr.t0(), tr.t1(), tr.t1() + 1.0] {
+                let rv = sub(tr.pos_at(emitted), x);
+                let received = emitted + prop.travel(rv, norm(rv));
+                for warm in [None, Some(tr.t0()), Some(tr.t1())] {
+                    assert!(tr.solve_emission_p(received, x, &prop, warm).is_none());
+                    if prop.w == [0.0; 3] {
+                        assert!(tr.solve_emission(received, x, prop.c, warm).is_none());
+                    }
                 }
             }
         }

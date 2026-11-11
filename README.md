@@ -205,6 +205,13 @@ source ground velocity `v_s` and acoustic travel time `T`, its predictions satis
 including crosswind displacement. This approximation does not trace refracted rays through atmospheric
 layers. Coarse gates retain the existing first-order wind rescaling of the fitted `v` and `d`.
 
+For recorded flight tracks, an emission-time solve that fails to converge with Newton's method
+retries inside a signed time bracket. A turning aircraft can otherwise make Newton alternate
+between distant parts of its path even when the sound has one valid emission time. The retry
+uses the same trajectory, atmosphere and Doppler derivative, requires an interior solution and
+the existing reception-time residual, and rejects invalid propagation. Successful Newton solves
+retain their original results.
+
 ### The pipeline
 
 ```text
