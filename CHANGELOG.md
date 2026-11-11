@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain usable weather across uneven hourly coverage
+
+- Select each weather cell's own UTC rows bracketing the recording. Missing leading or
+  trailing hours in one cell no longer discard the other complete pressure-level or
+  surface-weather columns.
+- Align equal selected timestamps even when downloaded axes start or end differently.
+  Preserve complete cells with different hourly phases through the existing scattered
+  atmosphere's per-cell temporal interpolation, rather than letting one cell choose
+  which other cells survive. Regular grids retain their original interpolation.
+- Report missing cells and mixed time axes explicitly. Fully covered mixed-axis responses
+  remain complete for cache reuse; partial responses retain the existing repair policy.
+- Add regressions for both weather formats, missing temporal brackets, shifted axes,
+  single-instant windows, original row/value alignment and cell-order independence.
+- Validation: source and integration review completed through GitHub. The execution host
+  became unavailable during the native build attempt, before the new tests could run.
+  Workspace checks and real-recording replays remain unverified.
+
 ### Retain coherent fast tracks when groundspeed reports are missing
 
 - Keep the established track cleaner first. If it produces no usable model and every

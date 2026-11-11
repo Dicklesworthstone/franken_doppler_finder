@@ -1077,11 +1077,14 @@ and warns when it does. Going offline therefore preserves the altitude reference
 
 Weather profiles retain the original hourly rows that bracket the requested time window. Missing
 temperature, pressure or winds in unrelated hours no longer discard usable weather for a short recording.
-Every retained grid cell must have all required interpolation endpoints. If some cells are unusable,
-complete cells remain available through the existing inverse-distance-squared spatial interpolation
-and harmonic averaging of sound speed; complete grids keep their original interpolation. The source
-description and report warnings identify partial coverage. A wrong location count, mismatched intact
-hourly axes, or no complete cell still invokes the existing fallback sources and warnings.
+Every retained grid cell must have all required interpolation endpoints. A cell whose hourly
+coverage misses the requested window is omitted with a warning while complete cells remain usable.
+Different leading or trailing rows are aligned by their selected UTC timestamps. Cells with matching
+selected timestamps keep regular-grid interpolation. When usable cells have different hourly phases,
+each retains its own temporal brackets and the existing inverse-distance-squared spatial interpolation
+and harmonic averaging of sound speed combine them. The report identifies that interpolation choice
+separately from missing cells; a fully covered grid remains complete for cache reuse. A wrong location
+count or no complete cell still invokes the existing fallback sources and warnings.
 
 Partial cached grids remain usable offline and still trigger an online repair attempt. A failed or
 unusable refresh preserves the cached partial response, as does another partial response with no more

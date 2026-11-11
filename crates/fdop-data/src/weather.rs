@@ -438,7 +438,6 @@ fn parse_om_grid(
             lats.len() * lons.len()
         )));
     }
-    let mut times: Option<Vec<f64>> = None;
     let mut per_loc = Vec::with_capacity(locs.len());
     let mut missing = Vec::new();
     for (index, l) in locs.iter().enumerate() {
@@ -449,13 +448,19 @@ fn parse_om_grid(
                 continue;
             }
         };
-        if times.as_ref().is_some_and(|t0| *t0 != t) {
-            return Err(DataError::new("open-meteo: mismatched time axes"));
-        }
-        let hours = hours_for_window(&t, t_start, t_end)?;
-        times.get_or_insert(t);
+        let hours = match hours_for_window(&t, t_start, t_end) {
+            Ok(hours) => hours,
+            Err(e) => {
+                missing.push(format!("cell {}: {e}", index + 1));
+                continue;
+            }
+        };
+        // Each cell may have different leading/trailing hours or a different
+        // hourly phase. Retain its actual UTC brackets alongside its profiles;
+        // neither its row indices nor its time axis can stand in for another cell.
+        let selected = t[hours.clone()].to_vec();
         match parse_location(l, levels, hours) {
-            Ok(p) => per_loc.push((index, p)),
+            Ok(p) => per_loc.push((index, selected, p)),
             Err(e) => missing.push(format!("cell {}: {e}", index + 1)),
         }
     }
@@ -465,48 +470,61 @@ fn parse_om_grid(
             missing.join("; ")
         )));
     }
-    let times = times.expect("a usable profile has a validated time axis");
-    let hours = hours_for_window(&times, t_start, t_end)?;
     let src = if levels {
         "Open-Meteo historical forecast (pressure levels)"
     } else {
         "Open-Meteo ERA5 archive (surface + standard lapse)"
     };
-    if !missing.is_empty() {
+    let partial = !missing.is_empty();
+    let aligned = per_loc.windows(2).all(|p| p[0].1 == p[1].1);
+    if partial || !aligned {
         let usable = per_loc.len();
         let stations = per_loc
             .into_iter()
-            .map(|(index, profiles)| {
+            .map(|(index, times, profiles)| {
                 (
                     lats[index / lons.len()],
                     lons[index % lons.len()],
-                    times[hours.clone()].iter().copied().zip(profiles).collect(),
+                    times.into_iter().zip(profiles).collect(),
                 )
             })
             .collect();
-        let source = format!("{src}, partial grid: {usable} of {} cells", locs.len());
+        let (source, warning) = if partial {
+            (
+                format!("{src}, partial grid: {usable} of {} cells", locs.len()),
+                format!(
+                    "{src}: only {usable} of {} grid cells cover the requested window; using complete cells with inverse-distance interpolation and each cell's UTC timestamps ({})",
+                    locs.len(),
+                    missing.join("; ")
+                ),
+            )
+        } else {
+            (
+                format!("{src}, independently timed grid"),
+                format!(
+                    "{src}: hourly timestamps differ between cells; using all {usable} complete grid cells with inverse-distance interpolation and each cell's UTC timestamps"
+                ),
+            )
+        };
         let atmo = ScatteredAtmosphere::new(stations, source).map_err(DataError)?;
         return Ok(WeatherSource {
             atmo: Arc::new(atmo),
-            warnings: vec![format!(
-                "{src}: only {usable} of {} grid cells cover the requested window; using complete cells with inverse-distance interpolation ({})",
-                locs.len(),
-                missing.join("; ")
-            )],
-            partial_cells: Some(usable),
+            warnings: vec![warning],
+            partial_cells: partial.then_some(usable),
         });
     }
-    let mut profiles = Vec::with_capacity(hours.len() * locs.len());
-    for it in 0..hours.len() {
-        for (_, p) in &per_loc {
+    let times = &per_loc[0].1;
+    let mut profiles = Vec::with_capacity(times.len() * locs.len());
+    for it in 0..times.len() {
+        for (_, _, p) in &per_loc {
             profiles.push(p[it].clone());
         }
     }
     GriddedAtmosphere::new(
         lats.to_vec(),
         lons.to_vec(),
-        times[hours.start],
-        times[1] - times[0],
+        times[0],
+        3600.0,
         &profiles,
         src.to_string(),
     )
@@ -1385,6 +1403,45 @@ mod tests {
             assert!(recovered.warnings[0].contains("2 of 3 grid cells"));
             assert!(recovered.warnings[0].contains("cell 2"));
             assert!(recovered.describe().contains("partial grid: 2 of 3 cells"));
+            // A valid hourly axis can still lack either requested interpolation
+            // endpoint. It must drop only that cell, just like a missing profile.
+            for rows in [0..6, 5..24, 12..24] {
+                let mut cropped = complete.clone();
+                for values in cropped[1]["hourly"].as_object_mut().unwrap().values_mut() {
+                    *values = serde_json::json!(&values.as_array().unwrap()[rows.clone()]);
+                }
+                let usable = parse(cropped).unwrap();
+                assert_eq!(usable.partial_cells, Some(2));
+                assert!(usable.warnings[0].contains("cell 2"));
+                assert!(usable.warnings[0].contains("do not cover the requested window"));
+                for lon in [0.0, 0.5, 1.0, 2.0] {
+                    for t in [t0, day + 5.0 * 3600.0, t1] {
+                        assert_eq!(
+                            usable.medium(0.0, lon, t, 30.0, 5000.0),
+                            recovered.medium(0.0, lon, t, 30.0, 5000.0)
+                        );
+                    }
+                }
+            }
+            // An unusable first column cannot set a foreign phase that then
+            // rejects all later columns with valid UTC-hour profiles.
+            let mut bad_first = complete.clone();
+            bad_first[0]["hourly"]["temperature_2m"] = serde_json::json!(vec![None::<f64>; 24]);
+            let expected = parse(bad_first.clone()).unwrap();
+            for t in bad_first[0]["hourly"]["time"].as_array_mut().unwrap() {
+                *t = serde_json::json!(t.as_i64().unwrap() + 1800);
+            }
+            let usable = parse(bad_first).unwrap();
+            assert_eq!(usable.partial_cells, Some(2));
+            assert!(usable.warnings[0].contains("cell 1"));
+            for lon in [0.0, 0.5, 1.0, 2.0] {
+                for t in [t0, day + 5.0 * 3600.0, t1] {
+                    assert_eq!(
+                        usable.medium(0.0, lon, t, 30.0, 5000.0),
+                        expected.medium(0.0, lon, t, 30.0, 5000.0)
+                    );
+                }
+            }
             let cell = |index| {
                 GriddedAtmosphere::new(
                     vec![0.0],
@@ -1448,12 +1505,92 @@ mod tests {
     }
 
     #[test]
+    fn model_grid_retains_independent_hourly_phases_without_order_bias() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (t0, t1) = (day + 4.25 * 3600.0, day + 5.75 * 3600.0);
+        for levels in [false, true] {
+            let cells = vec![
+                open_meteo_fixture(day as i64 + 1800, 24),
+                open_meteo_fixture(day as i64, 24),
+                open_meteo_fixture(day as i64, 24),
+            ];
+            let got = parse_om_grid(
+                serde_json::json!(cells),
+                &[0.0],
+                &[0.0, 1.0, 2.0],
+                t0,
+                t1,
+                levels,
+            )
+            .unwrap();
+            assert!(got.partial_cells.is_none());
+            assert_eq!(got.warnings.len(), 1);
+            assert!(got.warnings[0].contains("all 3 complete grid cells"));
+            let expected = ScatteredAtmosphere::new(
+                cells
+                    .iter()
+                    .enumerate()
+                    .map(|(index, cell)| {
+                        let (rows, phase) = if index == 0 {
+                            (3..7, 0.5)
+                        } else {
+                            (4..7, 0.0)
+                        };
+                        let profiles = parse_location(cell, levels, rows.clone()).unwrap();
+                        (
+                            0.0,
+                            index as f64,
+                            rows.zip(profiles)
+                                .map(|(hour, profile)| {
+                                    (day + (hour as f64 + phase) * 3600.0, profile)
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+                "independent UTC columns".into(),
+            )
+            .unwrap();
+            let mut reversed = cells.clone();
+            reversed.reverse();
+            let reordered = parse_om_grid(
+                serde_json::json!(reversed),
+                &[0.0],
+                &[2.0, 1.0, 0.0],
+                t0,
+                t1,
+                levels,
+            )
+            .unwrap();
+            assert!(reordered.partial_cells.is_none());
+            assert!(reordered.warnings[0].contains("all 3 complete grid cells"));
+            for lon in [0.0, 0.5, 1.0, 2.0] {
+                for t in [t0, day + 5.5 * 3600.0, t1] {
+                    let a = got.medium(0.0, lon, t, 30.0, 5000.0);
+                    let b = reordered.medium(0.0, lon, t, 30.0, 5000.0);
+                    assert_eq!(a, expected.medium(0.0, lon, t, 30.0, 5000.0));
+                    // Reversing an inverse-distance sum can change its rounding,
+                    // but must not choose a different subset of the complete cells.
+                    assert!((a.c - b.c).abs() < 1e-10);
+                    assert!((a.wind_e - b.wind_e).abs() < 1e-10);
+                    assert!((a.wind_n - b.wind_n).abs() < 1e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn partial_model_cache_repairs_online_and_survives_unusable_refreshes() {
         let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
         let first = open_meteo_fixture(day as i64, 24);
         let complete = serde_json::json!([first, first]);
         let mut partial = complete.clone();
         partial[1]["hourly"]["temperature_2m"][5] = serde_json::Value::Null;
+        // The second cell also lacks its final required timestamp. Its valid
+        // shorter axis must not make the usable cached first cell disappear.
+        for values in partial[1]["hourly"].as_object_mut().unwrap().values_mut() {
+            values.as_array_mut().unwrap().truncate(6);
+        }
         let mut none = partial.clone();
         none[0]["hourly"]["temperature_2m"][5] = serde_json::Value::Null;
         for replacement in [complete.clone(), none] {
@@ -1819,7 +1956,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_weather_rejects_shifted_location_time_axes() {
+    fn cached_weather_aligns_each_location_by_its_required_utc_hours() {
         let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
         let (lat, lon) = (40.876466, -73.524951);
         let bbox = BBox::new(lat, lon, lat, lon + 0.01);
@@ -1837,24 +1974,55 @@ mod tests {
         );
         let path = dir.join("weather").join(format!("{:016x}.json", fnv(&url)));
         let first = open_meteo_fixture(day as i64, 24);
-        let second = open_meteo_fixture(day as i64 + 3600, 24);
+        let second = open_meteo_fixture(day as i64 + 3600, 12);
         std::fs::write(
             &path,
             serde_json::to_vec(&serde_json::json!([first, second])).unwrap(),
         )
         .unwrap();
-        let err = om_grid(
-            OM_ARCHIVE,
-            &bbox,
-            day + 4.25 * 3600.0,
-            day + 5.75 * 3600.0,
-            &dir,
-            true,
-            false,
-        )
-        .err()
-        .unwrap();
-        assert!(err.0.contains("mismatched time axes"), "{err}");
+        for (start, end, left, right) in [(4.25, 5.75, 4..7, 3..6), (6.0, 6.0, 6..7, 5..6)] {
+            let got = om_grid(
+                OM_ARCHIVE,
+                &bbox,
+                day + start * 3600.0,
+                day + end * 3600.0,
+                &dir,
+                true,
+                false,
+            )
+            .unwrap();
+            assert!(got.warnings.is_empty());
+            assert!(got.partial_cells.is_none());
+            // Their hour-4 rows have different temperatures and winds: using the
+            // first cell's row index for the second gives the wrong atmosphere.
+            let left_profiles = parse_location(&first, false, left.clone()).unwrap();
+            let right_profiles = parse_location(&second, false, right).unwrap();
+            let profiles: Vec<_> = left_profiles
+                .iter()
+                .zip(&right_profiles)
+                .flat_map(|(a, b)| [a.clone(), b.clone()])
+                .collect();
+            let expected = GriddedAtmosphere::new(
+                vec![lat],
+                vec![lon, lon + 0.01],
+                day + left.start as f64 * 3600.0,
+                3600.0,
+                &profiles,
+                "independently aligned columns".into(),
+            )
+            .unwrap();
+            for x in [lon, lon + 0.0037, lon + 0.01] {
+                for hour in [start, 0.5 * (start + end), end] {
+                    let t = day + hour * 3600.0;
+                    for height in [1000.0, 5000.0] {
+                        assert_eq!(
+                            got.medium(lat, x, t, 30.0, height),
+                            expected.medium(lat, x, t, 30.0, height)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
