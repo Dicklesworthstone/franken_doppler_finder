@@ -19,6 +19,30 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Honor profiled flyover-time uncertainty during confirmation
+
+- Extend both confirmation's catalogue query and its local closest-approach scan to
+  include the event's permitted CPA-time uncertainty. The exact scorer already allows
+  that uncertainty; fixed preliminary windows must not discard the flight first.
+  Keep the original intervals and sampling phase where they already contain the
+  permitted interval and the local scanner's boundary support.
+- Retain the physical distance/speed gates, recorded trace and clock scoring, coverage
+  requirement and exclusion of already assigned passes. Confidence lines and search
+  budgets are unchanged; this does not remove the existing wind-delay approximation.
+- Add direct search-input regressions for early/late estimates at zero and Unix epochs,
+  a third aircraft that can only confirm, and a long physical trace whose two observed
+  sides survive while the old local CPA window misses its true pass. A close-range
+  boundary case checks scan support without widening the exact timing gate. These fixtures
+  establish the search contract, not recovery from a real recording or an actual fit.
+- Native validation: all three new regressions pass; the first two fail against the old
+  confirmation windows and the boundary case fails without the extra scan support.
+  The three-flight test recovers the synthetic observer within
+  0.56 m and the clock within 0.005 s. Five neighboring narrow-window, wind and repeated-
+  pass controls pass, as does `cargo clippy -p fdop-core --all-targets --locked -- -D warnings`.
+  These runs use the pinned nightly with its Cranelift backend after two LLVM builds
+  were killed in numerical dependencies. Full workspace checks, release selftest and
+  real-recording replays have not completed; no field-accuracy improvement is claimed.
+
 ### Retain jets in explicitly expanded ADS-B catalogues
 
 - Add `IngestSpec.include_jets` for callers that need known jet tracks. Apply the

@@ -2098,17 +2098,24 @@ fn best_confirmer(
     let t_heard = t_start + ev.t_rec;
     // A still-air fitted distance is not a physical radius in a moving or varying medium.
     // Keep that shortcut only when its scale is exactly one; otherwise the existing exact
-    // CPA gates below decide the range. The established emission-time window stays intact.
+    // CPA gates below decide the range.
     let reach = if matching_still_air(ev, p, atmo) {
         1.15 * ev.d_gate[1]
     } else {
         f64::INFINITY
     };
+    // Fitting can leave a wide CPA-time profile even when its best curve passed measurement.
+    // The exact timing gate permits that interval, so neither preliminary time query may
+    // discard it. Union with the established propagation windows to preserve their sampling
+    // phase wherever they already contain that interval. This retains the existing wind-delay
+    // approximation.
+    let earliest = t_heard - 1.2 * ev.d_gate[1] / c - ev.t_tol - 3.0;
+    let latest = t_heard + ev.t_tol + 3.0;
     let mut best: Option<(f64, EventMatch, u32)> = None;
     let mut scratch = TraceScratch::default();
     for ti in tix.overlapping_near(
-        t_heard - 1.2 * ev.d_gate[1] / c - 120.0,
-        t_heard + 30.0,
+        (t_heard - 1.2 * ev.d_gate[1] / c - 120.0).min(earliest),
+        (t_heard + 30.0).max(latest),
         o.x,
         reach,
     ) {
@@ -2116,10 +2123,15 @@ fn best_confirmer(
         if p.tonal_only && !tr.engine.tonal() {
             continue;
         }
-        // Keep the existing propagation window, but test every visit inside it: its closest
-        // pass may be at the wrong recording time while a farther return explains this event.
+        // Test every visit inside the permitted window: the closest pass may be at the wrong
+        // recording time while a farther return explains this event. Keep one second of scan
+        // support outside the new bounds because local_cpas rejects boundary minima (0.5 s).
         let guess = t_heard - 1.1 * ev.d_gate[1].min(12_000.0) / c * 0.5;
-        for cpa in tr.local_cpas(o.x, guess - 200.0, guess + 200.0) {
+        for cpa in tr.local_cpas(
+            o.x,
+            (guess - 200.0).min(earliest - 1.0),
+            (guess + 200.0).max(latest + 1.0),
+        ) {
             if cpa.d > reach {
                 continue;
             }
@@ -6787,6 +6799,226 @@ mod tests {
             assert!(explain(&wrong_clock, &atmo, &[]).is_none());
             check_wind_delayed_case(&case, med, run_case(&case, med));
         }
+    }
+
+    #[test]
+    fn uncertain_cpa_times_keep_physical_confirmers() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let dem = FlatElevation(0.0);
+        for start in [0.0, 1_788_895_000.0] {
+            let mut case = wind_delayed_case(med, start);
+            case.p.duration = 1000.0;
+            case.p.max_events = 2;
+            let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let mut third = straight_track(
+                &enu,
+                [0.0, 11_000.0, 1500.0],
+                [110.0, 0.0, 0.0],
+                start + 720.0,
+                start + 640.0,
+                start + 800.0,
+                5.0,
+            );
+            third.key = "uncertain-third".into();
+            let exact = synth_event(
+                "uncertain-third",
+                &third,
+                o.x,
+                start,
+                183.7,
+                343.0,
+                start + 720.0,
+                &Prop::still(343.0),
+            );
+            case.tracks.push(third);
+            let tix = TimeIndex::new(&case.tracks);
+            let explain = |ev: &SearchEvent, exclude: &[(u32, f64)]| {
+                best_confirmer(&o, start, ev, &case.tracks, &tix, &case.p, &atmo, exclude)
+            };
+            let (baseline_chi, baseline, baseline_ti) = explain(&exact, &[]).unwrap();
+            assert_eq!(baseline_ti, 2);
+            assert!(baseline_chi < 1.0);
+            // Exercise the SearchEvent API's uncertainty contract independently of fitting:
+            // the recorded trace and recording clock stay fixed while the coarse CPA
+            // estimate moves. This deliberately broad profile is not a measurement claim.
+            for shift in [-300.0, 300.0] {
+                let mut uncertain = exact.clone();
+                uncertain.t_rec += shift;
+                uncertain.t_tol = shift.abs() + 1.0;
+                let old_lo = start + uncertain.t_rec - 1.2 * uncertain.d_gate[1] / case.p.c - 120.0;
+                let old_hi = start + uncertain.t_rec + 30.0;
+                assert!(
+                    !tix.overlapping(old_lo, old_hi).any(|ti| ti == 2),
+                    "the old catalogue window must discard the true third flight"
+                );
+                let (chi, matched, ti) = explain(&uncertain, &[])
+                    .expect("a permitted CPA uncertainty must not hide the physical trace match");
+                assert_eq!(ti, 2);
+                assert!(chi < 1.0);
+                assert!((matched.t_cpa_heard_utc - baseline.t_cpa_heard_utc).abs() < 0.002);
+                assert!((chi - baseline_chi).abs() < 1e-8);
+                assert!(explain(&uncertain, &[(2, start + 720.0)]).is_none());
+                let mut too_narrow = uncertain.clone();
+                too_narrow.t_tol = 20.0;
+                assert!(explain(&too_narrow, &[]).is_none());
+                let mut wrong_trace = uncertain.clone();
+                wrong_trace.tr_f.fill(183.7);
+                assert!(explain(&wrong_trace, &[]).is_none());
+                let mut wrong_clock = case.p.clone();
+                wrong_clock.start_lo += 120.0;
+                wrong_clock.start_hi += 120.0;
+                assert!(
+                    best_confirmer(
+                        &o,
+                        start + 120.0,
+                        &uncertain,
+                        &case.tracks,
+                        &tix,
+                        &wrong_clock,
+                        &atmo,
+                        &[],
+                    )
+                    .is_none()
+                );
+                case.events.truncate(2);
+                case.events.push(uncertain);
+                let result = check_wind_delayed_case(&case, med, run_case(&case, med));
+                let top = &result.candidates[0];
+                assert!(top.events.iter().any(|m| {
+                    m.flight == "uncertain-third"
+                        && m.event == "uncertain-third"
+                        && m.role == "confirmer"
+                        && m.core
+                        && m.chi < 1.0
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_cpa_window_covers_both_observed_sides() {
+        let start = 1_788_895_000.0;
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let dem = FlatElevation(0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let o = observer(lat, lon, &dem);
+        let track = straight_track(
+            &enu,
+            [0.0, 11_000.0, 1500.0],
+            [90.0, 0.0, 0.0],
+            start + 600.0,
+            start + 200.0,
+            start + 1000.0,
+            5.0,
+        );
+        let prop = Prop::still(343.0);
+        let mut event = synth_event(
+            "wide-profile",
+            &track,
+            o.x,
+            start,
+            149.3,
+            343.0,
+            start + 600.0,
+            &prop,
+        );
+        let true_heard = event.t_rec;
+        event.tr_t = (0..=560)
+            .map(|k| true_heard - 280.0 + f64::from(k))
+            .collect();
+        event.tr_f = event
+            .tr_t
+            .iter()
+            .map(|&t| {
+                149.3
+                    * track
+                        .solve_emission_p(start + t, o.x, &prop, None)
+                        .unwrap()
+                        .2
+            })
+            .collect();
+        (event.q_t, event.q_f) = subsample(&event.tr_t, &event.tr_f, 40);
+        let tracks = [track];
+        let tix = TimeIndex::new(&tracks);
+        let p = SearchParams::new(start, start, 1200.0, BBox::new(lat, lon, lat, lon));
+        for shift in [-240.0, 240.0] {
+            event.t_rec = true_heard + shift;
+            event.t_tol = shift.abs() + 1.0;
+            assert!(event.t_rec - event.tr_t[0] >= 8.0);
+            assert!(event.tr_t.last().unwrap() - event.t_rec >= 8.0);
+            let heard = start + event.t_rec;
+            assert!(
+                tix.overlapping(heard - 1.2 * event.d_gate[1] / p.c - 120.0, heard + 30.0)
+                    .any(|ti| ti == 0),
+                "the long track already reaches the old time index"
+            );
+            let guess = heard - 1.1 * event.d_gate[1].min(12_000.0) / p.c * 0.5;
+            assert!(
+                tracks[0]
+                    .local_cpas(o.x, guess - 200.0, guess + 200.0)
+                    .all(|cpa| !cpa.interior),
+                "the old local window, not catalogue filtering, loses this pass"
+            );
+            let (chi, matched, ti) =
+                best_confirmer(&o, start, &event, &tracks, &tix, &p, &atmo, &[])
+                    .expect("both observed sides and their allowed CPA must remain searchable");
+            assert_eq!(ti, 0);
+            assert!(chi < 1e-6, "physical trace chi={chi}");
+            assert!((matched.t_cpa_heard_utc - start - true_heard).abs() < 0.002);
+        }
+    }
+
+    #[test]
+    fn uncertain_cpa_time_boundary_keeps_close_pass_interior() {
+        let start = 1_788_895_000.0;
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let o = observer(lat, lon, &FlatElevation(0.0));
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let tracks = [straight_track(
+            &enu,
+            [0.0, 400.0, 300.0],
+            [90.0, 0.0, 0.0],
+            start + 500.0,
+            start + 100.0,
+            start + 900.0,
+            5.0,
+        )];
+        let mut event = synth_event(
+            "close-time-boundary",
+            &tracks[0],
+            o.x,
+            start,
+            149.3,
+            343.0,
+            start + 500.0,
+            &Prop::still(343.0),
+        );
+        let true_heard = event.t_rec;
+        event.d_gate = [490.0, 510.0];
+        let tix = TimeIndex::new(&tracks);
+        let p = SearchParams::new(start, start, 1200.0, BBox::new(lat, lon, lat, lon));
+        let (baseline_chi, _, _) =
+            best_confirmer(&o, start, &event, &tracks, &tix, &p, &atmo, &[]).unwrap();
+        assert!(baseline_chi < 1.0);
+        event.t_tol = 301.0;
+        // Place the true received CPA just inside the exact timing gate's early edge.
+        // At close range, the propagation allowance provides less than the local CPA
+        // scanner's half-second interior margin; it needs explicit scan support.
+        event.t_rec += event.t_tol + 3.0 - 0.01;
+        let (chi, matched, ti) = best_confirmer(&o, start, &event, &tracks, &tix, &p, &atmo, &[])
+            .expect("an allowed close pass must not become an artificial scan endpoint");
+        assert_eq!(ti, 0);
+        // synth_event deliberately includes 0.05 Hz noise. The uncertainty change must
+        // preserve its exact physical score, not require a noiseless trace.
+        assert!((chi - baseline_chi).abs() < 1e-10);
+        assert!((matched.t_cpa_heard_utc - start - true_heard).abs() < 0.002);
+        event.t_rec += 0.02;
+        assert!(best_confirmer(&o, start, &event, &tracks, &tix, &p, &atmo, &[]).is_none());
     }
 
     impl Atmosphere for CountedAtmosphere {

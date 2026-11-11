@@ -1350,7 +1350,11 @@ Design notes:
 - **Returning aircraft keep distinct physical passes.** A hypothesis's emission time selects the
   nearest interior local closest approach in time, so a closer return elsewhere in the window does not
   replace its pass during pair scoring, clock checks or refinement. Confirmation considers each local
-  approach inside its existing window and applies the same timing, geometry and trace-fit gates.
+  approach inside its propagation window, extending that window when the event's profiled CPA-time
+  uncertainty reaches farther. Both the catalogue query and the local approach scan retain those
+  times, with enough scan support to distinguish a true approach from an artificial window edge.
+  Existing intervals and sampling stay when they already contain that support. The same timing,
+  geometry and trace-fit gates apply.
   It excludes an already assigned physical pass rather than its entire track, using the pair join's
   existing 30 s emission-CPA separation. Another pass by that aircraft can therefore provide a match.
   An aircraft already heard once is also checked for later, much closer passes with no detection;
@@ -1531,6 +1535,29 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Broad CPA-time profiles remain eligible for confirmation
+
+`uncertain_cpa_times_keep_physical_confirmers` checks the search-event uncertainty contract with
+an unchanged physical trace and recording clock. A third aircraft whose nominal CPA estimate
+is early or late must reach exact scoring, remain a core confirmer after actual search/refinement,
+and retain the existing wrong-trace, wrong-clock and same-pass exclusions. It runs at zero and
+Unix epochs. This is a direct search-input regression, not a claim that measurement produced
+the deliberately displaced estimates.
+
+`uncertain_cpa_window_covers_both_observed_sides` separately uses a 560-second physical trace
+with both displaced estimates inside its observed support. Its stored flight already survives
+the catalogue query; the old local closest-approach window alone excludes the true pass.
+`uncertain_cpa_time_boundary_keeps_close_pass_interior` checks a nearby aircraft just inside
+the exact time gate, where the scan needs a small margin to recognize an interior approach;
+moving it outside the time gate still refuses it. The change retains the existing propagation
+approximation and does not establish completeness for arbitrary wind delays. All three
+regressions pass. The first two fail against the old windows, and the close-range case fails
+without the extra scan support;
+the three-flight search recovers the synthetic observer within 0.56 m and its clock within
+0.005 s. Five neighboring narrow-window, wind and repeated-pass controls also pass, along
+with core all-targets clippy. Native runs use the pinned nightly's Cranelift backend; full
+workspace checks, release selftest and real-recording replays have not completed.
 
 ### Completed main feeds survive a failed MLAT download
 
