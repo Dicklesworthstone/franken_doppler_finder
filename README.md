@@ -1207,6 +1207,15 @@ Design notes:
   Each interval becomes a separate model; interpolation never crosses the hole. The original
   model and existing split keys stay intact; additional models use deterministic `#recoveredN`
   suffixes. Overlapping alternatives and a denser ambiguous winning component remain unresolved.
+- **Missing speed reports do not impose a 200 m/s aircraft limit.** If the established track
+  cleaner finds no usable model and every groundspeed report is missing, three consecutive
+  positions can establish a faster motion scale. Their adjacent horizontal velocity vectors
+  must agree within the existing 25 m/s tolerance and obey the existing gap and vertical-motion
+  limits. The inferred consistency envelope is capped at the nominal sound speed. The same
+  cleaner then retries once, and velocities still come from the retained positions. Already
+  supported tracks and finite speed reports keep their existing treatment; unsupported fast
+  turns and fast tracks hidden by a supported rival remain unresolved. This recovers geometry
+  for both searches without changing engine selection or the confidence gates.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
@@ -1611,6 +1620,24 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Fast tracks with missing groundspeed reports
+
+`missing_speed_reports_do_not_erase_a_supported_fast_flyover` covers 215, 245 and 270 m/s
+position-only tracks sampled every 30, 10 and 45 seconds, respectively, at two headings
+and at zero and Unix epochs. All twelve cases retain their genuine positions, reproduce
+position and velocity within 0.001 m and 0.001 m/s, and match received Doppler within
+0.001 Hz for a 100 Hz tone. Disabling only the new recovery makes the first case produce
+no model. `position_only_fast_recovery_requires_coherent_subsonic_support` covers isolated
+corrupt reports, persistent impossible jumps, inconsistent directions, finite speed
+reports and preservation of an already-supported competing chain.
+
+All 43 active tests in the actual `physics.rs` and `track.rs` modules passed through a
+temporary native runner linked to the real `fdop-types`; one existing timing benchmark
+was ignored. This used the configured nightly and Cranelift with optimization disabled.
+Whole-core builds using LLVM and Cranelift were killed in the `fsci-linalg` dependency
+before project tests. This module validation is not a workspace or release-selftest pass,
+and reference/field recordings have not been replayed for this change.
 
 ### Failed recovery seeds leave shorter physical curves eligible
 

@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain coherent fast tracks when groundspeed reports are missing
+
+- Keep the established track cleaner first. If it produces no usable model and every
+  groundspeed report is nonfinite, infer a bounded speed scale from three positions
+  with agreeing horizontal secants, then retry the same chain selection once.
+  Existing vertical/gap limits apply and the inferred envelope cannot exceed nominal
+  sound speed. Finite reports and already-supported models keep their original behavior.
+- This restores position-only fast aircraft that the old 200 m/s fallback discarded
+  before finite-difference velocities could be constructed. It adds no jet-selection
+  default, acoustic model, confidence threshold or dependency change.
+- Native evidence: 43 actual physics/track module tests passed, one timing benchmark
+  ignored, through a temporary runner using the real fdop-types and configured nightly
+  with Cranelift. New tests cover twelve physical flights plus corruption, impossible
+  motion, finite-speed and supported-rival controls. Disabling only the recovery makes
+  the positive test fail with no model at 215 m/s and 30-second sampling.
+- Changed-range formatting and whitespace checks pass. LLVM and unoptimized Cranelift
+  whole-core builds were killed in fsci-linalg before project tests; full workspace
+  checks, release selftest and real-recording replays remain unverified. The execution
+  host then disconnected; the validated patch was reconstructed and independently
+  reviewed through GitHub before publication.
+
 ### Measure recovery seeds before they can hide shorter flyovers
 
 - Separate true-edge/refused-seed recovery from the final short interior bank in the

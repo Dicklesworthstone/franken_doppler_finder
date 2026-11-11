@@ -121,6 +121,52 @@ fn drop_bracketed_non_gnss(pts: &mut Vec<fdop_types::store::TrackPoint>, max_spa
     });
 }
 
+/// Missing groundspeed is not evidence for the old 200 m/s limit. An otherwise unusable
+/// piece can infer its scale from three positions with agreeing horizontal secants. Use
+/// the reported-speed envelope, but cap this recovery at the nominal sound speed: repeated
+/// position jumps must not infer an arbitrarily large aircraft speed. This is deliberately
+/// limited to locally steady, ground-subsonic motion; unsupported turns stay refused.
+fn position_speed_limit(
+    pts: &[fdop_types::store::TrackPoint],
+    xy: &[[f64; 2]],
+    bp: &BuildParams,
+) -> Option<f64> {
+    let mut speeds = Vec::new();
+    for (p, x) in pts.windows(3).zip(xy.windows(3)) {
+        let dt = [p[1].t - p[0].t, p[2].t - p[1].t];
+        if dt
+            .iter()
+            .any(|&t| !t.is_finite() || t <= 0.0 || t > bp.max_gap_s)
+        {
+            continue;
+        }
+        let velocity = [
+            [(x[1][0] - x[0][0]) / dt[0], (x[1][1] - x[0][1]) / dt[0]],
+            [(x[2][0] - x[1][0]) / dt[1], (x[2][1] - x[1][1]) / dt[1]],
+        ];
+        let speed = velocity.map(|v| v[0].hypot(v[1]));
+        if speed
+            .iter()
+            .any(|&v| !v.is_finite() || v <= 0.0 || v > fdop_types::C_SOUND)
+            || (0..2).any(|k| {
+                (p[k + 1].alt_m - p[k].alt_m).abs() as f64
+                    > bp.max_vz_mps * dt[k] + bp.pos_slack_m.1
+            })
+            || (velocity[1][0] - velocity[0][0]).hypot(velocity[1][1] - velocity[0][1])
+                > bp.vel_consistency_mps
+        {
+            continue;
+        }
+        speeds.push(0.5 * (speed[0] + speed[1]));
+    }
+    if speeds.is_empty() {
+        return None;
+    }
+    let mid = speeds.len() / 2;
+    let (_, median, _) = speeds.select_nth_unstable_by(mid, f64::total_cmp);
+    Some((1.5 * *median + 30.0).min(fdop_types::C_SOUND))
+}
+
 /// Keep the original longest physically consistent chain, then recover well-separated parts
 /// before or after it. Added parts must have at least two points, be more than `max_gap_s` from
 /// every kept part, and be physically reachable from their kept neighbours. An alternative
@@ -135,7 +181,7 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
         .filter(|p| p.gs_mps.is_finite() && p.gs_mps > 0.0)
         .map(|p| p.gs_mps as f64)
         .collect();
-    let v_lim = if gs.is_empty() {
+    let mut v_lim = if gs.is_empty() {
         200.0
     } else {
         gs.sort_by(f64::total_cmp);
@@ -151,32 +197,48 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
             [e[0], e[1]]
         })
         .collect();
-    let ok = |i: usize, j: usize| -> bool {
+    let reachable = |i: usize, j: usize, limit: f64| -> bool {
         let dt = pts[j].t - pts[i].t;
         let dh = ((xy[j][0] - xy[i][0]).powi(2) + (xy[j][1] - xy[i][1]).powi(2)).sqrt();
         let dz = (pts[j].alt_m - pts[i].alt_m).abs() as f64;
-        dh <= v_lim * dt + bp.pos_slack_m.0 && dz <= bp.max_vz_mps * dt + bp.pos_slack_m.1
+        dh <= limit * dt + bp.pos_slack_m.0 && dz <= bp.max_vz_mps * dt + bp.pos_slack_m.1
     };
-    let mut best = vec![1usize; n];
-    let mut prev = vec![usize::MAX; n];
-    let mut prefix_best = vec![1usize; n];
-    for j in 1..n {
-        // A burst of bad reports must not hide an earlier valid predecessor. Bound the
-        // window by elapsed time, not sample count. The prefix maximum is an exact upper
-        // bound on every remaining chain; it makes clean tracks stop after their immediate
-        // predecessor without sacrificing a longer chain across arbitrarily dense junk.
-        for i in (0..j).rev() {
-            if pts[j].t - pts[i].t > bp.max_gap_s || prefix_best[i] < best[j] {
-                break;
+    let select = |limit| {
+        let mut best = vec![1usize; n];
+        let mut prev = vec![usize::MAX; n];
+        let mut prefix_best = vec![1usize; n];
+        for j in 1..n {
+            // A burst of bad reports must not hide an earlier valid predecessor. Bound the
+            // window by elapsed time, not sample count. The prefix maximum is an exact upper
+            // bound on every remaining chain; it makes clean tracks stop after their immediate
+            // predecessor without sacrificing a longer chain across arbitrarily dense junk.
+            for i in (0..j).rev() {
+                if pts[j].t - pts[i].t > bp.max_gap_s || prefix_best[i] < best[j] {
+                    break;
+                }
+                if best[i] + 1 > best[j] && reachable(i, j, limit) {
+                    best[j] = best[i] + 1;
+                    prev[j] = i;
+                }
             }
-            if best[i] + 1 > best[j] && ok(i, j) {
-                best[j] = best[i] + 1;
-                prev[j] = i;
-            }
+            prefix_best[j] = prefix_best[j - 1].max(best[j]);
         }
-        prefix_best[j] = prefix_best[j - 1].max(best[j]);
+        let winner = (0..n).max_by_key(|&k| (best[k], k)).unwrap_or(0);
+        (best, prev, winner)
+    };
+    let (mut best, mut prev, mut winner) = select(v_lim);
+    // Preserve every already-supported path, including ambiguous ones. Retry only an empty
+    // model with literally missing speed reports; a finite zero must not be reinterpreted,
+    // because the later sparse-sample velocity rule can still trust that report.
+    if best[winner] < 2
+        && pts.iter().all(|p| !p.gs_mps.is_finite())
+        && let Some(limit) = position_speed_limit(pts, &xy, bp)
+        && limit > v_lim
+    {
+        v_lim = limit;
+        (best, prev, winner) = select(v_lim);
     }
-    let winner = (0..n).max_by_key(|&k| (best[k], k)).unwrap_or(0);
+    let ok = |i, j| reachable(i, j, v_lim);
     let trace = |mut k: usize| {
         let mut chain = vec![k];
         while prev[k] != usize::MAX {
@@ -2167,6 +2229,150 @@ mod tests {
         );
     }
 
+    fn position_only_leg(
+        speed: f64,
+        heading: f64,
+        epoch: f64,
+        step: f64,
+    ) -> (FlightLeg, TrackModel, Enu) {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let truth = straight_track(
+            &enu,
+            [0.0, 0.0, 900.0],
+            [speed * heading.cos(), speed * heading.sin(), 0.0],
+            epoch + 90.0,
+            epoch,
+            epoch + 180.0,
+            step,
+        );
+        let points = truth
+            .t
+            .iter()
+            .zip(&truth.pos)
+            .map(|(&t, &pos)| {
+                let (lat, lon, alt) = ecef_to_geodetic(pos);
+                fdop_types::store::TrackPoint {
+                    t,
+                    lat,
+                    lon,
+                    alt_m: alt as f32,
+                    gs_mps: f32::NAN,
+                    track_deg: f32::NAN,
+                    vrate_mps: f32::NAN,
+                    alt_src: alt_src::GEOM,
+                    flags: 0,
+                }
+            })
+            .collect();
+        (gap_fixture_leg(points), truth, enu)
+    }
+
+    #[test]
+    fn missing_speed_reports_do_not_erase_a_supported_fast_flyover() {
+        let bp = BuildParams::default();
+        for epoch in [0.0, 1_788_895_000.0] {
+            for (speed, step) in [(215.0, 30.0), (245.0, 10.0), (270.0, 45.0)] {
+                for heading in [0.0, 1.3] {
+                    let (leg, truth, enu) = position_only_leg(speed, heading, epoch, step);
+                    let models = build(&leg, &bp);
+                    assert_eq!(models.len(), 1, "{speed} m/s, {step} s, epoch {epoch}");
+                    let model = &models[0];
+                    assert_eq!(model.t, truth.t, "supported positions were discarded");
+                    assert_eq!(model.reported_vel_frac, 0.0);
+                    let observer = enu.to_ecef([0.0; 3]);
+                    let prop = Prop::still(343.0);
+                    for t in [30.25, 60.5, 90.0, 121.75, 149.5] {
+                        let te = epoch + t;
+                        assert!(norm(sub(model.pos_at(te), truth.pos_at(te))) < 0.001);
+                        assert!(norm(sub(model.pv(te).1, truth.pv(te).1)) < 0.001);
+                        let range = norm(sub(truth.pos_at(te), observer));
+                        let received = te + range / prop.c;
+                        let (_, _, actual) = model
+                            .solve_emission_p(received, observer, &prop, None)
+                            .unwrap();
+                        let expected =
+                            prop.ratio(sub(truth.pos_at(te), observer), range, truth.pv(te).1);
+                        assert!((100.0 * (actual - expected)).abs() < 0.001);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn position_only_fast_recovery_requires_coherent_subsonic_support() {
+        let bp = BuildParams::default();
+        let (mut leg, truth, enu) = position_only_leg(245.0, 0.0, 0.0, 10.0);
+        let mut corrupt = leg.points[8];
+        corrupt.t += 5.0;
+        let (lat, lon, alt) = ecef_to_geodetic(enu.to_ecef([0.0, 100_000.0, 900.0]));
+        (corrupt.lat, corrupt.lon, corrupt.alt_m) = (lat, lon, alt as f32);
+        leg.points.push(corrupt);
+        let models = build(&leg, &bp);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].t, truth.t, "isolated position jump was retained");
+
+        let (mut teleport, _, _) = position_only_leg(5000.0, 0.0, 0.0, 10.0);
+        for p in &mut teleport.points {
+            p.alt_m = 900.0;
+        }
+        assert!(build(&teleport, &bp).is_empty());
+        let (mut corner, _, enu) = position_only_leg(270.0, 0.0, 0.0, 30.0);
+        corner.points.truncate(3);
+        for (p, xy) in corner.points.iter_mut().zip([
+            [0.0, 0.0],
+            [8100.0, 0.0],
+            [12_150.0, 8100.0 * 3.0_f64.sqrt() / 2.0],
+        ]) {
+            let (lat, lon, alt) = ecef_to_geodetic(enu.to_ecef([xy[0], xy[1], 900.0]));
+            (p.lat, p.lon, p.alt_m) = (lat, lon, alt as f32);
+        }
+        assert!(
+            build(&corner, &bp).is_empty(),
+            "inconsistent directions justified a recovery"
+        );
+        // These three reports imply opposing 270 m/s chords. Their scalar speeds
+        // agree, but they do not corroborate a velocity or justify a wider filter.
+        let (mut alternating, _, enu) = position_only_leg(270.0, 0.0, 0.0, 30.0);
+        alternating.points.truncate(3);
+        for (i, p) in alternating.points.iter_mut().enumerate() {
+            let (lat, lon, alt) =
+                ecef_to_geodetic(enu.to_ecef([if i == 1 { 8100.0 } else { 0.0 }, 0.0, 900.0]));
+            (p.lat, p.lon, p.alt_m) = (lat, lon, alt as f32);
+        }
+        // The old cleaner keeps the two matching endpoints; recovery must leave
+        // this already-supported result alone, not insert the intervening jump.
+        let models = build(&alternating, &bp);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].t, vec![0.0, 60.0]);
+
+        for report in [0.0, -1.0, 80.0] {
+            let (mut leg, _, _) = position_only_leg(270.0, 0.0, 0.0, 45.0);
+            for p in &mut leg.points {
+                p.gs_mps = report;
+            }
+            assert!(
+                build(&leg, &bp).is_empty(),
+                "finite report {report} was overridden"
+            );
+        }
+
+        // A supported rival already wins this ambiguous leg. The empty-model rescue
+        // must not replace it just because faster unsupported reports also exist.
+        let (mut mixed, _, enu) = position_only_leg(245.0, 0.0, 0.0, 10.0);
+        let mut rival = mixed.clone();
+        rival.points.truncate(2);
+        for (i, p) in rival.points.iter_mut().enumerate() {
+            let (lat, lon, alt) = ecef_to_geodetic(enu.to_ecef([0.0, 100_000.0, 900.0]));
+            p.t = 85.0 + i as f64;
+            (p.lat, p.lon, p.alt_m) = (lat, lon, alt as f32);
+        }
+        let expected = build(&rival, &bp);
+        mixed.points.extend(rival.points);
+        let actual = build(&mixed, &bp);
+        assert_eq!(actual.len(), 1);
+        assert_same_gap_model(&actual[0], &expected[0]);
+    }
 
     fn gap_fixture_point(t: f64, north: f64) -> fdop_types::store::TrackPoint {
         let enu = Enu::new(40.876466, -73.524951, 0.0);
