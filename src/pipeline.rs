@@ -27,6 +27,8 @@ pub struct LocateArgs {
     pub out: Option<PathBuf>,
     pub cache: PathBuf,
     pub offline: bool,
+    /// Retain known jets as candidate tonal sources in both searches and their decoys.
+    pub include_jets: bool,
     /// Exact recording start (ISO 8601) if known; narrows the clock search.
     pub start: Option<String>,
     pub clock_tol_s: f64,
@@ -205,14 +207,20 @@ struct PublishedWindow {
 }
 
 impl PublishedWindow {
-    fn track_spec(&self, bbox: BBox, duration: f64, geoid_n_m: f64) -> fdop_data::IngestSpec {
+    fn track_spec(
+        &self,
+        bbox: BBox,
+        duration: f64,
+        geoid_n_m: f64,
+        include_jets: bool,
+    ) -> fdop_data::IngestSpec {
         fdop_data::IngestSpec {
             bbox,
             t_start: self.clock.0 - 1200.0,
             t_end: (self.clock.1 + duration + 1200.0).min(self.adsb_end),
             geoid_n_m,
             keep_unknown: true,
-            include_jets: false,
+            include_jets,
         }
     }
 
@@ -853,7 +861,7 @@ fn run_curve_match(
         t_end,
         geoid_n_m,
         keep_unknown: true,
-        include_jets: false,
+        include_jets: a.include_jets,
     };
     let lg = log.clone();
     let opts = fdop_data::FetchOptions {
@@ -874,13 +882,7 @@ fn run_curve_match(
                 .map(|n| format!("curve match ADS-B {n}")),
         );
     }
-    let bp = track::BuildParams::default();
-    let tracks: Vec<track::TrackModel> = store
-        .legs
-        .par_iter()
-        .filter(|l| l.engine.tonal())
-        .flat_map_iter(|l| track::build(l, &bp))
-        .collect();
+    let tracks = build_track_models(&store, a.include_jets);
     drop(store);
     let inp = curvematch::MatchInputs {
         image,
@@ -896,6 +898,21 @@ fn run_curve_match(
     };
     let lg = log.clone();
     Ok(Some(curvematch::run(&inp, p, &move |s: &str| lg.say(s))))
+}
+
+/// Both searches must see the same engine policy, including every decoy clock. Keeping
+/// this at the shared catalogue boundary also protects ordinary runs from broader stores.
+fn build_track_models(
+    store: &fdop_types::store::TrackStore,
+    include_jets: bool,
+) -> Vec<track::TrackModel> {
+    let bp = track::BuildParams::default();
+    store
+        .legs
+        .par_iter()
+        .filter(|l| include_jets || l.engine.tonal())
+        .flat_map_iter(|l| track::build(l, &bp))
+        .collect()
 }
 
 fn stem(p: &Path) -> String {
@@ -1449,6 +1466,9 @@ fn locate_with_clock(
     let t_all = Instant::now();
     let mut timings = serde_json::Map::new();
     let mut warnings: Vec<String> = Vec::new();
+    if a.include_jets {
+        warnings.push("Experimental --include-jets: known jets are treated as potential tonal sources in both searches and their decoy clocks, including unheard-pass evidence. This still requires stable subsonic tones; broadband jet noise is not modelled, and jet localization has not been validated on field recordings.".into());
+    }
     let c = fdop_types::C_SOUND;
     // A decoy run is read only for its trace evidence. It draws no figures or map and asks the
     // Census geocoder nothing, so it writes a few megabytes instead of its answer's hundred-odd
@@ -1711,7 +1731,7 @@ fn locate_with_clock(
     let mut curve = None;
     let (tracks, atmo, has_wind, sevs, res, assessment) = loop {
         // ---- ADS-B for this attempt ------------------------------------------------------
-        let spec = archive.track_spec(fetch_box, dur, geoid_n);
+        let spec = archive.track_spec(fetch_box, dur, geoid_n, a.include_jets);
         log.say(&format!(
             "ADS-B: {} .. {} over [{:.2},{:.2},{:.2},{:.2}] (geoid N {geoid_n:.2} m, {geoid_src})",
             iso_utc(spec.t_start),
@@ -1756,17 +1776,16 @@ fn locate_with_clock(
             );
         }
         let t = Instant::now();
-        let bp = track::BuildParams::default();
-        let tracks: Vec<track::TrackModel> = store
-            .legs
-            .par_iter()
-            .filter(|l| l.engine.tonal())
-            .flat_map_iter(|l| track::build(l, &bp))
-            .collect();
+        let tracks = build_track_models(&store, a.include_jets);
         let n_jets = store.legs.iter().filter(|l| !l.engine.tonal()).count();
         log.say(&format!(
-            "track models: {} (excluded {} jet legs)",
+            "track models: {} ({} {} jet legs)",
             tracks.len(),
+            if a.include_jets {
+                "included"
+            } else {
+                "excluded"
+            },
             n_jets
         ));
         drop(store);
@@ -1792,7 +1811,7 @@ fn locate_with_clock(
         let t = Instant::now();
         let mut sp = SearchParams::new(archive.clock.0, archive.clock.1, dur, region.bbox);
         sp.c = c;
-        sp.tonal_only = true;
+        sp.tonal_only = !a.include_jets;
         sp.max_events = a.max_events;
         (sp.max_hyp_per_event, sp.max_hyp_total) = search::hyp_budget(search::physical_memory());
         let inp = SearchInputs {
@@ -2551,7 +2570,7 @@ fn locate_with_clock(
                 "no location found: {} usable flyover events; {}",
                 sevs.len(),
                 if sevs.len() < 2 {
-                    "need at least two clear propeller flyovers"
+                    "need at least two clear tonal aircraft flyovers"
                 } else {
                     "no ADS-B flight pair explains two events at one place and clock (check dates/region, or the aircraft lacked ADS-B)"
                 }
@@ -2615,6 +2634,7 @@ fn locate_with_clock(
         "window": window_note,
         "media": {"duration_s": info.duration_s, "decoded_duration_s": dur, "codec": info.audio_codec, "sample_rate": info.sample_rate, "creation_time": info.creation_time, "audio_stream": info.audio_stream, "audio_channel": info.audio_channel},
         "region_bbox": region.bbox.as_array(),
+        "include_jets": a.include_jets,
         "atmosphere": {"source": atmo.describe(), "c_0_1500m": m1.c, "c_0_5000m": m5.c, "wind_0_5000m": [m5.wind_e, m5.wind_n]},
         "search_events": sevs,
         "audio_analysis_reused": recording.is_some(),
@@ -3309,6 +3329,7 @@ mod tests {
     fn decoy_runs_move_only_the_start_and_skip_the_curve_match() {
         let mut a = offline_test_args("decoy-args");
         a.curve_match = true;
+        a.include_jets = true;
         a.quiet = false;
         a.start = Some("2026-09-08T20:17:00Z".into());
         let t0 = parse_iso_utc("2026-09-08T20:17:00Z").unwrap();
@@ -3319,6 +3340,10 @@ mod tests {
         );
         assert_eq!(d.out.as_deref(), Some(Path::new("/runs/x/decoy_clock_-2h")));
         assert!(d.quiet && !d.curve_match);
+        assert!(
+            d.include_jets,
+            "decoys must search the same aircraft population"
+        );
         assert_eq!(
             (
                 &d.media,
@@ -3436,6 +3461,7 @@ mod tests {
             out: Some(dir.join("run")),
             cache: dir.join("cache"),
             offline: true,
+            include_jets: false,
             start: None,
             clock_tol_s: 60.0,
             ignore_metadata_time: false,
@@ -3463,7 +3489,7 @@ mod tests {
                 t_end: start + 86_400.0 + 3600.0,
                 geoid_n_m: fdop_data::geoid::DEFAULT_GEOID_M,
                 sources: vec!["synthetic".into()],
-                stats: json!({}),
+                stats: json!({"include_jets": a.include_jets}),
                 created_unix: start,
             },
             legs,
@@ -3472,7 +3498,10 @@ mod tests {
             &a.cache
                 .join("adsb")
                 .join(format!("{:04}-{:02}-{:02}", day.0, day.1, day.2))
-                .join(format!("prod+mlatonly_{key}.fdtrk")),
+                .join(format!(
+                    "prod+mlatonly{}_{key}.fdtrk",
+                    if a.include_jets { "+jets" } else { "" }
+                )),
         )
         .unwrap();
     }
@@ -3565,7 +3594,8 @@ mod tests {
                 adsb_end: day + 86_400.0,
                 pending: Vec::new(),
             };
-            let spec = window.track_spec(fetch_box, 300.0, fdop_data::geoid::DEFAULT_GEOID_M);
+            let spec =
+                window.track_spec(fetch_box, 300.0, fdop_data::geoid::DEFAULT_GEOID_M, false);
             let opts = fdop_data::FetchOptions {
                 offline: true,
                 ..Default::default()
@@ -3601,22 +3631,32 @@ mod tests {
 
     #[test]
     fn offline_metadata_locates_with_only_its_archive_day() {
-        offline_location_with_selected_audio(false);
+        offline_location_with_selected_audio(false, false);
     }
 
     #[test]
     fn selected_audio_does_not_require_the_longer_videos_unpublished_day() {
-        offline_location_with_selected_audio(true);
+        offline_location_with_selected_audio(true, false);
     }
 
-    fn offline_location_with_selected_audio(long_video: bool) {
+    #[test]
+    fn offline_tonal_jets_locate_with_expanded_catalogue() {
+        // Synthetic harmonic flyovers with jet-labelled tracks exercise policy wiring,
+        // not a jet-specific acoustic model or evidence of real-recording performance.
+        offline_location_with_selected_audio(false, true);
+    }
+
+    fn offline_location_with_selected_audio(long_video: bool, include_jets: bool) {
         use fdop_types::geo::{Enu, ecef_to_geodetic, haversine_m};
         use fdop_types::store::{FlightLeg, TrackPoint, alt_src};
-        let mut a = offline_test_args(if long_video {
+        let mut a = offline_test_args(if include_jets {
+            "tonal-jets"
+        } else if long_video {
             "selected-audio"
         } else {
             "metadata-locate"
         });
+        a.include_jets = include_jets;
         // Generate in exactly the atmosphere an uncached offline run will use. The selftest
         // itself keeps its warm/windy atmosphere and otherwise uses this same synthesis.
         let atmo = fdop_types::atmo::StandardAtmosphere::new(15.0, 0.0, 0.5);
@@ -3670,9 +3710,17 @@ mod tests {
                 key: tr.key.clone(),
                 icao: tr.icao.clone(),
                 reg: tr.reg.clone(),
-                typ: tr.typ.clone(),
+                typ: if include_jets {
+                    "C25B".into()
+                } else {
+                    tr.typ.clone()
+                },
                 source: "synthetic".into(),
-                engine: tr.engine,
+                engine: if include_jets {
+                    fdop_types::engine::EngineClass::Jet
+                } else {
+                    tr.engine
+                },
                 points: tr
                     .t
                     .iter()
@@ -3707,7 +3755,12 @@ mod tests {
         };
         // Prove that the old eager full-date request really cannot run from this cache.
         let full_error = fdop_data::fetch_window(
-            &full.track_spec(bbox, fixture.duration, fdop_data::geoid::DEFAULT_GEOID_M),
+            &full.track_spec(
+                bbox,
+                fixture.duration,
+                fdop_data::geoid::DEFAULT_GEOID_M,
+                include_jets,
+            ),
             &a.cache,
             &fdop_data::FetchOptions {
                 offline: true,
@@ -3742,6 +3795,15 @@ mod tests {
             json!(info.duration_s)
         );
         assert_eq!(outcome.report.extra["audio_analysis_reused"], json!(false));
+        assert_eq!(outcome.report.extra["include_jets"], json!(include_jets));
+        assert_eq!(
+            outcome
+                .report
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("Experimental --include-jets")),
+            include_jets
+        );
         assert!(outcome.found, "{}", outcome.report.answer.verdict);
         let answer = &outcome.report.answer;
         // Metamorphic: moved by hours, the clock lines up no true pass, so the known answer must
@@ -3769,6 +3831,7 @@ mod tests {
             let report: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(dir.join("result.json")).unwrap()).unwrap();
             assert_eq!(report["extra"]["audio_analysis_reused"], json!(true));
+            assert_eq!(report["extra"]["include_jets"], json!(include_jets));
             for stage in ["decode_s", "detect_s", "measure_s"] {
                 assert_eq!(report["timings"][stage], json!(0.0), "{stage}");
             }
@@ -3919,7 +3982,8 @@ mod tests {
             ..Default::default()
         };
         let store =
-            fdop_data::fetch_window(&w.track_spec(bbox, 600.0, -30.0), &a.cache, &opts).unwrap();
+            fdop_data::fetch_window(&w.track_spec(bbox, 600.0, -30.0, false), &a.cache, &opts)
+                .unwrap();
         assert_eq!(store.meta.stats["days"], json!(["2026-09-08"]));
         assert!(
             first_published_window(
@@ -3940,8 +4004,9 @@ mod tests {
             adsb_end: f64::INFINITY,
             pending: Vec::new(),
         };
-        let error = fdop_data::fetch_window(&w.track_spec(bbox, 3600.0, -30.0), &a.cache, &opts)
-            .unwrap_err();
+        let error =
+            fdop_data::fetch_window(&w.track_spec(bbox, 3600.0, -30.0, false), &a.cache, &opts)
+                .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -4565,9 +4630,19 @@ mod tests {
 
     #[test]
     fn late_curve_match_uses_one_cached_day_and_keeps_all_decoys() {
+        late_curve_match_catalogue(false);
+    }
+
+    #[test]
+    fn jet_curve_match_uses_expanded_catalogue_for_every_decoy() {
+        late_curve_match_catalogue(true);
+    }
+
+    fn late_curve_match_catalogue(include_jets: bool) {
         use fdop_types::store::{FlightLeg, TrackPoint, alt_src};
         let mut a = offline_test_args("late-curve-catalog");
         a.curve_match = true;
+        a.include_jets = include_jets;
         let day = unix_from_utc(2026, 9, 8, 0, 0, 0.0);
         let midnight = day + 86_400.0;
         let clock = (day + 23.0 * 3600.0 + 600.0, day + 23.0 * 3600.0 + 840.0);
@@ -4579,9 +4654,13 @@ mod tests {
             key: "synthetic-evening".into(),
             icao: "000001".into(),
             reg: String::new(),
-            typ: "C172".into(),
+            typ: if include_jets { "C25B" } else { "C172" }.into(),
             source: "synthetic".into(),
-            engine: fdop_types::engine::EngineClass::Piston,
+            engine: if include_jets {
+                fdop_types::engine::EngineClass::Jet
+            } else {
+                fdop_types::engine::EngineClass::Piston
+            },
             points: [(clock.0 + 80.0, lon - 0.01), (clock.0 + 100.0, lon + 0.01)]
                 .into_iter()
                 .map(|(t, lon)| TrackPoint {
@@ -4599,14 +4678,15 @@ mod tests {
         };
         cache_test_day(&a, fetch_box, (2026, 9, 8), vec![leg]);
         let (_, key) = fdop_data::fetch::bbox_key(&fetch_box);
+        let policy = if include_jets { "+jets" } else { "" };
         let cache_path = a
             .cache
             .join("adsb/2026-09-08")
-            .join(format!("prod+mlatonly_{key}.fdtrk"));
+            .join(format!("prod+mlatonly{policy}_{key}.fdtrk"));
         // A real partial-feed cache makes fetch_window generate its coverage warning.
         std::fs::rename(
             &cache_path,
-            cache_path.with_file_name(format!("prod_{key}.fdtrk")),
+            cache_path.with_file_name(format!("prod{policy}_{key}.fdtrk")),
         )
         .unwrap();
         // Only the spectral bank is reduced; production clock and decoy parameters stay
@@ -4630,7 +4710,7 @@ mod tests {
                 t_end: midnight,
                 geoid_n_m: -30.0,
                 keep_unknown: true,
-                include_jets: false,
+                include_jets,
             },
             &a.cache,
             &fdop_data::FetchOptions {

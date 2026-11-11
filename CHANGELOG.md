@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Match explicitly requested tonal jets throughout locate
+
+- Add `--include-jets` to `locate` and `fetch`. Thread the policy through normal,
+  metadata-retry and independent curve-match catalogues, both track-building paths,
+  trace confirmation, unheard-pass evidence, and every decoy clock.
+- Apply `SearchParams.tonal_only` while generating hypotheses, after enumeration so
+  filtered tracks retain their original indices. Previously the library search used
+  that policy only for confirmation and unheard passes.
+- Add `extra.include_jets` to result JSON and an explicit experimental-mode warning.
+  The existing tone model, detection/measurement limits and grading thresholds remain.
+  Included jets are assumed potentially tonal for unheard-pass evidence too; this is
+  not a broadband jet-noise model or field-validated jet geolocation.
+- Add CLI-default/opt-in tests, a known-answer synthetic jet-track search with a
+  mixed-order index control, an offline synthetic-audio pipeline regression, and
+  independent curve-catalogue/decoy coverage. Document matching prefetch flags and
+  correct the FAQ's blanket claim that jets cannot produce tones.
+- Validation: reviewed the complete integration and read back the GitHub blobs. On the
+  pinned nightly, LLVM compilation was killed with SIGKILL in `fsci-special` and
+  `fsci-stats`; a single-job retry was also killed in `fsci-special`, before any project
+  test ran. The execution environment then disconnected. Tests, Clippy, selftest and
+  reference/field replays have not completed. The pre-change workspace formatting check
+  had existing failures; no runtime success or real-recording improvement is claimed.
+
 ### Honor profiled flyover-time uncertainty during confirmation
 
 - Extend both confirmation's catalogue query and its local closest-approach scan to

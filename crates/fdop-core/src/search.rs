@@ -603,6 +603,7 @@ fn hypotheses(
     let parts = tracks
         .par_iter()
         .enumerate()
+        .filter(|(_, tr)| !p.tonal_only || tr.engine.tonal())
         .map(|(ti, tr)| {
             let mut out = HypBuilder::new(cap);
             let te_lo = t_lo_all.max(tr.t0());
@@ -5890,6 +5891,76 @@ mod tests {
             wind_e: 7.0,
             wind_n: -5.0,
         });
+    }
+
+    #[test]
+    fn tonal_jet_tracks_seed_and_locate_only_when_enabled() {
+        let medium = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(medium);
+        case.p.start_lo = case.t_s - 5.0;
+        case.p.start_hi = case.t_s + 5.0;
+        case.p.region = BBox::new(
+            case.obs.0 - 0.02,
+            case.obs.1 - 0.03,
+            case.obs.0 + 0.02,
+            case.obs.1 + 0.03,
+        );
+        for tr in &mut case.tracks {
+            tr.engine = fdop_types::engine::EngineClass::Jet;
+            tr.typ = "C25B".into();
+        }
+        let excluded = run_case(&case, medium);
+        assert!(excluded.candidates.is_empty());
+        assert!(
+            excluded
+                .funnel
+                .hypotheses
+                .iter()
+                .all(|(_, n)| *n == Some(0))
+        );
+
+        case.p.tonal_only = false;
+        let included = run_case(&case, medium);
+        let top = included
+            .candidates
+            .first()
+            .expect("tonal jets must be eligible to seed the pair join");
+        assert!(
+            included.funnel.truncated.is_empty(),
+            "{:?}",
+            included.funnel
+        );
+        assert!(haversine_m(top.lat, top.lon, case.obs.0, case.obs.1) < 60.0);
+        assert!((top.t_start_utc - case.t_s).abs() < 1.0);
+        for (event, flight) in [("e1", "A"), ("e2", "B")] {
+            let found = top.events.iter().find(|m| m.event == event).unwrap();
+            assert_eq!(found.flight, flight);
+            assert_eq!(found.engine, "jet");
+        }
+
+        // An excluded leading track must not renumber the retained tracks' hypotheses.
+        // Its geometry duplicates A, making an accidental index shift observable.
+        for tr in &mut case.tracks[..2] {
+            tr.engine = fdop_types::engine::EngineClass::Turboprop;
+            tr.typ = "PC12".into();
+        }
+        let mut jet = case.tracks[0].clone();
+        jet.engine = fdop_types::engine::EngineClass::Jet;
+        jet.typ = "C25B".into();
+        jet.key = "excluded-jet".into();
+        case.tracks.insert(0, jet);
+        case.p.tonal_only = true;
+        let ordinary = run_case(&case, medium);
+        let top = ordinary.candidates.first().unwrap();
+        assert!(ordinary.funnel.truncated.is_empty());
+        assert!(haversine_m(top.lat, top.lon, case.obs.0, case.obs.1) < 60.0);
+        assert!((top.t_start_utc - case.t_s).abs() < 1.0);
+        for (event, flight) in [("e1", "A"), ("e2", "B")] {
+            let found = top.events.iter().find(|m| m.event == event).unwrap();
+            assert_eq!(found.flight, flight);
+            assert_eq!(found.engine, "turboprop");
+        }
+        assert!(top.trk.iter().all(|&(_, ti)| ti == 1 || ti == 2));
     }
 
     /// Two synthetic flyovers of an observer (flights A and B) plus a parallel decoy (D1).

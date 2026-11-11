@@ -1520,10 +1520,12 @@ mod tests {
         };
         // Either UTC day may have a missing or unrecognized aircraft type. The query
         // ends before the second day's reports, so losing the first half can lose the match.
-        for (known_type, known_first, unknown_type) in ["PC12", "B738"].into_iter().flat_map(|typ| {
-            [(false, ""), (true, ""), (false, "ZZZZ9"), (true, "ZZZZ9")]
-                .map(move |(first, unknown)| (typ, first, unknown))
-        }) {
+        for (known_type, known_first, unknown_type) in
+            ["PC12", "B738"].into_iter().flat_map(|typ| {
+                [(false, ""), (true, ""), (false, "ZZZZ9"), (true, "ZZZZ9")]
+                    .map(move |(first, unknown)| (typ, first, unknown))
+            })
+        {
             let spec = IngestSpec {
                 include_jets: known_type == "B738",
                 ..spec

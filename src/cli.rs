@@ -67,6 +67,9 @@ pub struct Common {
     /// Never use the network (cached data only).
     #[arg(long)]
     pub offline: bool,
+    /// Also match known jets with stable subsonic tones (experimental; uses a separate ADS-B cache).
+    #[arg(long)]
+    pub include_jets: bool,
     /// Less progress output on stderr.
     #[arg(short, long)]
     pub quiet: bool,
@@ -204,6 +207,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 out: Some(run_dir.clone()),
                 cache: cache.clone(),
                 offline: l.common.offline,
+                include_jets: l.common.include_jets,
                 start: l.start.clone(),
                 clock_tol_s: l.clock_tol,
                 ignore_metadata_time: l.ignore_metadata_time,
@@ -395,7 +399,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 t_end: hi + 4.0 * 3600.0,
                 geoid_n_m: n,
                 keep_unknown: true,
-                include_jets: false,
+                include_jets: f.common.include_jets,
             };
             // as in `locate`: fetch the published part, name the UTC days still pending
             let (until, pending) = fdop_data::published_until(
@@ -501,6 +505,26 @@ fn run(cli: Cli) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jet_catalogue_is_explicit_for_locate_and_fetch() {
+        for subcommand in ["locate", "fetch"] {
+            let mut args = vec!["fdop", subcommand];
+            if subcommand == "locate" {
+                args.push("clip.wav");
+            }
+            args.extend(["--dates", "2026-09-08", "--near", "NY"]);
+            for include_jets in [false, true] {
+                let actual = match Cli::try_parse_from(&args).unwrap().cmd {
+                    Cmd::Locate(l) => l.common.include_jets,
+                    Cmd::Fetch(f) => f.common.include_jets,
+                    _ => panic!("expected catalogue command"),
+                };
+                assert_eq!(actual, include_jets);
+                args.push("--include-jets");
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires ffmpeg and ffprobe"]

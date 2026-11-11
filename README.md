@@ -629,7 +629,7 @@ fdop selftest           # offline end-to-end known-answer run
 ## Command reference
 
 `fdop` has six subcommands. Run `fdop <cmd> --help` for the built-in text. The shared options `--cache`,
-`--offline` and `-q/--quiet` belong to `locate` and `fetch`, and go after the subcommand. `detect` needs no data
+`--offline`, `--include-jets` and `-q/--quiet` belong to `locate` and `fetch`, and go after the subcommand. `detect` needs no data
 and takes `-o`, `-q` and the audio selection options below. `runs` and `doctor` take `--cache` too.
 
 For media with multiple audio tracks, `locate` and `detect` analyse the first audio track by default, matching
@@ -647,6 +647,7 @@ or change their Doppler frequencies.
 |---|---|
 | `--cache <PATH>` | Cache root for ADS-B day stores, terrain, gazetteer, map tiles and geoid heights. Default: see [Configuration](#configuration) |
 | `--offline` | Never use the network; cached data only |
+| `--include-jets` | Experimental: include known jets as potential tonal sources; uses separate certified ADS-B caches and the existing acoustic gates |
 | `-q, --quiet` | Less progress output on stderr |
 
 ### `fdop locate <MEDIA>`: the full pipeline
@@ -664,6 +665,7 @@ or change their Doppler frequencies.
 | `--ignore-metadata-time` | off | Ignore the container's `creation_time` |
 | `--max-events <N>` | `12` | Maximum events that drive the pair join; the others can still confirm |
 | `--no-curve-match` | off | Skip the [curve match](#the-curve-match); the answer then comes from the trace search alone |
+| `--include-jets` | off | Retain known jets in both searches and their decoy clocks. Stable subsonic tones within the existing analysis band are still required; no field validation is claimed |
 | `--json` | off | Print the full result JSON on stdout instead of the summary |
 
 ```bash
@@ -673,7 +675,19 @@ fdop locate clip.wav --dates 2026-09-08 --near "40.87,-73.52,25" --start 2026-09
 fdop locate clip.m4a --dates 2026-09-08 --near CONUS --json > result.json
 fdop locate clip.m4a --dates 2026-09-08 --near NY --offline        # cached data only
 fdop locate clip.mov --dates 2026-09-08 --near NY --audio-stream 1 --audio-channel 0
+fdop locate clip.wav --dates 2026-09-08 --near NY --include-jets
 ```
+
+**Jet matching is opt-in.** `--include-jets` retains known jets through archive parsing,
+cross-feed and cross-day reconciliation, trace hypotheses and confirmation, and the
+independent curve match. Its real and decoy clocks use the same aircraft policy. Included
+jets are treated as potential tonal sources by the existing unheard-pass evidence too;
+this assumption can reject a location when nearby jets do not produce usable tones.
+The report warns that this mode has no field validation and records the request in the
+additive `extra.include_jets` boolean. The detector band, speed limits, measurement limits
+and confidence gates are unchanged. Broadband jet noise and supersonic propagation are
+not modelled. Ordinary runs continue to use the existing non-jet catalogues. Unknown
+types remain eligible in either mode.
 
 **The time window.** Without `--start`, recording starts are searched from local midnight on the first date to
 local midnight after the last, using every UTC offset the region spans, DST included. If the file's
@@ -759,6 +773,7 @@ Use `detect` to audit your own recordings (see
 ```bash
 fdop fetch --dates 2026-09-08 --near NY             # default --pad-km 30
 fdop fetch --dates 2026-09-07..2026-09-09 --near "Nassau County, NY" --pad-km 50
+fdop fetch --dates 2026-09-08 --near NY --include-jets # expanded aircraft catalogue
 ```
 
 This caches the ADS-B day stores that `locate` will need, which is useful before going offline or before
@@ -768,6 +783,9 @@ which days are pending and stops before them. If no published day is left, it ex
 the release. The `locate` footprint follows the largest retained event's upper distance gate plus
 15 km of track context; for wider ranges, prefetch with a sufficiently large `--pad-km`.
 The default 30 km prefetch footprint may not cover every `locate` request.
+Use matching aircraft flags for offline work: `fetch --include-jets` primes
+`locate --include-jets --offline`, while ordinary `fetch` primes ordinary `locate --offline`.
+The two cache populations are separate; neither silently substitutes for the other.
 
 ### `fdop runs`: the run ledger
 
@@ -877,6 +895,12 @@ Cache layout:
 ├── gazetteer/                                        Census 2024 gazetteer zips
 └── runs.sqlite                                       the run ledger (FrankenSQLite)
 ```
+
+Expanded jet-inclusive stores append `+jets` to the feedset, for example
+`prod+mlatonly+jets_<S>_<W>_<N>_<E>.fdtrk`. Their metadata must also contain the boolean
+`stats.include_jets: true` before an expanded request can reuse them. Renaming an old
+store cannot restore jets discarded during its ingestion. This coverage requirement
+also applies to offline legacy caches and to partial-feed fallback.
 
 Cached day stores are tried from the smallest covering box to the largest. A store is reused only when it
 can be read and its stored box and time interval cover the requested slice of that UTC day. Loading also
@@ -1035,7 +1059,7 @@ Missing temporal brackets retain the existing radiosonde interpolation policy.
 | Data | Source | Notes |
 |---|---|---|
 | ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing |
-| Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Jets are dropped; unknown types are kept |
+| Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Known jets are dropped by default and retained with `--include-jets`; unknown types are kept |
 | Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. A slow service does not discard a usable profile from the other source. Radiosonde stations are selected by archive dates covering the requested sounding brackets, so a station closed today can still serve historical recordings. US country metadata includes Alaska and Hawaii stations; their full identifiers are preserved when requesting soundings, while continental stations retain their existing cache keys. The 15 °C standard atmosphere is used only if no usable profile arrives, with a warning |
 | Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search; a tile that cannot be fetched counts as 0 m, with a warning giving the number of such tiles. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
 | Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL. Taken once two reads agree, then kept in the cache; −30 m, with a warning, if the reads fail or never agree, or under `--offline` |
@@ -1535,6 +1559,30 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Opt-in jet catalogues and complete search wiring
+
+The new regressions exercise compressed jet traces, cross-feed type reconciliation,
+certified cache coverage, and adjoining-day geometry whose aircraft type arrives from
+another day. An ordinary cache, a renamed old cache, a false marker and a string marker
+must all fail an expanded offline request. Certified expanded main-only caches retain
+the existing missing-MLAT warning.
+
+The search regression requires synthetic jet-labelled tracks to yield no hypotheses
+under the default policy, then recover the known observer within 60 m and its clock
+within 1 s when enabled. It also puts an excluded jet before eligible propeller tracks
+to verify that filtering preserves original track indices. Pipeline regressions carry
+the flag through actual offline cache loading, synthetic audio decoding and measurement,
+trace localization, saved result metadata, all four trace decoys, and all 48 curve-match
+decoy windows. These use synthesized harmonic tones, not a jet-specific noise model.
+
+**Validation is incomplete.** On the pinned nightly, the two-job LLVM build was killed
+with SIGKILL in `fsci-special` and `fsci-stats`; a single-job retry was also killed in
+`fsci-special`, before any project test ran. The execution environment then disconnected.
+Source review and recovered GitHub content checks completed, and the workspace formatting
+baseline already failed on existing files. The new regressions, workspace tests, Clippy,
+selftest and reference/field replays have not completed on this change. No real-recording
+accuracy improvement is claimed.
 
 ### Broad CPA-time profiles remain eligible for confirmation
 
@@ -3001,7 +3049,7 @@ audio or video recorded somewhere sensitive:
 - **The US in practice.** Region parsing, place names, ZIP codes, time zones, radiosondes and the geoid are
   US-specific. ADS-B coverage is global, so a `lat,lon` or box region elsewhere runs, but the place report and
   time-zone handling assume US data.
-- **At least two propeller flyovers**, each heard on both sides of its closest approach, from aircraft that
+- **At least two tonal aircraft flyovers**, propeller/rotor sources by default, each heard on both sides of its closest approach, from aircraft that
   broadcast ADS-B or were seen by MLAT. Aircraft without transponders, or outside adsb.lol's feeder coverage,
   cannot be matched.
 - **A stationary recorder, and simple passes.**
@@ -3044,8 +3092,10 @@ audio or video recorded somewhere sensitive:
   its 18.41 (`n1_dec1`). 17 more wrong dates on `c2c7578`, from the cached days, assert nothing (`f17_c2c7578`), so
   they test nothing about the gate. Its line and its decoys were fixed after seeing this one wrong answer, and only
   a sealed set can show what it is worth.
-- Jets are excluded when the ADS-B archive is ingested, so they can neither explain an event nor count as an
-  unheard close pass. There is no option to include them.
+- **Jet matching is experimental.** Known jets are excluded by default; `--include-jets` retains them
+  as potential tonal sources throughout both searches. It does not add a jet-specific acoustic model,
+  extend the existing frequency/speed envelope, or establish accuracy on real jet recordings.
+  The same unheard-pass assumptions apply to included jets, even when their noise is not tonal.
 - **The curve match's decoy test checks the clock, not the place.** On the right date the real window holds real
   aircraft tones, so a wrong place can beat every decoy clock. On set M, `b8abf86` and `11313ba` put Washington Square
   5.9 km off at medium from the curve match alone: 21.4 nats, 0.2 over the best of 48 decoy clocks, with six passes
@@ -3180,8 +3230,11 @@ recorder on a line beside that flight. A second curve, at its real time offset, 
 point and fixes the recording clock. More curves confirm the answer, and an aircraft that passed close but was
 not heard counts against it.
 
-**Why ignore jets?** Jet noise is broadband roar without a stable tone, so there is no clean curve to fit.
-Unknown aircraft types are kept.
+**Why exclude jets by default?** The model and field validation were developed for propeller and rotor
+tones. Turbofan engines can also produce fan and compressor tones ([NASA](https://ntrs.nasa.gov/citations/19950055972)),
+but this does not establish that a recording contains stable tones within `fdop`'s analysis band.
+`--include-jets` permits those aircraft to be matched experimentally; it does not fit broadband roar.
+Unknown aircraft types are kept in either mode.
 
 **How precise is it?** On the reference recording, the current code lands 263–270 m from the published location with a
 379–406 m radius (`r_ny_gc`, `r_md_gc`, `r_nassau_gc`). The validated `7e5cf3e` build landed 271–306 m away with a
