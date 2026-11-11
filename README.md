@@ -750,7 +750,12 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 
 Detects flyovers using the same recording analysis as `locate`: detections are measured strongest
 first within each stage until 24 independent aircraft events survive. If ordinary measurement
-finds fewer than two independent aircraft, a bounded half-second survey retries the recording's
+finds fewer than two independent aircraft, unmeasured detected harmonics of accepted families
+are measured strongest first: coarse survey grouping can put separate aircraft in one family.
+The observed ridges decide whether they are independent, and retries stop once two aircraft
+survive. True harmonics still count once, including siblings whose fitted closest-approach times
+or emitted tones disagree. These extra measurements retain expanded-search provenance and a warning.
+If an aircraft is still missing, a bounded half-second survey retries the recording's
 true edges and refused detections. Those candidates are measured before a fully supported short
 interior scan looks for any still-missing fast pass. Failed earlier candidates retain their slots
 and proposal costs but do not hide sound from that later scan. The observed ridges and detected harmonic families
@@ -761,8 +766,9 @@ Final events are ranked by measured quality and numbered
 passes. This replaces `detect`'s former detector-order output and event numbering.
 If a family's primary lost its
 ridge around the closest approach, its detected harmonic siblings are tried strongest first until one passes
-the existing quality and aircraft gates. The family supplies at most one result. Refused fits, non-aircraft fits and duplicate traces of one
-pass do not consume that allowance. The selected result for each measured family remains in `events.json`,
+the existing quality and aircraft gates. This first attempt supplies one result per family;
+the missing-aircraft recovery above may add independently measured siblings. Refused fits, non-aircraft fits and duplicate traces of one
+pass do not consume the independent-event allowance. Every selected family result and additional sibling attempt remains in `events.json`,
 including duplicates and unrecovered refusals. A warning on stderr says when either cap omits candidates, when the audio
 looks high-passed, or when the survey image was raised because its spread was under 0.5. A detection found
 only on the contrast image of such a recording has `"from_contrast": true` in `events.json`. The command
@@ -1648,6 +1654,53 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Aircraft hidden inside coarse harmonic families
+
+The survey's coarse harmonic grouping can put two independent aircraft in one family.
+When measurement leaves fewer than two independent passes, the shared `detect`/`locate`
+path now measures that family's unused detected siblings before scanning for new fast
+passes. It retains the original measurements and stops when two aircraft are available.
+Extra attempts use the existing quality gates, detection budget and expanded-measurement
+provenance; no detection or confidence threshold is lowered.
+
+`observed_siblings_recover_aircraft_hidden_by_coarse_harmonic_grouping` synthesizes
+200 and 400 Hz passes at 88 and 100 m/s, both 1,492.442 m away at closest approach.
+At source amplitudes 0.075 and 0.05 against the same seeded noise, the ordinary family
+path supplies one aircraft; independent sibling measurement supplies two. With the
+recording start supplied, the actual search and refinement recover the synthetic observer
+within 0.2951 m and 0.3064 m, respectively, with both intended core flights and no
+search truncation. These are synthetic results, not field-accuracy measurements.
+
+True harmonics must still count once. Known family members are compared using their
+observed ridges even if fitted closest-approach times or frequencies differ. An alternate
+seed retains the family links of measurements it duplicates, so changing the strongest
+representative cannot create an extra aircraft. Those links permit an observed comparison;
+distinct measured motion still remains independent. Controls cover uneven sampling,
+partial coverage, displaced fit metadata, alternate seeds and multiple linked families.
+
+On the recovery build before merging the concurrent wind/weather commits, all eight
+focused core measurement and family-selection tests passed. Another 45 physics, track
+and two-flight search tests passed in the actual core test binary; one existing timing
+benchmark was ignored. The exact shared pipeline source, linked to the real core in a
+temporary native runner, passed the quiet/loud recovery test. Substituting only the
+pre-change `measure_recording` from `1bdb123` made that same test fail with one aircraft
+instead of two. The original harmonic pipeline control retained one independent aircraft
+and its original measurement, then failed an obsolete whole-record-vector equality:
+the feature deliberately retains inspected sibling records. Its replacement checks exact
+primary/spectrum preservation, known siblings and provenance, but has not been rerun.
+
+After incorporating `e5cca91`, the combined core test harness compiled successfully.
+The normal library rebuild was killed, and the execution host disconnected before the
+nine combined family/wind test results or the null-audio result could be read. The earlier
+unchanged-source native selftest passed at 1.674 m position error, 75 m radius and 0.020 s
+clock error; the final combined selftest remains unrun. Full root compilation was killed
+in locked `asupersync 0.5.0`. Workspace Clippy/tests, release CLI selftest and reference/field
+replays remain incomplete; the native runners are not a full application-build pass.
+The subsequent track/ingest commits through `d1e4014` are preserved, but the final
+combined tree has not been run.
+Changed Rust ranges passed formatting and whitespace checks before publication; the
+workspace-wide formatter still reported existing unrelated differences.
 
 ### Fast tracks with missing groundspeed reports
 

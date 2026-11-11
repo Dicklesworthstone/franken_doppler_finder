@@ -1168,6 +1168,36 @@ pub(crate) struct AudioMeasurements {
     measure_s: f64,
 }
 
+/// Survey harmonic families are provisional. If they leave a recording short of the two
+/// independent aircraft needed for a location, let observed sibling ridges establish whether
+/// a family contains separate passes. Preserve the primary result and use the same measured
+/// trace grouping as the final search; another harmonic of one aircraft still counts once.
+fn measure_missing_family_siblings(
+    x: &[f32],
+    sr: u32,
+    survey: &Spec,
+    detections: &[Detection],
+    events: &mut Vec<MeasuredEvent>,
+    min_score: f64,
+    params: &MeasureParams,
+) -> std::ops::Range<usize> {
+    let first = events.len();
+    let mut independent = search::independent_measured_events(events, 0.0).len();
+    if independent >= 2 {
+        return first..first;
+    }
+    for sibling in measure::unmeasured_family_siblings(detections, events, min_score) {
+        if independent >= 2 {
+            break;
+        }
+        let refined = detect::refine(survey, sibling, params.c);
+        let id = format!("e{}", events.len() + 1);
+        events.push(measure::measure(x, sr, &refined, &id, params));
+        independent = search::independent_measured_events(events, 0.0).len();
+    }
+    first..events.len()
+}
+
 pub(crate) fn measure_recording(
     x: &[f32],
     sr: u32,
@@ -1247,6 +1277,10 @@ pub(crate) fn measure_recording(
         .filter(|&k| past_the_old_line(k, prim[k], &events[k].detection, max_measured, dp.thr_db))
         .map(|k| format!("e{}", k + 1))
         .collect();
+    let siblings =
+        measure_missing_family_siblings(x, sr, &lin, &dets, &mut events, dp.thr_silence_db, &mp);
+    let mut sibling_measurements = siblings.len();
+    added_ranks.extend(events[siblings].iter().map(|e| e.id.clone()));
     let mut recovery_detect_s = 0.0;
     // A one-second survey can smear a steep, short pass beyond the fast templates' reach.
     // A location needs two independent passes. Preserve the observed ridges of any accepted
@@ -1357,6 +1391,17 @@ pub(crate) fn measure_recording(
                     // Provenance belongs to the recovery stage even if refinement lowers speed.
                     added_ranks.extend(recovered_events.iter().map(|e| e.id.clone()));
                     events.append(&mut recovered_events);
+                    let siblings = measure_missing_family_siblings(
+                        x,
+                        sr,
+                        &lin,
+                        &dets,
+                        &mut events,
+                        dp.thr_silence_db,
+                        &mp,
+                    );
+                    sibling_measurements += siblings.len();
+                    added_ranks.extend(events[siblings].iter().map(|e| e.id.clone()));
                 }
                 Err(error) => {
                     warnings.push(format!(
@@ -1384,6 +1429,11 @@ pub(crate) fn measure_recording(
                 "short-window fast-pass recovery discarded at least {recovery_cut} candidate curves at the remaining detection limit; discarded curves neither explain events nor mark passes as heard",
             ));
         }
+    }
+    if sibling_measurements > 0 {
+        warnings.push(format!(
+            "measured {sibling_measurements} additional detected harmonic siblings while fewer than two independent aircraft were available; coarse survey families can contain separate aircraft, so observed traces decide independence; these measurements use the existing gates and count as measured past the old line",
+        ));
     }
     events.sort_by(|p, q| q.quality.score.total_cmp(&p.quality.score));
     let mut added = std::collections::HashSet::new();
@@ -2761,6 +2811,128 @@ mod tests {
     }
 
     #[test]
+    fn harmonic_sibling_recovery_supplies_a_missing_aircraft() {
+        // The quieter pair needs its grouped sibling. In the loud control, another
+        // ordinary seed already recovers that aircraft, so no additional work is needed.
+        for (amplitude, original_count) in [(0.075, 1), (0.6, 2)] {
+            let (sr, c, distance, t0r) = (4000.0, 343.0, 1492.4421390996094, 80.0);
+            let mut seed = 1789u64;
+            let x: Vec<f32> = (0..160 * 4000)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let t = i as f64 / sr;
+                    let mut sample = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+                    for (f0, v) in [(200.0, 88.0), (400.0, 100.0)] {
+                        let tau = physics::retarded_tau(t, t0r - distance / c, v, distance, c);
+                        let range = physics::cv_radial(tau, v, distance).0;
+                        sample +=
+                            amplitude * distance / range * (std::f64::consts::TAU * f0 * tau).sin();
+                    }
+                    sample as f32
+                })
+                .collect();
+            let dp = DetectParams::default();
+            let mp = MeasureParams::default();
+            let (ls, survey) = detect::survey(&x, 4000, &dp).unwrap();
+            let detections = detect::detect(&ls, &dp);
+            let original: Vec<_> = detections
+                .iter()
+                .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+                .enumerate()
+                .map(|(i, d)| {
+                    measure::measure_family(
+                        &x,
+                        4000,
+                        &survey,
+                        d,
+                        &detections,
+                        &format!("e{}", i + 1),
+                        &mp,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                search::independent_measured_events(&original, 0.0).len(),
+                original_count
+            );
+
+            let mut measured = measure_recording(&x, 4000, &Log::new(true), None).unwrap();
+            assert_eq!(
+                search::independent_measured_events(&measured.events, 0.0).len(),
+                2
+            );
+            assert_eq!(
+                serde_json::to_value(&measured.detections).unwrap(),
+                serde_json::to_value(&detections).unwrap(),
+            );
+            for old in &original {
+                let kept = measured
+                    .events
+                    .iter()
+                    .find(|m| m.detection.id == old.detection.id)
+                    .unwrap();
+                let mut expected = serde_json::to_value(old).unwrap();
+                expected["id"] = serde_json::json!(kept.id);
+                assert_eq!(expected, serde_json::to_value(kept).unwrap());
+                assert_eq!(
+                    old.spec.as_ref().unwrap().db,
+                    kept.spec.as_ref().unwrap().db
+                );
+            }
+            if original_count < 2 {
+                let recovered = measured
+                    .events
+                    .iter()
+                    .find(|m| m.detection.harmonic_of.is_some())
+                    .unwrap();
+                assert!(recovered.is_aircraft_like(), "{:?}", recovered.quality);
+                assert!(measured.added.contains(&recovered.id));
+            } else {
+                assert_eq!(measured.events.len(), original.len());
+            }
+            assert_eq!(
+                measured
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("additional detected harmonic siblings")),
+                original_count < 2,
+            );
+            assert_measurement_bookkeeping(&measured);
+
+            let before = measured.events.len();
+            let mut more = detections.clone();
+            more.push(Detection {
+                id: more.len(),
+                ..detections
+                    .iter()
+                    .find(|d| d.harmonic_of.is_some())
+                    .unwrap()
+                    .clone()
+            });
+            assert!(
+                !measure::unmeasured_family_siblings(&more, &measured.events, dp.thr_silence_db)
+                    .is_empty()
+            );
+            let attempts = measure_missing_family_siblings(
+                &x,
+                4000,
+                &survey,
+                &more,
+                &mut measured.events,
+                dp.thr_silence_db,
+                &mp,
+            );
+            assert!(
+                attempts.is_empty(),
+                "two independent aircraft need no sibling retry"
+            );
+            assert_eq!(measured.events.len(), before);
+        }
+    }
+
+    #[test]
     fn short_window_recovery_retains_fast_edge_passes_and_provenance() {
         let dp = DetectParams::default();
         let mp = MeasureParams::default();
@@ -3179,17 +3351,39 @@ mod tests {
             serde_json::to_value(&measured.detections).unwrap(),
             serde_json::to_value(&ordinary).unwrap()
         );
-        assert_eq!(
-            serde_json::to_value(&measured.events).unwrap(),
-            serde_json::to_value(&baseline).unwrap()
-        );
+        let kept = measured
+            .events
+            .iter()
+            .find(|event| event.detection.id == baseline[0].detection.id)
+            .expect("the original accepted primary must be preserved");
+        let mut expected = serde_json::to_value(&baseline[0]).unwrap();
+        expected["id"] = serde_json::json!(kept.id);
+        assert_eq!(serde_json::to_value(kept).unwrap(), expected);
         let (old_spec, kept_spec) = (
             baseline[0].spec.as_ref().unwrap(),
-            measured.events[0].spec.as_ref().unwrap(),
+            kept.spec.as_ref().unwrap(),
         );
         assert_eq!(old_spec.t, kept_spec.t);
         assert_eq!(old_spec.f, kept_spec.f);
         assert_eq!(old_spec.db, kept_spec.db);
+        let family = baseline[0]
+            .detection
+            .harmonic_of
+            .unwrap_or(baseline[0].detection.id);
+        let extra: Vec<_> = measured
+            .events
+            .iter()
+            .filter(|event| event.id != kept.id)
+            .collect();
+        assert!(!extra.is_empty(), "the known sibling must be inspected");
+        assert!(
+            extra.iter().any(|event| event.is_aircraft_like()),
+            "an accepted harmonic must still count as only one aircraft",
+        );
+        for event in extra {
+            assert_eq!(event.detection.harmonic_of, Some(family));
+            assert!(measured.added.contains(&event.id));
+        }
         assert_measurement_bookkeeping(&measured);
     }
 

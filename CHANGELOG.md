@@ -19,6 +19,42 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover independent aircraft hidden inside coarse harmonic families
+
+- When fewer than two independent aircraft survive measurement, try unused detected
+  siblings of accepted families before short-window recovery and after each recovery
+  stage. Preserve existing measurements, stop at two aircraft, and retain the existing
+  budgets, quality checks, expanded-measurement provenance, warnings and final event IDs.
+- Let observed ridges distinguish independent motion inside a coarse harmonic family.
+  Preserve family links through seeds already grouped as duplicates; fitted CPA/frequency
+  offsets or a higher-quality alternate must not let one pass count twice. Every family
+  merge still compares the surviving observed traces, with unchanged noise and overlap
+  requirements. Generic unrelated-event selection retains its existing behavior.
+- Add physical PCM regressions at two signal levels, a true-harmonic control and
+  duplicate/partial-coverage/fit-offset controls. The two positive subcases change one
+  measured aircraft into two and locate the synthetic observer at 0.295028 m and
+  0.306380 m error with the recording start supplied, both intended core flights and
+  no truncation. The pipeline regression also preserves the already-usable louder case.
+- Native validation before the concurrent upstream merge: all eight focused core
+  measurement/family tests passed; 45 existing physics/track/search tests passed and
+  one timing benchmark was ignored. The actual shared pipeline source passed the
+  quiet/loud recovery test in a native runner. Replacing only its orchestration with
+  commit `1bdb123`'s body failed the same test with one aircraft instead of two.
+  The old harmonic pipeline test preserved its one-aircraft count and primary but
+  rejected the intentionally retained sibling record; its updated exact-preservation,
+  family and provenance assertions await a rerun. The null test outcome is unconfirmed.
+- Preserve concurrent main changes through `d1e4014`, including wind/weather and
+  track/ingest fixes. The combined core test harness on
+  `e5cca91` compiled, but the subsequent normal library rebuild was killed and the
+  host disconnected before the nine combined family/wind test results could be read.
+  The earlier unchanged-source selftest passed at 1.673779 m, 75 m radius and
+  +0.019586 s clock error; the final combined tree and selftest remain unrun. Full root
+  compilation was killed in locked asupersync 0.5.0. Workspace Clippy/tests, release
+  CLI selftest and field/reference replays remain incomplete. Changed-range formatting
+  and whitespace checks passed; workspace formatting still has unrelated differences.
+  Publication reconstructed the preserved source through GitHub after the host loss,
+  with the final pipeline file verified against its recorded SHA-256.
+
 ### Preserve agreeing altitude evidence from duplicate ADS-B reports
 
 - Keep the preferred duplicate's time, coordinates, motion and position-source flags,

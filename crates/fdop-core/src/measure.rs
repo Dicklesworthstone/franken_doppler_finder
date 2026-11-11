@@ -457,6 +457,37 @@ pub fn measure_family(
     first
 }
 
+/// Detected siblings that have not yet been measured independently, from families with an
+/// accepted aircraft measurement. Survey grouping uses coarse curve bins: two aircraft with
+/// near-integer tone ratios can share that group even when their observed ridges differ.
+/// Callers missing an independent aircraft may measure these strongest first, then apply the
+/// ordinary observed-trace grouping and shared event limit. A recovered primary's selected
+/// sibling is already measured and must not be tried twice.
+pub fn unmeasured_family_siblings<'a>(
+    detections: &'a [Detection],
+    measured: &[MeasuredEvent],
+    min_score: f64,
+) -> Vec<&'a Detection> {
+    let measured_ids: std::collections::HashSet<_> =
+        measured.iter().map(|m| m.detection.id).collect();
+    let accepted_families: std::collections::HashSet<_> = measured
+        .iter()
+        .filter(|m| m.is_aircraft_like())
+        .map(|m| m.detection.harmonic_of.unwrap_or(m.detection.id))
+        .collect();
+    let mut siblings: Vec<_> = detections
+        .iter()
+        .filter(|d| {
+            d.score >= min_score
+                && !measured_ids.contains(&d.id)
+                && d.harmonic_of
+                    .is_some_and(|parent| accepted_families.contains(&parent))
+        })
+        .collect();
+    siblings.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    siblings
+}
+
 /// Whether a measurement lost its ridge around the CPA, the failure a harmonic sibling can
 /// recover: no fit, too few trace points, a trace short of the CPA on either side, or too little
 /// of the frequency drop followed. A NaN reading counts as lost.
@@ -1394,6 +1425,7 @@ mod tests {
             crate::search::independent_measured_events(&events, 0.0).len(),
             2
         );
+        assert!(unmeasured_family_siblings(&detections, &events, dp.thr_silence_db).is_empty());
         for (event, truth) in events.iter().zip([&detections[0], &detections[1]]) {
             assert!(event.is_aircraft_like(), "{:?}", event.quality);
             let b = event.fit.as_ref().unwrap().best;
@@ -1422,6 +1454,213 @@ mod tests {
             selected.spec.as_ref().unwrap().db,
             original.spec.as_ref().unwrap().db
         );
+        let mut candidates = detections.clone();
+        for (id, score, parent) in [
+            (9, 8.0, primary.id),
+            (3, 8.0, primary.id),
+            (10, 3.4, primary.id),
+            (11, 15.0, detections[1].id),
+        ] {
+            candidates.push(Detection {
+                id,
+                score,
+                harmonic_of: Some(parent),
+                ..detections[0].clone()
+            });
+        }
+        assert_eq!(
+            unmeasured_family_siblings(&candidates, &[selected], dp.thr_silence_db)
+                .iter()
+                .map(|d| d.id)
+                .collect::<Vec<_>>(),
+            [3, 7, 9],
+            "rank by score and ID, excluding weak siblings and unaccepted families",
+        );
+    }
+
+    fn coarse_family_audio(same_aircraft: bool, amplitude: f64) -> Vec<f32> {
+        let (sr, c, distance, t0r) = (4000.0, 343.0, 1492.4421390996094, 80.0);
+        let passes = [
+            (200.0, 88.0),
+            (400.0, if same_aircraft { 88.0 } else { 100.0 }),
+        ];
+        let mut seed = 1789u64;
+        (0..160 * 4000)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr;
+                let mut sample = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+                for (f0, v) in passes {
+                    let tau = crate::physics::retarded_tau(t, t0r - distance / c, v, distance, c);
+                    let range = crate::physics::cv_radial(tau, v, distance).0;
+                    sample +=
+                        amplitude * distance / range * (std::f64::consts::TAU * f0 * tau).sin();
+                }
+                sample as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn observed_siblings_recover_aircraft_hidden_by_coarse_harmonic_grouping() {
+        for (same_aircraft, amplitude) in [(false, 0.075), (false, 0.05), (true, 0.075)] {
+            let x = coarse_family_audio(same_aircraft, amplitude);
+            let dp = DetectParams::default();
+            let (ls, lin) = survey(&x, 4000, &dp).unwrap();
+            let detections = detect(&ls, &dp);
+            let mp = MeasureParams::default();
+            let mut events: Vec<_> = detections
+                .iter()
+                .filter(|d| d.harmonic_of.is_none() && d.score >= dp.thr_silence_db)
+                .enumerate()
+                .map(|(i, d)| {
+                    measure_family(&x, 4000, &lin, d, &detections, &format!("e{}", i + 1), &mp)
+                })
+                .collect();
+            eprintln!("coarse family same={same_aircraft} amplitude={amplitude}: {detections:?}");
+            eprintln!(
+                "family fits: {:?}",
+                events
+                    .iter()
+                    .map(|m| (&m.quality, m.fit.as_ref().map(|f| f.best)))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                crate::search::independent_measured_events(&events, 0.0).len(),
+                1
+            );
+            let preserved: Vec<_> = events
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap())
+                .collect();
+            let first = events.len();
+            for sibling in unmeasured_family_siblings(&detections, &events, dp.thr_silence_db) {
+                let refined = refine(&lin, sibling, mp.c);
+                events.push(measure(
+                    &x,
+                    4000,
+                    &refined,
+                    &format!("e{}", events.len() + 1),
+                    &mp,
+                ));
+            }
+            assert!(
+                events.len() > first,
+                "no detected sibling reached measurement"
+            );
+            assert_eq!(
+                events[..first]
+                    .iter()
+                    .map(|m| serde_json::to_value(m).unwrap())
+                    .collect::<Vec<_>>(),
+                preserved,
+            );
+            let independent = crate::search::independent_measured_events(&events, 0.0);
+            assert_eq!(independent.len(), if same_aircraft { 1 } else { 2 });
+            assert!(unmeasured_family_siblings(&detections, &events, dp.thr_silence_db).is_empty());
+            for event in &independent {
+                let measured = events.iter().find(|m| m.id == event.id).unwrap();
+                let b = measured.fit.as_ref().unwrap().best;
+                eprintln!(
+                    "coarse family measured same={same_aircraft} amplitude={amplitude}: {b:?}"
+                );
+                let expected_v = if same_aircraft || b.f0 < 300.0 {
+                    88.0
+                } else {
+                    100.0
+                };
+                assert!((b.v - expected_v).abs() < 2.0, "{b:?}");
+                assert!((b.d - 1492.4421390996094).abs() < 50.0, "{b:?}");
+                assert!((b.t0r - 80.0).abs() < 0.3, "{b:?}");
+            }
+            if same_aircraft {
+                // Perturb fitted metadata, not the actual observed harmonic ridges.
+                // Known-family selection must compare those ridges even when a CPA
+                // estimate no longer clears the generic eight-second family screen.
+                let sibling = events
+                    .iter()
+                    .position(|m| m.is_aircraft_like() && m.detection.harmonic_of.is_some())
+                    .expect("the actual harmonic must also have a measurable ridge");
+                events[sibling].fit.as_mut().unwrap().best.t0r += 12.0;
+                assert_eq!(
+                    crate::search::independent_measured_events(&events, 0.0).len(),
+                    1
+                );
+                events[sibling].detection.harmonic_of = None;
+                assert_eq!(
+                    crate::search::independent_measured_events(&events, 0.0).len(),
+                    2,
+                    "unrelated events retain the existing fitted-CPA screen",
+                );
+            }
+            if !same_aircraft {
+                // Two distinct observed ridges must supply an actual location, using
+                // orthogonal ADS-B paths with the same geometry that generated the PCM.
+                let (lat, lon, start) = (40.876466, -73.524951, 1_788_895_000.0);
+                let enu = fdop_types::geo::Enu::new(lat, lon, fdop_types::MIC_HEIGHT_M);
+                let distance = 1492.4421390996094f64;
+                let lateral = (distance * distance - 500.0f64.powi(2)).sqrt();
+                let mut tracks = Vec::new();
+                for (key, position, velocity) in [
+                    ("family-primary", [0.0, lateral, 500.0], [88.0, 0.0, 0.0]),
+                    ("family-sibling", [lateral, 0.0, 500.0], [0.0, 100.0, 0.0]),
+                ] {
+                    let mut track = crate::track::straight_track(
+                        &enu,
+                        position,
+                        velocity,
+                        start + 80.0 - distance / 343.0,
+                        start - 100.0,
+                        start + 260.0,
+                        2.0,
+                    );
+                    track.key = key.into();
+                    track.icao = key.into();
+                    tracks.push(track);
+                }
+                let dem = fdop_types::FlatElevation(0.0);
+                let atmo =
+                    fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+                let located = crate::search::run(
+                    &crate::search::SearchInputs {
+                        events: independent,
+                        tracks: &tracks,
+                        heard_times: detections.iter().map(|d| d.t0r).collect(),
+                        coarse_dem: &dem,
+                        fine_dem: &dem,
+                        atmo: &atmo,
+                    },
+                    &crate::search::SearchParams::new(
+                        start,
+                        start,
+                        160.0,
+                        fdop_types::BBox::new(lat - 0.005, lon - 0.005, lat + 0.005, lon + 0.005),
+                    ),
+                    &|message| eprintln!("coarse family search: {message}"),
+                );
+                let best = located
+                    .candidates
+                    .first()
+                    .expect("two recovered aircraft must locate");
+                for flight in ["family-primary", "family-sibling"] {
+                    assert!(
+                        best.events.iter().any(|e| e.flight == flight && e.core),
+                        "{best:?}"
+                    );
+                }
+                let refined = located.refine.as_ref().expect("the location must refine");
+                let error = fdop_types::geo::haversine_m(lat, lon, refined.lat, refined.lon);
+                eprintln!(
+                    "coarse family location: {error}m, clock={}s",
+                    refined.t_start_utc - start
+                );
+                assert!(error < 75.0, "{refined:?}");
+                assert!((refined.t_start_utc - start).abs() < 0.2, "{refined:?}");
+                assert!(located.funnel.truncated.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -1441,6 +1680,7 @@ mod tests {
         );
         assert_eq!(selected.detection.id, primary.id);
         assert!(!selected.is_aircraft_like());
+        assert!(unmeasured_family_siblings(&detections, &[selected], dp.thr_silence_db).is_empty());
     }
 
     /// Only a primary whose ridge is missing around the CPA may yield to a sibling. A primary that

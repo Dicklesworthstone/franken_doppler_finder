@@ -2279,6 +2279,14 @@ fn harmonic_events(a: &SearchEvent, b: &SearchEvent, cap_sigma: f64) -> bool {
     {
         return false;
     }
+    harmonic_trace_shape(a, b, cap_sigma)
+}
+
+/// Compare observed ridges, without using fitted CPA/frequency estimates as a family screen.
+/// A known survey sibling must pass this comparison before it supplies another aircraft:
+/// different trace coverage can move its fitted parameters without changing the shared sound.
+/// Missing two-sided overlap cannot establish independent motion.
+fn harmonic_trace_shape(a: &SearchEvent, b: &SearchEvent, cap_sigma: f64) -> bool {
     let (low, high) = if a.f0 <= b.f0 { (a, b) } else { (b, a) };
     let n = low.tr_t.len().min(low.tr_f.len());
     if n < 2 {
@@ -2324,7 +2332,7 @@ fn harmonic_events(a: &SearchEvent, b: &SearchEvent, cap_sigma: f64) -> bool {
         return true;
     }
     // Robust constant-ratio fit, allowing the same bounded stray-point influence used by
-    // trace scoring. The fitted f0 values are only a coarse family screen, not the scale fit.
+    // trace scoring. Fit the scale from observations, independently of fitted f0 estimates.
     let (mut xy, mut xx) = (0.0, 0.0);
     for &(_, fm, f, flo, fhi) in &points {
         if (f - ratio * fm).abs() <= cap_sigma * s2.sqrt() + ratio * (fhi - flo) {
@@ -2350,6 +2358,7 @@ fn harmonic_events(a: &SearchEvent, b: &SearchEvent, cap_sigma: f64) -> bool {
 /// Quality-passing, aircraft-like measured events under the standard search's independent-pass
 /// policy. Use the same selection when counting measurement slots and supplying the final search:
 /// multiple seeds or harmonics of one pass must not hide a later independent flyover.
+/// Known survey siblings require distinct observed ridges even when fitted CPA/f0 estimates drift.
 ///
 /// Wind widens the speed gates but does not change eligibility, ordering or harmonic grouping.
 /// This returns every selected event; a caller with a measurement cap must apply it afterwards.
@@ -2359,10 +2368,80 @@ pub fn independent_measured_events(events: &[MeasuredEvent], wind_mps: f64) -> V
         .filter(|e| e.is_aircraft_like())
         .filter_map(|e| SearchEvent::from_measured(e, wind_mps))
         .collect();
-    independent_events(eligible, DEFAULT_CAP_SIGMA)
+    if !events.iter().any(|e| e.detection.harmonic_of.is_some()) {
+        return independent_events(eligible, DEFAULT_CAP_SIGMA);
+    }
+    let families = events
+        .iter()
+        .map(|e| {
+            (
+                e.id.as_str(),
+                vec![(e.detection.id, e.detection.harmonic_of)],
+            )
+        })
+        .collect();
+    independent_events_with_families(eligible, families, DEFAULT_CAP_SIGMA)
 }
 
-fn independent_events(mut evs: Vec<SearchEvent>, cap_sigma: f64) -> Vec<SearchEvent> {
+fn independent_events_with_families(
+    evs: Vec<SearchEvent>,
+    mut families: HashMap<&str, Vec<(usize, Option<usize>)>>,
+    cap_sigma: f64,
+) -> Vec<SearchEvent> {
+    // Keep the ordinary quality winner and the family hints of each duplicate it explains.
+    // Otherwise a better-fitting alternate seed can erase the only link to a known sibling.
+    let mut representatives = independent_events_by(evs, |a, b| {
+        if !harmonic_events(a, b, cap_sigma) {
+            return false;
+        }
+        if let Some(members) = families.remove(b.id.as_str())
+            && let Some(kept) = families.get_mut(a.id.as_str())
+        {
+            kept.extend(members);
+        }
+        true
+    });
+    // The inherited family hint only permits comparing the representatives' actual ridges.
+    // It never unions all members of a survey family or overrides distinct observed motion.
+    loop {
+        let before = representatives.len();
+        representatives = independent_events_by(representatives, |a, b| {
+            let same_family = match (families.get(a.id.as_str()), families.get(b.id.as_str())) {
+                (Some(a), Some(b)) => a.iter().any(|&(a, parent_a)| {
+                    b.iter().any(|&(b, parent_b)| {
+                        (parent_a.is_some() || parent_b.is_some())
+                            && parent_a.unwrap_or(a) == parent_b.unwrap_or(b)
+                    })
+                }),
+                _ => false,
+            };
+            if !same_family || !harmonic_trace_shape(a, b, cap_sigma) {
+                return false;
+            }
+            if let Some(members) = families.remove(b.id.as_str())
+                && let Some(kept) = families.get_mut(a.id.as_str())
+            {
+                kept.extend(members);
+            }
+            true
+        });
+        if representatives.len() == before {
+            return representatives;
+        }
+        // A later parent can connect two earlier, better-fitting siblings. Recheck only
+        // after a removal; every further merge still requires the representatives' ridges
+        // to agree, and the count strictly decreases until the grouping stabilizes.
+    }
+}
+
+fn independent_events(evs: Vec<SearchEvent>, cap_sigma: f64) -> Vec<SearchEvent> {
+    independent_events_by(evs, |a, b| harmonic_events(a, b, cap_sigma))
+}
+
+fn independent_events_by(
+    mut evs: Vec<SearchEvent>,
+    mut same_event: impl FnMut(&SearchEvent, &SearchEvent) -> bool,
+) -> Vec<SearchEvent> {
     // events: clean fits first, then best quality; drop harmonics of a stronger event
     evs.sort_by(|a, b| {
         a.misfit
@@ -2371,7 +2450,7 @@ fn independent_events(mut evs: Vec<SearchEvent>, cap_sigma: f64) -> Vec<SearchEv
     });
     let mut keep: Vec<SearchEvent> = Vec::new();
     for e in evs {
-        if keep.iter().any(|k| harmonic_events(k, &e, cap_sigma)) {
+        if keep.iter().any(|k| same_event(k, &e)) {
             continue;
         }
         keep.push(e);
@@ -9250,10 +9329,10 @@ mod tests {
         assert_eq!(cloud.count, 0, "minimum AGL still applies to gap samples");
     }
 
-    #[test]
-    fn harmonic_noise_sampling_and_fit_offsets_do_not_split_one_pass() {
+    fn harmonic_trace_pair() -> (SearchEvent, SearchEvent) {
         let c = 343.0;
         let mut fundamental = plain_event(100.0, false);
+        fundamental.id = "fundamental".into();
         fundamental.t_rec = 100.0;
         fundamental.tr_t = (0..240).map(|i| 40.0 + 0.5 * i as f64).collect();
         fundamental.tr_f = fundamental
@@ -9266,6 +9345,7 @@ mod tests {
         // Same physical pass, but a different analysis window/cadence, independent noise,
         // and fitted f0/CPA offsets. The observed frequency ratio is still five.
         let mut fifth = plain_event(505.0, false);
+        fifth.id = "fifth".into();
         fifth.t_rec = 101.0;
         fifth.tr_t = (0..120).map(|i| 60.15 + 0.65 * i as f64).collect();
         fifth.tr_f = fifth
@@ -9275,6 +9355,12 @@ mod tests {
                 cv_curve(t, 500.0, 100.0, 3000.0, 100.0 - 3000.0 / c, c) + 0.15 * (t * 2.3).sin()
             })
             .collect();
+        (fundamental, fifth)
+    }
+
+    #[test]
+    fn harmonic_noise_sampling_and_fit_offsets_do_not_split_one_pass() {
+        let (fundamental, mut fifth) = harmonic_trace_pair();
         for (a, b) in [(&fundamental, &fifth), (&fifth, &fundamental)] {
             assert!(harmonic_events(a, b, 5.0));
         }
@@ -9290,6 +9376,156 @@ mod tests {
         fifth.tr_t.truncate(n);
         fifth.tr_f.truncate(n);
         assert!(harmonic_events(&fundamental, &fifth, 5.0));
+    }
+
+    #[test]
+    fn known_family_observations_override_fitted_harmonic_screens() {
+        let (fundamental, fifth) = harmonic_trace_pair();
+        // Deliberately perturb fitted metadata while preserving measured harmonic ridges.
+        // This tests selection invariance, not an assertion that the fitter makes these errors.
+        for (t_rec, f0) in [(112.0, 505.0), (101.0, 540.0), (112.0, 540.0)] {
+            let mut offset = fifth.clone();
+            offset.t_rec = t_rec;
+            offset.f0 = f0;
+            for (a, b) in [(&fundamental, &offset), (&offset, &fundamental)] {
+                assert!(!harmonic_events(a, b, 5.0));
+                assert!(harmonic_trace_shape(a, b, 5.0));
+            }
+            assert_eq!(
+                independent_events(vec![fundamental.clone(), offset.clone()], 5.0).len(),
+                2,
+                "unrelated events retain the fitted-parameter screen",
+            );
+            assert_eq!(
+                independent_events_by(vec![fundamental.clone(), offset.clone()], |a, b| {
+                    harmonic_trace_shape(a, b, 5.0)
+                })
+                .len(),
+                1,
+                "known-family ridges cannot supply duplicate aircraft evidence",
+            );
+            // An overlapping approach alone cannot distinguish two aircraft, even when
+            // fitted metadata fails the generic screen. A family hint is not new evidence.
+            let n = offset.tr_t.partition_point(|&t| t < fundamental.t_rec);
+            offset.tr_t.truncate(n);
+            offset.tr_f.truncate(n);
+            assert_eq!(
+                independent_events_by(vec![fundamental.clone(), offset], |a, b| {
+                    harmonic_trace_shape(a, b, 5.0)
+                })
+                .len(),
+                1,
+            );
+        }
+        // The family hint must still permit genuinely different observed motion. Shifting
+        // the entire received ridge changes its shape at shared times, beyond fit metadata.
+        let mut shifted = fifth;
+        shifted.t_rec = 112.0;
+        for t in &mut shifted.tr_t {
+            *t += 6.0;
+        }
+        for (a, b) in [(&fundamental, &shifted), (&shifted, &fundamental)] {
+            assert!(!harmonic_trace_shape(a, b, 5.0));
+        }
+        assert_eq!(
+            independent_events_by(vec![fundamental, shifted], |a, b| {
+                harmonic_trace_shape(a, b, 5.0)
+            })
+            .len(),
+            2,
+            "observed disagreement still recovers a distinct sibling",
+        );
+    }
+
+    #[test]
+    fn family_selection_retains_links_from_duplicate_primary_seeds() {
+        let (fundamental, mut fifth) = harmonic_trace_pair();
+        fifth.t_rec = 112.0;
+        fifth.quality = 120.0;
+        let mut alternate = fundamental.clone();
+        alternate.id = "alternate".into();
+        alternate.quality = 110.0;
+        let families = HashMap::from([
+            ("fundamental", vec![(0, None)]),
+            ("fifth", vec![(1, Some(0))]),
+            ("alternate", vec![(2, None)]),
+        ]);
+        let events = vec![fundamental.clone(), fifth.clone(), alternate.clone()];
+        let generic = independent_events(events.clone(), 5.0);
+        assert_eq!(generic.len(), 2);
+        assert_eq!(generic[1].id, "alternate", "keep the better primary fit");
+        let selected = independent_events_with_families(events, families.clone(), 5.0);
+        assert_eq!(selected.len(), 1, "a discarded parent must retain its link");
+        assert_eq!(selected[0].id, "fifth", "keep the best observed fit");
+
+        // An equal numeric detection ID without an explicit sibling relation adds no hint.
+        let mut unrelated = families.clone();
+        unrelated.insert("fifth", vec![(0, None)]);
+        assert_eq!(
+            independent_events_with_families(
+                vec![fundamental.clone(), fifth.clone(), alternate.clone()],
+                unrelated,
+                5.0,
+            )
+            .len(),
+            2,
+        );
+
+        // Inheriting the parent's hint must not merge different observed Doppler motion.
+        for t in &mut fifth.tr_t {
+            *t += 6.0;
+        }
+        let distinct =
+            independent_events_with_families(vec![fundamental, fifth, alternate], families, 5.0);
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(distinct[1].id, "alternate");
+    }
+
+    #[test]
+    fn family_selection_rechecks_higher_quality_siblings_after_a_parent_merge() {
+        let (fundamental, mut fifth) = harmonic_trace_pair();
+        fifth.t_rec = 112.0;
+        fifth.quality = 130.0;
+        let mut seventh = fifth.clone();
+        seventh.id = "seventh".into();
+        seventh.f0 *= 1.4;
+        seventh.sigma_hz *= 1.4;
+        for f in &mut seventh.tr_f {
+            *f *= 1.4;
+        }
+        seventh.t_rec = 124.0;
+        seventh.quality = 120.0;
+        let mut alternate = fundamental.clone();
+        alternate.id = "alternate".into();
+        alternate.quality = 110.0;
+        let families = HashMap::from([
+            ("fundamental", vec![(0, None)]),
+            ("fifth", vec![(1, Some(0))]),
+            ("alternate", vec![(2, None)]),
+            ("seventh", vec![(3, Some(2))]),
+        ]);
+        let events = vec![
+            fundamental.clone(),
+            fifth.clone(),
+            alternate.clone(),
+            seventh.clone(),
+        ];
+        assert_eq!(independent_events(events.clone(), 5.0).len(), 3);
+        let selected = independent_events_with_families(events, families.clone(), 5.0);
+        assert_eq!(selected.len(), 1, "both siblings share observed motion");
+        assert_eq!(selected[0].id, "fifth", "keep the best observed fit");
+
+        // A propagated parent hint is still insufficient to merge disagreeing ridges.
+        for t in &mut seventh.tr_t {
+            *t += 6.0;
+        }
+        let distinct = independent_events_with_families(
+            vec![fundamental, fifth, alternate, seventh],
+            families,
+            5.0,
+        );
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(distinct[1].id, "seventh");
     }
 
     #[test]
