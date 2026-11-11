@@ -395,6 +395,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 t_end: hi + 4.0 * 3600.0,
                 geoid_n_m: n,
                 keep_unknown: true,
+                include_jets: false,
             };
             // as in `locate`: fetch the published part, name the UTC days still pending
             let (until, pending) = fdop_data::published_until(

@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain jets in explicitly expanded ADS-B catalogues
+
+- Add `IngestSpec.include_jets` for callers that need known jet tracks. Apply the
+  policy during parsing, after cross-feed type reconciliation, and after cross-day
+  merging. Existing callers continue to exclude jets.
+- Give expanded day stores a separate `+jets` feedset suffix and require a boolean
+  `stats.include_jets: true` certificate before reuse. Ordinary stores, renamed
+  legacy stores, and incomplete coverage markers cannot satisfy an expanded request,
+  including offline midnight and partial-feed fallback paths.
+- Test compressed trace ingestion, unknown-to-jet metadata reconciliation, expanded
+  cache selection, and adjoining-day geometry whose jet type arrives from another day.
+  The existing binary still requests ordinary catalogues in this backend change.
+- Validation: the local data files passed rustfmt and whitespace checks before the
+  execution environment disconnected. The changes were reconstructed from the pinned
+  GitHub files and reviewed through the GitHub API to preserve the work. Native
+  compilation, tests, selftest and reference replays did not complete; no native
+  validation or real-recording accuracy improvement is claimed.
+
 ### Preserve completed main ADS-B feeds after MLAT failure
 
 - Keep a completely ingested prod or staging feed when another requested feed fails,

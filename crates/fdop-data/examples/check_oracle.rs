@@ -42,6 +42,7 @@ fn main() {
         t_end: parse_iso_utc("2026-09-10T11:00:00Z").unwrap(),
         geoid_n_m: n,
         keep_unknown: true,
+        include_jets: false,
     };
     let opts = FetchOptions {
         offline: true,

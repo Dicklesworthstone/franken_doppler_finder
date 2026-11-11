@@ -37,6 +37,8 @@ pub struct IngestSpec {
     pub geoid_n_m: f64,
     /// Keep aircraft whose type designator is missing/unknown (fail-open; default true).
     pub keep_unknown: bool,
+    /// Keep known jet aircraft as potential tonal sources (explicit opt-in).
+    pub include_jets: bool,
 }
 
 /// Nearest reports bracketing each UTC seam, with interpolation/duplicate support.
@@ -661,7 +663,7 @@ fn parse_member(
     }
     let typ = tf.t.0.as_deref().unwrap_or("").trim().to_ascii_uppercase();
     let engine = engine_class(&typ);
-    if engine == EngineClass::Jet {
+    if engine == EngineClass::Jet && !spec.include_jets {
         return Parsed::Dropped(DropReason::Jet);
     }
     if engine == EngineClass::Unknown && !spec.keep_unknown {
@@ -1033,6 +1035,7 @@ pub(crate) mod tests {
             t_end: T0 + 80_000.0,
             geoid_n_m: -32.0,
             keep_unknown: true,
+            include_jets: false,
         }
     }
 
@@ -1279,6 +1282,36 @@ pub(crate) mod tests {
         let (air, st) = ingest_reader(std::io::Cursor::new(tarb), "prod", &sp, &|_| {}).unwrap();
         assert!(air.is_empty());
         assert_eq!(st.unknown_dropped, 1);
+    }
+
+    #[test]
+    fn jets_are_retained_only_when_explicitly_requested() {
+        let jet = pc12_json().replace("PC12", "b738");
+        let bytes = tar_of(&[("trace_full_a1b2c3.json", gz(&jet))]);
+        for include_jets in [false, true] {
+            for keep_unknown in [false, true] {
+                let sp = IngestSpec {
+                    include_jets,
+                    keep_unknown,
+                    ..spec()
+                };
+                let (aircraft, stats) =
+                    ingest_reader(bytes.as_slice(), "prod", &sp, &|_| {}).unwrap();
+                assert_eq!(stats.parse_errors, 0);
+                assert_eq!(stats.jets_dropped, u64::from(!include_jets));
+                assert_eq!(aircraft.len(), usize::from(include_jets));
+                if include_jets {
+                    assert_eq!(aircraft[0].engine, EngineClass::Jet);
+                    assert_eq!(aircraft[0].typ, "B738");
+                    assert_eq!(aircraft[0].points.len(), 9);
+                    let store = crate::build::build_store(vec![(aircraft, stats)], &sp, vec![]);
+                    assert_eq!(store.legs.len(), 1);
+                    assert_eq!(store.legs[0].points.len(), 9);
+                    assert!(store.legs.iter().all(|leg| leg.engine == EngineClass::Jet));
+                    assert_eq!(store.meta.stats["include_jets"], true);
+                }
+            }
+        }
     }
 
     #[test]

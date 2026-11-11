@@ -5,6 +5,8 @@
 //! outward to 0.1 degree; the whole UTC day is kept, the window is applied at load) and
 //! `<cache>/adsb/<YYYY-MM-DD>/releases.json`. Day stores are always built with unknown types
 //! kept; `keep_unknown = false` is applied after cross-day metadata reconciliation.
+//! Explicit jet catalogues append `+jets` to the feedset and certify `include_jets` in
+//! their metadata. Ordinary stores cannot satisfy an expanded catalogue request.
 
 use crate::DataError;
 use crate::adsblol::{DayRelease, Feed, find_day_releases_cached};
@@ -94,6 +96,10 @@ fn covers(outer: &BBox, inner: &BBox) -> bool {
         && outer.west <= inner.west + 1e-9
         && outer.north >= inner.north - 1e-9
         && outer.east >= inner.east - 1e-9
+}
+
+fn cache_feedset(feedset: &str, include_jets: bool) -> String {
+    format!("{feedset}{}", if include_jets { "+jets" } else { "" })
 }
 
 /// Parse `<feedset>_<S>_<W>_<N>_<E>.fdtrk`.
@@ -302,10 +308,11 @@ fn find_cached(
 ) -> Option<(PathBuf, CachedDay)> {
     let rd = std::fs::read_dir(dir).ok()?;
     let mut candidates = Vec::new();
+    let cache_feedset = cache_feedset(feedset, want.include_jets);
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if let Some((fs, bb)) = parse_cache_name(&name)
-            && fs == feedset
+            && fs == cache_feedset
             && covers(&bb, &want.bbox)
         {
             candidates.push((bb.area_km2(), e.path()));
@@ -320,6 +327,12 @@ fn find_cached(
                     && s.meta.t_start <= want.t_start
                     && s.meta.t_end >= want.t_end =>
             {
+                if want.include_jets
+                    && s.meta.stats.get("include_jets").and_then(|v| v.as_bool()) != Some(true)
+                {
+                    opts.say(&format!("[adsb] {label}: cache {} lacks verified jet coverage; checking other cached stores", p.display()));
+                    continue;
+                }
                 if required_context.is_some_and(|required|
                     !DayContext::from_stats(&s.meta.stats).is_some_and(|context| context.includes(required)))
                 {
@@ -694,6 +707,7 @@ pub fn fetch_window(
         t_end: days_from_civil(day.0, day.1, day.2) as f64 * 86_400.0 + 86_400.0 + DAY_CACHE_PAD_S,
         geoid_n_m: spec.geoid_n_m,
         keep_unknown: true,
+        include_jets: spec.include_jets,
     };
     let mut failed = StreamedDayFailures::default();
     if !jobs.is_empty() {
@@ -766,7 +780,10 @@ pub fn fetch_window(
                 }
                 let store = build_day_store(parts, &day_spec(day), tags, day_context(day));
                 let dir = day_dir(cache_dir, day);
-                let path = dir.join(format!("{fs}_{key}.fdtrk"));
+                let path = dir.join(format!(
+                    "{}_{key}.fdtrk",
+                    cache_feedset(&fs, spec.include_jets)
+                ));
                 let (legs, points) = (store.legs.len(), store.n_points());
                 let published = CachedDay::publish(store, &path).map_err(|e| {
                     DataError(format!(
@@ -810,6 +827,9 @@ pub fn fetch_window(
     if !spec.keep_unknown {
         merged.legs.retain(|l| l.engine != EngineClass::Unknown);
     }
+    if !spec.include_jets {
+        merged.legs.retain(|l| l.engine != EngineClass::Jet);
+    }
     let mut out = merged.filtered(&spec.bbox, spec.t_start, spec.t_end);
     out.meta.geoid_n_m = spec.geoid_n_m;
     out.meta.stats = serde_json::json!({
@@ -818,6 +838,7 @@ pub fn fetch_window(
         "days": days.iter().map(|d| format!("{:04}-{:02}-{:02}", d.0, d.1, d.2)).collect::<Vec<_>>(),
         "cache_hits": cache_hits,
         "feedset": feedset,
+        "include_jets": spec.include_jets,
         "notes": notes,
         "day_stores": day_stats,
         "leg_boundaries": out.meta.stats.get("leg_boundaries").cloned().unwrap_or_default(),
@@ -876,6 +897,115 @@ mod tests {
             sp,
             vec!["synthetic".into()],
         )
+    }
+
+    #[test]
+    fn jet_requests_require_separate_certified_catalogues() {
+        use crate::ingest::tests::{gz, pc12_json, spec, tar_of};
+        let ordinary = spec();
+        let expanded = IngestSpec {
+            include_jets: true,
+            ..ordinary
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache =
+            std::env::temp_dir().join(format!("fdop-jet-catalogue-{}-{nonce}", std::process::id()));
+        let dir = day_dir(&cache, (2026, 9, 8));
+        let (_, key) = bbox_key(&ordinary.bbox);
+        let ordinary_path = dir.join(format!("prod_{key}.fdtrk"));
+        let expanded_path = dir.join(format!("prod+jets_{key}.fdtrk"));
+        let options = FetchOptions {
+            include_mlat: false,
+            offline: true,
+            ..Default::default()
+        };
+        let mut legacy = synthetic_store(&ordinary);
+        legacy
+            .meta
+            .stats
+            .as_object_mut()
+            .unwrap()
+            .remove("include_jets");
+        legacy.save(&ordinary_path).unwrap();
+        let default_result = fetch_window(&ordinary, &cache, &options).unwrap();
+        assert_eq!(default_result.meta.stats["cache_hits"], 1);
+        assert!(default_result.legs.iter().all(|leg| leg.engine.tonal()));
+        // Neither the old filename nor renaming an old cache proves jet coverage.
+        for marker in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!("true"),
+        ] {
+            legacy.meta.stats["include_jets"] = marker;
+            legacy.save(&expanded_path).unwrap();
+            let error = fetch_window(&expanded, &cache, &options).unwrap_err();
+            assert!(error.to_string().contains("offline, not cached"));
+            assert!(
+                find_cached(
+                    &dir,
+                    "prod",
+                    &expanded,
+                    "2026-09-08",
+                    &options,
+                    Some(day_context((2026, 9, 8)))
+                )
+                .is_none(),
+                "legacy midnight fallback must not admit an incomplete catalogue"
+            );
+        }
+        let jet = pc12_json()
+            .replace("A1B2C3", "000001")
+            .replace("PC12", "B738");
+        let bytes = tar_of(&[
+            ("trace_full_a1b2c3.json", gz(&pc12_json())),
+            ("trace_full_000001.json", gz(&jet)),
+        ]);
+        let part = ingest_reader(bytes.as_slice(), "prod", &expanded, &|_| {}).unwrap();
+        let full = build_store(vec![part], &expanded, vec!["synthetic".into()]);
+        full.save(&expanded_path).unwrap();
+        let result = fetch_window(&expanded, &cache, &options).unwrap();
+        assert_eq!(result.meta.stats["cache_hits"], 1);
+        assert_eq!(result.meta.stats["include_jets"], true);
+        assert_eq!(result.legs.len(), 2);
+        assert_eq!(
+            result
+                .legs
+                .iter()
+                .filter(|leg| leg.engine == EngineClass::Jet)
+                .count(),
+            1
+        );
+        // An explicit opt-in never replaces the default catalogue or its geometry.
+        let ordinary_again = fetch_window(&ordinary, &cache, &options).unwrap();
+        assert_eq!(ordinary_again.legs.len(), default_result.legs.len());
+        for (got, expected) in ordinary_again.legs.iter().zip(default_result.legs) {
+            assert_eq!(got.engine, expected.engine);
+            assert_eq!(got.points, expected.points);
+        }
+        // The same certificate is required when an offline run accepts a main-only
+        // store while MLAT is absent.
+        let partial = fetch_window(
+            &expanded,
+            &cache,
+            &FetchOptions {
+                include_mlat: true,
+                ..options
+            },
+        )
+        .unwrap();
+        assert_eq!(partial.legs.len(), result.legs.len());
+        assert!(
+            partial.meta.stats["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note
+                    .as_str()
+                    .is_some_and(|s| s.contains("no mlatonly data")))
+        );
     }
 
     #[test]
@@ -1352,6 +1482,7 @@ mod tests {
             t_end: midnight + 1.0,
             geoid_n_m: 0.0,
             keep_unknown: false,
+            include_jets: false,
         };
         let point = |dt, lon| TrackPoint {
             t: midnight + dt,
@@ -1389,9 +1520,14 @@ mod tests {
         };
         // Either UTC day may have a missing or unrecognized aircraft type. The query
         // ends before the second day's reports, so losing the first half can lose the match.
-        for (known_first, unknown_type) in
+        for (known_type, known_first, unknown_type) in ["PC12", "B738"].into_iter().flat_map(|typ| {
             [(false, ""), (true, ""), (false, "ZZZZ9"), (true, "ZZZZ9")]
-        {
+                .map(move |(first, unknown)| (typ, first, unknown))
+        }) {
+            let spec = IngestSpec {
+                include_jets: known_type == "B738",
+                ..spec
+            };
             for i in 0..2 {
                 let points = if i == 0 {
                     vec![point(-20.0, -0.012), point(-10.0, -0.006)]
@@ -1402,7 +1538,7 @@ mod tests {
                     leg(
                         "000001",
                         if known_first == (i == 0) {
-                            "PC12"
+                            known_type
                         } else {
                             unknown_type
                         },
@@ -1431,12 +1567,15 @@ mod tests {
                         t_end: day + 86_400.0 + 3600.0,
                         geoid_n_m: 0.0,
                         sources: vec![format!("synthetic-day-{i}")],
-                        stats: serde_json::json!({}),
+                        stats: serde_json::json!({"include_jets": spec.include_jets}),
                         created_unix: day,
                     },
                     legs,
                 }
-                .save(&day_dir(&dir, (2026, 9, 8 + i)).join(format!("prod_{key}.fdtrk")))
+                .save(&day_dir(&dir, (2026, 9, 8 + i)).join(format!(
+                    "{}_{key}.fdtrk",
+                    cache_feedset("prod", spec.include_jets)
+                )))
                 .unwrap();
             }
             let strict = fetch_window(&spec, &dir, &opts).unwrap();
@@ -1447,8 +1586,8 @@ mod tests {
             );
             let flight = &strict.legs[0];
             assert_eq!(flight.key, "000001_20260908_1");
-            assert_eq!(flight.typ, "PC12");
-            assert_eq!(flight.engine, EngineClass::Turboprop);
+            assert_eq!(flight.typ, known_type);
+            assert_eq!(flight.engine, fdop_types::engine::engine_class(known_type));
             assert_eq!(flight.points.len(), 4, "both halves must survive");
             assert_eq!(flight.t0(), midnight - 20.0);
             assert_eq!(flight.t1(), midnight + 20.0);
@@ -1463,7 +1602,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(inclusive.legs.len(), 3);
-            let same_flight = inclusive.legs.iter().find(|l| l.typ == "PC12").unwrap();
+            let same_flight = inclusive.legs.iter().find(|l| l.typ == known_type).unwrap();
             assert_eq!(flight.key, same_flight.key);
             assert_eq!(flight.points, same_flight.points);
         }
@@ -1572,6 +1711,7 @@ mod tests {
             t_end: midnight + 10.0,
             geoid_n_m: -28.0,
             keep_unknown: true,
+            include_jets: false,
         };
         let point = |t: f64, dx: f64, dy: f64| TrackPoint {
             t: midnight + t,

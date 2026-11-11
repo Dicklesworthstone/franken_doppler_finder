@@ -212,6 +212,7 @@ impl PublishedWindow {
             t_end: (self.clock.1 + duration + 1200.0).min(self.adsb_end),
             geoid_n_m,
             keep_unknown: true,
+            include_jets: false,
         }
     }
 
@@ -852,6 +853,7 @@ fn run_curve_match(
         t_end,
         geoid_n_m,
         keep_unknown: true,
+        include_jets: false,
     };
     let lg = log.clone();
     let opts = fdop_data::FetchOptions {
@@ -4628,6 +4630,7 @@ mod tests {
                 t_end: midnight,
                 geoid_n_m: -30.0,
                 keep_unknown: true,
+                include_jets: false,
             },
             &a.cache,
             &fdop_data::FetchOptions {
@@ -4723,6 +4726,7 @@ mod tests {
                     t_end: catalog.1,
                     geoid_n_m: -30.0,
                     keep_unknown: true,
+                    include_jets: false,
                 },
                 &a.cache,
                 &fdop_data::FetchOptions {

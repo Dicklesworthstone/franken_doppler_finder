@@ -355,7 +355,7 @@ fn build_store_inner(
         } else {
             engine_class(&typ)
         };
-        if engine == EngineClass::Jet {
+        if engine == EngineClass::Jet && !spec.include_jets {
             jets_late += 1;
             continue;
         }
@@ -570,6 +570,7 @@ fn build_store_inner(
             "parse_errors": stats.parse_errors,
             "aircraft_overlap": stats.aircraft_overlap,
             "jets_dropped": stats.jets_dropped + jets_late,
+            "include_jets": spec.include_jets,
             "unknown_kept": stats.unknown_kept,
             "unknown_dropped": stats.unknown_dropped,
             "mixed_kept": stats.mixed_kept,
@@ -849,6 +850,7 @@ mod tests {
             t_end: day + 86_400.0 + 3600.0,
             geoid_n_m: 0.0,
             keep_unknown: true,
+            include_jets: false,
         }
     }
 
@@ -1438,6 +1440,48 @@ mod tests {
                 assert_ne!(leg.points[0].flags & pt_flags::NEW_LEG, 0);
             } else {
                 assert!(store.legs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn jet_policy_applies_after_cross_feed_type_reconciliation() {
+        let mut prod = seam_part(T0, T0, "prod", &[seam_row(0.0, 0.02), seam_row(10.0, 0.03)]);
+        let mut mlat = seam_part(
+            T0,
+            T0,
+            "mlat",
+            &[seam_row(10.0, 0.03), seam_row(20.0, 0.04)],
+        );
+        prod.0[0].typ = "ZZZZ9".into();
+        prod.0[0].engine = EngineClass::Unknown;
+        mlat.0[0].typ = "B738".into();
+        mlat.0[0].engine = EngineClass::Jet;
+        for include_jets in [false, true] {
+            for reverse in [false, true] {
+                let mut parts = vec![prod.clone(), mlat.clone()];
+                if reverse {
+                    parts.reverse();
+                }
+                let sp = IngestSpec {
+                    include_jets,
+                    keep_unknown: false,
+                    ..seam_spec(T0)
+                };
+                let store = build_store(parts, &sp, vec![]);
+                assert_eq!(store.meta.stats["include_jets"], include_jets);
+                assert_eq!(store.legs.len(), usize::from(include_jets));
+                if include_jets {
+                    let leg = &store.legs[0];
+                    assert_eq!(leg.typ, "B738");
+                    assert_eq!(leg.engine, EngineClass::Jet);
+                    assert_eq!(leg.source, "prod+mlat");
+                    assert_eq!(leg.points.len(), 3);
+                    assert_eq!(leg.t0(), T0);
+                    assert_eq!(leg.t1(), T0 + 20.0);
+                } else {
+                    assert_eq!(store.meta.stats["jets_dropped"], 1);
+                }
             }
         }
     }

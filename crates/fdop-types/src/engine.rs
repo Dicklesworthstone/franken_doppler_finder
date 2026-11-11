@@ -2,8 +2,9 @@
 //!
 //! The table (`data/icao_engine_class.tsv`, designator TAB class) is derived from the ICAO
 //! Doc 8643 type list: J jet, T turboprop/turboshaft, P piston, E electric, M mixed, O other.
-//! Policy (fail-open): drop known jets; KEEP unknown designators, because dropping unknowns
-//! would silently remove props whose type is missing from the feed.
+//! Default policy (fail-open): drop known jets; KEEP unknown designators, because dropping
+//! unknowns would silently remove props whose type is missing from the feed. An explicitly
+//! inclusive catalogue can retain jets without changing the engine classification table.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -44,7 +45,7 @@ impl EngineClass {
             _ => Self::Unknown,
         }
     }
-    /// Is this aircraft a candidate tonal (propeller/rotor) source? Jets are not.
+    /// Is this aircraft in the default propeller/rotor candidate population? Jets are not.
     /// Mixed-type designators (some variants jet, some prop) are KEPT: fail-open.
     pub fn tonal(self) -> bool {
         !matches!(self, Self::Jet)
