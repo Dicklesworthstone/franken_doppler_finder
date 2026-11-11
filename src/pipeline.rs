@@ -1253,7 +1253,7 @@ pub(crate) fn measure_recording(
     let ordinary_aircraft = search::independent_measured_events(&events, 0.0).len();
     if ordinary_aircraft < 2 && dets.len() < dp.max_detections && remaining_candidates > 0 {
         log.say(&format!(
-            "{ordinary_aircraft} independent aircraft measured; checking unclaimed recording edges and refused detections with a shorter fast-pass survey"
+            "{ordinary_aircraft} independent aircraft measured; checking unclaimed recording edges, refused detections and brief interior passes with a shorter fast-pass survey"
         ));
         let owners: Vec<_> = events
             .iter()
@@ -1279,7 +1279,7 @@ pub(crate) fn measure_recording(
             .map(|event| &dets[event.detection.id])
             .collect();
         let recovery_started = Instant::now();
-        let recovery = detect::recover_fast_passes_with_owners(
+        let recovery = detect::recover_fast_passes_counted_with_owners(
             x,
             sr,
             &dp,
@@ -1291,7 +1291,7 @@ pub(crate) fn measure_recording(
         recovery_detect_s = recovery_started.elapsed().as_secs_f64();
         detect_s += recovery_detect_s;
         match recovery {
-            Ok((mut recovered, recovery_cut)) => {
+            Ok((mut recovered, recovery_cut, interior_incomplete)) => {
                 let first_detection = dets.len();
                 let recovered_count = recovered.len();
                 for d in &mut recovered {
@@ -1338,8 +1338,13 @@ pub(crate) fn measure_recording(
                 events.append(&mut recovered_events);
                 if recovered_count > 0 || ordinary_aircraft == 0 {
                     warnings.push(format!(
-                        "short-window fast-pass recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; a shorter survey of the recording's true edges and refused detections, excluding its measured ridges and harmonic families, supplied {recovered_count} candidates within the remaining detection budget; all use the existing measurement gates and count as measured past the old line",
+                        "short-window fast-pass recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; a shorter survey of the recording's true edges and refused detections, followed by fully supported short interior templates, excluded its measured ridges and harmonic families and supplied {recovered_count} candidates within the remaining detection budget; all use the existing measurement gates and count as measured past the old line",
                     ));
+                }
+                if interior_incomplete {
+                    warnings.push(
+                        "short-window fast-pass recovery left interior audio unsearched after the existing candidate allowance or detection slots ran out; other fast flyovers may remain undetected".into(),
+                    );
                 }
                 if recovery_cut > 0 {
                     warnings.push(format!(
@@ -2823,11 +2828,13 @@ mod tests {
         let mp = MeasureParams::default();
         // A separate, slower aircraft is audible above the fast pass's entire frequency
         // range. The existing bank measures it; the fast pass still needs the shorter
-        // survey, either at a true recording edge or at a refused interior detection.
+        // survey at a true recording edge, a refused interior detection, or a brief
+        // interior pass that cannot illuminate the full template's longer halves.
         for (duration, fast, ordinary_heard, ordinary_amplitude) in [
             (30, (83.0, 245.0, 700.0, 19.37), 9.13, 0.08),
             (30, (83.0, 245.0, 700.0, 19.37), 9.13, 0.04),
             (180, (118.0, 215.0, 900.0, 80.13), 40.13, 0.08),
+            (180, (83.0, 245.0, 700.0, 79.37), 40.13, 0.04),
         ] {
             let mut x = fast_recording(duration, fast, 0.32);
             for (i, sample) in x.iter_mut().enumerate() {
@@ -2919,7 +2926,7 @@ mod tests {
                 warning.contains("ordinary measurement found 1 independent aircraft")
             }));
             assert_measurement_bookkeeping(&measured);
-            if ordinary_amplitude == 0.08 {
+            if duration == 180 || ordinary_amplitude == 0.08 {
                 // The recovered event must actually make the recording locatable. These
                 // orthogonal tracks have the exact geometry used to synthesize both tones.
                 let (lat, lon, start) = (40.876466, -73.524951, 1_788_895_000.0);
@@ -3602,11 +3609,18 @@ mod tests {
             };
             // Exercise cache scanning, aircraft selection, final slicing and interpolation.
             let store = fdop_data::fetch_window(&spec, &a.cache, &opts).unwrap();
-            assert_eq!(store.legs.len(), 1, "the distant control must remain excluded");
+            assert_eq!(
+                store.legs.len(),
+                1,
+                "the distant control must remain excluded"
+            );
             assert_eq!(store.legs[0].icao, "000001");
             let models = track::build(&store.legs[0], &track::BuildParams::default());
             assert_eq!(models.len(), 1);
-            assert_eq!(models[0].t, vec![cpa_time - 60.0, cpa_time, cpa_time + 60.0]);
+            assert_eq!(
+                models[0].t,
+                vec![cpa_time - 60.0, cpa_time, cpa_time + 60.0]
+            );
             let observer = geodetic_to_ecef(lat, lon, fdop_types::MIC_HEIGHT_M);
             let cpa = models[0].cpa_near(observer, cpa_time, 60.0).unwrap();
             assert!(cpa.interior);

@@ -19,6 +19,42 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover brief fast flyovers inside a recording
+
+- After true-edge and refused-seed recovery, scan complete ten-second halves for fast
+  transitions whose natural support fits that interval. Use the existing half-second
+  survey, strong line and remaining proposal/detection budgets. The short bank can
+  revisit a refused neighborhood or find a pass with no ordinary seed; it never treats
+  a crop seam as a recording edge and requires actual STFT support on both sides.
+- Keep previous detections first and preserve accepted aircraft's observed ridges and
+  harmonic families. Bound default survey working audio to 141 seconds per tile.
+  The pipeline still retries only with fewer than two independent measured aircraft,
+  shares the 24-event limit, and retains expanded-measurement provenance and confidence
+  gates. Report incomplete short-bank coverage separately from accepted detections cut.
+- Native positive: the fixed 83 Hz, 245 m/s, 700 m interior pass at 79.37 seconds has
+  no usable aircraft through ordinary measurement and the complete earlier recovery
+  path. The new seed reaches standard measurement at 83.0066 Hz, 244.9895 m/s,
+  699.9509 m and 79.3696 seconds, with 91.5% central-drop traversal
+  (`short_interior_fast_recovery_finds_physical_passes`).
+- `short_interior_fast_recovery_supplies_a_second_independent_aircraft` adds a separate
+  450 Hz pass at amplitude 0.04. The old path leaves one measured aircraft; the new
+  path supplies two and, with the recording start supplied, search/refinement locates
+  the synthetic observer within 0.051 m, with both flights core and no truncation.
+  Harmonic, observed-owner, removed-drop, reversed-audio, noise/hum and limit controls
+  pass. The matching root pipeline regression is authored but unrun.
+- The actual unchanged `src/selftest.rs` module passes through a temporary native
+  runner: 1.674 m error, 75 m radius, 0.020 s clock error, both intended flights, the
+  original 1300-second audio and +/-6-hour clock search. This is unoptimized Cranelift
+  execution, not the release CLI or new recovery orchestration; that binary predates
+  concurrent jet-policy commit `5fb4a17`. After integration, the core jet-policy,
+  CPA-time, narrow-clock fingerprint and recovery-limit checks and all-targets clippy
+  pass. No real-recording improvement is claimed.
+- Workspace clippy was attempted with the pinned nightly and Cranelift, one build job
+  and optimization disabled; compilation was terminated by `SIGKILL` in `asupersync`
+  before reaching the root crate. Changed Rust files pass rustfmt; the workspace still
+  has pre-existing formatting differences elsewhere. Full workspace tests, release CLI
+  selftest and reference replays have not completed.
+
 ### Match explicitly requested tonal jets throughout locate
 
 - Add `--include-jets` to `locate` and `fetch`. Thread the policy through normal,

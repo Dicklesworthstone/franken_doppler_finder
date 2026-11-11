@@ -733,8 +733,9 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 
 Detects flyovers using the same recording analysis as `locate`: detections are measured strongest
 first within each stage until 24 independent aircraft events survive. If ordinary measurement
-finds fewer than two independent aircraft, a bounded half-second survey of the recording's true
-edges can recover a missing short fast pass. The observed ridges and detected harmonic families
+finds fewer than two independent aircraft, a bounded half-second survey retries the recording's
+true edges and refused detections, then scans fully supported short interior paths for a missing
+fast pass. The observed ridges and detected harmonic families
 of accepted aircraft are excluded from that recovery. Every recovered candidate must pass the
 unchanged measurement and aircraft checks; warnings identify added candidates and any cap.
 Final events are ranked by measured quality and numbered
@@ -1232,6 +1233,11 @@ Design notes:
   fast templates around detections that actually failed measurement, within bounded neighborhoods
   using their time scales and the existing ten-second suppression floor. These interior crops
   include complete template support; their seams cannot supply artificial edge detections.
+  A final interior bank uses ten-second halves for fast transitions whose natural shortest
+  support fits that interval. It scans complete paths on the half-second survey, including
+  centers with no ordinary seed and neighborhoods the longer bank already tried. Every scored
+  center has actual STFT support on both sides. Tiles cover at most 120 seconds of centers,
+  with at most 141 seconds of working audio under the defaults.
   An accepted aircraft keeps its original measurement and owns its
   observed ridge and detected harmonic family, even when its fitted geometry is inaccurate.
   Ownership interpolates only across traced gaps of at most three seconds and never extrapolates;
@@ -1240,8 +1246,10 @@ Design notes:
   its seeds through ordinary refinement and family measurement. Original and recovered aircraft
   share the 24-event limit. Every retry event counts as measured past the old line, including one
   whose fitted speed falls. Warnings record added candidates and any cut. Recordings with two
-  independent aircraft already measured keep their original path. Interior recovery needs an
-  ordinary detection to identify the retry window and cannot replenish an exhausted budget.
+  independent aircraft already measured keep their original path. The short interior bank does
+  not need an ordinary detection to identify a retry window, but cannot replenish an exhausted
+  budget. If the remaining proposal allowance or detection slots stop that bank, a separate
+  warning reports that some interior audio was not searched with its short templates.
 - **STFT working storage stays bounded as recordings grow.** Frames transform into a reusable block of
   at most 256 columns and 4 MiB of frequency values, then copy into the final row-major spectrogram.
   A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
@@ -1560,6 +1568,41 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Brief interior fast passes can reach physical measurement
+
+`short_interior_fast_recovery_finds_physical_passes` compares the complete earlier recovery
+path with the new short interior bank on the same 180-second synthetic PCM. A physical
+83 Hz pass at 245 m/s and 700 m, heard closest at 79.37 seconds, produces only refused
+ordinary measurements, and the earlier edge/refused-seed recovery produces no usable aircraft.
+The ten-second interior template supplies a seed that ordinary family measurement fits at
+83.0066 Hz, 244.9895 m/s, 699.9509 m and 79.3696 seconds, with 300 traced points and 91.5%
+of the central frequency drop traversed. This is a native synthetic recovery, not a real
+recording or a claim of broader field accuracy.
+
+`short_interior_fast_recovery_supplies_a_second_independent_aircraft` adds a separate 450 Hz,
+90 m/s pass at amplitude 0.04. Ordinary measurement supplies one independent aircraft, and
+the complete earlier recovery path supplies no second one. The new bank supplies the missing
+fast pass. With the recording start supplied, actual pair search and refinement recover the
+synthetic observer within 0.051 m, with both correct flights as core matches and no funnel cut.
+The harmonic PCM control still yields exactly one aircraft. Existing observed-owner,
+central-drop-removed, reversed-audio, noise-plus-hum and exhausted-limit controls also pass.
+
+The pipeline retains the existing detection and measurement budgets, records recovered events
+as measured past the old line, and requires the same quality and confidence gates. Its matching
+two-aircraft bookkeeping regression is added but has not run: workspace clippy stopped with
+`SIGKILL` while compiling pinned `asupersync`, before root-crate checks. Core all-targets clippy,
+the focused native regressions, and formatting of the changed Rust files pass. The workspace
+formatting check still reports pre-existing differences in other files.
+
+The unchanged `src/selftest.rs` module separately passed its original 1300-second WAV, ffmpeg
+decode, ordinary detection/measurement, wide region and +/-6-hour clock search: 1.674 m error,
+75 m radius and 0.020 s clock error, with both intended flights. A temporary runner linked the
+actual module against the pinned nightly's unoptimized Cranelift build; this was not the release
+CLI or the recovery orchestration. Its snapshot precedes the concurrent `5fb4a17` jet-policy
+filter. Subsequent combined-source checks pass the jet-policy regression, all three CPA-time
+regressions, the unchanged narrow-clock fingerprints and recovery-limit tests. Full workspace
+tests, the release CLI selftest and real-recording replays have not completed.
+
 ### Opt-in jet catalogues and complete search wiring
 
 The new regressions exercise compressed jet traces, cross-feed type reconciliation,
@@ -1580,9 +1623,10 @@ decoy windows. These use synthesized harmonic tones, not a jet-specific noise mo
 with SIGKILL in `fsci-special` and `fsci-stats`; a single-job retry was also killed in
 `fsci-special`, before any project test ran. The execution environment then disconnected.
 Source review and recovered GitHub content checks completed, and the workspace formatting
-baseline already failed on existing files. The new regressions, workspace tests, Clippy,
-selftest and reference/field replays have not completed on this change. No real-recording
-accuracy improvement is claimed.
+baseline already failed on existing files. Those were the validation limits at `5fb4a17`.
+The subsequent core jet-policy regression and core all-targets clippy passed as recorded
+above; the archive/pipeline regressions, full workspace and release CLI checks, and
+reference/field replays remain incomplete. No real-recording accuracy improvement is claimed.
 
 ### Broad CPA-time profiles remain eligible for confirmation
 
@@ -3065,7 +3109,9 @@ audio or video recorded somewhere sensitive:
   spans 40–175 m/s; a final strong-only bank adds faster subsonic templates, about 194–263 m/s at the
   default sound speed. Earlier detections can still mask a faster curve before that final bank runs.
   With fewer than two measured aircraft and budget remaining, a shorter survey revisits refused
-  detections' neighborhoods; a pass with no ordinary seed or no remaining budget is still lost.
+  detections' neighborhoods and scans complete ten-second fast paths through the interior.
+  An ordinary seed is no longer required for that short bank. Passes that do not clear its
+  strong line and measurement gates, or for which no detection budget remains, are still lost.
 - **Atmosphere:** a straight-ray, height-averaged speed of sound with horizontal wind only. No refraction.
 - **Data volume:** each new UTC day costs about 4 GB of download, and adsb.lol archives cannot be fetched
   partially. adsb.lol has gaps on some days.
