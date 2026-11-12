@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover brief ordinary-speed passes when another aircraft is still needed
+
+- Append a compact primary-speed bank to the half-second recovery survey after both
+  existing fast stages have been measured. Short, close ordinary-speed passes can now
+  reach measurement even without a usable full-length seed. The bank uses primary
+  speeds through 175 m/s and only transitions whose natural support fits its short half.
+- Keep prior detections and measurements intact, use only accepted observed ridges and
+  their harmonic families as owners between stages, and share the original proposals,
+  detection slots and event limits. The strong line and all physical/confidence gates
+  remain unchanged. Wire the stage into the shared recording pipeline and its existing
+  expanded-measurement provenance; warnings cover either fast or ordinary short recovery.
+- Native physical regressions demonstrate zero-to-one recovery of an 88 m/s, 250 m pass
+  and one-to-two recovery alongside an already accepted aircraft. Seven focused core
+  tests pass, including negative signals, repeated ownership, shared limits and prior
+  fast-stage/harmonic compatibility, using pinned nightly and official Cranelift.
+- Add a root pipeline integration/provenance regression; it remains unrun at this
+  snapshot. Whole-workspace formatting still reports existing differences; fix only one
+  new track-test wrapping hunk. Workspace checks, release selftest and real-recording
+  replays remain incomplete. No field-accuracy or performance improvement is claimed.
+
 ### Recover distant corrected-height portions beside surviving GNSS models
 
 - Extend corrected-height recovery beyond complete preferred-track failure. Keep all

@@ -1283,13 +1283,14 @@ pub(crate) fn measure_recording(
     let mut sibling_measurements = siblings.len();
     added_ranks.extend(events[siblings].iter().map(|e| e.id.clone()));
     let mut recovery_detect_s = 0.0;
-    // A one-second survey can smear a steep, short pass beyond the fast templates' reach.
+    // A one-second survey can smear a steep, short pass, and even an ordinary-speed
+    // close pass can fade before the full templates' long halves end.
     // A location needs two independent passes. Preserve the observed ridges of any accepted
     // aircraft so another fit of that same sound cannot manufacture the missing second event.
     let ordinary_aircraft = search::independent_measured_events(&events, 0.0).len();
     if ordinary_aircraft < 2 && dets.len() < dp.max_detections && remaining_candidates > 0 {
         log.say(&format!(
-            "{ordinary_aircraft} independent aircraft measured; checking unclaimed recording edges, refused detections and brief interior passes with a shorter fast-pass survey"
+            "{ordinary_aircraft} independent aircraft measured; checking unclaimed recording edges, refused detections and brief interior passes with shorter surveys"
         ));
         let first_recovery = dets.len();
         let mut recovery_cut = 0;
@@ -1297,6 +1298,7 @@ pub(crate) fn measure_recording(
         for stage in [
             detect::FastRecoveryStage::EdgeAndRefused,
             detect::FastRecoveryStage::ShortInterior,
+            detect::FastRecoveryStage::OrdinaryShortInterior,
         ] {
             let measured_aircraft = search::independent_measured_events(&events, 0.0).len();
             if measured_aircraft >= 2 {
@@ -1385,7 +1387,7 @@ pub(crate) fn measure_recording(
                     );
                     if recovery_prim.len() > recovered_events.len() {
                         warnings.push(format!(
-                        "short-window fast-pass recovery measured {} of {} families, reaching the limit of {max_measured} independent aircraft events; the rest only mark passes as heard",
+                        "short-window recovery measured {} of {} families, reaching the limit of {max_measured} independent aircraft events; the rest only mark passes as heard",
                         recovered_events.len(), recovery_prim.len(),
                     ));
                     }
@@ -1406,7 +1408,7 @@ pub(crate) fn measure_recording(
                 }
                 Err(error) => {
                     warnings.push(format!(
-                    "short-window fast-pass recovery failed: {error}; retaining the measurements collected so far",
+                    "short-window recovery failed: {error}; retaining the measurements collected so far",
                 ));
                     // A failed scan may have consumed proposals before returning its error.
                     // Do not retry another stage with an unaccounted allowance.
@@ -1417,17 +1419,17 @@ pub(crate) fn measure_recording(
         let recovered_count = dets.len() - first_recovery;
         if recovered_count > 0 || ordinary_aircraft == 0 {
             warnings.push(format!(
-                "short-window fast-pass recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; a shorter survey of the recording's true edges and refused detections, measured before any needed short interior scan, supplied {recovered_count} candidates within the remaining detection budget; only accepted measured ridges and harmonic families own evidence between stages; all use the existing measurement gates and count as measured past the old line",
+                "short-window recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; the recording's true edges and refused detections, followed by brief fast and ordinary-speed interior passes as needed, supplied {recovered_count} candidates within the remaining detection budget; only accepted measured ridges and harmonic families own evidence between stages; all use the existing measurement gates and count as measured past the old line",
             ));
         }
         if interior_incomplete {
             warnings.push(
-                "short-window fast-pass recovery left interior audio unsearched after the existing candidate allowance or detection slots ran out; other fast flyovers may remain undetected".into(),
+                "short-window recovery left interior audio unsearched after the existing candidate allowance or detection slots ran out; other flyovers may remain undetected".into(),
             );
         }
         if recovery_cut > 0 {
             warnings.push(format!(
-                "short-window fast-pass recovery discarded at least {recovery_cut} candidate curves at the remaining detection limit; discarded curves neither explain events nor mark passes as heard",
+                "short-window recovery discarded at least {recovery_cut} candidate curves at the remaining detection limit; discarded curves neither explain events nor mark passes as heard",
             ));
         }
     }
@@ -2939,6 +2941,37 @@ mod tests {
     }
 
     #[test]
+    fn short_window_recovery_adds_ordinary_speed_interior_pass_and_provenance() {
+        let pass = (450.0, 88.0, 250.0, 60.13);
+        let x = fast_recording(120, pass, 0.08);
+        let log = Log::new(true);
+        let measured = measure_recording(&x, 4000, &log, None).unwrap();
+        let independent = search::independent_measured_events(&measured.events, 0.0);
+        assert_eq!(independent.len(), 1, "{:?}", log.lines());
+        let event = measured
+            .events
+            .iter()
+            .find(|event| event.id == independent[0].id)
+            .unwrap();
+        let best = event.fit.as_ref().unwrap().best;
+        assert!((best.f0 - pass.0).abs() < 0.3, "{best:?}");
+        assert!((best.v - pass.1).abs() < 4.0, "{best:?}");
+        assert!((best.d / pass.2 - 1.0).abs() < 0.08, "{best:?}");
+        assert!((best.t0r - pass.3).abs() < 0.3, "{best:?}");
+        let seed = &measured.detections[event.detection.id];
+        assert!(seed.v <= detect::PRIMARY_MAX_SPEED_MPS);
+        assert_eq!(seed.half_s, DetectParams::default().edge_half_s);
+        assert!(measured.added.contains(&event.id));
+        assert!(
+            measured
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("left interior audio unsearched"))
+        );
+        assert_measurement_bookkeeping(&measured);
+    }
+
+    #[test]
     fn short_window_recovery_retains_fast_edge_passes_and_provenance() {
         let dp = DetectParams::default();
         let mp = MeasureParams::default();
@@ -2989,7 +3022,7 @@ mod tests {
                 measured
                     .warnings
                     .iter()
-                    .any(|warning| warning.contains("short-window fast-pass recovery"))
+                    .any(|warning| warning.contains("short-window recovery"))
             );
             assert_measurement_bookkeeping(&measured);
         }
@@ -3012,7 +3045,7 @@ mod tests {
             measured
                 .warnings
                 .iter()
-                .all(|warning| !warning.contains("short-window fast-pass recovery"))
+                .all(|warning| !warning.contains("short-window recovery"))
         );
         let event = measured
             .events

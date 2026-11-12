@@ -3791,9 +3791,9 @@ mod tests {
             // The supported portions outside 300..700 s are each separated from
             // the preferred 480..520 s segment by more than the ordinary 180 s gap.
             let mut corrected = leg.clone();
-            corrected.points.retain(|p| {
-                p.alt_src == alt_src::BARO_CORRECTED && (p.t < 1300.0 || p.t > 1700.0)
-            });
+            corrected
+                .points
+                .retain(|p| p.alt_src == alt_src::BARO_CORRECTED && (p.t < 1300.0 || p.t > 1700.0));
             let expected = build(&corrected, &NO_BRIDGE);
             assert_eq!(expected.len(), 2);
             let recovered = build(&leg, &BuildParams::default());

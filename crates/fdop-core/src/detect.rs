@@ -1039,12 +1039,14 @@ pub fn recover_fast_passes_counted_with_owners(
     recover_fast_passes_impl(x, sr, p, slots, remaining_candidates, owners, refused, true)
 }
 
-/// Recovery stages separated by ordinary measurement at the caller. A proposal that later
-/// fails physical measurement must not own the evidence needed by the shorter bank.
+/// Short-window recovery stages separated by ordinary measurement at the caller. A proposal
+/// that later fails physical measurement must not own the evidence needed by the shorter bank.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FastRecoveryStage {
     EdgeAndRefused,
     ShortInterior,
+    /// Final compact bank at the primary survey's speeds, after both fast stages were measured.
+    OrdinaryShortInterior,
 }
 
 /// One recovery stage's detections and its use of the original shared limits.
@@ -1062,9 +1064,11 @@ pub struct FastRecoveryBatch {
 
 /// Run just one recovery stage, retaining its unused proposal allowance for the next.
 ///
-/// `EdgeAndRefused` preserves the true-edge and refused-seed searches. `ShortInterior` ignores
-/// `refused` and does not rerun either earlier search. Only the supplied accepted measurements
-/// and detections made within this stage own its evidence. After measuring the earlier stage,
+/// `EdgeAndRefused` preserves the true-edge and refused-seed searches. The two short interior
+/// stages ignore `refused` and do not rerun an earlier search. `OrdinaryShortInterior` uses the
+/// primary speed grid: a close ordinary-speed pass can also fade before a full template ends.
+/// Only the supplied accepted measurements and detections made within this stage own its
+/// evidence. After measuring the earlier stage,
 /// callers pass its accepted observed ridges as `owners`; its refused detections still consume
 /// detection slots and proposal allowance, but cannot hide a new short-template candidate.
 #[allow(clippy::too_many_arguments)]
@@ -1128,12 +1132,16 @@ fn recover_fast_stages_impl(
     refused: &[&Detection],
     stage: Option<FastRecoveryStage>,
 ) -> Result<FastRecoveryBatch, String> {
-    let (mut out, mut cut, mut remaining_candidates) =
-        if stage == Some(FastRecoveryStage::ShortInterior) {
-            (Vec::new(), 0, remaining_candidates)
-        } else {
-            recover_fast_edges_impl(x, sr, p, slots, remaining_candidates, owners)?
-        };
+    let short_only = matches!(
+        stage,
+        Some(FastRecoveryStage::ShortInterior | FastRecoveryStage::OrdinaryShortInterior)
+    );
+    let ordinary_short = stage == Some(FastRecoveryStage::OrdinaryShortInterior);
+    let (mut out, mut cut, mut remaining_candidates) = if short_only {
+        (Vec::new(), 0, remaining_candidates)
+    } else {
+        recover_fast_edges_impl(x, sr, p, slots, remaining_candidates, owners)?
+    };
     let scan_short = stage != Some(FastRecoveryStage::EdgeAndRefused);
     let slots = slots.min(p.max_detections);
     let short = DetectParams {
@@ -1141,16 +1149,28 @@ fn recover_fast_stages_impl(
         hop_s: 0.5,
         ..p.clone()
     };
-    let templates = build_fast_templates(&short, short.hop_s);
+    let templates = if ordinary_short {
+        Vec::new()
+    } else {
+        build_fast_templates(&short, short.hop_s)
+    };
     let duration = x.len() as f64 / f64::from(sr);
     let base_half = p.min_half_s.min(p.max_half_s);
-    // Reuse fast edge paths only for transitions whose natural shortest support fits
+    // Reuse edge paths only for transitions whose natural shortest support fits
     // inside their short half. Here both complete sides must fit inside the recording.
     let k_min = p.k_tau.iter().copied().fold(f64::INFINITY, f64::min);
-    let compact: Vec<_> = build_fast_edge_templates(&short, short.hop_s)
+    let compact_bank = if ordinary_short {
+        build_edge_templates(&short, short.hop_s)
+    } else {
+        build_fast_edge_templates(&short, short.hop_s)
+    };
+    let compact: Vec<_> = compact_bank
         .into_iter()
         .filter_map(|mut t| {
-            if matches!(t.edge, EdgeRole::Edge { .. }) && k_min * t.d / t.v <= t.half {
+            if matches!(t.edge, EdgeRole::Edge { .. })
+                && k_min * t.d / t.v <= t.half
+                && (!ordinary_short || (t.v > 0.0 && t.v <= PRIMARY_MAX_SPEED_MPS))
+            {
                 t.edge = EdgeRole::Plain;
                 Some(t)
             } else {
@@ -1158,7 +1178,7 @@ fn recover_fast_stages_impl(
             }
         })
         .collect();
-    if templates.is_empty() || !duration.is_finite() {
+    if (templates.is_empty() && compact.is_empty()) || !duration.is_finite() {
         return Ok(FastRecoveryBatch {
             detections: out,
             cut,
@@ -1208,10 +1228,7 @@ fn recover_fast_stages_impl(
     for (short_stage, windows, templates) in
         [(false, &merged, &templates), (true, &interior, &compact)]
     {
-        if templates.is_empty()
-            || (short_stage && !scan_short)
-            || (!short_stage && stage == Some(FastRecoveryStage::ShortInterior))
-        {
+        if templates.is_empty() || (short_stage && !scan_short) || (!short_stage && short_only) {
             continue;
         }
         let first = out.len();
@@ -1892,6 +1909,7 @@ mod tests {
             for stage in [
                 FastRecoveryStage::EdgeAndRefused,
                 FastRecoveryStage::ShortInterior,
+                FastRecoveryStage::OrdinaryShortInterior,
             ] {
                 let batch = recover_fast_passes_stage_with_owners(
                     &x,
@@ -1908,7 +1926,7 @@ mod tests {
                 assert_eq!(batch.remaining_candidates, allowance);
                 assert_eq!(
                     batch.interior_incomplete,
-                    stage == FastRecoveryStage::ShortInterior
+                    stage != FastRecoveryStage::EdgeAndRefused
                 );
             }
         }
@@ -2085,6 +2103,249 @@ mod tests {
             assert!((b.v - pass.1).abs() < 4.0, "{b:?}");
             assert!((b.d / pass.2 - 1.0).abs() < 0.08, "{b:?}");
             assert!((b.t0r - pass.3).abs() < 0.3, "{b:?}");
+        }
+    }
+
+    /// Exercise the production recovery order with measurement between stages, as the
+    /// recording pipeline does. Only accepted observed ridges own later evidence.
+    fn measured_recovery_stage(
+        x: &[f32],
+        lin: &Spec,
+        p: &DetectParams,
+        detections: &mut Vec<Detection>,
+        events: &mut Vec<crate::measure::MeasuredEvent>,
+        budget: usize,
+        stage: FastRecoveryStage,
+    ) -> usize {
+        let owners: Vec<_> = events
+            .iter()
+            .filter(|event| event.is_aircraft_like())
+            .map(|event| {
+                let measured = &detections[event.detection.id];
+                let family = measured.harmonic_of.unwrap_or(measured.id);
+                RecoveryOwner {
+                    trace: &event.trace,
+                    harmonics: detections
+                        .iter()
+                        .filter(|d| {
+                            d.id != measured.id && (d.id == family || d.harmonic_of == Some(family))
+                        })
+                        .map(|d| d.f0 / measured.f0)
+                        .collect(),
+                }
+            })
+            .collect();
+        let refused: Vec<_> = events
+            .iter()
+            .filter(|event| !event.is_aircraft_like())
+            .map(|event| &detections[event.detection.id])
+            .collect();
+        let mut batch = recover_fast_passes_stage_with_owners(
+            x,
+            4000,
+            p,
+            p.max_detections - detections.len(),
+            budget,
+            &owners,
+            &refused,
+            stage,
+        )
+        .unwrap();
+        assert_eq!(batch.cut, 0);
+        assert!(!batch.interior_incomplete);
+        assert!(batch.remaining_candidates <= budget);
+        let first = detections.len();
+        for detection in &mut batch.detections {
+            detection.id += first;
+            detection.harmonic_of = detection.harmonic_of.map(|id| id + first);
+        }
+        events.extend(measure_edge_families(x, lin, &batch.detections));
+        detections.extend(batch.detections);
+        assert!(detections.len() <= p.max_detections);
+        batch.remaining_candidates
+    }
+
+    #[test]
+    fn ordinary_speed_short_interior_pass_reaches_measurement() {
+        // A close ordinary-speed aircraft can have a briefer, steeper transition
+        // than a distant fast one. Synthesize its actual emission phase and 1/r
+        // amplitude; a short survey must still earn the unchanged physical gates.
+        let pass = (450.0, 88.0, 250.0, 60.13);
+        let mut x = fast_pass_scene(pass, 0.08);
+        x.truncate(120 * 4000);
+        let p = DetectParams::default();
+        let (ls, lin) = survey(&x, 4000, &p).unwrap();
+        let (mut detections, cut, mut budget) = detect_counted_with_budget(&ls, &p);
+        assert_eq!(cut, 0);
+        let mut events = measure_edge_families(&x, &lin, &detections);
+        for stage in [
+            FastRecoveryStage::EdgeAndRefused,
+            FastRecoveryStage::ShortInterior,
+        ] {
+            budget =
+                measured_recovery_stage(&x, &lin, &p, &mut detections, &mut events, budget, stage);
+        }
+        assert!(crate::search::independent_measured_events(&events, 0.0).is_empty());
+        budget = measured_recovery_stage(
+            &x,
+            &lin,
+            &p,
+            &mut detections,
+            &mut events,
+            budget,
+            FastRecoveryStage::OrdinaryShortInterior,
+        );
+        eprintln!("ordinary-speed short detections: {detections:?}");
+        let diagnostic: Vec<_> = events
+            .iter()
+            .map(|event| (&event.quality, event.fit.as_ref().map(|fit| fit.best)))
+            .collect();
+        let independent = crate::search::independent_measured_events(&events, 0.0);
+        assert_eq!(independent.len(), 1, "{diagnostic:?}");
+        let event = events
+            .iter()
+            .find(|event| event.id == independent[0].id)
+            .unwrap();
+        let best = event.fit.as_ref().unwrap().best;
+        assert!((best.f0 - pass.0).abs() < 0.3, "{best:?}");
+        assert!((best.v - pass.1).abs() < 4.0, "{best:?}");
+        assert!((best.d / pass.2 - 1.0).abs() < 0.08, "{best:?}");
+        assert!((best.t0r - pass.3).abs() < 0.3, "{best:?}");
+
+        // An accepted observed ridge owns its sound. Repeating this final stage cannot
+        // turn one pass into two, or change the earlier detections and their family IDs.
+        let count = detections.len();
+        let earlier = serde_json::to_value(&detections).unwrap();
+        measured_recovery_stage(
+            &x,
+            &lin,
+            &p,
+            &mut detections,
+            &mut events,
+            budget,
+            FastRecoveryStage::OrdinaryShortInterior,
+        );
+        assert_eq!(serde_json::to_value(&detections[..count]).unwrap(), earlier);
+        assert_eq!(
+            crate::search::independent_measured_events(&events, 0.0).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn ordinary_short_recovery_supplies_a_missing_second_aircraft() {
+        let pass = (450.0, 88.0, 250.0, 60.13);
+        let original = (118.0, 90.0, 900.0, 35.13);
+        let mut x = fast_pass_scene(pass, 0.08);
+        x.truncate(120 * 4000);
+        for (i, sample) in x.iter_mut().enumerate() {
+            let t = i as f64 / 4000.0;
+            let tau = crate::physics::retarded_tau(
+                t,
+                original.3 - original.2 / 343.0,
+                original.1,
+                original.2,
+                343.0,
+            );
+            let range = crate::physics::cv_radial(tau, original.1, original.2).0;
+            *sample += (0.16 * original.2 / range
+                * (std::f64::consts::TAU * original.0 * tau).sin()) as f32;
+        }
+        let p = DetectParams::default();
+        let (ls, lin) = survey(&x, 4000, &p).unwrap();
+        let (mut detections, cut, mut budget) = detect_counted_with_budget(&ls, &p);
+        assert_eq!(cut, 0);
+        let mut events = measure_edge_families(&x, &lin, &detections);
+        for stage in [
+            FastRecoveryStage::EdgeAndRefused,
+            FastRecoveryStage::ShortInterior,
+        ] {
+            budget =
+                measured_recovery_stage(&x, &lin, &p, &mut detections, &mut events, budget, stage);
+        }
+        let before = crate::search::independent_measured_events(&events, 0.0);
+        assert_eq!(before.len(), 1, "{events:?}");
+        let existing = events.iter().find(|e| e.id == before[0].id).unwrap();
+        assert!((existing.fit.as_ref().unwrap().best.f0 - original.0).abs() < 0.3);
+        let (detection_count, event_count) = (detections.len(), events.len());
+        let original_detections = serde_json::to_value(&detections).unwrap();
+        let original_events = serde_json::to_value(&events).unwrap();
+        measured_recovery_stage(
+            &x,
+            &lin,
+            &p,
+            &mut detections,
+            &mut events,
+            budget,
+            FastRecoveryStage::OrdinaryShortInterior,
+        );
+        let independent = crate::search::independent_measured_events(&events, 0.0);
+        assert_eq!(independent.len(), 2, "{events:?}");
+        assert_eq!(
+            serde_json::to_value(&detections[..detection_count]).unwrap(),
+            original_detections
+        );
+        assert_eq!(
+            serde_json::to_value(&events[..event_count]).unwrap(),
+            original_events
+        );
+        let recovered = events[event_count..]
+            .iter()
+            .find(|event| independent.iter().any(|e| e.id == event.id))
+            .unwrap();
+        let best = recovered.fit.as_ref().unwrap().best;
+        assert!((best.f0 - pass.0).abs() < 0.3, "{best:?}");
+        assert!((best.v - pass.1).abs() < 4.0, "{best:?}");
+        assert!((best.d / pass.2 - 1.0).abs() < 0.08, "{best:?}");
+        assert!((best.t0r - pass.3).abs() < 0.3, "{best:?}");
+    }
+
+    #[test]
+    fn ordinary_short_recovery_requires_observed_physical_motion() {
+        let pass = (450.0, 88.0, 250.0, 60.13);
+        let p = DetectParams::default();
+        let mut noise = fast_pass_scene(pass, 0.0);
+        noise.truncate(120 * 4000);
+        let mut physical = fast_pass_scene(pass, 0.08);
+        physical.truncate(noise.len());
+        let mut steady = noise.clone();
+        for (i, sample) in steady.iter_mut().enumerate() {
+            *sample += (0.08 * (std::f64::consts::TAU * pass.0 * i as f64 / 4000.0).sin()) as f32;
+        }
+        let mut missing_drop = physical.clone();
+        let a = ((pass.3 - 10.0) * 4000.0) as usize;
+        let b = ((pass.3 + 10.0) * 4000.0) as usize;
+        missing_drop[a..b].copy_from_slice(&noise[a..b]);
+        physical.reverse();
+        for (label, x) in [
+            ("noise and hum", noise),
+            ("steady tone", steady),
+            ("missing transition", missing_drop),
+            ("reversed pass", physical),
+        ] {
+            let (_, lin) = survey(&x, 4000, &p).unwrap();
+            let batch = recover_fast_passes_stage_with_owners(
+                &x,
+                4000,
+                &p,
+                p.max_detections,
+                400_000,
+                &[],
+                &[],
+                FastRecoveryStage::OrdinaryShortInterior,
+            )
+            .unwrap();
+            assert_eq!(batch.cut, 0);
+            assert!(!batch.interior_incomplete);
+            let events = measure_edge_families(&x, &lin, &batch.detections);
+            assert!(
+                events.iter().all(|event| !event.is_aircraft_like()),
+                "{label}"
+            );
+            assert!(
+                crate::search::independent_measured_events(&events, 0.0).is_empty(),
+                "{label}"
+            );
         }
     }
 

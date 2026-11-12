@@ -1367,15 +1367,18 @@ Design notes:
   fast templates around detections that actually failed measurement, within bounded neighborhoods
   using their time scales and the existing ten-second suppression floor. These interior crops
   include complete template support; their seams cannot supply artificial edge detections.
-  These earlier recovery candidates are measured before deciding whether the final bank is
-  needed. Only accepted measurements own evidence between stages: a failed full-template seed
+  These earlier recovery candidates are measured before deciding whether a short interior bank
+  is needed. Only accepted measurements own evidence between stages: a failed full-template seed
   remains in the detections and spends its original slots and proposals, but cannot hide a
   valid shorter path or make it an unmeasured harmonic child. If fewer than two independent
-  aircraft remain, a final interior bank uses ten-second halves for fast transitions whose natural shortest
-  support fits that interval. It scans complete paths on the half-second survey, including
-  centers with no ordinary seed and neighborhoods the longer bank already tried. Every scored
-  center has actual STFT support on both sides. Tiles cover at most 120 seconds of centers,
-  with at most 141 seconds of working audio under the defaults.
+  aircraft remain, an interior bank uses ten-second halves for fast transitions whose natural
+  shortest support fits that interval. After measuring those candidates, a final bank tries
+  compact paths at the primary speed grid's ordinary speeds, up to 175 m/s, if an independent
+  aircraft is still missing. A close ordinary-speed pass can also fade before a full template
+  ends. Both short banks scan complete paths on the half-second survey, including centers with
+  no ordinary seed and neighborhoods the longer bank already tried. Every scored center has
+  actual STFT support on both sides. Tiles cover at most 120 seconds of centers, with at most
+  141 seconds of working audio under the defaults.
   An accepted aircraft keeps its original measurement and owns its
   observed ridge and detected harmonic family, even when its fitted geometry is inaccurate.
   Ownership interpolates only across traced gaps of at most three seconds and never extrapolates;
@@ -1716,6 +1719,36 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover brief ordinary-speed passes through physical measurement
+
+A close pass at an ordinary aircraft speed can have a steep transition and fade before the
+full template ends. The half-second recovery survey now has a final compact bank at the
+primary speeds, up to 175 m/s, after the existing fast recovery stages have been measured.
+It runs only while the recording lacks two independent aircraft. It uses ten-second halves,
+complete observed support, the existing strong line, accepted-ridge ownership and the
+remaining proposal/detection budgets. Its measurements retain the expanded-detection
+provenance used by the confidence gates.
+
+The actual-core regression synthesizes a 450 Hz source moving at 88 m/s, 250 m from the
+observer, with received CPA 60.13 s in a two-minute recording. All earlier measured stages
+find zero independent aircraft; the final bank supplies one within the unchanged frequency,
+speed, distance and CPA tolerances. In a mixed recording with a supported 118 Hz / 90 m/s /
+900 m pass, those earlier stages retain exactly one aircraft and the final bank supplies the
+second. Earlier detections and measurements remain unchanged.
+
+All **7 focused detector/recovery tests pass** on pinned `nightly-2026-08-31` with the official
+Cranelift backend and unoptimized profiles. They include both physical recoveries, repeated
+accepted-ridge ownership, noise/hum, steady-tone, missing-transition and reversed-pass
+controls, exhausted shared limits, and existing fast-stage/harmonic/ownership compatibility.
+No detection, measurement or confidence threshold was lowered.
+
+The root pipeline has an added integration/provenance regression, but it has not run at this
+snapshot. Whole-workspace formatting reports existing differences; workspace Clippy/tests,
+release selftest and reference/field replays remain incomplete. An adjacent search run
+passed 53 tests and ignored 3 timing benchmarks before being interrupted to prioritize this
+change; it is not a completed suite. These synthetic PCM/measurement results establish
+recovered events, not field localization accuracy or a runtime improvement.
 
 ### Recover distant corrected-height portions beside a valid GNSS segment
 
