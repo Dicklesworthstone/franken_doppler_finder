@@ -118,7 +118,8 @@ pub struct LogSpec {
     /// row's MAD before the frame contrast can remove the swell, which shrinks its own ridge;
     /// taking the frame contrast first keeps the swell out of the row statistics.
     /// [`detect_counted`] scores it after the primary and edge banks, on what `data` left unexplained.
-    /// A final edge scan recovers short-clip coverage after every existing stage has had its turn.
+    /// Ordinary contrast edges follow the original fast banks; final fast contrast banks then
+    /// recover supported fast ridges from the remaining evidence, with full paths before edges.
     pub contrast: Option<Vec<f32>>,
 }
 
@@ -562,8 +563,9 @@ pub struct Detection {
 }
 
 /// Run the template banks. Primary/edge detections come first, then the contrast stage's, then
-/// the fast full-length and fast edge stages', then contrast edge recovery. Each group is
-/// strongest first. All clear `thr_silence_db`; supplemental groups also clear `thr_db`.
+/// the fast full-length and fast edge stages', then contrast edge recovery and the fast
+/// contrast banks. Each group is strongest first. All clear `thr_silence_db`; supplemental
+/// groups also clear `thr_db`.
 /// Family primaries are the measurement candidates.
 pub fn detect(ls: &LogSpec, p: &DetectParams) -> Vec<Detection> {
     detect_counted(ls, p).0
@@ -583,7 +585,7 @@ pub fn detect_counted_with_budget(
     ls: &LogSpec,
     p: &DetectParams,
 ) -> (Vec<Detection>, usize, usize) {
-    detect_with_budget_impl(ls, p, true)
+    detect_with_budget_impl(ls, p, true, true)
 }
 
 // Keep the complete original stage sequence available for output-equivalence tests.
@@ -593,7 +595,7 @@ fn detect_counted_impl(
     p: &DetectParams,
     recover_contrast_edges: bool,
 ) -> (Vec<Detection>, usize) {
-    let (detections, cut, _) = detect_with_budget_impl(ls, p, recover_contrast_edges);
+    let (detections, cut, _) = detect_with_budget_impl(ls, p, recover_contrast_edges, false);
     (detections, cut)
 }
 
@@ -601,6 +603,7 @@ fn detect_with_budget_impl(
     ls: &LogSpec,
     p: &DetectParams,
     recover_contrast_edges: bool,
+    recover_fast_contrast: bool,
 ) -> (Vec<Detection>, usize, usize) {
     let (nt, nr) = (ls.nt(), ls.nr());
     if nt < 8 || nr < 8 {
@@ -866,11 +869,120 @@ fn detect_with_budget_impl(
         added.truncate(room);
         out.extend(added);
     }
+    if recover_fast_contrast {
+        cut +=
+            append_fast_contrast_candidates(ls, p, &mut known, &mut out, &mut remaining_candidates);
+    }
     for (i, d) in out.iter_mut().enumerate() {
         d.id = i;
     }
     group_harmonics(&mut out, p);
     (out, cut, remaining_candidates)
+}
+
+/// A broadband swell can hide a fast pass from the original survey while leaving its
+/// contrast ridge clear. Give that image the supported fast bank only after every earlier
+/// stage, with their live ownership mask and remaining proposal/detection allowances.
+fn append_fast_contrast_candidates(
+    ls: &LogSpec,
+    p: &DetectParams,
+    known: &mut [bool],
+    out: &mut Vec<Detection>,
+    remaining_candidates: &mut usize,
+) -> usize {
+    if !p.fast_templates || out.len() >= p.max_detections || *remaining_candidates == 0 {
+        return 0;
+    }
+    let Some(contrast) = ls.contrast.as_deref() else {
+        return 0;
+    };
+    let view = LogSpec {
+        t: ls.t.clone(),
+        freqs: ls.freqs.clone(),
+        data: contrast.to_vec(),
+        bins_per_octave: ls.bins_per_octave,
+        hop_s: ls.hop_s,
+        scale: ls.scale,
+        gain: ls.gain,
+        contrast: None,
+    };
+    let mut residual = contrast.to_vec();
+    let mut cut = 0;
+    let threshold = p.thr_db.max(p.thr_silence_db);
+    for edges_only in [false, true] {
+        let room = p.max_detections - out.len();
+        if room == 0 || *remaining_candidates == 0 {
+            break;
+        }
+        let templates = if edges_only {
+            build_fast_edge_templates(p, ls.hop_s)
+        } else {
+            build_fast_templates(p, ls.hop_s)
+        };
+        if templates.is_empty() {
+            continue;
+        }
+        let windows = if edges_only {
+            edge_windows(ls, p.min_half_s)
+        } else {
+            vec![(0, ls.nt())]
+        };
+        zero_known(&mut residual, known);
+        let (bs, bi) = score_bank(&view, &templates, &residual, &windows);
+        let mut candidates: Vec<_> = (0..ls.nr() * ls.nt())
+            .filter(|&k| bs[k] as f64 >= threshold)
+            .collect();
+        candidates.sort_by(|&a, &b| bs[b].total_cmp(&bs[a]));
+        candidates.truncate(*remaining_candidates);
+        *remaining_candidates -= candidates.len();
+        let dense = edges_only.then(|| {
+            build_fast_edge_templates(
+                &DetectParams {
+                    path_dt: ls.hop_s,
+                    ..p.clone()
+                },
+                ls.hop_s,
+            )
+        });
+        let before = out.len();
+        for k in candidates {
+            if out.len() >= p.max_detections * 3 {
+                break;
+            }
+            let ti = bi[k] as usize;
+            if let Some(dense) = dense.as_ref()
+                && !corroborate_contrast_edge(
+                    &view,
+                    p,
+                    (k / ls.nt(), k % ls.nt()),
+                    (&templates[ti], &dense[ti]),
+                    known,
+                    threshold,
+                )
+            {
+                continue;
+            }
+            accept_candidates(
+                &view,
+                p,
+                &templates,
+                (&bs, &bi),
+                &[k],
+                threshold,
+                known,
+                out,
+            );
+        }
+        let mut added = out.split_off(before);
+        for detection in &mut added {
+            detection.from_contrast = true;
+        }
+        added.sort_by(|a, b| b.score.total_cmp(&a.score));
+        cut += added.len().saturating_sub(room);
+        added.truncate(room);
+        out.extend(added);
+    }
+    cut
 }
 
 /// An already measured ridge and its detected harmonic family. Ownership follows the observed
@@ -941,9 +1053,7 @@ fn recover_edges_impl(
         build_edge_templates(&short, short.hop_s)
             .into_iter()
             .filter(|t| {
-                t.v > 0.0
-                    && t.v <= PRIMARY_MAX_SPEED_MPS
-                    && k_min * t.d / t.v <= short.edge_half_s
+                t.v > 0.0 && t.v <= PRIMARY_MAX_SPEED_MPS && k_min * t.d / t.v <= short.edge_half_s
             })
             .collect()
     } else {
@@ -1896,6 +2006,251 @@ pub(crate) const FAST_PASSES: [(f64, f64, f64, f64); 3] = [
 mod tests {
     use super::*;
     use crate::physics::cv_curve;
+
+    /// Analytic log-image evidence, not FFT output: an independently solved received
+    /// ridge is clear on the contrast image but compressed below the original image's line.
+    fn physical_contrast_image((f0, v, d, t0r): (f64, f64, f64, f64), duration: usize) -> LogSpec {
+        let p = DetectParams::default();
+        let t: Vec<_> = (0..duration).map(|i| i as f64 + 0.5).collect();
+        let nr = ((p.fmax / p.fmin).log2() * p.bins_per_octave as f64).floor() as usize + 1;
+        let freqs: Vec<_> = (0..nr)
+            .map(|r| p.fmin * 2.0f64.powf(r as f64 / p.bins_per_octave as f64))
+            .collect();
+        let mut contrast = vec![0.0; nr * t.len()];
+        for (i, &heard) in t.iter().enumerate() {
+            let u = heard - (t0r - d / p.c);
+            let (mut lo, mut hi) = (-100_000.0, u);
+            for _ in 0..70 {
+                let tau = 0.5 * (lo + hi);
+                if tau + d.hypot(v * tau) / p.c < u {
+                    lo = tau;
+                } else {
+                    hi = tau;
+                }
+            }
+            let tau = 0.5 * (lo + hi);
+            let range = d.hypot(v * tau);
+            let received = f0 * p.c / (p.c + v * v * tau / range);
+            let row = (received / p.fmin).log2() * p.bins_per_octave as f64;
+            let level = 6.0 * (d / range).sqrt();
+            for r in 0..nr {
+                contrast[r * t.len() + i] =
+                    (level * (-0.5 * ((r as f64 - row) / 0.5).powi(2)).exp()) as f32;
+            }
+        }
+        LogSpec {
+            t,
+            freqs,
+            data: contrast.iter().map(|&z| z * 0.05).collect(),
+            bins_per_octave: p.bins_per_octave,
+            hop_s: 1.0,
+            scale: 0.1,
+            gain: 4.0,
+            contrast: Some(contrast),
+        }
+    }
+
+    #[test]
+    fn fast_contrast_recovers_physical_interior_and_true_edge_candidates() {
+        let p = DetectParams::default();
+        for (t0r, duration) in [(60.5, 120), (10.5, 30), (19.5, 30)] {
+            let ls = physical_contrast_image((118.0, 263.0, 1500.0, t0r), duration);
+            let (detections, cut, remaining) = detect_counted_with_budget(&ls, &p);
+            assert_eq!(detections.len(), 1, "{t0r}: {detections:?}");
+            assert_eq!(cut, 0);
+            assert!(remaining < 400_000);
+            let d = &detections[0];
+            assert!(d.from_contrast && d.score >= p.thr_db);
+            assert!((d.f0 - 118.0).abs() < 1.0, "{d:?}");
+            assert!((d.v - 263.0).abs() < 2.0, "{d:?}");
+            assert!((d.d / 1500.0 - 1.0).abs() < 0.08, "{d:?}");
+            assert!((d.t0r - t0r).abs() < 1.0, "{d:?}");
+            assert_eq!(d.harmonic_of, None);
+            assert!(d.harmonics.is_empty());
+            if duration == 30 {
+                assert_eq!(d.half_s, p.edge_half_s);
+            } else {
+                assert!(d.half_s >= p.min_half_s);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_contrast_keeps_existing_candidates_and_uses_only_remaining_limits() {
+        let p = DetectParams::default();
+        let mut ls = physical_contrast_image((300.0, 88.0, 900.0, 30.5), 180);
+        ls.data.clone_from(ls.contrast.as_ref().unwrap());
+        let fast = physical_contrast_image((118.0, 263.0, 1500.0, 140.5), 180);
+        for (a, &b) in ls
+            .contrast
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(fast.contrast.as_ref().unwrap())
+        {
+            *a += b;
+        }
+        let (before, before_cut, before_remaining) = detect_with_budget_impl(&ls, &p, true, false);
+        let (after, cut, remaining) = detect_counted_with_budget(&ls, &p);
+        assert!(!before.is_empty());
+        assert_eq!(after.len(), before.len() + 1, "{after:?}");
+        assert_eq!(
+            serde_json::to_value(&after[..before.len()]).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert!(after.last().unwrap().from_contrast);
+        assert_eq!(cut, before_cut);
+        assert!(remaining < before_remaining);
+        let capped = DetectParams {
+            max_detections: before.len(),
+            ..p.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(detect_counted(&ls, &capped).0).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+
+        let ls = physical_contrast_image((118.0, 263.0, 1500.0, 60.5), 120);
+        let mut known = vec![false; ls.nr() * ls.nt()];
+        let (mut out, mut allowance) = (Vec::new(), 0);
+        assert_eq!(
+            append_fast_contrast_candidates(&ls, &p, &mut known, &mut out, &mut allowance),
+            0
+        );
+        assert!(out.is_empty() && !known.iter().any(|&x| x));
+        allowance = 1;
+        assert_eq!(
+            append_fast_contrast_candidates(&ls, &p, &mut known, &mut out, &mut allowance),
+            0
+        );
+        assert_eq!(allowance, 0);
+        assert_eq!(out.len(), 1);
+        allowance = 400_000;
+        assert_eq!(
+            append_fast_contrast_candidates(&ls, &p, &mut known, &mut out, &mut allowance),
+            0
+        );
+        assert_eq!(out.len(), 1, "an owned ridge must not be counted again");
+    }
+
+    #[test]
+    fn fast_contrast_respects_disabled_fast_templates_and_missing_contrast() {
+        let p = DetectParams::default();
+        let mut ls = physical_contrast_image((118.0, 263.0, 1500.0, 60.5), 120);
+        let off = DetectParams {
+            fast_templates: false,
+            ..p.clone()
+        };
+        assert!(detect(&ls, &off).is_empty());
+        ls.contrast = None;
+        assert!(detect(&ls, &p).is_empty());
+    }
+
+    #[test]
+    fn fast_contrast_adds_no_noise_steady_reversed_or_one_sided_candidates() {
+        let p = DetectParams::default();
+        for control in [
+            "ordinary", "silence", "noise", "steady", "reversed", "approach", "recede",
+        ] {
+            let pass = if control == "ordinary" {
+                (300.0, 88.0, 900.0, 60.5)
+            } else {
+                (118.0, 263.0, 1500.0, 60.5)
+            };
+            let mut ls = physical_contrast_image(pass, 120);
+            let nt = ls.nt();
+            let nr = ls.nr();
+            let image = ls.contrast.as_mut().unwrap();
+            let mut seed = 2026u64;
+            for r in 0..nr {
+                if control == "reversed" {
+                    image[r * nt..(r + 1) * nt].reverse();
+                }
+                for i in 0..nt {
+                    let x = &mut image[r * nt + i];
+                    match control {
+                        "silence" => *x = 0.0,
+                        "noise" => {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            *x = (1.2 * seed as f64 / u64::MAX as f64 - 0.6) as f32;
+                        }
+                        "steady" => *x = if r == 84 { 6.0 } else { 0.0 },
+                        "approach" if i >= 60 => *x = 0.0,
+                        "recede" if i <= 60 => *x = 0.0,
+                        _ => {}
+                    }
+                }
+            }
+            let before = detect_with_budget_impl(&ls, &p, true, false).0;
+            let after = detect(&ls, &p);
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(before).unwrap(),
+                "{control}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_contrast_edges_still_require_a_continuous_ridge() {
+        let p = DetectParams::default();
+        for t0r in [10.5, 19.5] {
+            let mut ls = physical_contrast_image((118.0, 263.0, 1500.0, t0r), 30);
+            let nt = ls.nt();
+            let center = (t0r - 0.5) as usize;
+            for row in ls.contrast.as_mut().unwrap().chunks_mut(nt) {
+                for (i, x) in row.iter_mut().enumerate() {
+                    if !i.abs_diff(center).is_multiple_of(2) {
+                        *x = 0.0;
+                    }
+                }
+            }
+            let templates = build_fast_edge_templates(&p, ls.hop_s);
+            let (scores, _) = score_bank(
+                &ls,
+                &templates,
+                ls.contrast.as_ref().unwrap(),
+                &edge_windows(&ls, p.min_half_s),
+            );
+            assert!(scores.iter().any(|&s| f64::from(s) >= p.thr_db));
+            assert!(
+                detect(&ls, &p).is_empty(),
+                "sparse edge at {t0r} became a detection"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_contrast_harmonics_remain_one_family() {
+        let p = DetectParams::default();
+        let mut ls = physical_contrast_image((118.0, 263.0, 1500.0, 60.5), 120);
+        let harmonic = physical_contrast_image((236.0, 263.0, 1500.0, 60.5), 120);
+        for (a, &b) in ls
+            .contrast
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(harmonic.contrast.as_ref().unwrap())
+        {
+            *a += b;
+        }
+        let detections = detect(&ls, &p);
+        assert_eq!(detections.len(), 2, "{detections:?}");
+        assert_eq!(
+            detections
+                .iter()
+                .filter(|d| d.harmonic_of.is_none())
+                .count(),
+            1
+        );
+        assert!(
+            detections
+                .iter()
+                .all(|d| d.from_contrast && d.score >= p.thr_db)
+        );
+    }
 
     #[test]
     fn short_recovery_tiles_preserve_interior_centres() {
@@ -3291,7 +3646,7 @@ mod tests {
             assert_eq!(continuous.len(), 1, "hop {hop_s}: {continuous:?}");
             assert!(continuous[0].from_contrast);
             assert_eq!(continuous[0].half_s, p.edge_half_s);
-            let (_, _, before_edge) = detect_with_budget_impl(&continuous_image, &p, false);
+            let (_, _, before_edge) = detect_with_budget_impl(&continuous_image, &p, false, false);
             assert!(
                 remaining < before_edge,
                 "contrast edges did not consume the shared budget"
@@ -3415,7 +3770,7 @@ mod tests {
                     ..p.clone()
                 };
                 let (old, old_cut) = detect_counted_impl(&ls, &params, false);
-                let (new, cut) = detect_counted(&ls, &params);
+                let (new, cut) = detect_counted_impl(&ls, &params, true);
                 assert!(new.len() >= old.len() && new.len() <= cap, "scene {scene}");
                 assert!(cut >= old_cut, "scene {scene}");
                 for (before, after) in old.iter().zip(&new) {
@@ -3631,7 +3986,8 @@ mod tests {
         for (name, x) in scenes {
             let (ls, _) = survey(&x, 4000, &p).unwrap();
             let (without, old_cut) = detect_counted(&ls, &off);
-            let (with, cut) = detect_counted(&ls, &p);
+            // Isolate the established fast-image stages from the later contrast addition.
+            let (with, cut) = detect_counted_impl(&ls, &p, true);
             assert!(with.len() >= without.len(), "{name}");
             assert!(with.len() <= p.max_detections, "{name}");
             assert!(cut >= old_cut, "{name}");
@@ -3665,7 +4021,7 @@ mod tests {
                     ..capped.clone()
                 };
                 assert_eq!(
-                    serde_json::to_value(detect_counted(&ls, &capped).0).unwrap(),
+                    serde_json::to_value(detect_counted_impl(&ls, &capped, true).0).unwrap(),
                     serde_json::to_value(detect_counted(&ls, &capped_off).0).unwrap(),
                     "{name}: the fast stage displaced a kept detection"
                 );

@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover fast passes from the contrast-first survey
+
+- Append fast full-length and fast edge banks on the existing contrast-first image, after
+  every original stage. A curve revealed by broadband-background suppression can now use
+  the same supported fast templates as the original survey image.
+- Reuse the live residual mask, remaining proposal allowance and detection slots, strong
+  line, harmonic grouping and edge coverage/coherence guard. Earlier candidates retain
+  their priority and existing family relationships. New candidates carry `from_contrast` and keep the
+  pipeline's existing expanded-measurement provenance; no thresholds or caps change.
+- Add six regression groups for physical analytic log images, previous-stage preservation,
+  proposal/slot exhaustion, ownership, disabled banks, negative signals, sparse edge
+  rejection and harmonics. The old detector loses the interior and both edge fixtures;
+  the new fast-contrast stage recovers one accurately seeded candidate in each.
+- Eighteen selected detector/physics component tests pass with genuine pinned Rust and
+  dependencies, including all six new groups. These analytic image tests do not execute the production FFT or fitter.
+  Full workspace checks, release selftest and reference/field replays remain incomplete;
+  no PCM-measurement, field-accuracy or whole-recording performance claim is made.
+
 ### Retain candidates supported by weather at the observer
 
 - Replace aircraft-column speed and reach rejection with conservative whole-provider

@@ -1386,6 +1386,13 @@ Design notes:
   recovery with no baseline event; it does not establish recovery of a real field miss. The new
   fast-edge PCM recovery assertion still fails in the native baseline: its early 215 m/s case adds
   no fast-edge seed. The contrast-edge change does not repair or weaken that separate assertion (Testing).
+  After the ordinary contrast-edge stage, both fast banks also search the contrast-first image
+  when that image exists. Full-length fast contrast paths run before their edge paths, using
+  the remaining proposal allowance, detection slots and live ownership mask. A broadband swell
+  can therefore reveal a fast curve after background suppression even when the original image
+  cannot detect it. Edge paths retain the full-template coverage guard and native-frame ridge
+  corroboration. Earlier candidates keep their order and families; every new candidate carries
+  `from_contrast`, so its measurement keeps the existing expanded-detection provenance.
 - **A shorter survey can supply the missing second aircraft.** A steep fast pass can smear
   across frequency in the ordinary one-second survey. If fewer than two independent aircraft
   survive ordinary measurement, a half-second survey first searches fast edge templates at the
@@ -1750,6 +1757,27 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Fast passes can use the background-suppressed survey
+
+The fast full-length and edge template banks now also run on the contrast-first image after
+all earlier stages. Six regression groups cover physical received-frequency ridges in the
+interior and at both true recording ends, preservation of earlier candidates, shared limits,
+live ownership, disabled banks, negative signals, continuous edge support and harmonic families.
+
+The positive inputs are analytic log-frequency images, with received frequencies independently
+solved from the emission-time equation. They represent a 263 m/s, 118 Hz aircraft at 1500 m,
+with a heard centre at 60.5 s in a 120 s image or 10.5/19.5 s in a 30 s image. The previous
+detector finds no candidate in each; the fast bank's previously unused contrast scores exceed
+the unchanged 4.5 strong line. The new path recovers a single fast contrast candidate in each
+case, with the correct coarse tone, speed, range and centre. Eighteen selected native detector
+and physics component tests pass, including all six new groups and existing scalar-bank,
+coverage, ownership and harmonic controls, using genuine pinned Rust and dependencies.
+
+This checks the actual detector and contrast recovery from supplied log images. It does not
+execute the production FFT, ridge measurement or complete audio-to-location pipeline; those
+dependencies and genuine RCH remain unavailable. Reference/field replays and recovery rates
+on real audio remain unverified. The existing PCM fast-edge regression is unchanged.
 
 ### Retain aircraft supported by the observer's actual weather
 
