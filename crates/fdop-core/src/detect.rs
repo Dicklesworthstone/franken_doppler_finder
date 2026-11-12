@@ -912,20 +912,21 @@ pub fn recover_fast_edges_with_owners(
     remaining_candidates: usize,
     owners: &[RecoveryOwner<'_>],
 ) -> Result<(Vec<Detection>, usize), String> {
-    recover_fast_edges_impl(x, sr, p, slots, remaining_candidates, owners)
+    recover_edges_impl(x, sr, p, slots, remaining_candidates, owners, false)
         .map(|(detections, cut, _)| (detections, cut))
 }
 
-fn recover_fast_edges_impl(
+fn recover_edges_impl(
     x: &[f32],
     sr: u32,
     p: &DetectParams,
     slots: usize,
     mut remaining_candidates: usize,
     owners: &[RecoveryOwner<'_>],
+    ordinary: bool,
 ) -> Result<(Vec<Detection>, usize, usize), String> {
     let slots = slots.min(p.max_detections);
-    if slots == 0 || remaining_candidates == 0 || !p.fast_templates {
+    if slots == 0 || remaining_candidates == 0 || (!ordinary && !p.fast_templates) {
         return Ok((Vec::new(), 0, remaining_candidates));
     }
     let short = DetectParams {
@@ -933,7 +934,21 @@ fn recover_fast_edges_impl(
         hop_s: 0.5,
         ..p.clone()
     };
-    let templates = build_fast_edge_templates(&short, short.hop_s);
+    let templates = if ordinary {
+        // Use the same compact primary-speed domain as the short interior bank, but retain
+        // each base/edge pair's coverage guard. A crop seam must never become a true edge.
+        let k_min = short.k_tau.iter().copied().fold(f64::INFINITY, f64::min);
+        build_edge_templates(&short, short.hop_s)
+            .into_iter()
+            .filter(|t| {
+                t.v > 0.0
+                    && t.v <= PRIMARY_MAX_SPEED_MPS
+                    && k_min * t.d / t.v <= short.edge_half_s
+            })
+            .collect()
+    } else {
+        build_fast_edge_templates(&short, short.hop_s)
+    };
     if templates.is_empty() {
         return Ok((Vec::new(), 0, remaining_candidates));
     }
@@ -1045,8 +1060,10 @@ pub fn recover_fast_passes_counted_with_owners(
 pub enum FastRecoveryStage {
     EdgeAndRefused,
     ShortInterior,
-    /// Final compact bank at the primary survey's speeds, after both fast stages were measured.
+    /// Compact bank at the primary survey's speeds, after both fast stages were measured.
     OrdinaryShortInterior,
+    /// Final compact primary-speed bank at true recording ends, after interior measurement.
+    OrdinaryEdges,
 }
 
 /// One recovery stage's detections and its use of the original shared limits.
@@ -1057,8 +1074,8 @@ pub struct FastRecoveryBatch {
     pub cut: usize,
     /// Unused proposal allowance to pass unchanged to the next stage.
     pub remaining_candidates: usize,
-    /// Short-bank evidence left unsearched because proposal or detection limits stopped it.
-    /// Always false for `EdgeAndRefused`, which does not attempt that bank.
+    /// Short-window recovery whose coverage cannot be completed within the original limits.
+    /// Includes the ordinary edge stage; always false for `EdgeAndRefused`.
     pub interior_incomplete: bool,
 }
 
@@ -1067,6 +1084,8 @@ pub struct FastRecoveryBatch {
 /// `EdgeAndRefused` preserves the true-edge and refused-seed searches. The two short interior
 /// stages ignore `refused` and do not rerun an earlier search. `OrdinaryShortInterior` uses the
 /// primary speed grid: a close ordinary-speed pass can also fade before a full template ends.
+/// `OrdinaryEdges` runs last, for the same compact passes too close to a real recording end
+/// to have complete short-template support. Measure the interior stage before calling it.
 /// Only the supplied accepted measurements and detections made within this stage own its
 /// evidence. After measuring the earlier stage,
 /// callers pass its accepted observed ridges as `owners`; its refused detections still consume
@@ -1132,6 +1151,17 @@ fn recover_fast_stages_impl(
     refused: &[&Detection],
     stage: Option<FastRecoveryStage>,
 ) -> Result<FastRecoveryBatch, String> {
+    if stage == Some(FastRecoveryStage::OrdinaryEdges) {
+        let (detections, cut, remaining_candidates) =
+            recover_edges_impl(x, sr, p, slots, remaining_candidates, owners, true)?;
+        return Ok(FastRecoveryBatch {
+            detections,
+            cut,
+            remaining_candidates,
+            // Exhausting the original allowance cannot certify complete edge coverage.
+            interior_incomplete: slots.min(p.max_detections) == 0 || remaining_candidates == 0,
+        });
+    }
     let short_only = matches!(
         stage,
         Some(FastRecoveryStage::ShortInterior | FastRecoveryStage::OrdinaryShortInterior)
@@ -1140,7 +1170,7 @@ fn recover_fast_stages_impl(
     let (mut out, mut cut, mut remaining_candidates) = if short_only {
         (Vec::new(), 0, remaining_candidates)
     } else {
-        recover_fast_edges_impl(x, sr, p, slots, remaining_candidates, owners)?
+        recover_edges_impl(x, sr, p, slots, remaining_candidates, owners, false)?
     };
     let scan_short = stage != Some(FastRecoveryStage::EdgeAndRefused);
     let slots = slots.min(p.max_detections);
@@ -1910,6 +1940,7 @@ mod tests {
                 FastRecoveryStage::EdgeAndRefused,
                 FastRecoveryStage::ShortInterior,
                 FastRecoveryStage::OrdinaryShortInterior,
+                FastRecoveryStage::OrdinaryEdges,
             ] {
                 let batch = recover_fast_passes_stage_with_owners(
                     &x,
@@ -2298,6 +2329,176 @@ mod tests {
         assert!((best.v - pass.1).abs() < 4.0, "{best:?}");
         assert!((best.d / pass.2 - 1.0).abs() < 0.08, "{best:?}");
         assert!((best.t0r - pass.3).abs() < 0.3, "{best:?}");
+    }
+
+    #[test]
+    fn ordinary_short_edges_recover_previously_unmeasured_physical_passes() {
+        // These CPAs leave enough sound for the unchanged eight-second measurement gate,
+        // but not the complete ten-second halves required by the short interior bank.
+        let p = DetectParams::default();
+        for t0r in [9.13, 110.87] {
+            let pass = (450.0, 88.0, 250.0, t0r);
+            let mut recovered = 0;
+            for quieter_db in (0..=12).step_by(3) {
+                let amplitude = 0.32 * 10.0f64.powf(-(quieter_db as f64) / 20.0);
+                let mut x = fast_pass_scene(pass, amplitude);
+                x.truncate(120 * 4000);
+                let (ls, lin) = survey(&x, 4000, &p).unwrap();
+                let (mut detections, cut, mut budget) = detect_counted_with_budget(&ls, &p);
+                assert_eq!(cut, 0);
+                let mut events = measure_edge_families(&x, &lin, &detections);
+                for stage in [
+                    FastRecoveryStage::EdgeAndRefused,
+                    FastRecoveryStage::ShortInterior,
+                    FastRecoveryStage::OrdinaryShortInterior,
+                ] {
+                    if !crate::search::independent_measured_events(&events, 0.0).is_empty() {
+                        break;
+                    }
+                    budget = measured_recovery_stage(
+                        &x, &lin, &p, &mut detections, &mut events, budget, stage,
+                    );
+                }
+                // Only a previously unmeasurable pass demonstrates this additional capability.
+                if !crate::search::independent_measured_events(&events, 0.0).is_empty() {
+                    continue;
+                }
+                let first_detection = detections.len();
+                let first_event = events.len();
+                let earlier_detections = serde_json::to_value(&detections).unwrap();
+                let earlier_events = serde_json::to_value(&events).unwrap();
+                budget = measured_recovery_stage(
+                    &x,
+                    &lin,
+                    &p,
+                    &mut detections,
+                    &mut events,
+                    budget,
+                    FastRecoveryStage::OrdinaryEdges,
+                );
+                assert_eq!(
+                    serde_json::to_value(&detections[..first_detection]).unwrap(),
+                    earlier_detections
+                );
+                assert_eq!(
+                    serde_json::to_value(&events[..first_event]).unwrap(),
+                    earlier_events
+                );
+                assert!(detections[first_detection..].iter().all(|d| {
+                    d.v <= PRIMARY_MAX_SPEED_MPS
+                        && d.half_s == p.edge_half_s
+                        && d.score >= p.thr_db.max(p.thr_silence_db)
+                }));
+                let independent = crate::search::independent_measured_events(&events, 0.0);
+                let diagnostics: Vec<_> = events[first_event..]
+                    .iter()
+                    .map(|e| (&e.quality, e.fit.as_ref().map(|f| f.best)))
+                    .collect();
+                assert!(independent.len() <= 1, "{t0r}/{quieter_db}: {diagnostics:?}");
+                for event in events[first_event..]
+                    .iter()
+                    .filter(|event| event.is_aircraft_like())
+                {
+                    let best = event.fit.as_ref().unwrap().best;
+                    assert!(
+                        (best.f0 - pass.0).abs() < 0.3,
+                        "{t0r}/{quieter_db}: {best:?}"
+                    );
+                    assert!(
+                        (best.v - pass.1).abs() < 4.0,
+                        "{t0r}/{quieter_db}: {best:?}"
+                    );
+                    assert!(
+                        (best.d / pass.2 - 1.0).abs() < 0.08,
+                        "{t0r}/{quieter_db}: {best:?}"
+                    );
+                    assert!(
+                        (best.t0r - pass.3).abs() < 0.3,
+                        "{t0r}/{quieter_db}: {best:?}"
+                    );
+                }
+                if independent.is_empty() {
+                    continue;
+                }
+                recovered += 1;
+                // A second scan cannot turn this accepted ridge into another aircraft.
+                if recovered == 1 {
+                    measured_recovery_stage(
+                        &x,
+                        &lin,
+                        &p,
+                        &mut detections,
+                        &mut events,
+                        budget,
+                        FastRecoveryStage::OrdinaryEdges,
+                    );
+                    assert_eq!(
+                        crate::search::independent_measured_events(&events, 0.0).len(),
+                        1,
+                        "an accepted edge ridge cannot become another aircraft"
+                    );
+                }
+            }
+            assert!(
+                recovered > 0,
+                "no newly measured ordinary-speed edge pass at {t0r}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_short_edges_refuse_noise_tones_and_one_sided_sound() {
+        let p = DetectParams {
+            fast_templates: false,
+            ..Default::default()
+        };
+        let pass = (450.0, 88.0, 250.0, 9.13);
+        let mut noise = fast_pass_scene(pass, 0.0);
+        noise.truncate(120 * 4000);
+        let mut physical = fast_pass_scene(pass, 0.32);
+        physical.truncate(noise.len());
+        let mut steady = noise.clone();
+        for (i, sample) in steady.iter_mut().enumerate() {
+            *sample +=
+                (0.32 * (std::f64::consts::TAU * pass.0 * i as f64 / 4000.0).sin()) as f32;
+        }
+        let split = (pass.3 * 4000.0) as usize;
+        let mut no_approach = physical.clone();
+        no_approach[..split].copy_from_slice(&noise[..split]);
+        let mut no_recede = physical.clone();
+        no_recede[split..].copy_from_slice(&noise[split..]);
+        physical.reverse();
+        for (label, x) in [
+            ("noise and hum", noise),
+            ("steady tone", steady),
+            ("no approach", no_approach),
+            ("no recede", no_recede),
+            ("reversed pass", physical),
+        ] {
+            let (_, lin) = survey(&x, 4000, &p).unwrap();
+            let batch = recover_fast_passes_stage_with_owners(
+                &x,
+                4000,
+                &p,
+                p.max_detections,
+                400_000,
+                &[],
+                &[],
+                FastRecoveryStage::OrdinaryEdges,
+            )
+            .unwrap();
+            assert_eq!(batch.cut, 0);
+            assert!(!batch.interior_incomplete);
+            let events = measure_edge_families(&x, &lin, &batch.detections);
+            assert!(
+                events.iter().all(|event| !event.is_aircraft_like()),
+                "{label}: {events:?}"
+            );
+            assert!(
+                crate::search::independent_measured_events(&events, 0.0).is_empty(),
+                "{label}"
+            );
+        }
     }
 
     #[test]

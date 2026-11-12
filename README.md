@@ -1375,13 +1375,18 @@ Design notes:
   remains in the detections and spends its original slots and proposals, but cannot hide a
   valid shorter path or make it an unmeasured harmonic child. If fewer than two independent
   aircraft remain, an interior bank uses ten-second halves for fast transitions whose natural
-  shortest support fits that interval. After measuring those candidates, a final bank tries
+  shortest support fits that interval. After measuring those candidates, another bank tries
   compact paths at the primary speed grid's ordinary speeds, up to 175 m/s, if an independent
   aircraft is still missing. A close ordinary-speed pass can also fade before a full template
-  ends. Both short banks scan complete paths on the half-second survey, including centers with
-  no ordinary seed and neighborhoods the longer bank already tried. Every scored center has
-  actual STFT support on both sides. Tiles cover at most 120 seconds of centers, with at most
-  141 seconds of working audio under the defaults.
+  ends. Both short interior banks scan complete paths on the half-second survey, including centers
+  with no ordinary seed and neighborhoods the longer bank already tried. Every scored interior
+  center has actual STFT support on both sides. Tiles cover at most 120 seconds of centers, with
+  at most 141 seconds of working audio under the defaults. After interior measurement, a final
+  ordinary-speed bank checks the true recording ends, using the same at-most-48-second edge
+  crops. It retains the existing full-template coverage guard and partial-edge coverage rule:
+  crop seams cannot masquerade as recording ends. It uses the same compact-duration domain and
+  strong line, so a short ordinary-speed transition can be proposed near an end without
+  relaxing its subsequent eight-second measurement requirements.
   An accepted aircraft keeps its original measurement and owns its
   observed ridge and detected harmonic family, even when its fitted geometry is inaccurate.
   Ownership interpolates only across traced gaps of at most three seconds and never extrapolates;
@@ -1392,8 +1397,8 @@ Design notes:
   whose fitted speed falls. Warnings record added candidates and any cut. Recordings with two
   independent aircraft already measured keep their original path. The short interior bank does
   not need an ordinary detection to identify a retry window, but cannot replenish an exhausted
-  budget. If the remaining proposal allowance or detection slots stop that bank, a separate
-  warning reports that some interior audio was not searched with its short templates.
+  budget. If the remaining proposal allowance or detection slots stop short recovery, a separate
+  warning reports that complete coverage could not be confirmed; detection cuts remain explicit.
 - **STFT working storage stays bounded as recordings grow.** Frames transform into a reusable block of
   at most 256 columns and 4 MiB of frequency values, then copy into the final row-major spectrogram.
   A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
@@ -1722,6 +1727,27 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Extend compact ordinary-speed recovery to true recording edges
+
+A final ordinary-speed stage now checks short transitions at the recording's real beginning
+and end after all earlier recovery stages have been measured. It shares their candidate and
+detection budgets, uses accepted observed ridges as owners, and keeps recovered events marked
+as measurements past the old line. Interior tiling and the earlier fast recovery paths are
+unchanged.
+
+New core regressions use the existing 450 Hz / 88 m/s / 250 m synthetic source at 9.13 s and
+110.87 s in a 120-second recording, over the fixed 0–12 dB attenuation ladder. The positive
+test requires at least one previously unmeasured accurate recovery at each end and checks
+that earlier detections and measurements remain intact. Noise, steady tones, missing approach
+or recede, reversed motion, repeated ownership and exhausted shared limits supply controls.
+A root pipeline regression checks recovered geometry, original detection preservation and
+expanded-measurement provenance.
+
+These assertions have not executed: the host remains unavailable. Source review and
+added-line whitespace checks are the available checks, not native recovery evidence.
+Core/workspace tests, formatting of the new Rust, Clippy, release selftest and real-recording
+replays remain unverified. No measured gain in recovery rate, runtime or field accuracy is claimed.
 
 ### Preserve fast-track coverage when valid reports become denser
 

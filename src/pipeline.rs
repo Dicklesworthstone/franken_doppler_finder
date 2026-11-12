@@ -1299,6 +1299,7 @@ pub(crate) fn measure_recording(
             detect::FastRecoveryStage::EdgeAndRefused,
             detect::FastRecoveryStage::ShortInterior,
             detect::FastRecoveryStage::OrdinaryShortInterior,
+            detect::FastRecoveryStage::OrdinaryEdges,
         ] {
             let measured_aircraft = search::independent_measured_events(&events, 0.0).len();
             if measured_aircraft >= 2 {
@@ -1419,12 +1420,12 @@ pub(crate) fn measure_recording(
         let recovered_count = dets.len() - first_recovery;
         if recovered_count > 0 || ordinary_aircraft == 0 {
             warnings.push(format!(
-                "short-window recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; the recording's true edges and refused detections, followed by brief fast and ordinary-speed interior passes as needed, supplied {recovered_count} candidates within the remaining detection budget; only accepted measured ridges and harmonic families own evidence between stages; all use the existing measurement gates and count as measured past the old line",
+                "short-window recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; the recording's fast edges and refused detections, followed by brief fast and ordinary-speed interior passes and ordinary-speed true edges as needed, supplied {recovered_count} candidates within the remaining detection budget; only accepted measured ridges and harmonic families own evidence between stages; all use the existing measurement gates and count as measured past the old line",
             ));
         }
         if interior_incomplete {
             warnings.push(
-                "short-window recovery left interior audio unsearched after the existing candidate allowance or detection slots ran out; other flyovers may remain undetected".into(),
+                "short-window recovery could not confirm complete coverage within the existing candidate allowance or detection slots; other flyovers may remain undetected".into(),
             );
         }
         if recovery_cut > 0 {
@@ -2966,9 +2967,54 @@ mod tests {
             measured
                 .warnings
                 .iter()
-                .all(|warning| !warning.contains("left interior audio unsearched"))
+                .all(|warning| !warning.contains("could not confirm complete coverage"))
         );
         assert_measurement_bookkeeping(&measured);
+    }
+
+    #[test]
+    fn short_window_recovery_marks_ordinary_edge_measurements_as_added() {
+        let dp = DetectParams::default();
+        for t0r in [9.13, 110.87] {
+            let pass = (450.0, 88.0, 250.0, t0r);
+            let mut recovered = 0;
+            for quieter_db in (0..=12).step_by(3) {
+                let amplitude = 0.32 * 10.0f64.powf(-(quieter_db as f64) / 20.0);
+                let x = fast_recording(120, pass, amplitude);
+                let (ls, _) = detect::survey(&x, 4000, &dp).unwrap();
+                let original = detect::detect(&ls, &dp);
+                let measured = measure_recording(&x, 4000, &Log::new(true), None).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&measured.detections[..original.len()]).unwrap(),
+                    serde_json::to_value(&original).unwrap()
+                );
+                let independent = search::independent_measured_events(&measured.events, 0.0);
+                assert!(independent.len() <= 1);
+                for event in measured.events.iter().filter(|event| {
+                    event.is_aircraft_like()
+                        && event.detection.id >= original.len()
+                        && measured.detections[event.detection.id].v
+                            <= detect::PRIMARY_MAX_SPEED_MPS
+                }) {
+                    let best = event.fit.as_ref().unwrap().best;
+                    assert!((best.f0 - pass.0).abs() < 0.3, "{t0r}/{quieter_db}: {best:?}");
+                    assert!((best.v - pass.1).abs() < 4.0, "{t0r}/{quieter_db}: {best:?}");
+                    assert!(
+                        (best.d / pass.2 - 1.0).abs() < 0.08,
+                        "{t0r}/{quieter_db}: {best:?}"
+                    );
+                    assert!((best.t0r - pass.3).abs() < 0.3, "{t0r}/{quieter_db}: {best:?}");
+                    assert_eq!(
+                        measured.detections[event.detection.id].half_s,
+                        dp.edge_half_s
+                    );
+                    assert!(measured.added.contains(&event.id));
+                    recovered += 1;
+                }
+                assert_measurement_bookkeeping(&measured);
+            }
+            assert!(recovered > 0, "no ordinary edge recovery reached the pipeline at {t0r}");
+        }
     }
 
     #[test]
@@ -3107,7 +3153,7 @@ mod tests {
             measured
                 .warnings
                 .iter()
-                .all(|warning| !warning.contains("left interior audio unsearched"))
+                .all(|warning| !warning.contains("could not confirm complete coverage"))
         );
         assert_measurement_bookkeeping(&measured);
     }

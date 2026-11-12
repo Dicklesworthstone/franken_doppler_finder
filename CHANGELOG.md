@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Try compact ordinary-speed passes at true recording boundaries
+
+- Append a final ordinary-speed edge stage after measured short-interior recovery, only
+  while fewer than two independent aircraft remain. Reuse the half-second survey's bounded
+  true-edge crops, base/edge coverage guard and compact primary-speed template domain.
+- Share the original proposal and detection limits, accepted-ridge ownership and physical
+  measurement gates. Preserve the earlier stages and mark all new measurements as past the
+  old line. Broaden the incomplete-recovery warning to include the final boundary stage.
+- Add physical attenuation-sweep regressions requiring newly usable passes at both ends,
+  unchanged earlier observations and strict recovered geometry. Add negative-signal,
+  ownership, shared-limit and root pipeline/provenance coverage.
+- Validation remains source review and added-line whitespace checks: the execution host is
+  unavailable. New Rust tests and formatting, workspace Clippy/tests, release selftest and
+  reference/field replays have not run. The new recovery assertions are unverified, and
+  no field-accuracy, recovery-rate or timing improvement is claimed.
+
 ### Preserve whole fast flyovers when valid position sampling becomes denser
 
 - Retry the existing position-supported speed envelope when a missing-groundspeed chain
