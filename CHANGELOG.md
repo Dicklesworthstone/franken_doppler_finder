@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Derive exact fitted geometry for aircraft in wind
+
+- Add the homogeneous-wavefront conversion from physical aircraft motion to the
+  equivalent still-air fitted speed and distance. The two coordinates have distinct
+  scales; a single first-order factor can exclude a valid aircraft before trace scoring.
+- Derive conservative distance-scale bounds before the observer direction is known,
+  retain exact calm-air scaling, and reject invalid or degenerate curves. Project the
+  range perpendicular to velocity before evaluating it to avoid along-track cancellation.
+- Add three regressions for independent wavefront/frequency agreement, rotated and
+  shifted coordinates, CPA-direction bounds, calm controls and invalid inputs.
+  Independent numerical reproduction checked 450 waveform observations with maximum
+  frequency discrepancy below 4.85e-7 Hz; this is not native Rust execution.
+- Changed-range formatting and whitespace checks completed before the execution host
+  disconnected. Actual core build attempts were killed in locked dependencies cc
+  and wide; no new native regression ran. Workspace checks, release selftest and
+  real-recording replays remain unverified. Search integration follows separately.
+
 ### Resume completed raw ADS-B feeds after a geoid-reference change
 
 - Reuse a verified raw-feed checkpoint when only its finite geoid reference changed.

@@ -1168,6 +1168,93 @@ impl Prop {
         }
     }
 
+    /// Speed (m/s) and closest distance (m) of the equivalent still-air fit at `c_fit`.
+    /// A constant-velocity source in homogeneous wind still describes one retarded curve,
+    /// but its speed and range have different scales. With `a = c² - |w|²`, `q = w.v`
+    /// and `A = q² + a |v|²`, its fitted speed is `c_fit sqrt(A) / (a + q)`.
+    /// The range follows the same quadratic after shifting to its minimum. Projecting
+    /// `rv` perpendicular to `v` first avoids subtracting two large squared along-track
+    /// offsets; this remains valid when the supplied reference is not the physical CPA.
+    /// A turning track uses its instantaneous tangent, as do the other coarse fit gates.
+    pub fn fit_geometry(&self, rv: V3, v: V3, c_fit: f64) -> Option<(f64, f64)> {
+        let a = self.c * self.c - dot(self.w, self.w);
+        let v2 = dot(v, v);
+        let relative = sub(v, self.w);
+        if !(self.c > 0.0
+            && c_fit > 0.0
+            && c_fit.is_finite()
+            && a > 0.0
+            && a.is_finite()
+            && v2 > 0.0
+            && v2.is_finite())
+            || rv.iter().chain(&v).chain(&self.w).any(|x| !x.is_finite())
+            || dot(relative, relative) >= self.c * self.c
+        {
+            return None;
+        }
+        let cross = |a: V3, b: V3| {
+            [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ]
+        };
+        let perpendicular = scale(cross(v, cross(rv, v)), 1.0 / v2);
+        let d2 = dot(perpendicular, perpendicular);
+        let q = dot(self.w, v);
+        let transverse_c2 = a + q * q / v2;
+        let (speed, distance) = if self.w == [0.0; 3] {
+            (v2.sqrt() * c_fit / self.c, d2.sqrt() * c_fit / self.c)
+        } else {
+            let b = dot(self.w, perpendicular);
+            (
+                c_fit * v2.sqrt() * transverse_c2.sqrt() / (a + q),
+                c_fit * (d2 + b * b / transverse_c2).sqrt() / a.sqrt(),
+            )
+        };
+        (speed > 0.0
+            && speed < c_fit
+            && speed.is_finite()
+            && distance > 0.0
+            && distance.is_finite())
+        .then_some((speed, distance))
+    }
+
+    /// Physical/fitted speed scale and bounds on the physical/fitted CPA-distance scale.
+    /// Before an observer is known, the perpendicular range can point anywhere around
+    /// the velocity axis. Its wind projection spans zero to the transverse wind speed;
+    /// these bounds retain every orientation for the exact `fit_geometry` check later.
+    pub fn fit_gate_scales(&self, v: V3, c_fit: f64) -> Option<(f64, [f64; 2])> {
+        let a = self.c * self.c - dot(self.w, self.w);
+        let v2 = dot(v, v);
+        let relative = sub(v, self.w);
+        if !(self.c > 0.0
+            && c_fit > 0.0
+            && c_fit.is_finite()
+            && a > 0.0
+            && a.is_finite()
+            && v2 > 0.0
+            && v2.is_finite())
+            || v.iter().chain(&self.w).any(|x| !x.is_finite())
+            || dot(relative, relative) >= self.c * self.c
+        {
+            return None;
+        }
+        if self.w == [0.0; 3] {
+            let scale = self.c / c_fit;
+            return (scale > 0.0 && scale.is_finite()).then_some((scale, [scale; 2]));
+        }
+        let q = dot(self.w, v);
+        let transverse_c = (a + q * q / v2).sqrt();
+        let speed = (a + q) / (c_fit * transverse_c);
+        let d_hi = a.sqrt() / c_fit;
+        let d_lo = (d_hi * transverse_c / self.c).min(d_hi);
+        // Include extrema that round onto either side of the exact bound.
+        let (d_lo, d_hi) = (d_lo.next_down(), d_hi.next_up());
+        (speed > 0.0 && speed.is_finite() && d_lo > 0.0 && d_lo.is_finite() && d_hi.is_finite())
+            .then_some((speed, [d_lo, d_hi]))
+    }
+
     /// First-order scale for the coarse gates on speeds/distances fitted in still air at
     /// `c_fit`: (c, v, d) -> lambda (c, v, d) leaves a still-air curve invariant, and the
     /// leading wind correction adds v.w/c to the effective c. This is an approximation;
@@ -1419,6 +1506,167 @@ mod tests {
             prop.fit_center_offset(rv, [f64::INFINITY, 0.0, 0.0])
                 .is_nan()
         );
+    }
+
+    #[test]
+    fn fitted_wind_geometry_reproduces_independent_wavefront_observations() {
+        let emitted = 180.0;
+        let rotate = |v: V3| [v[2], v[0], v[1]];
+        for (rv, v, w) in [
+            ([0.0, 3000.0, 1200.0], [180.0, 0.0, 0.0], [-80.0, 0.0, 0.0]),
+            ([0.0, 3000.0, 1200.0], [180.0, 0.0, 0.0], [80.0, 0.0, 0.0]),
+            ([1200.0, 0.0, 4000.0], [0.0, 110.0, 0.0], [40.0, -25.0, 10.0]),
+            (
+                [1000.0, -2000.0, 1700.0],
+                [150.0, 75.0, -20.0],
+                [35.0, -60.0, 5.0],
+            ),
+            ([0.0, 1000.0, 500.0], [200.0, 80.0, 20.0], [0.0; 3]),
+        ] {
+            for (rv, v, w) in [(rv, v, w), (rotate(rv), rotate(v), rotate(w))] {
+                for c in [300.0, 343.0, 360.0] {
+                    let prop = Prop { c, w };
+                    for c_fit in [300.0, 343.0, 360.0] {
+                        let (speed, distance) = prop.fit_geometry(rv, v, c_fit).unwrap();
+                        let centre = prop.fit_center_offset(rv, v);
+                        let tone = emitted / prop.source_tone_scale(v);
+                        for shift in [-500.0, 50.0, 500.0] {
+                            let shifted = prop
+                                .fit_geometry(add(rv, scale(v, shift)), v, c_fit)
+                                .unwrap();
+                            assert!((shifted.0 - speed).abs() < 1e-12);
+                            assert!((shifted.1 - distance).abs() < 1e-9);
+                        }
+                        for te in [-180.0, -30.0, 0.0, 30.0, 180.0] {
+                            let position = add(rv, scale(v, te));
+                            let heard = te + wavefront_travel(position, w, c);
+                            let dt = 0.001;
+                            let before = wavefront_travel(sub(position, scale(v, dt)), w, c);
+                            let after = wavefront_travel(add(position, scale(v, dt)), w, c);
+                            let observed = emitted / (1.0 + (after - before) / (2.0 * dt));
+                            let fitted = cv_curve(
+                                heard,
+                                tone,
+                                speed,
+                                distance,
+                                centre - distance / c_fit,
+                                c_fit,
+                            );
+                            assert!(
+                                (fitted - observed).abs() < 2e-6,
+                                "c={c}, c_fit={c_fit}, rv={rv:?}, v={v:?}, w={w:?}, te={te}: {fitted} vs {observed}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wind_geometry_gate_bounds_cover_every_cpa_direction() {
+        let v = [180.0, 0.0, 0.0];
+        for w in [
+            [0.0; 3],
+            [-80.0, 0.0, 0.0],
+            [0.0, 80.0, 0.0],
+            [40.0, -60.0, 30.0],
+        ] {
+            let prop = Prop { c: 320.0, w };
+            for c_fit in [300.0, 343.0, 360.0] {
+                let (speed_scale, [d_lo, d_hi]) = prop.fit_gate_scales(v, c_fit).unwrap();
+                if w == [0.0; 3] {
+                    assert_eq!(
+                        (speed_scale, d_lo, d_hi),
+                        (320.0 / c_fit, 320.0 / c_fit, 320.0 / c_fit)
+                    );
+                }
+                let mut minimum = f64::INFINITY;
+                let mut maximum = f64::NEG_INFINITY;
+                // The two axes attain both limits for pure crosswind; the full circle
+                // also exercises oblique wind without deriving the fitted range twice.
+                for degrees in 0..=360 {
+                    let angle = (degrees as f64).to_radians();
+                    let rv = [0.0, 3000.0 * angle.cos(), 3000.0 * angle.sin()];
+                    let (speed, distance) = prop.fit_geometry(rv, v, c_fit).unwrap();
+                    let actual = norm(rv) / distance;
+                    assert!((speed * speed_scale - norm(v)).abs() < 1e-10);
+                    assert!(actual >= d_lo - 1e-12 && actual <= d_hi + 1e-12);
+                    minimum = minimum.min(actual);
+                    maximum = maximum.max(actual);
+                }
+                if w[2] == 0.0 {
+                    assert!((minimum - d_lo).abs() < 1e-12);
+                    assert!((maximum - d_hi).abs() < 1e-12);
+                }
+            }
+        }
+        // At ordinary fit floors, one scale for both dimensions rejects a valid
+        // headwind pass even though its equivalent fitted speed is below 0.8 c_fit.
+        let prop = Prop {
+            c: 320.0,
+            w: [-80.0, 0.0, 0.0],
+        };
+        let (speed, distance) = prop.fit_geometry([0.0, 3000.0, 0.0], v, 343.0).unwrap();
+        assert!(speed < 0.8 * 343.0);
+        let legacy = prop.fit_scale(v, 343.0);
+        assert!((speed * 0.95 - 3.0) * legacy > norm(v));
+        let (speed_scale, [_, distance_scale]) = prop.fit_gate_scales(v, 343.0).unwrap();
+        assert!((speed * speed_scale - 180.0).abs() < 1e-10);
+        assert!((distance * distance_scale - 3000.0).abs() < 1e-9);
+        assert!((speed_scale - distance_scale).abs() > 0.1);
+    }
+
+    #[test]
+    fn fitted_geometry_refuses_invalid_or_degenerate_curves() {
+        let rv = [0.0, 3000.0, 1200.0];
+        let v = [180.0, 0.0, 0.0];
+        for prop in [
+            Prop::still(0.0),
+            Prop::still(-343.0),
+            Prop::still(f64::NAN),
+            Prop::still(f64::INFINITY),
+            Prop {
+                c: 343.0,
+                w: [343.0, 0.0, 0.0],
+            },
+            Prop {
+                c: 343.0,
+                w: [f64::NAN, 0.0, 0.0],
+            },
+            Prop {
+                c: 343.0,
+                w: [-200.0, 0.0, 0.0],
+            },
+        ] {
+            assert!(prop.fit_geometry(rv, v, 343.0).is_none());
+            assert!(prop.fit_gate_scales(v, 343.0).is_none());
+        }
+        let prop = Prop {
+            c: 343.0,
+            w: [-80.0, 0.0, 0.0],
+        };
+        for c_fit in [0.0, -343.0, f64::NAN, f64::INFINITY] {
+            assert!(prop.fit_geometry(rv, v, c_fit).is_none());
+            assert!(prop.fit_gate_scales(v, c_fit).is_none());
+        }
+        for v in [
+            [0.0; 3],
+            [500.0, 0.0, 0.0],
+            [f64::NAN, 0.0, 0.0],
+            [f64::INFINITY, 0.0, 0.0],
+        ] {
+            assert!(prop.fit_geometry(rv, v, 343.0).is_none());
+            assert!(prop.fit_gate_scales(v, 343.0).is_none());
+        }
+        for rv in [
+            [0.0; 3],
+            [3000.0, 0.0, 0.0],
+            [f64::NAN, 0.0, 0.0],
+            [0.0, f64::INFINITY, 0.0],
+        ] {
+            assert!(prop.fit_geometry(rv, v, 343.0).is_none());
+        }
     }
 
     #[test]
