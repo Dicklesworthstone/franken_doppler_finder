@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover independent aircraft from refused coarse harmonic families
+
+- When fewer than two independent aircraft remain, also inspect unused detected
+  siblings of a complete primary ridge refused by the fit or aircraft criteria.
+  Preserve the primary result and admit a sibling only when the existing observed-ridge
+  comparison establishes distinct two-sided motion from every complete refused family
+  member. A cleaner harmonic fit or missing overlap cannot overturn that refusal.
+- Share this recovery through the existing detect/locate pipeline, retain declined
+  sibling traces and fits with an explicit reason, and keep the detection/event budgets,
+  quality gates, independent-event grouping and expanded-measurement provenance.
+- Add a physical PCM detector/measurement regression and a true-harmonic refusal
+  control, including original-record preservation, misleading fit metadata and missing
+  or one-sided overlap. Their expectations remain unverified; in particular the positive
+  fixture's initial zero-aircraft count and subsequent recovery have not been executed.
+- Validation: source review, independent cross-review and patch whitespace checks
+  completed. Native LLVM and Cranelift builds were killed in pinned `fsci-stats 0.4.0`
+  before core tests compiled, and the execution host disconnected. Native regressions,
+  workspace Clippy/tests, release CLI selftest and reference/field replays remain
+  unverified. No field-accuracy or performance improvement is claimed.
+
 ### Recover corrected-height flights hidden by unusable GNSS reports
 
 - If GNSS bridging removed other reports and the preferred reconstruction yields no

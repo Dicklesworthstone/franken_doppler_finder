@@ -761,7 +761,10 @@ with a warning, or errors when none remain; it does not widen past an explicit `
 Detects flyovers using the same recording analysis as `locate`: detections are measured strongest
 first within each stage until 24 independent aircraft events survive. If ordinary measurement
 finds fewer than two independent aircraft, unmeasured detected harmonics of accepted families
-are measured strongest first: coarse survey grouping can put separate aircraft in one family.
+or families with a complete but refused primary ridge are measured strongest first: coarse
+survey grouping can put separate moving sources in one family. A sibling of a complete refused
+ridge must show distinct observed motion on both sides of the closest approach; a cleaner fit
+of the same sound or missing overlap cannot overturn that refusal. The original result remains.
 The observed ridges decide whether they are independent, and retries stop once two aircraft
 survive. True harmonics still count once, including siblings whose fitted closest-approach times
 or emitted tones disagree. These extra measurements retain expanded-search provenance and a warning.
@@ -1458,6 +1461,11 @@ Design notes:
   supplies the family's single event. If none passes, the
   original primary refusal remains. The recovered detection retains its `harmonic_of` link and always
   counts as measured past the old line, including when the primary had a strong survey score.
+  If fewer than two independent aircraft remain, an unused sibling of a complete refused
+  primary can also be measured as a separate event. It must have distinct two-sided observed
+  motion from every complete refused member of that family. The primary remains refused;
+  compatible motion or insufficient overlap refuses the sibling too, with its trace and fit
+  retained for inspection. All extra attempts retain expanded-measurement provenance.
 - **Measurement slots belong to independent aircraft events.** The same measured-curve comparison used by
   the search groups duplicate seeds and harmonics before deciding whether the 24-event allowance is full.
   Fits below the existing aircraft limits (28 m/s or 200 m closest distance) do not fill it either. Later
@@ -1713,6 +1721,14 @@ Rust regressions, full workspace checks, release selftest and field/reference re
 remain unverified. No real-recording accuracy improvement is claimed.
 
 ### Aircraft hidden inside coarse harmonic families
+
+The sibling scan also includes complete primary ridges refused by the aircraft or fit checks.
+New regressions synthesize a slow tonal source beside an aircraft and require the aircraft to
+remain eligible only when their measured motion differs. A true-harmonic control, including
+misleading fitted metadata, must remain refused; missing or one-sided overlap cannot establish
+independence. These new regressions have not run: both native compiler backends were killed in
+pinned `fsci-stats` before the core test binary was built, then the execution host disconnected.
+Their expected recovery is not a measured native or real-recording result.
 
 The survey's coarse harmonic grouping can put two independent aircraft in one family.
 When measurement leaves fewer than two independent passes, the shared `detect`/`locate`

@@ -1186,13 +1186,14 @@ fn measure_missing_family_siblings(
     if independent >= 2 {
         return first..first;
     }
-    for sibling in measure::unmeasured_family_siblings(detections, events, min_score) {
+    for sibling in measure::unmeasured_family_siblings(detections, events, min_score, params) {
         if independent >= 2 {
             break;
         }
-        let refined = detect::refine(survey, sibling, params.c);
         let id = format!("e{}", events.len() + 1);
-        events.push(measure::measure(x, sr, &refined, &id, params));
+        let measured =
+            measure::measure_independent_sibling(x, sr, survey, sibling, events, &id, params);
+        events.push(measured);
         independent = search::independent_measured_events(events, 0.0).len();
     }
     first..events.len()
@@ -2912,8 +2913,13 @@ mod tests {
                     .clone()
             });
             assert!(
-                !measure::unmeasured_family_siblings(&more, &measured.events, dp.thr_silence_db)
-                    .is_empty()
+                !measure::unmeasured_family_siblings(
+                    &more,
+                    &measured.events,
+                    dp.thr_silence_db,
+                    &mp,
+                )
+                .is_empty()
             );
             let attempts = measure_missing_family_siblings(
                 &x,

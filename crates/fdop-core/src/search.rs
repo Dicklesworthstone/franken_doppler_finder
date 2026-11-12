@@ -85,10 +85,16 @@ impl SearchEvent {
     /// Build from a quality-passing measured event. `wind_mps` widens the speed gate (ground
     /// speed vs the air-relative speed the Doppler curve encodes).
     pub fn from_measured(m: &MeasuredEvent, wind_mps: f64) -> Option<Self> {
-        let fr = m.fit.as_ref()?;
         if !m.quality.ok {
             return None;
         }
+        Self::from_observed_trace(m, wind_mps)
+    }
+
+    // A refused fit's ridge can still establish that a detected sibling is the same
+    // sound. This conversion alone never makes that fit eligible for the search.
+    fn from_observed_trace(m: &MeasuredEvent, wind_mps: f64) -> Option<Self> {
+        let fr = m.fit.as_ref()?;
         let b = fr.best;
         let g = &fr.ranges_generous;
         let t_tol = (b.t0r - g.t0r[0]).max(g.t0r[1] - b.t0r).max(1.0);
@@ -2397,6 +2403,30 @@ fn harmonic_trace_shape(a: &SearchEvent, b: &SearchEvent, cap_sigma: f64) -> boo
         .sum::<f64>()
         / points.len() as f64;
     chi <= CORE_CHI
+}
+
+/// Positive two-sided observed-ridge evidence that a candidate moves differently from a
+/// measured family member, even when that member's fit was refused. The existing family
+/// comparison treats absent overlap or unusable noise estimates as no such evidence.
+pub(crate) fn distinct_measured_motion(a: &MeasuredEvent, b: &MeasuredEvent) -> bool {
+    let usable = |m: &MeasuredEvent| {
+        m.fit.as_ref().is_some_and(|f| {
+            f.best.f0.is_finite()
+                && f.best.f0 > 0.0
+                && f.best.t0r.is_finite()
+                && f.best.rmse.is_finite()
+        })
+    };
+    if !usable(a) || !usable(b) {
+        return false;
+    }
+    match (
+        SearchEvent::from_observed_trace(a, 0.0),
+        SearchEvent::from_observed_trace(b, 0.0),
+    ) {
+        (Some(a), Some(b)) => !harmonic_trace_shape(&a, &b, DEFAULT_CAP_SIGMA),
+        _ => false,
+    }
 }
 
 /// Quality-passing, aircraft-like measured events under the standard search's independent-pass
