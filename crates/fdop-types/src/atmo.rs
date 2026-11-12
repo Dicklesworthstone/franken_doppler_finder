@@ -52,6 +52,82 @@ impl Medium {
     }
 }
 
+/// Certified bounds on every finite, physically valid path average a provider returns.
+/// Wind is a magnitude bound, independent of the observer's local east/north frame.
+/// Bounds only support conservative search pruning; each candidate still needs its actual
+/// medium. An unknown provider must return `None`, not an envelope from sampled locations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MediumBounds {
+    pub c: [f64; 2],
+    pub wind_max: f64,
+}
+
+impl MediumBounds {
+    fn checked(self) -> Option<Self> {
+        (self.c[0] > 0.0
+            && self.c[1] >= self.c[0]
+            && self.c.iter().all(|c| c.is_finite())
+            && self.wind_max >= 0.0
+            && self.wind_max.is_finite())
+        .then_some(self)
+    }
+
+    // A forward-error allowance gamma_n = n*eps/(1-n*eps), rounded outwards. The callers
+    // count interpolation/normalisation operations, including cancellation in wind sums.
+    fn outward(self, operations: usize) -> Option<Self> {
+        self.checked()?;
+        let ne = operations as f64 * f64::EPSILON;
+        let gamma = ne / (1.0 - ne);
+        if !(0.0..1.0).contains(&gamma) {
+            return None;
+        }
+        Self {
+            c: [
+                (self.c[0] * (1.0 - gamma)).next_down(),
+                (self.c[1] * (1.0 + gamma)).next_up(),
+            ],
+            wind_max: if self.wind_max == 0.0 {
+                0.0
+            } else {
+                (self.wind_max * (1.0 + gamma) + operations as f64 * f64::from_bits(1)).next_up()
+            },
+        }
+        .checked()
+    }
+
+    fn uniform(m: Medium) -> Option<Self> {
+        let wind = m.wind_e.hypot(m.wind_n);
+        if !(wind.is_finite() && wind < m.c) {
+            return None;
+        }
+        Self {
+            c: [m.c; 2],
+            // Include rounding of the norm and its later ENU-to-ECEF rotation.
+            wind_max: if wind == 0.0 {
+                0.0
+            } else {
+                (wind * (1.0 + 16.0 * f64::EPSILON) + 16.0 * f64::from_bits(1)).next_up()
+            },
+        }
+        .checked()
+    }
+
+    fn cover(bounds: impl IntoIterator<Item = Option<Self>>, operations: usize) -> Option<Self> {
+        let mut all: Option<Self> = None;
+        for bounds in bounds {
+            let b = bounds?.checked()?;
+            all = Some(match all {
+                None => b,
+                Some(a) => Self {
+                    c: [a.c[0].min(b.c[0]), a.c[1].max(b.c[1])],
+                    wind_max: a.wind_max.max(b.wind_max),
+                },
+            });
+        }
+        all?.outward(operations)
+    }
+}
+
 /// One sounding level.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Level {
@@ -83,6 +159,7 @@ pub struct Column {
     /// cumulative int w_e dz, int w_n dz
     we: Vec<f64>,
     wn: Vec<f64>,
+    bounds: Option<MediumBounds>,
 }
 
 impl Column {
@@ -138,26 +215,66 @@ impl Column {
             wn[k] = wn[k - 1] + 0.5 * DZ * (prev.2 + cur.2);
             prev = cur;
         }
-        Self { s, we, wn }
+        let bounds = Self::cell_bounds(&s, &we, &wn);
+        Self { s, we, wn, bounds }
     }
 
-    /// Cumulative integral at height `z`. Beyond the grid the column is constant (as
-    /// `from_levels` defines it), so the integral keeps growing at the edge cell's rate. A
-    /// clamp here would drop that part of a path while `mean` still divides by its full
-    /// height: a terrain value of -600 m over water raised c from 338 to 375 m/s.
+    /// Each effective cell has the slope of the stored cumulative integral, including
+    /// both extrapolated tails. Bound those actual slopes, not just the input levels.
+    fn cell_bounds(s: &[f64], we: &[f64], wn: &[f64]) -> Option<MediumBounds> {
+        let mut b = MediumBounds {
+            c: [f64::INFINITY, 0.0],
+            wind_max: 0.0,
+        };
+        for k in 0..NZ - 1 {
+            let c = 1.0 / Self::slope(s, k);
+            let wind = Self::slope(we, k).hypot(Self::slope(wn, k));
+            if !(c > 0.0 && c.is_finite() && wind.is_finite() && wind < c) {
+                return None;
+            }
+            b.c[0] = b.c[0].min(c);
+            b.c[1] = b.c[1].max(c);
+            b.wind_max = b.wind_max.max(wind);
+        }
+        // Endpoint weights, the bounded middle difference, normalisation, reciprocal and
+        // vector norm take fewer than 32 operations. Leave another factor of two for the
+        // independently rounded cumulative-cell slopes used as the reference above.
+        b.outward(64)
+    }
+
     #[inline]
-    fn cum(v: &[f64], z: f64) -> f64 {
-        let top = Z0 + (NZ - 1) as f64 * DZ;
-        if z < Z0 {
-            return v[0] - (Z0 - z) * (v[1] - v[0]) / DZ;
+    fn slope(v: &[f64], k: usize) -> f64 {
+        (v[k + 1] - v[k]) / DZ
+    }
+
+    /// Average integral slope in O(1), without subtracting large extrapolated integrals
+    /// for a short distant path. At most two partial cells surround one in-grid difference.
+    fn mean_slope(v: &[f64], lo: f64, hi: f64) -> f64 {
+        let cell = |z: f64| {
+            let mut k = (((z - Z0) / DZ).floor().max(0.0) as usize).min(NZ - 2);
+            // Division can round a neighbouring float onto a grid boundary. Compare
+            // against the exact grid heights so neither partial-cell weight is negative.
+            if k > 0 && z < Z0 + k as f64 * DZ {
+                k -= 1;
+            } else if k < NZ - 2 && z >= Z0 + (k + 1) as f64 * DZ {
+                k += 1;
+            }
+            k
+        };
+        let (i, j) = (cell(lo), cell(hi));
+        if i == j {
+            return Self::slope(v, i);
         }
-        if z > top {
-            return v[NZ - 1] + (z - top) * (v[NZ - 1] - v[NZ - 2]) / DZ;
-        }
-        let u = (z - Z0) / DZ;
-        let i = (u.floor() as usize).min(NZ - 2);
-        let w = u - i as f64;
-        v[i] * (1.0 - w) + v[i + 1] * w
+        let a = Z0 + (i + 1) as f64 * DZ;
+        let b = Z0 + j as f64 * DZ;
+        let h = hi - lo;
+        let (wa, wb, wm) = ((a - lo) / h, (hi - b) / h, (b - a) / h);
+        let middle = if j > i + 1 {
+            (v[j] - v[i + 1]) / (b - a)
+        } else {
+            0.0
+        };
+        (wa * Self::slope(v, i) + wb * Self::slope(v, j) + wm * middle) / (wa + wb + wm)
     }
 
     /// Path average between two heights (MSL).
@@ -169,11 +286,17 @@ impl Column {
             (lo, hi)
         };
         let h = hi - lo;
-        let ds = Self::cum(&self.s, hi) - Self::cum(&self.s, lo);
+        if !(lo.is_finite() && hi.is_finite() && h > 0.0 && h.is_finite()) {
+            return Medium {
+                c: f64::NAN,
+                wind_e: f64::NAN,
+                wind_n: f64::NAN,
+            };
+        }
         Medium {
-            c: h / ds,
-            wind_e: (Self::cum(&self.we, hi) - Self::cum(&self.we, lo)) / h,
-            wind_n: (Self::cum(&self.wn, hi) - Self::cum(&self.wn, lo)) / h,
+            c: 1.0 / Self::mean_slope(&self.s, lo, hi),
+            wind_e: Self::mean_slope(&self.we, lo, hi),
+            wind_n: Self::mean_slope(&self.wn, lo, hi),
         }
     }
 }
@@ -187,6 +310,12 @@ pub trait Atmosphere: Send + Sync {
     /// temporally and vertically constant. Unknown or varying providers return `None`.
     fn uniform_medium(&self) -> Option<Medium> {
         None
+    }
+    /// A certified envelope over every place, time and representable height interval.
+    /// Default providers can certify only their advertised uniform medium. Returning
+    /// `None` disables bound-based pruning; sampled weather is never a certificate.
+    fn medium_bounds(&self) -> Option<MediumBounds> {
+        self.uniform_medium().and_then(MediumBounds::uniform)
     }
 }
 
@@ -271,6 +400,9 @@ impl Atmosphere for StandardAtmosphere {
             "standard atmosphere, surface {:.1} C at {:.0} m, lapse 6.5 K/km, wind ({:.1}, {:.1}) m/s",
             self.surface_c, self.surface_z, self.wind.0, self.wind.1
         )
+    }
+    fn medium_bounds(&self) -> Option<MediumBounds> {
+        self.col.bounds
     }
 }
 
@@ -374,6 +506,26 @@ impl Atmosphere for GriddedAtmosphere {
             self.nt
         )
     }
+    fn medium_bounds(&self) -> Option<MediumBounds> {
+        let ordered = |axis: &[f64]| {
+            !axis.is_empty()
+                && axis.iter().all(|x| x.is_finite())
+                && axis.windows(2).all(|w| w[0] < w[1])
+        };
+        if !(self.dt > 0.0 && self.dt.is_finite() && self.t0.is_finite())
+            || !ordered(&self.lats)
+            || !ordered(&self.lons)
+            || self.nt == 0
+            || self
+                .nt
+                .checked_mul(self.lats.len())?
+                .checked_mul(self.lons.len())?
+                != self.cols.len()
+        {
+            return None;
+        }
+        MediumBounds::cover(self.cols.iter().map(|c| c.bounds), 64)
+    }
 }
 
 /// Soundings at scattered stations (radiosondes): per station a time series of columns.
@@ -452,6 +604,22 @@ impl Atmosphere for ScatteredAtmosphere {
     fn describe(&self) -> String {
         format!("{} ({} stations)", self.source, self.stations.len())
     }
+    fn medium_bounds(&self) -> Option<MediumBounds> {
+        if self.stations.iter().any(|(lat, lon, series)| {
+            !lat.is_finite()
+                || !lon.is_finite()
+                || series.iter().any(|(t, _)| !t.is_finite())
+                || series.windows(2).any(|w| w[0].0 >= w[1].0)
+        }) {
+            return None;
+        }
+        MediumBounds::cover(
+            self.stations
+                .iter()
+                .flat_map(|(_, _, series)| series.iter().map(|(_, column)| column.bounds)),
+            self.stations.len().saturating_mul(16).saturating_add(64),
+        )
+    }
 }
 
 /// Air temperature (C, dry) that has sound speed `c`.
@@ -486,7 +654,7 @@ impl Atmosphere for AdjustedAtmosphere {
         let top = (lo + self.depth).min(hi.max(lo + 1.0));
         // integral of (1 - (z - zs)/depth) from lo to top
         let u = top - lo;
-        let integral = u - u * u / (2.0 * self.depth);
+        let integral = u * (1.0 - 0.5 * (u / self.depth));
         let mean_ds = ds0 * integral / h.max(u);
         Medium {
             c: 1.0 / (1.0 / m.c + mean_ds),
@@ -500,11 +668,324 @@ impl Atmosphere for AdjustedAtmosphere {
             self.surface.describe()
         )
     }
+    fn medium_bounds(&self) -> Option<MediumBounds> {
+        if !(self.depth > 0.0 && self.depth.is_finite()) {
+            return None;
+        }
+        let base = self.base.medium_bounds()?.checked()?;
+        // Use the same monotone Kelvin calculation as `medium`, including cancellation
+        // in temp_of_c + 273.15. Pad the correction before subtracting it from one:
+        // padding only the final c cannot bound a nearly cancelled slowness denominator.
+        let kelvin_min = temp_of_c(base.c[0]) + 273.15;
+        let change = (15.0 / (2.0 * kelvin_min) * (1.0 + 64.0 * f64::EPSILON)).next_up();
+        if !(kelvin_min.is_finite() && change >= 0.0 && change < 1.0) {
+            return None;
+        }
+        // c' = c / (1 - dT*q/(2*K_surface)), with |dT| <= 15 K and 0 <= q <= 1.
+        // The surface provider need not have bounds: its correction is already clamped.
+        MediumBounds {
+            c: [base.c[0] / (1.0 + change), base.c[1] / (1.0 - change)],
+            wind_max: base.wind_max,
+        }
+        .outward(64)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_enclosed(bounds: MediumBounds, medium: Medium) {
+        assert!(
+            (bounds.c[0]..=bounds.c[1]).contains(&medium.c),
+            "{medium:?} outside {bounds:?}"
+        );
+        assert!(
+            medium.wind_e.hypot(medium.wind_n) <= bounds.wind_max,
+            "{medium:?} outside {bounds:?}"
+        );
+    }
+
+    fn layered_column() -> Column {
+        Column::from_levels(&[
+            Level {
+                z_msl: -500.0,
+                t_c: 25.0,
+                rh: 0.6,
+                wind_e: 17.0,
+                wind_n: -31.0,
+            },
+            Level {
+                z_msl: 900.0,
+                t_c: 5.0,
+                rh: 0.3,
+                wind_e: -45.0,
+                wind_n: 19.0,
+            },
+            Level {
+                z_msl: 11_000.0,
+                t_c: -50.0,
+                rh: 0.1,
+                wind_e: 60.0,
+                wind_n: -25.0,
+            },
+        ])
+    }
+
+    // Previous arithmetic is an independent equivalence check at ordinary heights and
+    // reproduces the loss of precision on a short path far outside the tabulated column.
+    fn former_cumulative(v: &[f64], z: f64) -> f64 {
+        let top = Z0 + (NZ - 1) as f64 * DZ;
+        if z < Z0 {
+            return v[0] - (Z0 - z) * (v[1] - v[0]) / DZ;
+        }
+        if z > top {
+            return v[NZ - 1] + (z - top) * (v[NZ - 1] - v[NZ - 2]) / DZ;
+        }
+        let u = (z - Z0) / DZ;
+        let i = (u.floor() as usize).min(NZ - 2);
+        let w = u - i as f64;
+        v[i] * (1.0 - w) + v[i + 1] * w
+    }
+
+    #[test]
+    fn stable_column_mean_preserves_ordinary_paths_and_its_bounds() {
+        let col = layered_column();
+        let bounds = col.bounds.unwrap();
+        let heights = [
+            -700.0, -500.0, -499.7, -449.5, 0.0, 137.2, 899.9, 900.0, 4500.25, 15_000.0, 25_000.0,
+        ];
+        for za in heights {
+            for zb in heights {
+                let m = col.mean(za, zb);
+                assert_eq!(m, col.mean(zb, za));
+                assert_enclosed(bounds, m);
+                let lo = za.min(zb);
+                let hi = za.max(zb);
+                let (lo, hi) = if hi - lo < 1.0 {
+                    (lo - 0.5, lo + 0.5)
+                } else {
+                    (lo, hi)
+                };
+                let h = hi - lo;
+                let old = Medium {
+                    c: h / (former_cumulative(&col.s, hi) - former_cumulative(&col.s, lo)),
+                    wind_e: (former_cumulative(&col.we, hi) - former_cumulative(&col.we, lo)) / h,
+                    wind_n: (former_cumulative(&col.wn, hi) - former_cumulative(&col.wn, lo)) / h,
+                };
+                assert!((m.c - old.c).abs() < 1e-8, "{za}..{zb}: {m:?} vs {old:?}");
+                assert!((m.wind_e - old.wind_e).abs() < 1e-8);
+                assert!((m.wind_n - old.wind_n).abs() < 1e-8);
+            }
+        }
+    }
+
+    #[test]
+    fn path_ending_next_to_a_grid_boundary_stays_convex() {
+        let levels: Vec<_> = [(8100.0, 100.0), (8150.0, 100.0), (8200.0, -100.0)]
+            .into_iter()
+            .map(|(z_msl, wind_e)| Level {
+                z_msl,
+                t_c: 20.0,
+                rh: 0.0,
+                wind_e,
+                wind_n: 0.0,
+            })
+            .collect();
+        let col = Column::from_levels(&levels);
+        let bounds = col.bounds.unwrap();
+        // A rounded cell index formerly gave the first interval a negative endpoint
+        // weight, returning 100.00000000009095 m/s despite a 100 m/s maximum.
+        for hi in [8150.0_f64.next_down(), 8150.0, 8150.0_f64.next_up()] {
+            let m = col.mean(hi - 1.0, hi);
+            assert!((0.0..=100.0).contains(&m.wind_e), "{hi}: {m:?}");
+            assert_enclosed(bounds, m);
+        }
+    }
+
+    #[test]
+    fn extrapolated_short_paths_keep_the_actual_cell_medium() {
+        let col = layered_column();
+        let bounds = col.bounds.unwrap();
+        for lo in [-1e100_f64, -1e16, 1e16, 1e100] {
+            let hi = lo.next_up().next_up().next_up().next_up();
+            let k = if lo < Z0 { 0 } else { NZ - 2 };
+            let expected = Medium {
+                c: 1.0 / Column::slope(&col.s, k),
+                wind_e: Column::slope(&col.we, k),
+                wind_n: Column::slope(&col.wn, k),
+            };
+            let m = col.mean(lo, hi);
+            assert_eq!(m, expected);
+            assert_enclosed(bounds, m);
+        }
+        assert_enclosed(bounds, col.mean(-1e100, 1e100));
+        let lo = 1e16;
+        let hi = lo + 8.0;
+        let old_c = (hi - lo) / (former_cumulative(&col.s, hi) - former_cumulative(&col.s, lo));
+        assert!(
+            !(bounds.c[0]..=bounds.c[1]).contains(&old_c),
+            "the previous cumulative subtraction must expose the cancellation: {old_c}"
+        );
+        for (lo, hi) in [(f64::NAN, 1.0), (0.0, f64::INFINITY), (-f64::MAX, f64::MAX)] {
+            assert!(col.mean(lo, hi).c.is_nan());
+        }
+    }
+
+    #[test]
+    fn interpolated_providers_keep_certified_envelopes() {
+        let profiles: Vec<_> = (0..8)
+            .map(|i| {
+                standard_levels(
+                    -30.0 + 8.0 * f64::from(i),
+                    0.0,
+                    0.4,
+                    20.0 * f64::from(i).sin(),
+                    25.0 * f64::from(i).cos(),
+                )
+            })
+            .collect();
+        let grid = GriddedAtmosphere::new(
+            vec![0.0, 1.0],
+            vec![2.0, 4.0],
+            0.0,
+            3600.0,
+            &profiles,
+            "test".into(),
+        )
+        .unwrap();
+        let stations = ScatteredAtmosphere::new(
+            vec![
+                (
+                    0.0,
+                    2.0,
+                    vec![(0.0, profiles[0].clone()), (3600.0, profiles[4].clone())],
+                ),
+                (
+                    1.0,
+                    4.0,
+                    vec![(0.0, profiles[3].clone()), (3600.0, profiles[7].clone())],
+                ),
+            ],
+            "test".into(),
+        )
+        .unwrap();
+        for provider in [&grid as &dyn Atmosphere, &stations] {
+            let bounds = provider.medium_bounds().unwrap();
+            for lat in [-5.0, 0.0, 0.25, 1.0, 10.0] {
+                for lon in [-5.0, 2.0, 2.75, 4.0, 7.0] {
+                    for time in [-1000.0, 0.0, 1234.5, 3600.0, 9000.0] {
+                        for (za, zb) in [
+                            (-700.0, 500.0),
+                            (900.0, 900.0),
+                            (0.0, 25_000.0),
+                            (1e16, 1e16 + 8.0),
+                        ] {
+                            assert_enclosed(bounds, provider.medium(lat, lon, time, za, zb));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adjusted_bounds_cover_both_clamped_temperature_corrections() {
+        for temperature in [-100.0, 100.0] {
+            for depth in [0.0001, 1.0, 1500.0, 1e100] {
+                let atmo = AdjustedAtmosphere {
+                    base: Box::new(StandardAtmosphere::with_wind(20.0, 0.0, 0.3, 3.0, -4.0)),
+                    surface: Box::new(UniformAtmosphere(Medium::still(sound_speed(
+                        temperature,
+                        0.0,
+                    )))),
+                    depth,
+                };
+                let bounds = atmo.medium_bounds().unwrap();
+                for (za, zb) in [
+                    (0.0, 0.0),
+                    (0.0, 1.0),
+                    (0.0, 800.0),
+                    (0.0, 6000.0),
+                    (-1000.0, 25_000.0),
+                ] {
+                    assert_enclosed(bounds, atmo.medium(0.0, 0.0, 0.0, za, zb));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adjusted_bounds_fail_open_at_a_nearly_cancelled_slowness() {
+        for c in [54.897_360_671_316_21, 55.0, 60.0, 343.0] {
+            let atmo = AdjustedAtmosphere {
+                base: Box::new(UniformAtmosphere(Medium::still(c))),
+                surface: Box::new(UniformAtmosphere(Medium::still(343.0))),
+                depth: 1e100,
+            };
+            let m = atmo.medium(0.0, 0.0, 0.0, 0.0, 1.0);
+            if c < 55.0 {
+                assert!(
+                    m.c > 1e15,
+                    "the positive denominator is nearly cancelled: {m:?}"
+                );
+                assert!(atmo.medium_bounds().is_none());
+            } else {
+                assert_enclosed(atmo.medium_bounds().unwrap(), m);
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_or_invalid_provider_bounds_fail_open() {
+        struct Unknown;
+        impl Atmosphere for Unknown {
+            fn medium(&self, _: f64, _: f64, _: f64, _: f64, _: f64) -> Medium {
+                Medium::still(343.0)
+            }
+            fn describe(&self) -> String {
+                "unknown".into()
+            }
+        }
+        assert!(Unknown.medium_bounds().is_none());
+        assert_eq!(
+            UniformAtmosphere(Medium::still(343.0)).medium_bounds(),
+            Some(MediumBounds {
+                c: [343.0; 2],
+                wind_max: 0.0
+            })
+        );
+        for m in [
+            Medium::still(0.0),
+            Medium::still(f64::NAN),
+            Medium {
+                c: 343.0,
+                wind_e: 343.0,
+                wind_n: 0.0,
+            },
+        ] {
+            assert!(UniformAtmosphere(m).medium_bounds().is_none());
+        }
+        assert!(
+            StandardAtmosphere::with_wind(15.0, 0.0, 0.5, f64::INFINITY, 0.0)
+                .medium_bounds()
+                .is_none()
+        );
+        for depth in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let adjusted = AdjustedAtmosphere {
+                base: Box::new(UniformAtmosphere(Medium::still(343.0))),
+                surface: Box::new(Unknown),
+                depth,
+            };
+            assert!(adjusted.medium_bounds().is_none());
+        }
+        let adjusted = AdjustedAtmosphere {
+            base: Box::new(Unknown),
+            surface: Box::new(Unknown),
+            depth: 1000.0,
+        };
+        assert!(adjusted.medium_bounds().is_none());
+    }
 
     #[test]
     fn only_constant_providers_advertise_a_uniform_medium() {

@@ -1150,6 +1150,14 @@ and warns when it does. Going offline therefore preserves the altitude reference
 
 ### Data sources
 
+Weather providers expose conservative sound-speed and wind envelopes from their complete
+resampled profiles, including spatial and temporal interpolation and the existing bounded
+surface-temperature adjustment. Unknown or numerically uncertifiable providers supply no
+envelope; a few sampled locations cannot certify a whole region. Column path averages use
+the actual endpoint-cell slopes and the integrated middle, so subtracting large cumulative
+values cannot corrupt a short extrapolated path. The one-metre minimum averaging interval
+and the existing constant extension outside the height grid remain in place.
+
 Weather profiles retain the original hourly rows that bracket the requested time window. Missing
 temperature, pressure or winds in unrelated hours no longer discard usable weather for a short recording.
 Every retained grid cell must have all required interpolation endpoints. A cell whose hourly
@@ -1733,6 +1741,23 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Stable path averages and conservative weather envelopes
+
+Seven new atmosphere regressions cover ordinary-height agreement with the former calculation,
+close and extrapolated paths, exact grid boundaries, grid and station interpolation, both
+signs of the clamped surface-temperature adjustment, invalid providers and a nearly cancelled adjustment
+denominator. Roundoff-dominated adjustments return no envelope rather than an unsafe bound.
+The actual atmosphere, track, propagation and geodesy component passes 82 tests with no
+failures and one ignored timing benchmark using the pinned nightly compiler and genuine
+pinned serde. The shared weather wrapper's unchanged forwarding regression also passes
+natively as an exact production-source component.
+
+These are component checks, not a complete `fdop-core` or `fdop-data` test run. The whole
+atmosphere file passes pinned rustfmt; changed weather-wrapper lines are formatted, while
+older unrelated formatting differences remain. Workspace tests/Clippy, release selftest
+and reference/field replays remain incomplete because genuine RCH and the pinned numerical
+dependencies are unavailable. No field-accuracy or whole-recording timing claim is made.
+
 ### Extend compact ordinary-speed recovery to true recording edges
 
 A final ordinary-speed stage now checks short transitions at the recording's real beginning
@@ -1749,8 +1774,9 @@ or recede, reversed motion, repeated ownership and exhausted shared limits suppl
 A root pipeline regression checks recovered geometry, original detection preservation and
 expanded-measurement provenance.
 
-These assertions have not executed: the host remains unavailable. Source review and
-added-line whitespace checks are the available checks, not native recovery evidence.
+These assertions have not executed: the restored host still lacks the pinned numerical
+dependencies needed by detection and measurement. Source review and added-line whitespace
+checks are the available checks, not native recovery evidence.
 Core/workspace tests, formatting of the new Rust, Clippy, release selftest and real-recording
 replays remain unverified. No measured gain in recovery rate, runtime or field accuracy is claimed.
 
@@ -1773,10 +1799,14 @@ four displaced-rival controls. Twenty additional cases add a report near either 
 three interior times; both time directions of the separated-support fixture retain their
 original chains. This is an arithmetic cross-check, not execution of the Rust.
 
-The Rust regressions have not run: the execution host disconnected after the initial formatting
-and dependency checks. The formatter already reported unrelated differences, and offline
-dependency resolution lacked pinned `fsci-fft`. Native component/workspace tests, Clippy,
-release selftest and reference/field replays remain unverified for this change.
+The restored host now passes these Rust regressions in a native component run of the complete
+production track, propagation, atmosphere and geodesy modules: 75 tests pass, none fail, and
+one timing benchmark is ignored at `50b7152`. The pinned compiler and genuine pinned serde
+are used; store data declarations are extracted unchanged. Replacing only the chain-selection
+code with the parent of `f96c1de` makes the denser-report regression fail natively (2 retained
+reports where the test requires all 20), while the separated-support control still passes.
+This is component validation. Workspace tests, Clippy, release selftest and reference/field
+replays remain incomplete, and workspace formatting has pre-existing differences.
 
 ### Keep fast corrected-height segments when speed reports are missing
 
@@ -1803,11 +1833,11 @@ about 89.09 km over a 363.75 s gap, beyond the former 73.00 km allowance but wit
 the ordinary-speed control keeps the 200 m/s envelope. This verifies the gate arithmetic,
 not native model construction or the added Doppler assertions.
 
-The new Rust regressions remain unrun after the dependency-build interruptions. Pinned
-rustfmt parses the changed source and new-line formatting has been checked; unrelated
-existing formatting differences remain. Workspace tests/Clippy, release selftest and
-reference/field replays remain incomplete. Earlier native track results below apply to
-their recorded snapshot, not to these new tests. No field-accuracy or timing gain is claimed.
+Both regression groups now pass in the native 75-test component run at `50b7152`
+described above, including their reconstructed Doppler and preservation assertions.
+Pinned rustfmt parses the source; unrelated existing formatting differences remain.
+Workspace tests/Clippy, release selftest and reference/field replays remain incomplete.
+No field-accuracy or timing gain is claimed.
 
 ### Calm-air curve votes follow the observer's propagation path
 

@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Stabilize path averages and certify conservative weather envelopes
+
+- Expose optional sound-speed and wind bounds over each provider's complete profiles.
+  Standard, gridded, scattered and surface-adjusted weather derive them from the actual
+  resampled columns; shared fallback profiles preserve the certificates. Unknown or
+  numerically uncertifiable providers return no bound instead of trusting sampled weather.
+- Compute column path averages from endpoint-cell slopes and the integrated middle in
+  constant time. This removes cancellation between large extrapolated cumulative values
+  while retaining the existing minimum averaging interval and constant tail extension.
+  Evaluate the boundary-layer integral without squaring its depth-sized interval.
+- Add seven native regressions for ordinary-path agreement, extrapolated paths, exact grid
+  boundaries, interpolation, adjusted profiles and invalid inputs. Independent review exposed a nearly cancelled
+  adjusted slowness denominator; account for roundoff before that subtraction and protect
+  the exact counterexample. No search or confidence threshold changes.
+- The actual atmosphere/track/propagation/geodesy component passes 82 tests, with none
+  failed and one timing benchmark ignored, using pinned nightly and genuine pinned serde.
+  The shared weather wrapper's exact production-source regression separately passes.
+  This also validates the earlier denser-report and corrected-fast-segment regressions.
+- Atmosphere rustfmt and patch whitespace checks pass; unrelated workspace formatting
+  differences remain. Full workspace checks, release selftest and reference/field replays
+  remain incomplete without genuine RCH and pinned numerical dependencies. Component
+  checks do not establish field accuracy or whole-recording performance.
+
 ### Retain separated fast corrected-height segments without speed reports
 
 - Reuse the existing position-supported motion envelope when attaching independently

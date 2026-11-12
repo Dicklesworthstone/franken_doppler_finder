@@ -14,8 +14,8 @@
 use crate::DataError;
 use fdop_types::BBox;
 use fdop_types::atmo::{
-    AdjustedAtmosphere, Atmosphere, GriddedAtmosphere, Level, ScatteredAtmosphere,
-    StandardAtmosphere, standard_levels, wind_en,
+    AdjustedAtmosphere, Atmosphere, GriddedAtmosphere, Level, Medium, MediumBounds,
+    ScatteredAtmosphere, StandardAtmosphere, standard_levels, wind_en,
 };
 use fdop_types::time::utc_date;
 use std::path::Path;
@@ -863,12 +863,20 @@ type AtmosphereResult = Result<WeatherSource, DataError>;
 struct SharedAtmosphere(Arc<dyn Atmosphere>);
 
 impl Atmosphere for SharedAtmosphere {
-    fn medium(&self, lat: f64, lon: f64, t: f64, z_a: f64, z_b: f64) -> fdop_types::atmo::Medium {
+    fn medium(&self, lat: f64, lon: f64, t: f64, z_a: f64, z_b: f64) -> Medium {
         self.0.medium(lat, lon, t, z_a, z_b)
     }
 
     fn describe(&self) -> String {
         self.0.describe()
+    }
+
+    fn uniform_medium(&self) -> Option<Medium> {
+        self.0.uniform_medium()
+    }
+
+    fn medium_bounds(&self) -> Option<MediumBounds> {
+        self.0.medium_bounds()
     }
 }
 
@@ -1039,6 +1047,26 @@ mod tests {
             "test soundings".into(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn shared_profiles_preserve_certified_search_bounds() {
+        let constant: Arc<dyn Atmosphere> = Arc::new(fdop_types::atmo::UniformAtmosphere(Medium {
+            c: 340.0,
+            wind_e: 3.0,
+            wind_n: -4.0,
+        }));
+        let soundings: Arc<dyn Atmosphere> = Arc::new(test_soundings());
+        for original in [constant, soundings] {
+            let shared = SharedAtmosphere(original.clone());
+            assert!(original.medium_bounds().is_some());
+            assert_eq!(shared.medium_bounds(), original.medium_bounds());
+            assert_eq!(shared.uniform_medium(), original.uniform_medium());
+            assert_eq!(
+                shared.medium(0.0, 0.0, 0.0, 1.5, 2000.0),
+                original.medium(0.0, 0.0, 0.0, 1.5, 2000.0)
+            );
+        }
     }
 
     #[test]
