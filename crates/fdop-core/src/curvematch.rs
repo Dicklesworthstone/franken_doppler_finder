@@ -1344,9 +1344,9 @@ fn stamp_track(
                     }
                     let c = c_at(bt);
                     let scale = BASE_C / c;
-                    // Keep the established calm arithmetic and time-interpolated sound table.
-                    // A regional calm wind does not establish calm along this observer's path:
-                    // query it only after a CPA survives the existing physical gates.
+                    // The regional table serves callers without a path provider. With one,
+                    // both calm and windy passes must use this observer's actual path average,
+                    // sampled only after the CPA survives the existing physical gates.
                     let (mut bank_v, mut bank_d, mut arrive) = (v * scale, d * scale, bt + d / c);
                     if let Some(atmo) = atmo {
                         let (lat, lon) = g.latlon(xx as usize, yy as usize);
@@ -1365,6 +1365,9 @@ fn stamp_track(
                                 continue;
                             };
                             (bank_v, bank_d, arrive) = (mapped_v, mapped_d, bt + heard);
+                        } else {
+                            let scale = BASE_C / medium.c;
+                            (bank_v, bank_d, arrive) = (v * scale, d * scale, bt + d / medium.c);
                         }
                     }
                     let tv = nearest_log(&p.v_grid, bank_v);
@@ -6366,15 +6369,15 @@ mod tests {
     }
 
     #[test]
-    fn calm_coarse_stamps_preserve_the_original_bits() {
+    fn uniform_calm_coarse_stamps_preserve_the_original_bits() {
         struct Calm;
         impl Atmosphere for Calm {
             fn describe(&self) -> String {
-                "calm test atmosphere".into()
+                "uniform calm test atmosphere".into()
             }
 
-            fn medium(&self, _lat: f64, _lon: f64, t: f64, z0: f64, _z1: f64) -> Medium {
-                Medium::still(325.0 + 0.01 * (t % 600.0) + z0 * 0.001)
+            fn medium(&self, _lat: f64, _lon: f64, _t: f64, _z0: f64, _z1: f64) -> Medium {
+                Medium::still(325.0)
             }
         }
         let (lat, lon, clock) = SCENE_AT;
@@ -6424,6 +6427,112 @@ mod tests {
             };
             assert!(!original.is_empty());
             assert_eq!(bits(&current), bits(&original));
+        }
+    }
+
+    #[test]
+    fn calm_coarse_stamps_use_the_observers_medium_before_clock_voting() {
+        struct LocalCalm {
+            clock: f64,
+            queries: std::sync::Mutex<Vec<[f64; 5]>>,
+        }
+        impl LocalCalm {
+            fn path_c(&self, lat: f64, lon: f64, t: f64, z0: f64, z1: f64) -> f64 {
+                if z0 < 500.0 {
+                    // The regional table samples a different height interval.
+                    BASE_C
+                } else {
+                    310.0
+                        + 50.0 * (lat - SCENE_AT.0)
+                        + 20.0 * (lon - SCENE_AT.1)
+                        + 0.5 * ((t - self.clock) / 300.0).sin()
+                        + 0.001 * (z1 - z0)
+                }
+            }
+        }
+        impl Atmosphere for LocalCalm {
+            fn describe(&self) -> String {
+                "spatial, temporal and height-dependent calm test atmosphere".into()
+            }
+            fn medium(&self, lat: f64, lon: f64, t: f64, z0: f64, z1: f64) -> Medium {
+                self.queries.lock().unwrap().push([lat, lon, t, z0, z1]);
+                Medium::still(self.path_c(lat, lon, t, z0, z1))
+            }
+        }
+        let (lat, lon, _) = SCENE_AT;
+        let p = MatchParams::default();
+        let region = BBox::new(lat - 0.004, lon - 0.006, lat + 0.004, lon + 0.006);
+        let g = make_grid(&p, &region, &FlatElevation(700.0));
+        for clock in [1_000.0, SCENE_AT.2] {
+            let atmo = LocalCalm {
+                clock,
+                queries: std::sync::Mutex::new(Vec::new()),
+            };
+            let tr = straight_track(
+                &Enu::new(lat, lon, 0.0),
+                [0.0, 6_000.0, 1_700.0 + MIC_HEIGHT_M],
+                [175.0, 0.0, 0.0],
+                clock + 200.0,
+                clock - 200.0,
+                clock + 500.0,
+                4.0,
+            );
+            let span = (clock - 200.0, clock + 500.0);
+            let sound = SoundTable::new(&atmo, lat, lon, span);
+            atmo.queries.lock().unwrap().clear();
+            let (mut regional, mut local) = (Vec::new(), Vec::new());
+            stamp_track(
+                &tr,
+                &g,
+                &p,
+                &|t| sound.at(t),
+                None,
+                clock,
+                span,
+                &mut regional,
+            );
+            stamp_track(
+                &tr,
+                &g,
+                &p,
+                &|t| sound.at(t),
+                Some(&atmo),
+                clock,
+                span,
+                &mut local,
+            );
+            assert!(!local.is_empty());
+            assert_eq!(regional.len(), local.len());
+            let queries = atmo.queries.lock().unwrap();
+            assert_eq!(queries.len(), local.len(), "one query per physical CPA");
+            let mut changed_templates = 0;
+            for ((old, new), q) in regional.iter().zip(&local).zip(queries.iter()) {
+                assert_eq!(old.0, new.0);
+                let cell = new.0 as usize;
+                let (la, lo) = g.latlon(cell % g.ncols, cell / g.ncols);
+                let observer = g.enu.to_ecef(g.observers[cell]);
+                let (pos, vel) = tr.pv(q[2]);
+                let (_, _, z) = ecef_to_geodetic(observer);
+                let (_, _, h) = ecef_to_geodetic(pos);
+                assert_eq!((q[0], q[1]), (la, lo));
+                assert!((q[3] - z).abs() < 1e-8 && (q[4] - h).abs() < 1e-8);
+                let prop = Prop::still(atmo.path_c(la, lo, q[2], z, h));
+                let rv = sub(pos, observer);
+                let expected = q[2] + prop.travel(rv, norm(rv)) - clock;
+                assert!((f64::from(new.1.arrive) - expected).abs() < 2e-4);
+                assert!(
+                    (f64::from(old.1.arrive) - expected).abs() > 1.0,
+                    "regional sound speed must demonstrate a real clock displacement"
+                );
+                let (v, d) = prop.fit_geometry(rv, vel, BASE_C).unwrap();
+                let tpl = nearest_log(&p.v_grid, v) * p.d_grid.len() + nearest_log(&p.d_grid, d);
+                assert_eq!(new.1.tpl as usize, tpl);
+                changed_templates += usize::from(old.1.tpl != new.1.tpl);
+            }
+            assert!(
+                changed_templates > 0,
+                "the correct propagation selects a different bank"
+            );
         }
     }
 

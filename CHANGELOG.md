@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Use the observer's calm-air path for raw-spectrogram votes
+
+- Map a calm pass's speed, distance and arrival time with its candidate observer's
+  path-averaged sound speed. The coarse curve matcher previously sampled that medium
+  but retained the region-centre reference column whenever wind was zero.
+- Add a physical elevated-observer regression comparing each encoded vote with
+  wave travel and equivalent fitted geometry at relative/Unix clocks. Retain a
+  constant-medium bit-comparison across straight, turning and track-boundary cases.
+  The former varying-medium compatibility expectation now follows the actual path.
+- Keep the physical gates, wind mapping, exact scorer, amplitude/null models and
+  confidence rules. Independent WGS84/retarded-frequency arithmetic reproduces the
+  clock and template mismatch; new native regressions remain unrun.
+- Fix only new-line formatting from this change and the preceding search regression.
+  Rustfmt parses both changed files; pre-existing formatting differences remain.
+  Workspace checks, release selftest and reference/field replays remain incomplete.
+
 ### Use the candidate observer's calm-air medium before the clock join
 
 - Calculate a calm hypothesis's arrival time using the path-averaged sound speed

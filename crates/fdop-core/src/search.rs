@@ -7841,7 +7841,14 @@ mod tests {
                     t_base,
                     10_000,
                 );
-                assert!(control.stored.as_ref().unwrap().iter().any(|h| h.trk as usize == i));
+                assert!(
+                    control
+                        .stored
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .any(|h| h.trk as usize == i)
+                );
                 let cloud = hypotheses(
                     event,
                     &case.tracks,
@@ -7853,7 +7860,12 @@ mod tests {
                     10_000,
                 );
                 assert!(
-                    cloud.stored.as_ref().unwrap().iter().any(|h| h.trk as usize == i),
+                    cloud
+                        .stored
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .any(|h| h.trk as usize == i),
                     "the observer's own medium must retain flight {} at start {start}: {} hypotheses",
                     event.id,
                     cloud.count

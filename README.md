@@ -459,8 +459,10 @@ in `crates/fdop-core/src/curvematch.rs`:
   A retained CPA queries the atmosphere at that observer and the actual source/receiver heights.
   In wind, its locally straight frequency curve is mapped to the existing bank's equivalent
   speed, distance and heard centre; correcting travel time alone would leave the wrong shape.
-  Calm paths retain their original arithmetic. This mapping changes which supported candidates
-  reach exact scoring; exact trajectory scores, amplitude weights, nulls and decoy gates retain
+  Calm paths use that observer's sound speed for both bank geometry and arrival time, so a
+  regional reference column cannot select another template or shift the recording clock.
+  This mapping changes which supported candidates reach exact scoring; exact trajectory
+  scores, amplitude weights, nulls and decoy gates retain
   their existing models. It assumes a homogeneous path-averaged medium and local constant velocity.
   The grid bounds the geographic box's ellipsoid projection, keeps a centre point on narrow axes, and
   includes a one-cell fringe clipped onto the boundary. Small boxes and long, thin regions therefore
@@ -1773,6 +1775,33 @@ and dependency checks. The formatter already reported unrelated differences, and
 dependency resolution lacked pinned `fsci-fft`. Native component/workspace tests, Clippy,
 release selftest and reference/field replays remain unverified for this change.
 
+### Calm-air curve votes follow the observer's propagation path
+
+The raw-spectrogram matcher already queried each candidate observer's atmosphere, but a
+zero-wind result left its regional reference sound speed in use. That reference averages
+the column at the region centre between 10 m and 1500 m. It can differ from the actual
+source-to-microphone path in space, time or height. The coarse vote now uses the observer
+path average for both equivalent bank speed/range and arrival time, consistent with the
+medium used by exact trajectory scoring. Wind mapping, physical reach/speed limits,
+amplitude weights, nulls and confidence gates keep their existing behavior.
+
+The new regression places a synthetic observer at 700 m elevation and a 175 m/s aircraft
+about 6 km away. The regional column returns 343 m/s while actual observer paths return
+about 311 m/s. It checks each atmosphere query's position and path heights, compares
+arrival times with physical wave travel and template selection with the equivalent
+fitted geometry, and exercises relative and Unix clocks. The constant-medium control
+retains the earlier bit-comparison across straight, turning and boundary tracks.
+The former compatibility expectation for varying calm paths is replaced by these
+observer-path checks.
+
+Independent WGS84 and retarded-frequency arithmetic reproduces about 1.7–2.0 s of
+regional-clock bias in this fixture and agrees with the corrected equivalent curve.
+This is numerical evidence, not native execution. Rustfmt parsed the changed files;
+formatting differences on new lines were fixed while unrelated existing differences
+remain. The new Rust regressions, workspace checks, release selftest and recording
+replays remain unrun or incomplete after dependency compilation was interrupted.
+No field-accuracy or performance improvement is established.
+
 ### Candidate clocks follow the observer's calm-air weather
 
 The calm hypothesis path previously looked up the candidate observer's medium but divided
@@ -2333,10 +2362,11 @@ and evidence 8.606058 nats. The separate wrong-clock and pure-noise controls ret
 The fixture deliberately omits decoys to isolate foreground reachability and asserts that it
 cannot stand as a confident answer without them; this is not a new confidence-calibration result.
 
-Five further native regressions compare the mapping with actual retarded propagation, reject
-invalid/relative-supersonic media, preserve calm stamps bit for bit, and check prior-clock
-independence and observer-specific atmosphere coordinates/heights. All six pass, as does component
-Clippy with warnings denied. The combined actual production engine selftest retains its prior
+At the wind-mapping snapshot, five further native regressions compared the mapping with actual
+retarded propagation, rejected invalid/relative-supersonic media, preserved the former calm stamps
+bit for bit, and checked prior-clock independence and observer-specific atmosphere coordinates/heights.
+All six passed, as did component Clippy with warnings denied. The later calm observer-path correction
+above changes that compatibility expectation and has not completed its native regressions. The combined actual production engine selftest retains its prior
 four-event, two-flight result through real FFmpeg. These checks use synthetic recordings; reference,
 wrong-date and field recordings have not been replayed. The mapping is exact for the frequency
 shape under its local model, not for the bank's amplitude weighting or curved/changing-medium paths.
