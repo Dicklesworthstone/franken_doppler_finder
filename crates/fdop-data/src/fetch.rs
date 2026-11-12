@@ -1663,6 +1663,7 @@ mod tests {
         spec: IngestSpec,
         releases: [DayRelease; 2],
         parts: [Part; 2],
+        archives: [Vec<u8>; 2],
     }
 
     impl OfflineRawFixture {
@@ -1753,6 +1754,7 @@ mod tests {
             spec,
             releases,
             parts,
+            archives,
         }
     }
 
@@ -1811,6 +1813,113 @@ mod tests {
                 let cached = fetch_window(&f.want, &f.cache, &opts).unwrap();
                 assert_eq!(cached.meta.stats["cache_hits"], 1);
                 assert_same_legs(&cached.legs, &got.legs);
+            }
+        }
+    }
+
+    #[test]
+    fn offline_raw_recovery_references_geoid_before_joint_altitude_correction() {
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                // Exact binary metre shifts keep the existing bit-for-bit comparison
+                // meaningful even though raw GNSS heights have already become f32.
+                for old_geoid in [-30.0, -34.0] {
+                    let f = offline_raw_fixture(main, include_jets);
+                    let context = day_context((2026, 9, 8));
+                    let previous = IngestSpec {
+                        geoid_n_m: old_geoid,
+                        ..f.spec
+                    };
+                    for i in 0..f.releases.len() {
+                        // Actually ingest the archive at the old reference: changing
+                        // checkpoint metadata alone would encode the wrong heights.
+                        let part = ingest_day_reader(
+                            f.archives[i].as_slice(),
+                            f.releases[i].feed.label(),
+                            &previous,
+                            &|_| {},
+                            context,
+                        )
+                        .unwrap();
+                        crate::raw_cache::save(
+                            &f.dir,
+                            &f.releases[i],
+                            &previous,
+                            context,
+                            &part,
+                        )
+                        .unwrap();
+                    }
+                    let raw_bytes: [Vec<u8>; 2] = std::array::from_fn(|i| {
+                        std::fs::read(crate::raw_cache::path(
+                            &f.dir,
+                            &f.releases[i],
+                            &previous,
+                        ))
+                        .unwrap()
+                    });
+                    let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
+                    tags.sort();
+                    // The fixture's original parts were freshly ingested at target N.
+                    let fresh = build_day_store(
+                        f.parts.to_vec(),
+                        &f.spec,
+                        tags.clone(),
+                        context,
+                    );
+                    let expected = merge_stores(vec![fresh.clone()], DAY_JOIN_GAP_S).filtered(
+                        &f.want.bbox,
+                        f.want.t_start,
+                        f.want.t_end,
+                    );
+                    let opts = FetchOptions {
+                        offline: true,
+                        ..Default::default()
+                    };
+                    let got = fetch_window(&f.want, &f.cache, &opts).unwrap();
+                    assert_eq!(got.meta.stats["cache_hits"], 0);
+                    assert_eq!(got.meta.geoid_n_m, f.want.geoid_n_m);
+                    assert_eq!(got.meta.sources, tags);
+                    assert_same_legs(&got.legs, &expected.legs);
+                    assert!(!got.legs.is_empty());
+                    assert!(
+                        got.legs
+                            .iter()
+                            .all(|leg| leg.engine != EngineClass::Unknown)
+                    );
+                    assert!(
+                        got.legs
+                            .iter()
+                            .flat_map(|leg| &leg.points)
+                            .any(|point| point.alt_src == alt_src::BARO_CORRECTED)
+                    );
+                    assert_eq!(
+                        got.legs.iter().any(|leg| leg.engine == EngineClass::Jet),
+                        include_jets
+                    );
+                    let fs = cache_feedset(&feedset_name(main, true), include_jets);
+                    let saved = TrackStore::load(
+                        &f.dir.join(format!("{fs}_{}.fdtrk", bbox_key(&f.spec.bbox).1)),
+                    )
+                    .unwrap();
+                    assert_eq!(saved.meta.geoid_n_m, f.spec.geoid_n_m);
+                    assert_eq!(saved.meta.stats, fresh.meta.stats);
+                    assert_same_legs(&saved.legs, &fresh.legs);
+                    for (i, bytes) in raw_bytes.iter().enumerate() {
+                        assert_eq!(
+                            &std::fs::read(crate::raw_cache::path(
+                                &f.dir,
+                                &f.releases[i],
+                                &previous,
+                            ))
+                            .unwrap(),
+                            bytes
+                        );
+                    }
+                    let cached = fetch_window(&f.want, &f.cache, &opts).unwrap();
+                    assert_eq!(cached.meta.stats["cache_hits"], 1);
+                    assert_same_legs(&cached.legs, &got.legs);
+                }
             }
         }
     }
@@ -2116,7 +2225,7 @@ mod tests {
         for case in [
             "jet_policy",
             "context",
-            "geoid",
+            "invalid_geoid",
             "release",
             "wrong_day",
             "wrong_feed",
@@ -2132,7 +2241,7 @@ mod tests {
             match case {
                 "jet_policy" => f.want.include_jets = true,
                 "context" => context = DayContext::new(T0, DAY_JOIN_GAP_S + 1.0, DAY_CACHE_PAD_S),
-                "geoid" => saved_spec.geoid_n_m += 1.0,
+                "invalid_geoid" => saved_spec.geoid_n_m = f64::NAN,
                 "release" => saved_release.parts[0].size += 1,
                 "wrong_day" => {
                     saved_release.tag = crate::adsblol::tag_for(2026, 9, 9, Feed::Prod, 0);

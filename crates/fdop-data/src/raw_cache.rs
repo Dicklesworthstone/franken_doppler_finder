@@ -1,7 +1,8 @@
 //! Private checkpoints of completely ingested release parts. Retain raw altitude pairs
 //! and boundary provenance so a later feed is reconciled by the ordinary day builder.
 //! This is disposable cache data, not a public interchange format: a version, release,
-//! filter or policy mismatch is a miss and an unreadable file is refetched.
+//! coverage or policy mismatch is a miss and an unreadable file is refetched. A change
+//! only to the geoid re-references GNSS heights without discarding the completed ingest.
 
 use crate::DataError;
 use crate::adsblol::DayRelease;
@@ -86,10 +87,40 @@ pub(crate) fn load(
     };
     // from_reader consumes the complete JSON; the multi-member decoder also checks
     // the gzip footer and rejects truncated/trailing data before a part is trusted.
-    let cached: Checkpoint = serde_json::from_reader(BufReader::new(MultiGzDecoder::new(file)))
+    let mut cached: Checkpoint = serde_json::from_reader(BufReader::new(MultiGzDecoder::new(file)))
         .map_err(|e| DataError(format!("raw feed checkpoint: {e}")))?;
-    if cached.identity != Identity::new(rel, spec, context) {
+    let old_geoid = f64::from_bits(cached.identity.filter_bits[6]);
+    if !old_geoid.is_finite() || !spec.geoid_n_m.is_finite() {
         return Ok(None);
+    }
+    let mut required = Identity::new(rel, spec, context);
+    if cached.identity != required {
+        // The initial run may have used the default geoid before an NGS lookup
+        // succeeded. All coverage, release and policy fields must still match;
+        // only the reference of stored GNSS heights can be changed without re-ingest.
+        required.filter_bits[6] = cached.identity.filter_bits[6];
+        if cached.identity != required {
+            return Ok(None);
+        }
+        // MSL = ellipsoid - N, so N_old - N_new has the same sign as the existing
+        // processed-store conversion. Barometric heights and missing-value bits stay.
+        let shift = (old_geoid - spec.geoid_n_m) as f32;
+        if !shift.is_finite() {
+            return Ok(None);
+        }
+        if shift != 0.0 {
+            for aircraft in &mut cached.aircraft {
+                for point in &mut aircraft.points {
+                    if point.alt_geom_msl.is_finite() {
+                        let height = point.alt_geom_msl + shift;
+                        if !height.is_finite() {
+                            return Ok(None);
+                        }
+                        point.alt_geom_msl = height;
+                    }
+                }
+            }
+        }
     }
     Ok(Some((cached.aircraft, cached.stats)))
 }
@@ -364,18 +395,17 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_identity_requires_exact_release_filter_policy_and_context() {
+    fn checkpoint_identity_requires_exact_release_coverage_policy_and_context() {
         let (dir, rel, spec, context) = fixture();
         save(&dir, &rel, &spec, context, &part()).unwrap();
         let original_path = path(&dir, &rel, &spec);
-        let changed_specs: [fn(&mut IngestSpec); 9] = [
+        let changed_specs: [fn(&mut IngestSpec); 8] = [
             |s| s.bbox.south = f64::from_bits(s.bbox.south.to_bits() + 1),
             |s| s.bbox.west = f64::from_bits(s.bbox.west.to_bits() + 1),
             |s| s.bbox.north = f64::from_bits(s.bbox.north.to_bits() + 1),
             |s| s.bbox.east = f64::from_bits(s.bbox.east.to_bits() + 1),
             |s| s.t_start = f64::from_bits(s.t_start.to_bits() + 1),
             |s| s.t_end = f64::from_bits(s.t_end.to_bits() + 1),
-            |s| s.geoid_n_m = f64::from_bits(s.geoid_n_m.to_bits() + 1),
             |s| s.keep_unknown = !s.keep_unknown,
             |s| s.include_jets = !s.include_jets,
         ];
@@ -425,6 +455,107 @@ mod tests {
             assert!(load(&dir, &rel, &spec, changed).unwrap().is_none());
         }
         assert!(load(&dir, &rel, &spec, context).unwrap().is_some());
+    }
+
+    #[test]
+    fn checkpoint_references_only_finite_gnss_heights_to_a_new_geoid() {
+        let (dir, rel, spec, context) = fixture();
+        let mut original = part();
+        let sample = original.0[0].points[0];
+        for (i, height) in [880.0, -0.0, -12.75].into_iter().enumerate() {
+            original.0[0].points.push(RawPoint {
+                t: sample.t + (i + 1) as f64,
+                alt_geom_msl: height,
+                alt_baro_m: 840.0,
+                ..sample
+            });
+        }
+        original.1.points_kept = original.0[0].points.len() as u64;
+        save(&dir, &rel, &spec, context, &original).unwrap();
+        let checkpoint = path(&dir, &rel, &spec);
+        let bytes = std::fs::read(&checkpoint).unwrap();
+        let original_bits = serde_json::to_vec(&original.0).unwrap();
+        for geoid in [
+            spec.geoid_n_m,
+            -30.0,
+            -35.5,
+            f64::from_bits(spec.geoid_n_m.to_bits() + 1),
+        ] {
+            let requested = IngestSpec {
+                geoid_n_m: geoid,
+                ..spec
+            };
+            let got = load(&dir, &rel, &requested, context).unwrap().unwrap();
+            let mut expected = original.0.clone();
+            if geoid != spec.geoid_n_m {
+                for point in &mut expected[0].points {
+                    if point.alt_geom_msl.is_finite() {
+                        point.alt_geom_msl =
+                            (point.alt_geom_msl as f64 + spec.geoid_n_m - geoid) as f32;
+                    }
+                }
+            }
+            // The raw serde representation encodes every float by its bits, so this
+            // also checks NaN payloads, barometric heights, motion and boundaries.
+            assert_eq!(
+                serde_json::to_vec(&got.0).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert_eq!(got.1, original.1);
+            assert_eq!(std::fs::read(&checkpoint).unwrap(), bytes);
+            let unchanged = load(&dir, &rel, &spec, context).unwrap().unwrap();
+            assert_eq!(serde_json::to_vec(&unchanged.0).unwrap(), original_bits);
+        }
+
+        // The exception must never hide a coverage mismatch that shares a filename.
+        let changed = IngestSpec {
+            t_end: spec.t_end + 1.0,
+            geoid_n_m: -30.0,
+            ..spec
+        };
+        assert!(load(&dir, &rel, &changed, context).unwrap().is_none());
+    }
+
+    #[test]
+    fn checkpoint_rejects_invalid_geoid_conversions_without_changing_raw_data() {
+        let (dir, rel, spec, context) = fixture();
+        let original = part();
+        save(&dir, &rel, &spec, context, &original).unwrap();
+        for geoid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+            let requested = IngestSpec {
+                geoid_n_m: geoid,
+                ..spec
+            };
+            assert!(load(&dir, &rel, &requested, context).unwrap().is_none());
+        }
+        for geoid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let invalid = IngestSpec {
+                geoid_n_m: geoid,
+                ..spec
+            };
+            save(&dir, &rel, &invalid, context, &original).unwrap();
+            assert!(load(&dir, &rel, &spec, context).unwrap().is_none());
+            assert!(load(&dir, &rel, &invalid, context).unwrap().is_none());
+        }
+        let mut extreme = original;
+        extreme.0[0].points[0].alt_geom_msl = f32::MAX;
+        save(&dir, &rel, &spec, context, &extreme).unwrap();
+        let checkpoint = path(&dir, &rel, &spec);
+        let bytes = std::fs::read(&checkpoint).unwrap();
+        assert!(
+            load(
+                &dir,
+                &rel,
+                &IngestSpec {
+                    geoid_n_m: -1e38,
+                    ..spec
+                },
+                context,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), bytes);
     }
 
     #[test]

@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Resume completed raw ADS-B feeds after a geoid-reference change
+
+- Reuse a verified raw-feed checkpoint when only its finite geoid reference changed.
+  Shift finite GNSS heights by old N minus new N before the ordinary day builder
+  reconciles feeds and derives barometric corrections. A retry that replaces the
+  fallback geoid with an available measurement no longer loses completed raw work.
+- Preserve exact release/assets, region/time, engine policy and midnight-context
+  matching. Identical references retain the exact path; raw barometric heights, NaN
+  payloads, motion, boundaries, statistics and on-disk checkpoint bytes are unchanged.
+- Add raw-cache conversion/identity controls and an offline main-plus-MLAT rebuild
+  comparison against fresh ingestion at the requested reference. The strict comparison
+  uses exactly representable shifts, not a claim of bit equality for every f32 offset.
+- Validation: source review and independent height-reference arithmetic checks completed.
+  Native Rust regressions and workspace checks could not run after the execution host
+  disconnected. No live archive or real-recording result is claimed.
+
 ### Recover robust Doppler fits despite a short jump to another ridge
 
 - Rank multistart soft-L1 fits by the same robust objective used to solve them. Ranking

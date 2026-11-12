@@ -965,10 +965,16 @@ the existing leg and regional barometric corrections, with the contributing feed
 leg provenance. The rule applies to fresh ingestion and raw-checkpoint reconstruction; an
 existing processed day store must be rebuilt to recover evidence discarded by older ingestion.
 
-Reuse requires the exact release metadata and ordered assets, spatial/time filter, geoid
-reference, unknown/jet policy and midnight-context version. All raw floats and boundary
-times are stored as integer bit patterns, preserving missing-altitude NaNs and exact
-timing. A complete empty feed is reusable; a truncated ingest is never published. This
+Reuse requires the exact release metadata and ordered assets, spatial/time filter,
+unknown/jet policy and midnight-context version. A changed finite geoid reference can
+reuse the same checkpoint: finite GNSS heights shift by the old reference minus the new
+one before ordinary cross-feed reconciliation and barometric correction. This lets a
+retry use a newly available geoid correction without downloading the completed feed again.
+Raw barometric heights, missing-altitude values, motion and flight boundaries retain their
+original bits. The cached source is unchanged, and identical geoid references bypass the
+conversion entirely. All raw floats and boundary times are stored as integer bit patterns,
+preserving missing-altitude NaNs and exact timing. A complete empty feed is reusable;
+a truncated ingest is never published. This
 private cache is written atomically and checked through the gzip footer when loaded.
 A missing, incompatible or damaged checkpoint causes a fresh download of that feed.
 A checkpoint-write failure warns and keeps the current successful ingest; it does not
@@ -977,8 +983,7 @@ change final day-store publication errors.
 If no processed full or partial day cache is usable, `--offline` can rebuild it from
 completed raw checkpoints and cached `releases.json` or `releases-main.json` metadata.
 It validates that each release belongs to the requested day and feed, then applies the same
-exact raw identity as an
-online retry. A usable prod checkpoint takes priority over staging. Available requested
+raw identity checks and geoid conversion as an online retry. A usable prod checkpoint takes priority over staging. Available requested
 MLAT is reconciled with the main feed; if requested MLAT is unavailable, a main-only result
 keeps its missing-feed warning. MLAT alone cannot supply a day. Existing processed-cache
 hits keep their priority.
@@ -1892,6 +1897,21 @@ the three-flight search recovers the synthetic observer within 0.56 m and its cl
 0.005 s. Five neighboring narrow-window, wind and repeated-pass controls also pass, along
 with core all-targets clippy. Native runs use the pinned nightly's Cranelift backend; full
 workspace checks, release selftest and real-recording replays have not completed.
+
+### Resume raw ADS-B recovery after the geoid correction changes
+
+Raw-cache regressions cover conversion in both directions, exact reuse at the original
+reference, preservation of missing-altitude bits and all unrelated report fields, and
+rejection of invalid references or incompatible release/filter policies. An offline
+fetch regression rebuilds main plus MLAT feeds from existing checkpoints after a geoid
+change and compares the result with fresh ingestion at the new reference. It also checks
+that the original checkpoint bytes stay unchanged, preventing cumulative corrections
+on later retries. The comparison uses exactly representable reference shifts; arbitrary
+shifts retain the raw format's existing f32 altitude precision.
+
+These Rust regressions were authored during an execution-host outage and have not run.
+Source review and independent height-reference arithmetic checks completed; workspace
+checks, live archive recovery and real-recording validation remain unverified.
 
 ### Rebuild interrupted day catalogues offline
 
