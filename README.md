@@ -1293,14 +1293,17 @@ Design notes:
   velocities, order and keys stay intact; added parts use deterministic `#correctedN` suffixes.
   No spline crosses these gaps, and raw pressure altitudes cannot enter this recovery.
 - **Missing speed reports do not impose a 200 m/s aircraft limit.** If the established track
-  cleaner finds no usable model and every groundspeed report is missing, three consecutive
-  positions can establish a faster motion scale. Their adjacent horizontal velocity vectors
-  must agree within the existing 25 m/s tolerance and obey the existing gap and vertical-motion
-  limits. The inferred consistency envelope is capped at the nominal sound speed. The same
-  cleaner then retries once, and velocities still come from the retained positions. Already
-  supported tracks and finite speed reports keep their existing treatment; unsupported fast
-  turns and fast tracks hidden by a supported rival remain unresolved. This recovers geometry
-  for both searches without changing engine selection or the confidence gates.
+  cleaner loses reports and every groundspeed report is missing, three consecutive positions
+  can establish a faster motion scale. Their adjacent horizontal velocity vectors must agree
+  within the existing 25 m/s tolerance and obey the existing gap and vertical-motion limits.
+  The inferred consistency envelope is capped at the nominal sound speed. The same cleaner
+  then retries once. A usable original winner can only gain reports: the longer replacement
+  must retain every report of that winner in order. A few closely spaced valid reports therefore
+  cannot suppress recovery of the rest of a fast flyover. Existing supported parts separated
+  from the winner keep the original selection; an extension cannot swallow their coverage.
+  Complete tracks, finite speed reports and displaced supported rivals also keep their treatment.
+  Velocities still come from the retained positions; unsupported fast turns remain unresolved.
+  This supplies geometry to both searches without changing engine selection or confidence gates.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
@@ -1719,6 +1722,30 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Preserve fast-track coverage when valid reports become denser
+
+Position-based fast-track recovery now also extends an incomplete usable chain, provided the
+longer chain retains every report in the original winner. Previously, one genuine report
+between a pair of widely spaced samples could leave a short fragment under the default
+speed envelope and disable recovery of the rest of the same flyover.
+
+Three new regressions cover added report times, two headings, relative and Unix clocks,
+preservation of competing and separated supported chains, and full reconstructed position,
+velocity and received-frequency geometry at 215, 245 and 270 m/s. The existing finite-speed, impossible
+jump and unsupported-turn controls remain in place. No threshold or confidence gate changes.
+
+An independent JavaScript numerical reproduction, using WGS84 projection and both chain
+selection algorithms, restores all reports in the twelve speed/heading/epoch combinations:
+2 to 8 reports at 215 m/s, 3 to 20 at 245 m/s, and 2 to 6 at 270 m/s. It also preserves the
+four displaced-rival controls. Twenty additional cases add a report near either end or at
+three interior times; both time directions of the separated-support fixture retain their
+original chains. This is an arithmetic cross-check, not execution of the Rust.
+
+The Rust regressions have not run: the execution host disconnected after the initial formatting
+and dependency checks. The formatter already reported unrelated differences, and offline
+dependency resolution lacked pinned `fsci-fft`. Native component/workspace tests, Clippy,
+release selftest and reference/field replays remain unverified for this change.
 
 ### Recover brief ordinary-speed passes through physical measurement
 

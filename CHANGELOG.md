@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve whole fast flyovers when valid position sampling becomes denser
+
+- Retry the existing position-supported speed envelope when a missing-groundspeed chain
+  is incomplete. Accept a longer chain only if it retains every report of the original
+  usable winner; keep the former empty-model recovery and reject displacement of a rival.
+  Preserve the original selection when separated supported parts could otherwise be swallowed.
+- Add chain-level regressions for denser genuine reports at multiple times, headings and
+  epochs, forward/reversed preservation of separated support, plus model-level checks of
+  complete coverage, position, velocity and received
+  Doppler at 215, 245 and 270 m/s. Retain the existing invalid-motion and finite-report controls.
+- The position-consistency, subsonic, gap, vertical-motion and confidence limits are unchanged.
+  Both searches consume the recovered track through the existing shared builder.
+- Independent JavaScript arithmetic with WGS84 projection reproduces the loss and restores
+  complete support in 32 positive cases, preserving four displaced rivals and both directions
+  of the separated-support control.
+  This is a numerical cross-check, not a Rust test pass.
+- New Rust regressions have not run because the execution host disconnected. Initial workspace
+  formatting found existing differences; offline dependency resolution lacked pinned fsci-fft.
+  Clippy, native tests, release selftest and reference/field replays remain unverified.
+  No field-accuracy claim is made.
+
 ### Recover brief ordinary-speed passes when another aircraft is still needed
 
 - Append a compact primary-speed bank to the half-second recovery survey after both

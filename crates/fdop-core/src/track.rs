@@ -121,8 +121,8 @@ fn drop_bracketed_non_gnss(pts: &mut Vec<fdop_types::store::TrackPoint>, max_spa
     });
 }
 
-/// Missing groundspeed is not evidence for the old 200 m/s limit. An otherwise unusable
-/// piece can infer its scale from three positions with agreeing horizontal secants. Use
+/// Missing groundspeed is not evidence for the old 200 m/s limit. A piece with missing
+/// coverage can infer its scale from three positions with agreeing horizontal secants. Use
 /// the reported-speed envelope, but cap this recovery at the nominal sound speed: repeated
 /// position jumps must not infer an arbitrarily large aircraft speed. This is deliberately
 /// limited to locally steady, ground-subsonic motion; unsupported turns stay refused.
@@ -232,16 +232,44 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
         (best, prev, winner)
     };
     let (mut best, mut prev, mut winner) = select(v_lim);
-    // Preserve every already-supported path, including ambiguous ones. Retry only an empty
-    // model with literally missing speed reports; a finite zero must not be reinterpreted,
+    // A few closely spaced reports can pass the default envelope even when the rest of a
+    // coherent fast flyover does not. Recover missing coverage only by extending the legacy
+    // winner, never by replacing a supported rival. A finite zero must not be reinterpreted,
     // because the later sparse-sample velocity rule can still trust that report.
-    if best[winner] < 2
+    if best[winner] < n
         && pts.iter().all(|p| !p.gs_mps.is_finite())
         && let Some(limit) = position_speed_limit(pts, &xy, bp)
         && limit > v_lim
     {
-        v_lim = limit;
-        (best, prev, winner) = select(v_lim);
+        let mut first = winner;
+        while prev[first] != usize::MAX {
+            first = prev[first];
+        }
+        // A longer primary must not swallow an independently supported part that the
+        // original cleaner can keep below. Every such part has a supported endpoint
+        // more than max_gap_s outside the primary's interval, on either side.
+        let disjoint_support = best.iter().enumerate().any(|(k, &len)| {
+            len >= 2
+                && (pts[first].t - pts[k].t > bp.max_gap_s
+                    || pts[k].t - pts[winner].t > bp.max_gap_s)
+        });
+        if !disjoint_support {
+            let (expanded_best, expanded_prev, expanded_winner) = select(limit);
+            let mut old = winner;
+            let mut expanded = expanded_winner;
+            while expanded != usize::MAX && old != usize::MAX {
+                if expanded == old {
+                    old = prev[old];
+                }
+                expanded = expanded_prev[expanded];
+            }
+            if expanded_best[expanded_winner] > best[winner]
+                && (best[winner] < 2 || old == usize::MAX)
+            {
+                v_lim = limit;
+                (best, prev, winner) = (expanded_best, expanded_prev, expanded_winner);
+            }
+        }
     }
     let ok = |i, j| reachable(i, j, v_lim);
     let trace = |mut k: usize| {
@@ -3078,6 +3106,165 @@ mod tests {
     }
 
     #[test]
+    fn dense_reports_do_not_hide_a_position_only_fast_chain() {
+        let bp = BuildParams::default();
+        for epoch in [0.0, 1_788_895_000.0] {
+            for heading in [0.0_f64, 1.3] {
+                let enu = Enu::new(40.876466, -73.524951, 0.0);
+                let point = |dt: f64, north: f64| {
+                    let along = 245.0 * (dt - 90.0);
+                    let (lat, lon, alt) = ecef_to_geodetic(enu.to_ecef([
+                        along * heading.cos(),
+                        along * heading.sin() + north,
+                        900.0,
+                    ]));
+                    fdop_types::store::TrackPoint {
+                        t: epoch + dt,
+                        lat,
+                        lon,
+                        alt_m: alt as f32,
+                        gs_mps: f32::NAN,
+                        track_deg: f32::NAN,
+                        vrate_mps: f32::NAN,
+                        alt_src: alt_src::GEOM,
+                        flags: 0,
+                    }
+                };
+                let sparse: Vec<_> = (0..=18).map(|k| point(f64::from(k) * 10.0, 0.0)).collect();
+                assert_eq!(
+                    consistent_chains(&sparse, &bp),
+                    vec![(0..sparse.len()).collect::<Vec<_>>()]
+                );
+                for dense_time in [1.0, 81.0, 85.0, 89.0, 179.0] {
+                    let mut points = sparse.clone();
+                    points.push(point(dense_time, 0.0));
+                    points.sort_by(|a, b| a.t.total_cmp(&b.t));
+                    assert_eq!(
+                        consistent_chains(&points, &bp),
+                        vec![(0..points.len()).collect::<Vec<_>>()],
+                        "a genuine extra report at {dense_time} s cropped the flyover, epoch {epoch}, heading {heading}"
+                    );
+                }
+                // A separate supported rival is not an extension of the fast track.
+                // More fast reports must not displace either of its accepted anchors.
+                let mut ambiguous = sparse;
+                ambiguous.extend([point(85.0, 100_000.0), point(86.0, 100_000.0)]);
+                ambiguous.sort_by(|a, b| a.t.total_cmp(&b.t));
+                let rival: Vec<_> = ambiguous
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| [epoch + 85.0, epoch + 86.0].contains(&p.t))
+                    .map(|(i, _)| i)
+                    .collect();
+                assert_eq!(consistent_chains(&ambiguous, &bp), vec![rival]);
+            }
+        }
+    }
+
+    #[test]
+    fn dense_position_reports_preserve_the_whole_fast_flyover_geometry() {
+        let bp = BuildParams::default();
+        for epoch in [0.0, 1_788_895_000.0] {
+            for (speed, step, extra_time) in [
+                (215.0, 30.0, 88.0),
+                (245.0, 10.0, 85.0),
+                (270.0, 45.0, 88.0),
+            ] {
+                for heading in [0.0, 1.3] {
+                    let (mut leg, truth, enu) = position_only_leg(speed, heading, epoch, step);
+                    let extra_time = epoch + extra_time;
+                    let (lat, lon, alt) = ecef_to_geodetic(truth.pos_at(extra_time));
+                    let mut extra = leg.points[0];
+                    extra.t = extra_time;
+                    extra.lat = lat;
+                    extra.lon = lon;
+                    extra.alt_m = alt as f32;
+                    leg.points.push(extra);
+                    let mut expected_times = truth.t.clone();
+                    expected_times.push(extra_time);
+                    expected_times.sort_by(f64::total_cmp);
+                    let models = build(&leg, &bp);
+                    assert_eq!(models.len(), 1, "{speed} m/s, {step} s, epoch {epoch}");
+                    let model = &models[0];
+                    assert_eq!(
+                        model.t, expected_times,
+                        "a denser valid report lost track coverage"
+                    );
+                    assert_eq!(model.reported_vel_frac, 0.0);
+                    let observer = enu.to_ecef([0.0; 3]);
+                    let prop = Prop::still(343.0);
+                    for offset in [30.25, 60.5, 90.0, 121.75, 149.5] {
+                        let te = epoch + offset;
+                        assert!(norm(sub(model.pos_at(te), truth.pos_at(te))) < 0.001);
+                        assert!(norm(sub(model.pv(te).1, truth.pv(te).1)) < 0.001);
+                        let range = norm(sub(truth.pos_at(te), observer));
+                        let received = te + range / prop.c;
+                        let (_, _, actual) = model
+                            .solve_emission_p(received, observer, &prop, None)
+                            .unwrap();
+                        let expected =
+                            prop.ratio(sub(truth.pos_at(te), observer), range, truth.pv(te).1);
+                        assert!((100.0 * (actual - expected)).abs() < 0.001);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn position_only_fast_extension_preserves_separated_legacy_support() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let bp = BuildParams::default();
+        for reverse in [false, true] {
+            let time = |t: f64| if reverse { 1500.0 - t } else { t };
+            let point = |t: f64, east: f64| {
+                let (lat, lon, alt) = ecef_to_geodetic(enu.to_ecef([east, 0.0, 900.0]));
+                fdop_types::store::TrackPoint {
+                    t: time(t),
+                    lat,
+                    lon,
+                    alt_m: alt as f32,
+                    gs_mps: f32::NAN,
+                    track_deg: f32::NAN,
+                    vrate_mps: f32::NAN,
+                    alt_src: alt_src::GEOM,
+                    flags: 0,
+                }
+            };
+            let primary: Vec<_> = (0..100).map(|i| f64::from(i) * 0.1).collect();
+            let secondary: Vec<_> = (0..99).map(|i| 500.05 + f64::from(i) * 0.1).collect();
+            let mut points: Vec<_> = primary
+                .iter()
+                .chain(&secondary)
+                .map(|&t| point(t, 0.0))
+                .collect();
+            // This coherent faster alternative can extend the primary but conflicts
+            // with the separated part that already has its own supported reports.
+            points.extend((2..=150).map(|i| {
+                let t = f64::from(i) * 10.0;
+                point(t, 245.0 * (t - 10.0))
+            }));
+            points.sort_by(|a, b| a.t.total_cmp(&b.t));
+            let actual: Vec<Vec<_>> = consistent_chains(&points, &bp)
+                .iter()
+                .map(|chain| chain.iter().map(|&i| points[i].t).collect())
+                .collect();
+            let expected: Vec<Vec<_>> = [primary, secondary]
+                .into_iter()
+                .map(|times| {
+                    let mut times: Vec<_> = times.into_iter().map(time).collect();
+                    times.sort_by(f64::total_cmp);
+                    times
+                })
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "fast extension lost supported disjoint coverage, reverse={reverse}"
+            );
+        }
+    }
+
+    #[test]
     fn position_only_fast_recovery_requires_coherent_subsonic_support() {
         let bp = BuildParams::default();
         let (mut leg, truth, enu) = position_only_leg(245.0, 0.0, 0.0, 10.0);
@@ -3135,7 +3322,7 @@ mod tests {
             );
         }
 
-        // A supported rival already wins this ambiguous leg. The empty-model rescue
+        // A supported rival already wins this ambiguous leg. Position-based recovery
         // must not replace it just because faster unsupported reports also exist.
         let (mut mixed, _, enu) = position_only_leg(245.0, 0.0, 0.0, 10.0);
         let mut rival = mixed.clone();
