@@ -743,8 +743,10 @@ fn hypotheses(
                             let observer_z = h - hh;
                             let path = atmo.medium(ola, olo, t, observer_z, h);
                             let centre_offset = if path.wind_e == 0.0 && path.wind_n == 0.0 {
-                                // Preserve the established still-air cloud and sampling exactly.
-                                d / c
+                                // Arrival time belongs to this observer's path average, which
+                                // can differ from the column beneath the aircraft. Uniform
+                                // still-air providers retain exactly the same arithmetic.
+                                d / path.c
                             } else {
                                 // A measured still-air curve is centred at its fitted CPA,
                                 // which oblique wind shifts from the geometric CPA's arrival.
@@ -7755,6 +7757,118 @@ mod tests {
             case.events[i] = ev;
         }
         case
+    }
+
+    #[test]
+    fn calm_spatial_weather_keeps_clock_consistent_pair_hypotheses() {
+        struct SpatialCalm {
+            lat: f64,
+            lon: f64,
+        }
+        impl Atmosphere for SpatialCalm {
+            fn medium(
+                &self,
+                lat: f64,
+                lon: f64,
+                _t: f64,
+                _za: f64,
+                _zb: f64,
+            ) -> fdop_types::atmo::Medium {
+                // Every tested observer uses the same cool path average. The warmer
+                // columns beneath the distant aircraft are not that observer's medium.
+                let radius = haversine_m(self.lat, self.lon, lat, lon);
+                let weight = ((radius - 2000.0) / 18_000.0).clamp(0.0, 1.0);
+                fdop_types::atmo::Medium::still(330.0 + 13.0 * weight)
+            }
+            fn describe(&self) -> String {
+                "synthetic spatial calm weather".into()
+            }
+        }
+        let med = fdop_types::atmo::Medium::still(330.0);
+        let dem = FlatElevation(0.0);
+        for start in [0.0, 1_788_895_000.0] {
+            let mut case = wind_delayed_case(med, start);
+            let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let atmo = SpatialCalm {
+                lat: case.obs.0,
+                lon: case.obs.1,
+            };
+            let prop = Prop::still(med.c);
+            for (i, (key, pos, vel, dt, f0)) in [
+                ("A", [0.0, 30_000.0, 1200.0], [90.0, 0.0, 0.0], 120.0, 112.7),
+                ("B", [27_000.0, 0.0, 900.0], [0.0, 95.0, 0.0], 360.0, 149.3),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut tr = straight_track(
+                    &enu,
+                    pos,
+                    vel,
+                    start + dt,
+                    start - 200.0,
+                    start + 800.0,
+                    5.0,
+                );
+                tr.key = key.into();
+                let cpa = tr.cpa_nearest_time(o.x, start + dt, 30.0).unwrap();
+                let (v, d) = prop.fit_geometry(cpa.rv, cpa.vel, 343.0).unwrap();
+                let mut event = synth_event(key, &tr, o.x, start, f0, 343.0, start + dt, &prop);
+                event.v_gate = [0.95 * v - 3.0, 1.05 * v + 3.0];
+                event.d_gate = [0.9 * d, 1.1 * d];
+                event.t_tol = 1.0;
+                assert!(gates_ok(&event, &cpa, &prop, 0.0));
+                let ((lat, lon, height), _) = tr.geo_at(cpa.t_e);
+                let under_aircraft = atmo.medium(lat, lon, cpa.t_e, MIC_HEIGHT_M, height);
+                assert_eq!(under_aircraft.c, 343.0);
+                let old_start = cpa.t_e + cpa.d / under_aircraft.c - event.t_rec;
+                assert!(old_start < start - event.t_tol - 1.0);
+                case.tracks[i] = tr;
+                case.events[i] = event;
+            }
+            let frame = Frame::new(&case.p.region);
+            let t_base = start - 86_400.0;
+            for (i, event) in case.events.iter().enumerate() {
+                let uniform = fdop_types::atmo::UniformAtmosphere(med);
+                let control = hypotheses(
+                    event,
+                    &case.tracks,
+                    &case.p,
+                    &frame,
+                    &dem,
+                    &uniform,
+                    t_base,
+                    10_000,
+                );
+                assert!(control.stored.as_ref().unwrap().iter().any(|h| h.trk as usize == i));
+                let cloud = hypotheses(
+                    event,
+                    &case.tracks,
+                    &case.p,
+                    &frame,
+                    &dem,
+                    &atmo,
+                    t_base,
+                    10_000,
+                );
+                assert!(
+                    cloud.stored.as_ref().unwrap().iter().any(|h| h.trk as usize == i),
+                    "the observer's own medium must retain flight {} at start {start}: {} hypotheses",
+                    event.id,
+                    cloud.count
+                );
+            }
+            let inputs = SearchInputs {
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                heard_times: vec![],
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            check_wind_delayed_case(&case, med, run(&inputs, &case.p, &|_| {}));
+        }
     }
 
     #[test]

@@ -1227,13 +1227,13 @@ Design notes:
   flights that the search itself permits. Larger ranges now request larger cached
   footprints and can retain more tracks. This removes that cap; the fixed context
   padding is not a proof of complete coverage for arbitrary wind or curved paths.
-- **Wind delay is included before the recording-clock join.** After a candidate ground point
+- **Candidate clocks use the observer's propagation medium.** After a candidate ground point
   passes the existing geometry gates, its source-to-observer propagation uses the path-averaged
   atmosphere at that observer, with wind in the observer's frame. The same moving-medium travel
-  model is used by exact trace scoring. A far lateral pass can therefore remain inside a tightly
-  specified recording clock instead of being discarded by a still-air travel-time seed. Calm
-  paths first use the original clock arithmetic. The coarse geometry remains approximate;
-  search budgets and confidence gates are unchanged.
+  model is used by exact trace scoring. Calm paths also use that observer's path-averaged sound
+  speed: a different weather column beneath the aircraft must not shift the implied recording
+  start before the pair join. Uniform calm arithmetic is unchanged. The coarse geometry remains
+  approximate; search budgets and confidence gates are unchanged.
 - **Wind-delayed passes survive the early source-time crop.** The search first keeps its
   existing scan and sampling phase, then also examines the earlier retained track span
   when the atmosphere is windy, varying or unknown. Only an explicitly uniform calm
@@ -1772,6 +1772,28 @@ The Rust regressions have not run: the execution host disconnected after the ini
 and dependency checks. The formatter already reported unrelated differences, and offline
 dependency resolution lacked pinned `fsci-fft`. Native component/workspace tests, Clippy,
 release selftest and reference/field replays remain unverified for this change.
+
+### Candidate clocks follow the observer's calm-air weather
+
+The calm hypothesis path previously looked up the candidate observer's medium but divided
+distance by the sound speed sampled beneath the aircraft. Exact trace scoring already used
+the observer's medium. With spatially varying weather, that discrepancy could reject a
+physically supported flight before the two-event join.
+
+The new physical regression uses two perpendicular tracks about 30 km and 27 km from an
+observer at the published reference location, with a 330 m/s observer path average and
+343 m/s columns beneath the aircraft. Their implied clocks differ by about 3.45 s and 3.10 s under
+the former calculation, beyond the existing one-second event tolerance. The test retains
+ordinary speed/range gates, first checks uniform-weather hypotheses, then requires both
+spatial-weather flight clouds and the paired search result at relative and Unix-epoch clocks.
+
+An independent numerical reproduction of the geodesy and coarse clock calculation confirms
+that the former calculation rejects the sampled in-region points, while the observer-medium
+calculation restores eligible candidates through the unchanged clock gate. This is arithmetic
+evidence, not native Rust execution. The new native regression remains unrun at this snapshot
+after the execution host repeatedly interrupted dependency compilation.
+Workspace checks, release selftest and reference/field replays remain incomplete; no field
+accuracy or runtime improvement is established by these synthetic expectations.
 
 ### Recover brief ordinary-speed passes through physical measurement
 

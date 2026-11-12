@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Use the candidate observer's calm-air medium before the clock join
+
+- Calculate a calm hypothesis's arrival time using the path-averaged sound speed
+  already sampled at that candidate observer. The old branch instead reused the
+  column beneath the aircraft, even though exact trace scoring uses the observer.
+- Preserve uniform calm arithmetic, coarse geometry, uncertainty intervals, gates and
+  budgets. This branch now uses the candidate observer's path average consistently
+  even when the aircraft and observer occupy different weather columns.
+- Add a physical two-flight regression with uniform-weather controls, narrow region,
+  the existing one-second event tolerance, relative/Unix clocks and the complete
+  pair search. Independent geodesy/clock arithmetic reproduces the original exclusion;
+  the authored native regression has not run after dependency-build interruptions.
+  Workspace checks, release selftest and real-recording replays remain incomplete.
+
 ### Try compact ordinary-speed passes at true recording boundaries
 
 - Append a final ordinary-speed edge stage after measured short-interior recovery, only
