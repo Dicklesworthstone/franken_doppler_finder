@@ -1727,7 +1727,7 @@ Three new track regressions check independent moving-wavefront observations, coo
 rotations and reference shifts, conservative CPA-direction bounds, calm controls and invalid
 inputs. Independent numerical reproduction passed 450 waveform observations (maximum
 frequency discrepancy 4.843e-7 Hz) and 4332 direction-bound cases. These are arithmetic checks,
-not execution of the authored Rust tests.
+separate from the native Rust validation below.
 
 A search regression supplies propagated traces to the actual constant-velocity fitter and
 measured-event adapter, then exercises the pair search, confirmation and final reevaluation
@@ -1736,13 +1736,26 @@ wrong-speed, wrong-distance and wrong-clock controls. Two earlier synthetic fixt
 use physically fitted geometry instead of the old approximation; their original recovery
 assertions and tolerances remain in place.
 
-Native validation is incomplete: pinned core build attempts were killed while compiling
-locked dependencies `cc` and `wide`, then the execution host disconnected before any new
-Rust regression ran. The changes passed changed-range formatting and whitespace checks before
-that loss; publication reconstructed the preserved patch through GitHub, with a reviewed
-fixture adjustment. Workspace Clippy/tests, release selftest and reference/field replays
-remain unverified. No end-to-end location, field-accuracy or performance improvement is claimed
-from this change.
+Native validation resumed successfully after the execution host recovered. With the pinned
+`nightly-2026-08-31` LLVM toolchain, all six focused regressions pass, and the complete track
+and search modules pass **145 tests, with 4 ignored and no failures**. The actual-fitter
+regression recovers both intended aircraft at relative and Unix-epoch clocks, with observer
+errors **0.182087 m and 0.182078 m**, zero clock error to six decimal places, and no search
+truncation. Wrong-speed, wrong-distance and wrong-clock controls pass too.
+
+That regression's first received sample needs an emission before its original synthetic track
+boundary. Extending the generated source track from -100 s to -300 s supplies that observation;
+the 90 s half-window, gates and recovery assertions are unchanged. Native validation also
+corrected a GNSS-gap fixture that had accidentally relabelled missing corrected reports as
+dense GNSS support. It now checks its preferred-only and corrected-only prerequisites before
+testing recovery, under the unchanged production rules.
+
+The broader core run encountered the already documented
+`curvematch::tests::grazing_passes_are_heard_across_exact_clock_seeds` failure and was interrupted;
+it is not a passing full-suite result. At this validation snapshot, workspace Clippy/tests,
+release selftest and reference/field replays had not completed. These synthetic trace cases
+cover fitting through final search reevaluation; they do not establish real-recording accuracy
+or an end-to-end runtime improvement.
 
 ### Recover the physical pass when a trace jumps to another ridge
 

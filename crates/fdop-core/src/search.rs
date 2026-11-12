@@ -1,14 +1,15 @@
 //! Flight-centric geolocation search over ADS-B tracks.
 //!
-//! Every measured event says: "some tonal aircraft passed its closest point of approach at a
-//! slant distance in `d_gate`, moving at a speed in `v_gate`, and with fitted curve centre at
-//! recording time `t_rec`". Wind can shift that centre from the geometric CPA's heard time.
+//! Every measured event constrains a still-air fitted distance in `d_gate`, speed in
+//! `v_gate`, and curve centre at recording time `t_rec`. The propagation medium maps each
+//! physical aircraft CPA into these fitted coordinates; wind changes their scales separately
+//! and can shift the centre from the geometric CPA's heard time.
 //! For an aircraft at position p with velocity v, the ground points
 //! whose CPA is *now* lie on the line perpendicular to the horizontal velocity, displaced
 //! along-track by a = H*vU/vH (H = height above the observer), at cross-track offsets b with
 //! a^2 + b^2 + H^2 = d^2. Sampling every track every <= 2 s / 400 m and every such line every
 //! 400 m gives, per event, a cloud of hypotheses (position, implied recording start
-//! t_s = t_cpa + d/c - t_rec). Two events recorded at the same place must agree on BOTH the
+//! t_s from the medium-adjusted fitted centre). Two events at the same place must agree on BOTH
 //! position and t_s, so a spatiotemporal hash join of two events' clouds yields the candidate
 //! (flight, flight, place, clock) combinations.
 //!
@@ -84,8 +85,8 @@ fn subsample(t: &[f64], f: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
 }
 
 impl SearchEvent {
-    /// Build from a quality-passing measured event. `wind_mps` widens the speed gate (ground
-    /// speed vs the air-relative speed the Doppler curve encodes).
+    /// Build from a quality-passing measured event. `wind_mps` retains the extra speed
+    /// allowance in fitted coordinates; each candidate's propagation medium maps its motion.
     pub fn from_measured(m: &MeasuredEvent, wind_mps: f64) -> Option<Self> {
         if !m.quality.ok {
             return None;
@@ -6652,12 +6653,14 @@ mod tests {
             ] {
                 let mut position = position;
                 position[2] += MIC_HEIGHT_M;
+                // Headwind compresses the received approach: A's first sample near
+                // 98 s was emitted near -163 s, before the old -100 s track boundary.
                 let mut tr = straight_track(
                     &enu,
                     position,
                     velocity,
                     start + at,
-                    start - 100.0,
+                    start - 300.0,
                     start + 900.0,
                     5.0,
                 );

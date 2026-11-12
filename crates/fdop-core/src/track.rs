@@ -1279,10 +1279,10 @@ impl Prop {
             .then_some((speed, [d_lo, d_hi]))
     }
 
-    /// First-order scale for the coarse gates on speeds/distances fitted in still air at
+    /// Legacy first-order scale for speeds/distances fitted in still air at
     /// `c_fit`: (c, v, d) -> lambda (c, v, d) leaves a still-air curve invariant, and the
     /// leading wind correction adds v.w/c to the effective c. This is an approximation;
-    /// the scored predictions use the full homogeneous-wind travel time and Doppler ratio.
+    /// new hypothesis gates use `fit_gate_scales` and exact checks use `fit_geometry`.
     #[inline]
     pub fn fit_scale(&self, v: V3, c_fit: f64) -> f64 {
         (self.c + dot(v, self.w) / self.c) / c_fit
@@ -1539,7 +1539,11 @@ mod tests {
         for (rv, v, w) in [
             ([0.0, 3000.0, 1200.0], [180.0, 0.0, 0.0], [-80.0, 0.0, 0.0]),
             ([0.0, 3000.0, 1200.0], [180.0, 0.0, 0.0], [80.0, 0.0, 0.0]),
-            ([1200.0, 0.0, 4000.0], [0.0, 110.0, 0.0], [40.0, -25.0, 10.0]),
+            (
+                [1200.0, 0.0, 4000.0],
+                [0.0, 110.0, 0.0],
+                [40.0, -25.0, 10.0],
+            ),
             (
                 [1000.0, -2000.0, 1700.0],
                 [150.0, 75.0, -20.0],
@@ -3583,10 +3587,14 @@ mod tests {
                 enu.vec_to_ecef([100.0, 0.0, 0.0]),
             )
         });
+        // Missing corrected reports leave holes in their support, while the GNSS
+        // reports retain the original 20 s cadence. Relabelling missing reports as
+        // GNSS would create 1.25 s pairs inside the position-noise allowance.
+        leg.points
+            .retain(|p| p.alt_src == alt_src::GEOM || retain_corrected(p.t - 1000.0));
         for p in &mut leg.points {
             let t = p.t - 1000.0;
-            if p.alt_src == alt_src::GEOM || !retain_corrected(t) {
-                p.alt_src = alt_src::GEOM;
+            if p.alt_src == alt_src::GEOM {
                 // Finite, wrong positions whose 300 m/s chords contradict their
                 // unchanged 100 m/s reports. Height itself remains correctly referenced.
                 let (lat, lon, _) =
@@ -3681,6 +3689,17 @@ mod tests {
         let (leg, _) = failed_gnss_brackets(720.0, |t| {
             t < 120.0 || (300.0..312.0).contains(&t) || t > 600.0
         });
+        let mut preferred = leg.clone();
+        preferred.points.retain(|p| p.alt_src == alt_src::GEOM);
+        assert!(build(&preferred, &BuildParams::default()).is_empty());
+        let mut corrected = leg.clone();
+        corrected
+            .points
+            .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
+        let expected = build(&corrected, &NO_BRIDGE);
+        assert_eq!(expected.len(), 3);
+        assert_eq!(expected[1].t.len(), 2);
+
         let recovered = build(&leg, &BuildParams::default());
         assert_eq!(recovered.len(), 2);
         assert!(recovered[0].t1() < 1120.0);
@@ -3694,13 +3713,6 @@ mod tests {
                     .all(|t| t[1] - t[0] <= BuildParams::default().max_gap_s)
             );
         }
-        let mut corrected = leg;
-        corrected
-            .points
-            .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
-        let expected = build(&corrected, &NO_BRIDGE);
-        assert_eq!(expected.len(), 3);
-        assert_eq!(expected[1].t.len(), 2);
         assert_same_gap_model(&recovered[0], &expected[0]);
         assert_same_gap_model(&recovered[1], &expected[2]);
     }

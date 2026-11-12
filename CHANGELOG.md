@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Validate wind recovery and the physical prerequisites of recovery fixtures
+
+- Resume actual `fdop-core` validation on pinned `nightly-2026-08-31` after the host
+  recovered. All six focused wind regressions pass. The complete track/search module
+  run passes 145 tests, with 4 ignored, no failures and 180 unrelated tests filtered out.
+- The actual-fitter wind regression recovers both intended aircraft at relative and
+  Unix-epoch clocks: observer errors 0.182087 m and 0.182078 m, zero printed clock error
+  to six decimal places, and no search truncation. Its negative geometry/clock controls
+  and final reevaluation pass. These are synthetic trace/search results, not field replays.
+- Extend only that regression's synthetic source coverage to -300 s: its first received
+  sample near 98 s was emitted near -163 s, outside the original -100 s boundary.
+  Retain the full observation window, measured intervals, gates and recovery assertions.
+- Correct the GNSS-gap fixture to remove missing corrected reports while retaining the
+  original 20 s GNSS cadence. Relabelling those reports as GNSS had created 1.25 s pairs
+  inside the existing position-noise allowance, legitimately disabling fallback. Assert
+  preferred-only refusal and the corrected-only three-part input before the unchanged
+  recovery checks. Production GNSS reconstruction and preferred-model priority are unchanged.
+- The broader core run reproduced the documented grazing-pass audibility failure and
+  was interrupted; it is not a passing full suite. Full-workspace formatting still reports
+  existing differences; patch whitespace checks pass. Workspace Clippy/tests, release
+  selftest and real-recording replays had not completed at this validation snapshot.
+
 ### Preserve wind-supported aircraft through the complete geometry search
 
 - Use separate physical/fitted speed and range conversions in hypothesis reach and
@@ -33,10 +55,11 @@ at that commit, not per-change commits.
 - Correct two earlier synthetic fixtures that encoded the former approximate geometry.
   Preserve their original assertions and tolerances; adjust the synthetic medium so
   each still demonstrates its intended reach or omitted-time-window failure.
-- Source review and independent wavefront/bound arithmetic completed. Native builds
-  failed in locked dependencies before project compilation, and the host disconnected
-  before any new Rust regression ran. Workspace checks, release selftest and real
-  replays remain unverified; no field accuracy, timing or native recovery claim is made.
+- At initial publication, source review and independent wavefront/bound arithmetic
+  completed. Native builds failed in locked dependencies before project compilation,
+  and the host disconnected before any new Rust regression ran. Workspace checks,
+  release selftest and real replays were unverified; no field accuracy, timing or native
+  recovery claim was made.
   The preserved patch was reconstructed through GitHub after the host loss.
 
 ### Recover independent aircraft from refused coarse harmonic families
@@ -70,11 +93,11 @@ at that commit, not per-change commits.
   erased its coherent corrected-height reports. Controls cover Doppler/position truth,
   raw altitude, insufficient and inconsistent support, coverage gaps, and exact
   preservation of partial and complete usable GNSS models.
-- Validation: source review, an independent cross-review and patch whitespace checks
+- At initial publication: source review, an independent cross-review and patch whitespace checks
   completed. Native LLVM and Cranelift builds both stopped with SIGKILL in pinned
   `fsci-stats 0.4.0`, before core tests compiled; the execution host then disconnected.
   The new regressions, workspace Clippy/tests, release CLI selftest and reference/field
-  replays remain unverified. No real-recording accuracy or timing improvement is claimed.
+  replays were unverified. No real-recording accuracy or timing improvement was claimed.
 
 ### Derive exact fitted geometry for aircraft in wind
 
