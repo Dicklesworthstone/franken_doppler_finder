@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain separated fast corrected-height segments without speed reports
+
+- Reuse the existing position-supported motion envelope when attaching independently
+  valid corrected-height portions to preferred models. Missing groundspeed no longer
+  reinstates the unrelated 200 m/s default after retained positions established fast motion.
+- Infer only from the original preferred models' selected samples, with at least three
+  reports and the existing secant, gap, vertical and subsonic checks. Require NaN-only
+  groundspeeds on both sides; preserve the former envelope for other reports.
+  Keep original models, keys and gap separation intact; appended portions cannot raise
+  the envelope and discarded positions cannot contribute speed evidence.
+- Add physical head/tail regressions at 100, 215, 245 and 270 m/s, exact model preservation
+  and Doppler checks, plus unreachable, discarded-rival, insufficient-support and report
+  controls. Asymmetric finite-report cases independently protect both eligibility guards.
+- Independent WGS84 arithmetic confirms the former rejection and supported reach of both
+  fast portions; it does not establish native test success. New Rust regressions remain
+  unrun. Pinned rustfmt parses the source and new-line formatting is checked, while
+  pre-existing differences remain. Workspace checks, release selftest and real-recording
+  replays remain incomplete; no field-accuracy or performance claim is made.
+
 ### Use the observer's calm-air path for raw-spectrogram votes
 
 - Map a calm pass's speed, distance and arrival time with its candidate observer's

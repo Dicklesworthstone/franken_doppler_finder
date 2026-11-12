@@ -1291,8 +1291,11 @@ Design notes:
   retained reports under the existing position, velocity and gap checks. When preferred models
   survive, recovery uses only observations more than the configured gap (180 s by default)
   outside their time coverage. Added models must also be physically reachable from their nearest
-  kept neighbours under the same motion limits and position allowances. Preferred samples,
-  velocities, order and keys stay intact; added parts use deterministic `#correctedN` suffixes.
+  kept neighbours under the same motion limits and position allowances. When speed reports
+  on both sides are missing, retained preferred-model positions can supply the existing checked,
+  subsonic motion envelope for this reachability test. Rejected positions cannot set that limit;
+  non-NaN speed reports retain the previous envelope. Preferred samples, velocities, order and
+  keys stay intact; added parts use deterministic `#correctedN` suffixes.
   No spline crosses these gaps, and raw pressure altitudes cannot enter this recovery.
 - **Missing speed reports do not impose a 200 m/s aircraft limit.** If the established track
   cleaner loses reports and every groundspeed report is missing, three consecutive positions
@@ -1775,6 +1778,37 @@ and dependency checks. The formatter already reported unrelated differences, and
 dependency resolution lacked pinned `fsci-fft`. Native component/workspace tests, Clippy,
 release selftest and reference/field replays remain unverified for this change.
 
+### Keep fast corrected-height segments when speed reports are missing
+
+The track cleaner can establish fast motion from agreeing positions when groundspeed is
+missing. The final check between separated preferred and corrected-height models previously
+fell back to 200 m/s, discarding independently usable fast portions. It now reuses the existing
+position-supported envelope from the original preferred models' retained samples.
+
+Inference requires at least three samples, agreeing horizontal secants and the existing
+vertical/gap checks; its envelope remains capped at nominal sound speed. Only literal missing
+values on both sides allow the retry. Finite, zero or infinite speed reports retain the former
+envelope. Rejected positions and newly appended portions cannot raise the limit. Original
+preferred geometry, separate model identities and unobserved gaps remain intact.
+
+Two regression groups cover 100, 215, 245 and 270 m/s physical trajectories, both earlier and
+later corrected portions, exact preservation of preferred and independently built corrected
+models, and reconstructed Doppler. Controls exercise unreachable but internally coherent
+portions, rejected fast rivals, insufficient two-point support, and non-missing reports on
+either side independently.
+
+Independent WGS84 arithmetic confirms the 245 m/s example: the earlier portion travels
+about 89.09 km over a 363.75 s gap, beyond the former 73.00 km allowance but within the
+125.02 km supported allowance. The later portion has the same old-reject/new-accept result;
+the ordinary-speed control keeps the 200 m/s envelope. This verifies the gate arithmetic,
+not native model construction or the added Doppler assertions.
+
+The new Rust regressions remain unrun after the dependency-build interruptions. Pinned
+rustfmt parses the changed source and new-line formatting has been checked; unrelated
+existing formatting differences remain. Workspace tests/Clippy, release selftest and
+reference/field replays remain incomplete. Earlier native track results below apply to
+their recorded snapshot, not to these new tests. No field-accuracy or timing gain is claimed.
+
 ### Calm-air curve votes follow the observer's propagation path
 
 The raw-spectrogram matcher already queried each candidate observer's atmosphere, but a
@@ -1868,8 +1902,8 @@ floating-point bit with the original result. Controls cover raw altitude, two-po
 nearby support and internally coherent portions displaced 500 km away.
 
 The before-fix native regression returned one model instead of the expected three; its
-restriction controls already passed. With the fix, both new regressions pass. The complete
-track module passes **54 tests, with 1 ignored timing benchmark and no failures**, using the
+restriction controls already passed. At that earlier recovery snapshot, both new regressions
+passed. The complete track module passed **54 tests, with 1 ignored timing benchmark and no failures**, using the
 actual `fdop-core` test crate, pinned `nightly-2026-08-31`, the official Cranelift backend and
 unoptimized build profiles. Preferred-model preservation and every existing GNSS/track gate
 test pass with them.

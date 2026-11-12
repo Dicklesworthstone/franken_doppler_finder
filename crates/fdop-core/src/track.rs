@@ -442,6 +442,49 @@ fn recover_velocity_component(
     }
 }
 
+/// A missing speed report must not reinstate the 200 m/s default between models whose
+/// retained positions already support faster motion. Only literal NaNs permit this retry;
+/// finite or invalid non-NaN reports retain the reported envelope. Rejected GNSS positions
+/// cannot set the limit: use the same checked secants on the preferred models' own samples.
+fn corrected_recovery_speed_limit(
+    pts: &[fdop_types::store::TrackPoint],
+    preferred: &[TrackModel],
+    bp: &BuildParams,
+) -> f64 {
+    let mut limit = reported_speed_limit(pts);
+    if pts.iter().any(|p| !p.gs_mps.is_nan()) {
+        return limit;
+    }
+    for model in preferred.iter().filter(|model| model.t.len() >= 3) {
+        // The builder supplies its sorted, bridge-filtered points. Each model time
+        // names exactly one of them; no chord crosses into a rejected report.
+        let support: Vec<_> = model
+            .t
+            .iter()
+            .filter_map(|t| {
+                pts.binary_search_by(|p| p.t.total_cmp(t))
+                    .ok()
+                    .map(|i| pts[i])
+            })
+            .collect();
+        if support.len() != model.t.len() {
+            continue;
+        }
+        let enu = Enu::new(support[0].lat, support[0].lon, 0.0);
+        let xy: Vec<_> = support
+            .iter()
+            .map(|p| {
+                let e = enu.from_ecef(geodetic_to_ecef(p.lat, p.lon, 0.0));
+                [e[0], e[1]]
+            })
+            .collect();
+        if let Some(inferred) = position_speed_limit(&support, &xy, bp) {
+            limit = limit.max(inferred);
+        }
+    }
+    limit
+}
+
 /// Separate models may describe the same aircraft only if their endpoints remain reachable
 /// under the chain cleaner's horizontal/vertical limits. No interpolation crosses this gap.
 fn separated_models_reachable(
@@ -590,7 +633,11 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
                 // Preserve the established all-preferred-failed fallback, including its keys.
                 out = recovered;
             } else {
-                let speed_limit = reported_speed_limit(&pts);
+                let speed_limit = if corrected.points.iter().all(|p| p.gs_mps.is_nan()) {
+                    corrected_recovery_speed_limit(&pts, &out, bp)
+                } else {
+                    reported_speed_limit(&pts)
+                };
                 let original_len = out.len();
                 for mut model in recovered {
                     let i = kept.partition_point(|&k| out[k].t0() < model.t0());
@@ -4056,6 +4103,202 @@ mod tests {
             assert_eq!(got.len(), 1);
             assert_same_gap_model(&got[0], &preferred[0]);
         }
+    }
+
+    fn partial_gnss_missing_speed_leg(speed: f64) -> (FlightLeg, Enu) {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let mut leg = mixed_leg((0.0, 1080.0), 20.0, false, |t| {
+            (
+                enu.to_ecef([speed * t, 0.0, 1200.0]),
+                enu.vec_to_ecef([speed, 0.0, 0.0]),
+            )
+        });
+        leg.points.retain(|p| {
+            let t = p.t - 1000.0;
+            p.alt_src == alt_src::GEOM || t < 120.0 || t > 960.0
+        });
+        for p in &mut leg.points {
+            let t = p.t - 1000.0;
+            p.gs_mps = f32::NAN;
+            if p.alt_src == alt_src::GEOM && !(480.0..=520.0).contains(&t) {
+                // These false brackets exceed even the existing subsonic position
+                // envelope. Only the three genuine central GNSS points may survive.
+                let (lat, lon, _) =
+                    ecef_to_geodetic(enu.to_ecef([600_000.0 + 500.0 * t, 600_000.0, 1200.0]));
+                (p.lat, p.lon) = (lat, lon);
+            }
+        }
+        (leg, enu)
+    }
+
+    #[test]
+    fn corrected_fast_segments_use_their_preferred_neighbours_supported_speed() {
+        let bp = BuildParams::default();
+        for speed in [100.0, 215.0, 245.0, 270.0] {
+            let (leg, enu) = partial_gnss_missing_speed_leg(speed);
+            let mut gnss = leg.clone();
+            gnss.points.retain(|p| p.alt_src == alt_src::GEOM);
+            let preferred = build(&gnss, &NO_BRIDGE);
+            assert_eq!(preferred.len(), 1, "{speed} m/s preferred support");
+            assert_eq!(preferred[0].t, vec![1480.0, 1500.0, 1520.0]);
+            let mut corrected = leg.clone();
+            corrected
+                .points
+                .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
+            let expected = build(&corrected, &NO_BRIDGE);
+            assert_eq!(expected.len(), 2, "{speed} m/s corrected support");
+            assert!(expected.iter().all(|model| model.t.len() >= 3));
+            let reported = reported_speed_limit(&gnss.points);
+            assert_eq!(reported, 200.0);
+            let supported = corrected_recovery_speed_limit(&gnss.points, &preferred, &bp);
+            assert!(supported <= fdop_types::C_SOUND);
+            if speed > reported {
+                assert!(!separated_models_reachable(
+                    &expected[0],
+                    &preferred[0],
+                    reported,
+                    &bp
+                ));
+                assert!(!separated_models_reachable(
+                    &preferred[0],
+                    &expected[1],
+                    reported,
+                    &bp
+                ));
+                assert!(supported > reported);
+            } else {
+                assert_eq!(supported, reported);
+            }
+            let recovered = build(&leg, &bp);
+            assert_eq!(
+                recovered.len(),
+                3,
+                "{speed} m/s must retain both separated portions"
+            );
+            assert_same_gap_model(&recovered[0], &preferred[0]);
+            for (k, (actual, original)) in recovered[1..].iter().zip(&expected).enumerate() {
+                let mut original = original.clone();
+                original.key = format!("{}#corrected{k}", leg.key);
+                assert_same_gap_model(actual, &original);
+                let span = (actual.t0() - 1000.0 + 5.0, actual.t1() - 1000.0 - 5.0);
+                let state = |t| {
+                    (
+                        enu.to_ecef([speed * t, 0.0, 1200.0]),
+                        enu.vec_to_ecef([speed, 0.0, 0.0]),
+                    )
+                };
+                let observer = enu.to_ecef([0.5 * speed * (span.0 + span.1), 1500.0, 0.0]);
+                let rms = doppler_rms_hz(actual, observer, span, state);
+                assert!(rms < 1e-4, "{speed} m/s recovered Doppler RMS {rms} Hz");
+            }
+        }
+    }
+
+    #[test]
+    fn corrected_fast_recovery_keeps_report_and_physical_reach_limits() {
+        let bp = BuildParams::default();
+        let (leg, enu) = partial_gnss_missing_speed_leg(245.0);
+        for report in [0.0, 140.0, f32::INFINITY] {
+            let mut reported = leg.clone();
+            for p in &mut reported.points {
+                p.gs_mps = report;
+            }
+            let mut gnss = reported.clone();
+            gnss.points.retain(|p| p.alt_src == alt_src::GEOM);
+            let preferred = build(&gnss, &NO_BRIDGE);
+            assert_eq!(
+                corrected_recovery_speed_limit(&gnss.points, &preferred, &bp),
+                reported_speed_limit(&gnss.points)
+            );
+            let actual = build(&reported, &bp);
+            assert_eq!(actual.len(), preferred.len());
+            for (actual, original) in actual.iter().zip(&preferred) {
+                assert_same_gap_model(actual, original);
+            }
+        }
+
+        // Either side's real report must independently block the missing-speed retry.
+        for report_on_preferred in [false, true] {
+            let mut mixed = leg.clone();
+            for p in &mut mixed.points {
+                if (p.alt_src == alt_src::GEOM) == report_on_preferred {
+                    p.gs_mps = 140.0;
+                }
+            }
+            let mut gnss = mixed.clone();
+            gnss.points.retain(|p| p.alt_src == alt_src::GEOM);
+            let preferred = build(&gnss, &NO_BRIDGE);
+            assert_eq!(preferred.len(), 1);
+            let mut corrected = mixed.clone();
+            corrected
+                .points
+                .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
+            assert_eq!(build(&corrected, &NO_BRIDGE).len(), 2);
+            let actual = build(&mixed, &bp);
+            assert_eq!(
+                actual.len(),
+                1,
+                "finite report on preferred={report_on_preferred}"
+            );
+            assert_same_gap_model(&actual[0], &preferred[0]);
+        }
+
+        let mut preferred_only = leg.clone();
+        preferred_only.points.retain(|p| p.alt_src == alt_src::GEOM);
+        let preferred = build(&preferred_only, &NO_BRIDGE);
+        assert_eq!(preferred.len(), 1);
+        let mut unreachable = leg;
+        for p in &mut unreachable.points {
+            if p.alt_src == alt_src::BARO_CORRECTED {
+                let t = p.t - 1000.0;
+                let (lat, lon, _) =
+                    ecef_to_geodetic(enu.to_ecef([500_000.0 + 245.0 * t, 500_000.0, 1200.0]));
+                (p.lat, p.lon) = (lat, lon);
+            }
+        }
+        let mut isolated = unreachable.clone();
+        isolated
+            .points
+            .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
+        let supported = build(&isolated, &NO_BRIDGE);
+        assert_eq!(supported.len(), 2);
+        assert!(supported.iter().all(|model| model.t.len() >= 3));
+        let actual = build(&unreachable, &bp);
+        assert_eq!(
+            actual.len(),
+            1,
+            "internally coherent but unreachable portions stay rejected"
+        );
+        assert_same_gap_model(&actual[0], &preferred[0]);
+
+        // A discarded fast rival cannot lend speed to a slower preferred segment.
+        let (mut slow, enu) = partial_gnss_missing_speed_leg(100.0);
+        slow.points.retain(|p| p.alt_src == alt_src::GEOM);
+        for p in &mut slow.points {
+            let t = p.t - 1000.0;
+            if !(480.0..=520.0).contains(&t) {
+                let (lat, lon, _) =
+                    ecef_to_geodetic(enu.to_ecef([600_000.0 + 300.0 * t, 600_000.0, 1200.0]));
+                (p.lat, p.lon) = (lat, lon);
+            }
+        }
+        let kept = build(&slow, &NO_BRIDGE);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].t, vec![1480.0, 1500.0, 1520.0]);
+        assert_eq!(
+            corrected_recovery_speed_limit(&slow.points, &kept, &bp),
+            200.0
+        );
+
+        // Two preferred samples do not establish agreeing secants for a new envelope.
+        let mut short = preferred[0].clone();
+        short.t.truncate(2);
+        short.pos.truncate(2);
+        short.vel.truncate(2);
+        assert_eq!(
+            corrected_recovery_speed_limit(&preferred_only.points, &[short], &bp),
+            200.0
+        );
     }
 
     #[test]
