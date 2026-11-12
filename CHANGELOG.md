@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover valid locations after a rejected join representative
+
+- A failed quick check no longer rejects every compatible seed in the same flight-pair,
+  600 m / 20 s cell. After the original event-pair passes finish, try alternatives in their
+  original traversal order until that cell has a passing representative.
+- Preserve successful representatives and the original event-pair comparison priority.
+  Reuse the same physical gates and spend only the remaining global quick-check allowance;
+  count every added attempt. Unchecked alternatives produce an explicit budget cut and
+  fail the existing margin gate. No grids, thresholds or budget limits change.
+- Stream recovery in bounded batches, skip exact consecutive duplicate hypotheses and
+  joined midpoints, and release the clouds before fine scoring; do not collect raw pairs.
+- Add physical close-pair recovery at zero/epoch clocks, a three-aircraft original-priority
+  regression and controls for successful-cell ownership, exact exhaustion reporting,
+  duplicate geometry and bounded delivery. Search grids and ordinary event gates stay
+  unchanged. These synthetic event-trace checks do not run the FFT/fitter or field media.
+- The identical physical test fails against the previous committed search with no location.
+  Both new full-search cases recover the intended core aircraft within 0.17 m, with the
+  correct recording clock, one additional quick comparison and no budget cut.
+- Native search component: 95 passed, 0 failed, 3 ignored; four existing actual-fitter tests
+  remain excluded. Independent review verifies the compiled production/source hashes.
+  Patch whitespace passes; workspace formatting reports only previously recorded differences.
+  Full workspace checks, release selftest and reference/field replays remain incomplete.
+
 ### Recover fast passes from the contrast-first survey
 
 - Append fast full-length and fast edge banks on the existing contrast-first image, after

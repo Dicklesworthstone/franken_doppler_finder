@@ -1073,6 +1073,58 @@ struct Joined {
     t_s: f64,
 }
 
+/// One flight pair's 600 m / 20 s join cell; each event pair is visited separately.
+type JoinCell = (u32, u32, i32, i32, i64);
+
+fn join_bucket(h: &Hyp, r: f64, tt: f64) -> (i32, i32, i64) {
+    (
+        (h.e as f64 / r).floor() as i32,
+        (h.n as f64 / r).floor() as i32,
+        (h.t_s as f64 / tt).floor() as i64,
+    )
+}
+
+fn joined_cell(j: &Joined) -> Option<JoinCell> {
+    Some((
+        j.ti,
+        j.tj,
+        (j.e / 600.0).floor() as i32,
+        (j.n / 600.0).floor() as i32,
+        clock_cell(j.t_s)?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn joined_pair(
+    a: &Hyp,
+    b: &Hyp,
+    ei: usize,
+    ej: usize,
+    r2: f64,
+    tt: f64,
+    same_flight_min_dt: f64,
+    t_base: f64,
+) -> Option<Joined> {
+    let (de, dn) = ((a.e - b.e) as f64, (a.n - b.n) as f64);
+    if de * de + dn * dn > r2
+        || ((a.t_s - b.t_s) as f64).abs() > tt
+        || (a.trk == b.trk && ((a.t_e - b.t_e) as f64).abs() < same_flight_min_dt)
+    {
+        return None;
+    }
+    Some(Joined {
+        ei,
+        ej,
+        ti: a.trk,
+        tj: b.trk,
+        te_i: a.t_e as f64 + t_base,
+        te_j: b.t_e as f64 + t_base,
+        e: 0.5 * (a.e + b.e) as f64,
+        n: 0.5 * (a.n + b.n) as f64,
+        t_s: 0.5 * (a.t_s + b.t_s) as f64 + t_base,
+    })
+}
+
 // Bound duplicate-bearing scratch without capping the distinct seeds that reach scoring.
 // Indexed chunks keep the original input/bucket order, including the first representative.
 const JOIN_BATCH_HYPOTHESES: usize = 4096;
@@ -1096,27 +1148,11 @@ fn join_batches(
     if hi.is_empty() || hj.is_empty() {
         return 0;
     }
-    let key = |e: f32, n: f32, ts: f32| {
-        (
-            (e as f64 / r).floor() as i32,
-            (n as f64 / r).floor() as i32,
-            (ts as f64 / tt).floor() as i64,
-        )
-    };
     let mut map: HashMap<(i32, i32, i64), Vec<u32>> = HashMap::with_capacity(hi.len() / 2);
     for (k, h) in hi.iter().enumerate() {
-        map.entry(key(h.e, h.n, h.t_s)).or_default().push(k as u32);
+        map.entry(join_bucket(h, r, tt)).or_default().push(k as u32);
     }
     // One representative per (flights, 600 m cell, 20 s), as in the original join.
-    let cell = |j: &Joined| {
-        Some((
-            j.ti,
-            j.tj,
-            (j.e / 600.0).floor() as i32,
-            (j.n / 600.0).floor() as i32,
-            clock_cell(j.t_s)?,
-        ))
-    };
     let r2 = r * r;
     let mut seen = std::collections::HashSet::new();
     let mut ready = Vec::with_capacity(JOIN_OUTPUT_SEEDS);
@@ -1128,39 +1164,28 @@ fn join_batches(
                 let mut local_seen = std::collections::HashSet::new();
                 let mut kept = Vec::new();
                 for b in chunk {
-                    let (kx, ky, kt) = key(b.e, b.n, b.t_s);
+                    let (kx, ky, kt) = join_bucket(b, r, tt);
                     for dx in -1..=1 {
                         for dy in -1..=1 {
                             for dtk in -1..=1 {
                                 if let Some(list) = map.get(&(kx + dx, ky + dy, kt + dtk)) {
                                     for &ia in list {
-                                        let a = &hi[ia as usize];
-                                        let (de, dn) = ((a.e - b.e) as f64, (a.n - b.n) as f64);
-                                        if de * de + dn * dn > r2
-                                            || ((a.t_s - b.t_s) as f64).abs() > tt
-                                        {
-                                            continue;
-                                        }
-                                        if a.trk == b.trk
-                                            && ((a.t_e - b.t_e) as f64).abs() < same_flight_min_dt
-                                        {
-                                            continue;
-                                        }
-                                        let j = Joined {
+                                        let Some(j) = joined_pair(
+                                            &hi[ia as usize],
+                                            b,
                                             ei,
                                             ej,
-                                            ti: a.trk,
-                                            tj: b.trk,
-                                            te_i: a.t_e as f64 + t_base,
-                                            te_j: b.t_e as f64 + t_base,
-                                            e: 0.5 * (a.e + b.e) as f64,
-                                            n: 0.5 * (a.n + b.n) as f64,
-                                            t_s: 0.5 * (a.t_s + b.t_s) as f64 + t_base,
+                                            r2,
+                                            tt,
+                                            same_flight_min_dt,
+                                            t_base,
+                                        ) else {
+                                            continue;
                                         };
                                         // Deduplicate at production, not after collecting even
                                         // one bucket: a dense bucket alone can make millions
                                         // of raw pairs. Earlier batches need no scratch entry.
-                                        if let Some(k) = cell(&j)
+                                        if let Some(k) = joined_cell(&j)
                                             && !seen.contains(&k)
                                             && local_seen.insert(k)
                                         {
@@ -1179,7 +1204,7 @@ fn join_batches(
         // emit candidates: later fitting depends on the original first representative.
         for part in parts {
             for j in part {
-                if let Some(k) = cell(&j)
+                if let Some(k) = joined_cell(&j)
                     && seen.insert(k)
                 {
                     ready.push(j);
@@ -1197,6 +1222,129 @@ fn join_batches(
         consume(&ready);
     }
     joined
+}
+
+/// A failed midpoint does not rule out every other seed in its 600 m / 20 s cell.
+/// Keep every successful first representative, then try alternatives in the same raw order.
+/// Each pending cell owns at most one seed: resolve it before accepting another, without
+/// storing raw pairs. Only this added work is limited by the remaining quick-check budget.
+#[allow(clippy::too_many_arguments)]
+fn recover_joined(
+    hi: &[Hyp],
+    hj: &[Hyp],
+    ei: usize,
+    ej: usize,
+    r: f64,
+    tt: f64,
+    same_flight_min_dt: f64,
+    t_base: f64,
+    accepted: &mut std::collections::HashSet<JoinCell>,
+    budget: usize,
+    mut consume: impl FnMut(&[Joined]) -> Vec<bool>,
+) -> (usize, bool) {
+    if hi.is_empty() || hj.is_empty() {
+        return (0, false);
+    }
+    let same = |a: &Hyp, b: &Hyp| {
+        a.trk == b.trk
+            && a.t_e.to_bits() == b.t_e.to_bits()
+            && a.e.to_bits() == b.e.to_bits()
+            && a.n.to_bits() == b.n.to_bits()
+            && a.t_s.to_bits() == b.t_s.to_bits()
+    };
+    let mut map: HashMap<(i32, i32, i64), Vec<u32>> = HashMap::with_capacity(hi.len() / 2);
+    for (i, h) in hi.iter().enumerate() {
+        map.entry(join_bucket(h, r, tt)).or_default().push(i as u32);
+    }
+    let r2 = r * r;
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = std::collections::HashSet::new();
+    let mut ready = Vec::with_capacity(JOIN_OUTPUT_SEEDS.min(budget));
+    let mut attempted = 0usize;
+    let mut truncated = false;
+    let mut flush = |ready: &mut Vec<Joined>,
+                     pending: &mut std::collections::HashSet<JoinCell>,
+                     accepted: &mut std::collections::HashSet<JoinCell>,
+                     attempted: &mut usize| {
+        if ready.is_empty() {
+            return;
+        }
+        let passed = consume(ready);
+        assert_eq!(passed.len(), ready.len());
+        *attempted += ready.len();
+        for (j, passed) in ready.iter().zip(passed) {
+            if passed {
+                accepted.insert(joined_cell(j).unwrap());
+            }
+        }
+        ready.clear();
+        pending.clear();
+    };
+    let mut previous_b = None;
+    let mut previous_pair = None;
+    'scan: for b in hj {
+        // A repeated hypothesis predicts exactly the same raw joins. Skip only identical
+        // geometry, aircraft and clocks; nearby points can pass different physical gates.
+        if previous_b.is_some_and(|previous| same(previous, b)) {
+            continue;
+        }
+        previous_b = Some(b);
+        let (kx, ky, kt) = join_bucket(b, r, tt);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dtk in -1..=1 {
+                    let Some(list) = map.get(&(kx + dx, ky + dy, kt + dtk)) else {
+                        continue;
+                    };
+                    let mut previous_a = None;
+                    for &ia in list {
+                        let a = &hi[ia as usize];
+                        if previous_a.is_some_and(|previous| same(previous, a)) {
+                            continue;
+                        }
+                        previous_a = Some(a);
+                        let Some(j) = joined_pair(a, b, ei, ej, r2, tt, same_flight_min_dt, t_base)
+                        else {
+                            continue;
+                        };
+                        let Some(k) = joined_cell(&j) else {
+                            continue;
+                        };
+                        // Distinct symmetric hypothesis pairs can yield the same complete
+                        // midpoint and emission clocks. Adjacent copies need one check.
+                        if previous_pair == Some(j) {
+                            continue;
+                        }
+                        previous_pair = Some(j);
+                        if accepted.contains(&k) || visited.insert(k) {
+                            // Skip this cell's first occurrence: join_batches already
+                            // checked that representative in the original pass.
+                            continue;
+                        }
+                        if pending.contains(&k) {
+                            flush(&mut ready, &mut pending, accepted, &mut attempted);
+                        }
+                        if accepted.contains(&k) {
+                            continue;
+                        }
+                        if attempted + ready.len() >= budget {
+                            // This is a real untested alternative, not merely reaching the
+                            // allowance at the exact end of a complete comparison.
+                            truncated = true;
+                            break 'scan;
+                        }
+                        pending.insert(k);
+                        ready.push(j);
+                        if ready.len() == JOIN_OUTPUT_SEEDS {
+                            flush(&mut ready, &mut pending, accepted, &mut attempted);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    flush(&mut ready, &mut pending, accepted, &mut attempted);
+    (attempted, truncated)
 }
 
 /// Merge duplicate place/clock seeds and rank every flight pair's best cell before its next.
@@ -2752,6 +2900,35 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
     funnel.event_pairs = pairs.len();
     let mut pairs_done = 0usize;
+    let mut failed_pairs = Vec::new();
+    let check_batch = |batch: &[Joined], joined_so_far: usize| {
+        // Only survivors outlive this bounded output batch. Keep a result for every
+        // attempted seed so recovery knows which cell has a successful representative.
+        batch
+            .par_iter()
+            .map(|j| {
+                let k = done.fetch_add(1, Ordering::Relaxed);
+                if k.is_multiple_of(500_000) && k > 0 {
+                    progress(&format!("quick check {k}/{joined_so_far} joined so far"));
+                }
+                let (la, lo) = frame.latlon(j.e, j.n);
+                if !p.region.contains(la, lo) {
+                    return None;
+                }
+                let o = observer(la, lo, inp.coarse_dem);
+                let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
+                let pe = eval_point(&o, &assign, &evs, tracks, p, atmo, true, true, true)?;
+                let worst = pe.chis.iter().map(|c| c.chi).fold(0.0, f64::max);
+                let qs: f64 = pe
+                    .chis
+                    .iter()
+                    .zip(&assign)
+                    .map(|(c, a)| ev_weight(&evs[a.0]) * (1.0 - c.chi / p.quick_chi).max(0.0))
+                    .sum();
+                (worst <= p.quick_chi).then_some((*j, qs))
+            })
+            .collect::<Vec<_>>()
+    };
     for &(_, _, i, j) in &pairs {
         let (hi, hj) = (hyps[i].as_ref().unwrap(), hyps[j].as_ref().unwrap());
         let (a, b, ha, hb) = if hi.len() <= hj.len() {
@@ -2760,6 +2937,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             (j, i, hj, hi)
         };
         let tt = evs[i].t_tol + evs[j].t_tol + slop;
+        let quick_before = quick.len();
         let joined = join_batches(
             ha,
             hb,
@@ -2771,42 +2949,59 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             t_base,
             |batch| {
                 funnel.joined += batch.len();
-                // Only quick survivors outlive this output batch. The join still visits
-                // the complete event pair, and emits the original representative order.
-                let checked: Vec<(Joined, f64)> = batch
-                    .par_iter()
-                    .filter_map(|j| {
-                        let k = done.fetch_add(1, Ordering::Relaxed);
-                        if k.is_multiple_of(500_000) && k > 0 {
-                            progress(&format!("quick check {k}/{} joined so far", funnel.joined));
-                        }
-                        let (la, lo) = frame.latlon(j.e, j.n);
-                        if !p.region.contains(la, lo) {
-                            return None;
-                        }
-                        let o = observer(la, lo, inp.coarse_dem);
-                        let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
-                        let pe = eval_point(&o, &assign, &evs, tracks, p, atmo, true, true, true)?;
-                        let worst = pe.chis.iter().map(|c| c.chi).fold(0.0, f64::max);
-                        let qs: f64 = pe
-                            .chis
-                            .iter()
-                            .zip(&assign)
-                            .map(|(c, a)| {
-                                ev_weight(&evs[a.0]) * (1.0 - c.chi / p.quick_chi).max(0.0)
-                            })
-                            .sum();
-                        (worst <= p.quick_chi).then_some((*j, qs))
-                    })
-                    .collect();
-                quick.extend(checked);
+                quick.extend(check_batch(batch, funnel.joined).into_iter().flatten());
             },
         );
+        if quick.len() - quick_before < joined {
+            failed_pairs.push((a, b, quick_before..quick.len()));
+        }
         progress(&format!("join {}x{}: {}", evs[a].id, evs[b].id, joined));
         pairs_done += 1;
-        // The budget counts every joined seed, including rejected ones, and still stops
-        // only after a complete event pair. Streaming must not grant extra comparisons.
+        // Preserve the complete first-pass event pairs and their original budget policy.
+        // Earlier failures must not spend recovery work ahead of a later pair's old success.
         if funnel.joined > p.max_quick {
+            break;
+        }
+    }
+    for (a, b, old_survivors) in failed_pairs {
+        let mut accepted = quick[old_survivors]
+            .iter()
+            .filter_map(|(j, _)| joined_cell(j))
+            .collect();
+        let (recovered, truncated) = recover_joined(
+            hyps[a].as_ref().unwrap(),
+            hyps[b].as_ref().unwrap(),
+            a,
+            b,
+            r_join,
+            evs[a].t_tol + evs[b].t_tol + slop,
+            SAME_FLIGHT_MIN_DT_S,
+            t_base,
+            &mut accepted,
+            p.max_quick.saturating_sub(funnel.joined),
+            |batch| {
+                funnel.joined += batch.len();
+                let checked = check_batch(batch, funnel.joined);
+                let passed = checked.iter().map(Option::is_some).collect();
+                quick.extend(checked.into_iter().flatten());
+                passed
+            },
+        );
+        if recovered > 0 {
+            progress(&format!(
+                "join alternatives {}x{}: {recovered}",
+                evs[a].id, evs[b].id
+            ));
+        }
+        if truncated {
+            warnings.push(format!(
+                "{}x{}: alternative seeds in rejected join cells remain unchecked after {recovered} additional comparisons exhausted the quick-check budget ({}); narrow the region or dates",
+                evs[a].id, evs[b].id, p.max_quick
+            ));
+            funnel.truncated.push(format!(
+                "join alternatives {}x{}: budget {} exhausted",
+                evs[a].id, evs[b].id, p.max_quick
+            ));
             break;
         }
     }
@@ -4240,6 +4435,186 @@ mod tests {
     #[ignore = "resource measurement: 1 million compatible hypothesis pairs"]
     fn dense_pair_join_with_one_million_raw_matches() {
         check_dense_pair_join(1024);
+    }
+
+    #[test]
+    fn rejected_join_cells_try_alternatives_without_replacing_successes() {
+        let h = Hyp {
+            trk: 0,
+            t_e: 100.0,
+            e: 100.0,
+            n: 100.0,
+            t_s: 200.0,
+        };
+        let hi: Vec<_> = [100.0, 200.0, 300.0]
+            .into_iter()
+            .map(|e| Hyp { e, ..h })
+            .collect();
+        let hj = vec![Hyp { trk: 1, ..h }; 65];
+        let first = join(&hi, &hj, 0, 1, 600.0, 20.0, 30.0, 0.0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].e, 100.0);
+        let cell = joined_cell(&first[0]).unwrap();
+        for budget in [0, 1, 2, usize::MAX] {
+            let mut accepted = std::collections::HashSet::new();
+            let mut checked = Vec::new();
+            let (count, cut) = recover_joined(
+                &hi,
+                &hj,
+                0,
+                1,
+                600.0,
+                20.0,
+                30.0,
+                0.0,
+                &mut accepted,
+                budget,
+                |batch| {
+                    checked.extend_from_slice(batch);
+                    batch.iter().map(|j| j.e >= 175.0).collect()
+                },
+            );
+            assert_eq!(count, budget.min(2));
+            assert_eq!(cut, budget < 2);
+            assert_eq!(
+                checked.iter().map(|j| j.e).collect::<Vec<_>>(),
+                [150.0, 200.0][..budget.min(2)]
+            );
+            assert_eq!(accepted.contains(&cell), budget >= 2);
+
+            // A first representative that already passed must remain the sole owner,
+            // even when another point would score better or no recovery budget remains.
+            let mut accepted = std::collections::HashSet::from([cell]);
+            let actual = recover_joined(
+                &hi,
+                &hj,
+                0,
+                1,
+                600.0,
+                20.0,
+                30.0,
+                0.0,
+                &mut accepted,
+                budget,
+                |_| panic!("a successful original representative was revisited"),
+            );
+            assert_eq!(actual, (0, false));
+            assert_eq!(accepted, std::collections::HashSet::from([cell]));
+        }
+    }
+
+    #[test]
+    fn join_recovery_bounds_batches_and_collapses_only_exact_duplicates() {
+        let h = Hyp {
+            trk: 0,
+            t_e: 100.0,
+            e: 100.0,
+            n: 100.0,
+            t_s: 200.0,
+        };
+        let hi = vec![h; 16_384];
+        let hj = vec![Hyp { trk: 20_000, ..h }; 16_384];
+        let mut accepted = std::collections::HashSet::new();
+        // Hundreds of millions of duplicate raw pairs describe one already-tested
+        // failure. They must neither spend the allowance nor falsely mark a cut.
+        assert_eq!(
+            recover_joined(
+                &hi,
+                &hj,
+                0,
+                1,
+                600.0,
+                20.0,
+                30.0,
+                0.0,
+                &mut accepted,
+                0,
+                |_| panic!("identical geometry was scored again"),
+            ),
+            (0, false)
+        );
+        let changed = [h, Hyp { e: 101.0, ..h }];
+        let mut checked = Vec::new();
+        assert_eq!(
+            recover_joined(
+                &changed,
+                &hj,
+                0,
+                1,
+                600.0,
+                20.0,
+                30.0,
+                0.0,
+                &mut accepted,
+                1,
+                |batch| {
+                    checked.extend_from_slice(batch);
+                    vec![false; batch.len()]
+                },
+            ),
+            (1, false),
+            "exhausting the allowance after every alternative was tested is complete"
+        );
+        assert_eq!(checked.len(), 1);
+        assert_eq!(checked[0].e, 100.5);
+        assert!(accepted.is_empty());
+
+        let symmetric: Vec<_> = [99.0, 101.0].into_iter().map(|e| Hyp { e, ..h }).collect();
+        let other: Vec<_> = symmetric.iter().map(|a| Hyp { trk: 1, ..*a }).collect();
+        let mut checked = Vec::new();
+        assert_eq!(
+            recover_joined(
+                &symmetric,
+                &other,
+                0,
+                1,
+                600.0,
+                20.0,
+                30.0,
+                0.0,
+                &mut accepted,
+                2,
+                |batch| {
+                    checked.extend(batch.iter().map(|j| j.e));
+                    batch.iter().map(|j| j.e > 100.5).collect()
+                },
+            ),
+            (2, false)
+        );
+        assert_eq!(checked, [100.0, 101.0]);
+        accepted.clear();
+
+        let hi: Vec<_> = [100.0, 200.0, 300.0]
+            .into_iter()
+            .flat_map(|e| (0..8205).map(move |trk| Hyp { trk, e, ..h }))
+            .collect();
+        let mut checked = 0;
+        let mut largest = 0;
+        let actual = recover_joined(
+            &hi,
+            &hj[..1],
+            0,
+            1,
+            600.0,
+            20.0,
+            30.0,
+            0.0,
+            &mut accepted,
+            5000,
+            |batch| {
+                largest = largest.max(batch.len());
+                for j in batch {
+                    assert_eq!(j.ti as usize, checked);
+                    assert_eq!(j.e, 150.0);
+                    checked += 1;
+                }
+                vec![false; batch.len()]
+            },
+        );
+        assert_eq!(actual, (5000, true));
+        assert_eq!(checked, 5000);
+        assert_eq!(largest, JOIN_OUTPUT_SEEDS);
+        assert!(accepted.is_empty());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6503,6 +6878,234 @@ mod tests {
             atmo: &atmo,
         };
         run(&inp, &case.p, &|_s| {})
+    }
+
+    fn close_flyover_case(start: f64, swap_axes: bool) -> TwoCase {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = observer(lat, lon, &FlatElevation(0.0)).x;
+        let prop = Prop::still(343.0);
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        for (key, mut position, mut velocity, t_cpa, f0) in [
+            ("A", [0.0, 200.0, 200.0], [150.0, 0.0, 0.0], 120.0, 112.7),
+            ("B", [200.0, 0.0, 200.0], [0.0, 95.0, 0.0], 360.0, 149.3),
+        ] {
+            if swap_axes {
+                position.swap(0, 1);
+                velocity.swap(0, 1);
+            }
+            let mut tr = straight_track(
+                &enu,
+                position,
+                velocity,
+                start + t_cpa,
+                start - 200.0,
+                start + 800.0,
+                5.0,
+            );
+            tr.key = key.into();
+            let mut ev = synth_event(key, &tr, x, start, f0, 343.0, start + t_cpa, &prop);
+            let cpa = tr.cpa_nearest_time(x, start + t_cpa, 30.0).unwrap();
+            // These passes exceed the detector's 250 m domain and measurement's 200 m
+            // minimum. Use the fitter's ordinary floors and the pipeline's wind allowance.
+            assert!(cpa.d > 250.0 && cpa.speed >= 28.0);
+            ev.v_gate = [0.95 * cpa.speed - 3.0, 1.05 * cpa.speed + 3.0];
+            ev.d_gate = [cpa.d / 1.25, cpa.d * 1.25];
+            ev.sigma_hz = (0.002 * ev.f0).max(0.12);
+            assert!(gates_ok(&ev, &cpa, &prop, 0.0));
+            tracks.push(tr);
+            events.push(ev);
+        }
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+        // A legitimate narrow region puts the observer inside one join cell; the first
+        // compatible midpoint is 100-200 m away and fails a close aircraft's range gate.
+        let p = SearchParams::new(
+            start,
+            start,
+            600.0,
+            BBox::new(
+                lat - 500.0 / mlat,
+                lon - 500.0 / mlon,
+                lat + 100.0 / mlat,
+                lon + 100.0 / mlon,
+            ),
+        );
+        TwoCase {
+            tracks,
+            events,
+            p,
+            t_s: start,
+            obs: (lat, lon),
+        }
+    }
+
+    #[test]
+    fn close_flyovers_survive_rejected_join_representatives() {
+        let dem = FlatElevation(0.0);
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        for (start, swap_axes) in [(0.0, false), (1_788_895_000.0, true)] {
+            let case = close_flyover_case(start, swap_axes);
+            let frame = Frame::new(&case.p.region);
+            let t_base = start - 86_400.0;
+            let clouds: Vec<_> = case
+                .events
+                .iter()
+                .map(|ev| {
+                    hypotheses(
+                        ev,
+                        &case.tracks,
+                        &case.p,
+                        &frame,
+                        &dem,
+                        &atmo,
+                        t_base,
+                        10_000,
+                    )
+                    .stored
+                    .unwrap()
+                })
+                .collect();
+            assert_eq!(clouds.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2]);
+            let r = case.p.along_step_m.hypot(case.p.cross_step_m) + 120.0;
+            let tt = case.events[0].t_tol
+                + case.events[1].t_tol
+                + case.p.along_dt_max
+                + case.p.cross_step_m / case.p.c
+                + 2.0;
+            let first = join(
+                &clouds[0],
+                &clouds[1],
+                0,
+                1,
+                r,
+                tt,
+                SAME_FLIGHT_MIN_DT_S,
+                t_base,
+            );
+            assert_eq!(first.len(), 1);
+            let j = first[0];
+            let (la, lo) = frame.latlon(j.e, j.n);
+            assert!(
+                eval_point(
+                    &observer(la, lo, &dem),
+                    &[(0, j.ti, j.te_i), (1, j.tj, j.te_j)],
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &atmo,
+                    true,
+                    true,
+                    true,
+                )
+                .is_none(),
+                "the original representative must reproduce the physical rejection"
+            );
+            let inp = SearchInputs {
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                heard_times: case.events.iter().map(|ev| ev.t_rec).collect(),
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            let result = run(&inp, &case.p, &|_| {});
+            let top = result
+                .candidates
+                .first()
+                .unwrap_or_else(|| panic!("{:?}", result.funnel));
+            let error = haversine_m(case.obs.0, case.obs.1, top.lat, top.lon);
+            assert!(error < 75.0 && (top.t_start_utc - start).abs() < 0.2);
+            for key in ["A", "B"] {
+                assert!(top.events.iter().any(|m| m.event == key
+                    && m.flight == key
+                    && m.core
+                    && m.chi < 1.0
+                    && m.coverage >= 0.99));
+            }
+            assert!(result.funnel.joined > first.len());
+            assert_eq!(result.funnel.quick_passed, 1);
+            assert!(result.funnel.truncated.is_empty());
+            eprintln!(
+                "recovered rejected join, start={start}, swap={swap_axes}: error {error:.6} m, clock {:.6} s, {:?}",
+                top.t_start_utc - start,
+                result.funnel
+            );
+
+            let limited = SearchParams {
+                max_quick: first.len(),
+                ..case.p.clone()
+            };
+            let cut = run(&inp, &limited, &|_| {});
+            assert_eq!(cut.funnel.joined, first.len());
+            assert_eq!(cut.funnel.quick_passed, 0);
+            assert!(cut.candidates.is_empty());
+            assert_eq!(
+                cut.funnel.truncated,
+                ["join alternatives AxB: budget 1 exhausted"]
+            );
+            assert!(!cut.margin_passes(3.0));
+        }
+    }
+
+    #[test]
+    fn join_recovery_preserves_later_original_pairs_at_budget_boundary() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = close_flyover_case(0.0, false);
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let x = observer(case.obs.0, case.obs.1, &FlatElevation(0.0)).x;
+        let mut third = straight_track(
+            &enu,
+            [1000.0, 0.0, 1000.0],
+            [0.0, 80.0, 0.0],
+            480.0,
+            -200.0,
+            800.0,
+            5.0,
+        );
+        third.key = "C".into();
+        let mut event = synth_event(
+            "C",
+            &third,
+            x,
+            0.0,
+            173.1,
+            343.0,
+            480.0,
+            &Prop::still(343.0),
+        );
+        let cpa = third.cpa_nearest_time(x, 480.0, 30.0).unwrap();
+        event.v_gate = [0.95 * cpa.speed - 3.0, 1.05 * cpa.speed + 3.0];
+        event.d_gate = [cpa.d / 1.25, cpa.d * 1.25];
+        event.sigma_hz = (0.002 * event.f0).max(0.12);
+        event.quality = 90.0;
+        case.tracks.push(third);
+        case.events.push(event);
+        // The failed A/B first pass exactly fills this allowance. The established strict
+        // `>` policy still visits A/C's whole original first pass before stopping. Retrying
+        // A/B early would instead mark a recovery cut and hide this existing success.
+        case.p.max_quick = 1;
+        let result = run_case(&case, med);
+        let top = result
+            .candidates
+            .first()
+            .unwrap_or_else(|| panic!("{:?}", result.funnel));
+        for key in ["A", "C"] {
+            assert!(
+                top.events
+                    .iter()
+                    .any(|m| m.event == key && m.flight == key && m.role == "pair" && m.core)
+            );
+        }
+        assert!(haversine_m(case.obs.0, case.obs.1, top.lat, top.lon) < 75.0);
+        assert!(top.t_start_utc.abs() < 0.2);
+        assert!(result.funnel.joined > case.p.max_quick);
+        assert_eq!(
+            result.funnel.truncated,
+            ["join alternatives AxB: budget 1 exhausted", "pairs: 3 -> 2",]
+        );
+        assert!(!result.margin_passes(3.0));
     }
 
     #[test]
@@ -9683,13 +10286,64 @@ mod tests {
         // Force all quick checks to fail. Counting survivors instead of joined seeds
         // would now join every pair, changing the budget's meaning and hiding its cut.
         case.p.quick_chi = -1.0;
+        let frame = Frame::new(&case.p.region);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let t_base = case.p.start_lo - 86_400.0;
+        let clouds: Vec<_> = case.events[..2]
+            .iter()
+            .map(|ev| {
+                hypotheses(
+                    ev,
+                    &case.tracks,
+                    &case.p,
+                    &frame,
+                    &dem,
+                    &atmo,
+                    t_base,
+                    usize::MAX,
+                )
+                .stored
+                .unwrap()
+            })
+            .collect();
+        let (a, b) = if clouds[0].len() <= clouds[1].len() {
+            (0, 1)
+        } else {
+            (1, 0)
+        };
+        let expected_first = join(
+            &clouds[a],
+            &clouds[b],
+            a,
+            b,
+            case.p.along_step_m.hypot(case.p.cross_step_m) + 120.0,
+            case.events[a].t_tol
+                + case.events[b].t_tol
+                + case.p.along_dt_max
+                + case.p.cross_step_m / case.p.c
+                + 2.0,
+            SAME_FLIGHT_MIN_DT_S,
+            t_base,
+        )
+        .len();
+        assert!(expected_first > 0);
         let result = run_case(&case, med);
         assert_eq!(result.funnel.events_used, 3);
         assert_eq!(result.funnel.event_pairs, 3);
-        assert!(result.funnel.joined > 0, "{:?}", result.funnel);
+        assert_eq!(
+            result.funnel.joined, expected_first,
+            "recovery must spend no extra comparison"
+        );
         assert_eq!(result.funnel.quick_passed, 0);
         assert_eq!(result.funnel.fine_scored, 0);
-        assert_eq!(result.funnel.truncated, ["pairs: 3 -> 1"]);
+        assert_eq!(
+            result.funnel.truncated,
+            [
+                "join alternatives e1xe2: budget 0 exhausted",
+                "pairs: 3 -> 1",
+            ]
+        );
         assert!(result.candidates.is_empty());
         assert!(!result.margin_passes(3.0));
     }

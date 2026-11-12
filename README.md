@@ -1653,7 +1653,7 @@ trials: exhaustive 256-422 ms, outward 43-107 ms, median paired speedup **5.27x*
 This uses the pinned nightly at optimization level 1 on a shared AMD EPYC 9V74 Linux x86-64 host. It is a
 closest-approach component measurement; no whole-recording speedup is claimed.
 
-Pair joining now discards duplicate flight/place/clock seeds as they are generated, using bounded
+The initial pair join discards duplicate flight/place/clock seeds as they are generated, using bounded
 batches of 4,096 input hypotheses and ordered worker chunks. Previously it held every compatible
 raw pair before deduplicating: a dense bucket could exhaust memory before the quick-check budget
 was considered. The hash index, deduplication keys, active worker chunks and quick survivors still
@@ -1668,6 +1668,16 @@ the join's deduplication keys and active worker chunks still grow with the data.
 budget counts rejected seeds and stops at the same complete-pair boundary. Hypothesis clouds are
 released before fine scoring, and fine-grid input seeds before confirmation and refinement.
 Later stages retain their surviving candidates; the changes impose no additional search cut.
+
+A rejected representative no longer discards its entire 600 m / 20 s flight-pair cell. After
+all original event-pair passes allowed by the existing budget policy, a recovery pass tries
+other compatible seeds in rejected cells. Successful first representatives keep their cells;
+each recovered cell stops at its first passing alternative. The same geometry, clock and
+trace gates apply. Additional comparisons consume only the remaining global quick-check
+allowance and are included in the joined-seed count. If a real alternative remains when that
+allowance runs out, the funnel records the cut and the margin gate fails. Recovery streams
+at most 4,096 pending seeds, without collecting raw pairs; its hash keys and accepted cells
+still grow with the input. Hypothesis clouds are released after both passes.
 
 **Pair-join component measurement, 2026-11-07.** The
 `dense_pair_join_with_one_million_raw_matches` workload has 1,024 hypotheses on each side,
@@ -1757,6 +1767,38 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### A rejected join midpoint can retain a valid two-aircraft location
+
+`close_flyovers_survive_rejected_join_representatives` covers two perpendicular aircraft
+at 150 and 95 m/s, each passing 200 m horizontally from the observer at 200 m altitude.
+The actual closest range exceeds the detector's 250 m domain minimum. The synthetic event
+gates use the fitter's ordinary speed/range floors, the pipeline's wind allowance and a
+0.2% tone uncertainty. Search grids, refinement and comparison budgets remain at defaults;
+the supplied region is narrow and the recording start is known.
+
+Each event supplies two compatible hypotheses. The original join keeps one midpoint,
+whose physical check fails, and drops a later passing point in the same cell. The regression
+requires the complete search to recover both intended aircraft as core matches, with no
+budget cut, at zero and epoch clocks with swapped flight axes. A separate three-aircraft
+case verifies that retries cannot spend a later original event pair's budget. Controls also
+cover successful-cell ownership, rejected attempts, exact completion versus exhaustion,
+duplicate hypotheses and midpoints, and the 4,096-seed output bound.
+
+The byte-identical positive test fails against the previous committed search: two hypotheses
+per event become one rejected representative and no location. With recovery, the relative-clock
+case locates at 0.165999 m error and the epoch/swapped-axis case at 0.165252 m; both retain the
+correct recording clock and both core aircraft. Each adds exactly one quick comparison, with
+two joined points, one quick survivor, one fine candidate and no truncation.
+
+The native search component passes 95 tests, with 3 existing ignored benchmarks. This
+includes the four new regression groups and the original exact join-order, bounded-buffer,
+weather, terrain, refinement and budget controls. Four tests that require the actual curve
+fitter remain excluded because their dependencies are unavailable. The compiled production
+source and all component source hashes match the final implementation.
+
+These use analytic measured-event traces and the actual search/physics/track code. They do
+not run the production FFT or curve fitter, or establish recovery rates on field recordings.
 
 ### Fast passes can use the background-suppressed survey
 
