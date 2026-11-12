@@ -923,6 +923,7 @@ Cache layout:
 ~/.cache/fdop/
 ├── adsb/<YYYY-MM-DD>/<feeds>_<S>_<W>_<N>_<E>.fdtrk   regional track store per UTC day (gzip, magic FDOPTRK1)
 ├── adsb/<YYYY-MM-DD>/releases.json                   archive release metadata
+├── adsb/<YYYY-MM-DD>/releases-main.json              main-only discovery metadata
 ├── adsb/<YYYY-MM-DD>/raw/*.fdopraw.gz                completed filtered raw feeds for retry
 ├── weather/                                          Open-Meteo and radiosonde responses
 ├── geoid/<lat>_<lon>.txt                             NGS geoid height at a region's centre
@@ -937,6 +938,17 @@ Expanded jet-inclusive stores append `+jets` to the feedset, for example
 `stats.include_jets: true` before an expanded request can reuse them. Renaming an old
 store cannot restore jets discarded during its ingestion. This coverage requirement
 also applies to offline legacy caches and to partial-feed fallback.
+
+Availability checks look up only the main feed (prod, or staging when prod is absent).
+Fetches with MLAT disabled also skip its release lookup. With MLAT enabled, an optional
+MLAT lookup failure keeps the successfully discovered main feed and records the error in
+progress and final notes, so a usable main cache or archive can still supply the day.
+Required main-feed lookup errors remain fatal.
+
+Main-only discoveries use `releases-main.json`. They never replace `releases.json` or
+certify that MLAT is absent. A later online request for both feeds retries MLAT unless an
+existing full listing is reusable under the established publication rules. Offline reconstruction
+can combine main-only metadata with an existing MLAT-only listing without rewriting either.
 
 Completed raw feed checkpoints live under `adsb/<YYYY-MM-DD>/raw/` as
 `<feed[+jets]>_<S>_<W>_<N>_<E>.fdopraw.gz`. They retain the filtered reports before
@@ -963,8 +975,9 @@ A checkpoint-write failure warns and keeps the current successful ingest; it doe
 change final day-store publication errors.
 
 If no processed full or partial day cache is usable, `--offline` can rebuild it from
-completed raw checkpoints and the cached `releases.json`. It validates that each release
-belongs to the requested day and feed, then applies the same exact raw identity as an
+completed raw checkpoints and cached `releases.json` or `releases-main.json` metadata.
+It validates that each release belongs to the requested day and feed, then applies the same
+exact raw identity as an
 online retry. A usable prod checkpoint takes priority over staging. Available requested
 MLAT is reconciled with the main feed; if requested MLAT is unavailable, a main-only result
 keeps its missing-feed warning. MLAT alone cannot supply a day. Existing processed-cache

@@ -3,7 +3,8 @@
 //!
 //! Cache layout: `<cache>/adsb/<YYYY-MM-DD>/<feedset>_<S>_<W>_<N>_<E>.fdtrk` (bbox rounded
 //! outward to 0.1 degree; the whole UTC day is kept, the window is applied at load) and
-//! `<cache>/adsb/<YYYY-MM-DD>/releases.json`. Day stores are always built with unknown types
+//! `<cache>/adsb/<YYYY-MM-DD>/releases.json` (or `releases-main.json` for main-only discovery).
+//! Day stores are always built with unknown types
 //! kept; `keep_unknown = false` is applied after cross-day metadata reconciliation.
 //! Explicit jet catalogues append `+jets` to the feedset and certify `include_jets` in
 //! their metadata. Ordinary stores cannot satisfy an expanded catalogue request.
@@ -11,7 +12,7 @@
 //! reconciliation, so retries download only missing releases for an identical ingest policy.
 
 use crate::DataError;
-use crate::adsblol::{DayRelease, Feed, find_day_releases_cached};
+use crate::adsblol::{DayRelease, Feed, find_day_releases_for_fetch_cached};
 use crate::build::{build_day_store, merge_stores};
 use crate::ingest::{
     DayContext, IngestProgress, IngestSpec, IngestStats, RawAircraft, ingest_day_reader,
@@ -476,7 +477,10 @@ pub fn published_until(
             let raw_cached = if cached {
                 false
             } else {
-                let rels = find_day_releases_cached(None, day.0, day.1, day.2, &dir, true)?;
+                let rels = find_day_releases_for_fetch_cached(
+                    None, day.0, day.1, day.2, &dir, true, false,
+                )?
+                .releases;
                 std::fs::read_dir(dir.join("raw")).is_ok_and(|rd| {
                     rd.flatten().any(|entry| {
                         entry.path().is_file()
@@ -504,8 +508,16 @@ pub fn published_until(
                 if net.is_none() {
                     net = Some(fdop_http::Net::new()?);
                 }
-                let rels =
-                    find_day_releases_cached(net.as_ref(), day.0, day.1, day.2, &dir, false)?;
+                let rels = find_day_releases_for_fetch_cached(
+                    net.as_ref(),
+                    day.0,
+                    day.1,
+                    day.2,
+                    &dir,
+                    false,
+                    false,
+                )?
+                .releases;
                 !rels
                     .iter()
                     .any(|r| matches!(r.feed, Feed::Prod | Feed::Staging))
@@ -681,6 +693,23 @@ pub fn fetch_window(
     cache_dir: &Path,
     opts: &FetchOptions,
 ) -> Result<TrackStore, DataError> {
+    fetch_window_with_discovery(spec, cache_dir, opts, find_day_releases_for_fetch_cached)
+}
+
+fn fetch_window_with_discovery(
+    spec: &IngestSpec,
+    cache_dir: &Path,
+    opts: &FetchOptions,
+    mut discover: impl FnMut(
+        Option<&fdop_http::Net>,
+        i64,
+        u32,
+        u32,
+        &Path,
+        bool,
+        bool,
+    ) -> Result<crate::adsblol::ReleaseDiscovery, DataError>,
+) -> Result<TrackStore, DataError> {
     let feedset = if opts.include_mlat {
         "prod+mlatonly"
     } else {
@@ -731,7 +760,21 @@ pub fn fetch_window(
         let rels = if opts.offline {
             Vec::new()
         } else {
-            find_day_releases_cached(net.as_ref(), day.0, day.1, day.2, &dir, false)?
+            let found = discover(
+                net.as_ref(),
+                day.0,
+                day.1,
+                day.2,
+                &dir,
+                false,
+                opts.include_mlat,
+            )?;
+            if let Some(error) = found.mlat_error {
+                notes.push(format!(
+                    "{label}: MLAT-only release lookup failed; using the available main feed: {error}"
+                ));
+            }
+            found.releases
         };
         let available = feedset_available(&rels, opts.include_mlat);
         for fs in partial_feedsets(feedset) {
@@ -757,7 +800,7 @@ pub fn fetch_window(
             // Processed full and partial stores above retain their existing priority.
             // A completed raw ingest can still recover a day whose publication was
             // interrupted. Use the same padded spec as online, never the clipped want.
-            let rels = find_day_releases_cached(None, day.0, day.1, day.2, &dir, true)?;
+            let rels = discover(None, day.0, day.1, day.2, &dir, true, opts.include_mlat)?.releases;
             let sp = day_spec(day);
             let context = day_context(day);
             let mut parts = Vec::new();
@@ -990,6 +1033,36 @@ mod tests {
     use super::*;
     use crate::build::build_store;
     use crate::ingest::ingest_reader;
+
+    /// Compare the complete persisted leg contents, including missing-value NaN payloads.
+    #[track_caller]
+    fn assert_same_legs(actual: &[FlightLeg], expected: &[FlightLeg]) {
+        assert_eq!(actual.len(), expected.len(), "leg count");
+        for (i, (a, b)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                (&a.key, &a.icao, &a.reg, &a.typ, &a.source, a.engine),
+                (&b.key, &b.icao, &b.reg, &b.typ, &b.source, b.engine),
+                "leg {i} metadata"
+            );
+            assert_eq!(a.points.len(), b.points.len(), "leg {i} point count");
+            let bits = |p: &fdop_types::store::TrackPoint| {
+                (
+                    p.t.to_bits(),
+                    p.lat.to_bits(),
+                    p.lon.to_bits(),
+                    p.alt_m.to_bits(),
+                    p.gs_mps.to_bits(),
+                    p.track_deg.to_bits(),
+                    p.vrate_mps.to_bits(),
+                    p.alt_src,
+                    p.flags,
+                )
+            };
+            for (j, (a, b)) in a.points.iter().zip(&b.points).enumerate() {
+                assert_eq!(bits(a), bits(b), "leg {i} point {j}");
+            }
+        }
+    }
 
     #[test]
     fn every_stand_in_feedset_is_reported() {
@@ -1606,6 +1679,14 @@ mod tests {
     }
 
     fn offline_raw_fixture(main: Feed, include_jets: bool) -> OfflineRawFixture {
+        offline_raw_fixture_with_listing(main, include_jets, false)
+    }
+
+    fn offline_raw_fixture_with_listing(
+        main: Feed,
+        include_jets: bool,
+        main_only_listing: bool,
+    ) -> OfflineRawFixture {
         use crate::ingest::tests::{T0, gz, pc12_json, spec, tar_of};
         let want = IngestSpec {
             include_jets,
@@ -1659,11 +1740,12 @@ mod tests {
         ));
         let dir = day_dir(&cache, (2026, 9, 8));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("releases.json"),
-            serde_json::to_vec(&releases).unwrap(),
-        )
-        .unwrap();
+        let (listing_name, listing) = if main_only_listing {
+            ("releases-main.json", &releases[..1])
+        } else {
+            ("releases.json", &releases[..])
+        };
+        std::fs::write(dir.join(listing_name), serde_json::to_vec(listing).unwrap()).unwrap();
         OfflineRawFixture {
             cache,
             dir,
@@ -1701,11 +1783,8 @@ mod tests {
                 let got = fetch_window(&f.want, &f.cache, &opts).unwrap();
                 assert_eq!(got.meta.stats["cache_hits"], 0);
                 assert_eq!(got.meta.sources, tags);
-                assert_eq!(
-                    serde_json::to_value(&got.legs).unwrap(),
-                    serde_json::to_value(&expected.legs).unwrap(),
-                    "offline raw recovery must retain joint type and altitude reconciliation"
-                );
+                // offline raw recovery must retain joint type and altitude reconciliation.
+                assert_same_legs(&got.legs, &expected.legs);
                 assert!(!got.legs.is_empty());
                 assert!(
                     got.legs
@@ -1728,16 +1807,10 @@ mod tests {
                     .join(format!("{fs}_{}.fdtrk", bbox_key(&f.spec.bbox).1));
                 let saved = TrackStore::load(&path).unwrap();
                 assert_eq!(saved.meta.stats, fresh.meta.stats);
-                assert_eq!(
-                    serde_json::to_value(&saved.legs).unwrap(),
-                    serde_json::to_value(&fresh.legs).unwrap()
-                );
+                assert_same_legs(&saved.legs, &fresh.legs);
                 let cached = fetch_window(&f.want, &f.cache, &opts).unwrap();
                 assert_eq!(cached.meta.stats["cache_hits"], 1);
-                assert_eq!(
-                    serde_json::to_value(&cached.legs).unwrap(),
-                    serde_json::to_value(&got.legs).unwrap()
-                );
+                assert_same_legs(&cached.legs, &got.legs);
             }
         }
     }
@@ -1784,6 +1857,124 @@ mod tests {
                         .any(|point| point.alt_src == alt_src::BARO_RAW)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn main_only_release_metadata_recovers_offline_availability_and_raw_tracks() {
+        use crate::ingest::tests::T0;
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_mlat in [false, true] {
+                for existing_optional_listing in [false, true] {
+                    let f = offline_raw_fixture_with_listing(main, false, true);
+                    f.checkpoint(0);
+                    let full_path = f.dir.join("releases.json");
+                    if existing_optional_listing {
+                        std::fs::write(&full_path, serde_json::to_vec(&f.releases[1..]).unwrap())
+                            .unwrap();
+                    }
+                    let full_before = std::fs::read(&full_path).ok();
+                    let want = IngestSpec {
+                        keep_unknown: true,
+                        ..f.want
+                    };
+                    assert_eq!(
+                        published_until(want.t_start, want.t_end, &f.cache, true, T0 + 90_000.0,)
+                            .unwrap(),
+                        (want.t_end, vec![])
+                    );
+                    let opts = FetchOptions {
+                        offline: true,
+                        include_mlat,
+                        ..Default::default()
+                    };
+                    let got = fetch_window(&want, &f.cache, &opts).unwrap();
+                    assert!(!got.legs.is_empty());
+                    assert_eq!(got.meta.sources, [f.releases[0].tag.clone()]);
+                    assert_eq!(got.meta.stats["cache_hits"], 0);
+                    assert_eq!(
+                        got.meta.stats["notes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|note| { note.as_str().unwrap().contains(NO_MLATONLY) }),
+                        include_mlat
+                    );
+                    assert_eq!(std::fs::read(&full_path).ok(), full_before);
+                    let cached = fetch_window(&want, &f.cache, &opts).unwrap();
+                    assert_eq!(cached.meta.stats["cache_hits"], 1);
+                    assert_same_legs(&cached.legs, &got.legs);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optional_discovery_outage_reuses_main_cache_and_survives_in_final_notes() {
+        for main in [Feed::Prod, Feed::Staging] {
+            let f = offline_raw_fixture_with_listing(main, false, true);
+            let store = build_day_store(
+                vec![f.parts[0].clone()],
+                &f.spec,
+                vec![f.releases[0].tag.clone()],
+                day_context((2026, 9, 8)),
+            );
+            let fs = feedset_name(main, false);
+            store
+                .save(
+                    &f.dir
+                        .join(format!("{fs}_{}.fdtrk", bbox_key(&f.spec.bbox).1)),
+                )
+                .unwrap();
+            let messages = Arc::new(Mutex::new(Vec::new()));
+            let log = messages.clone();
+            let opts = FetchOptions {
+                progress: Some(Arc::new(move |line| {
+                    log.lock().unwrap().push(line.to_owned())
+                })),
+                ..Default::default()
+            };
+            let want = IngestSpec {
+                keep_unknown: true,
+                ..f.want
+            };
+            let mut calls = 0;
+            let got = fetch_window_with_discovery(
+                &want,
+                &f.cache,
+                &opts,
+                |_, _, _, _, _, offline, include_mlat| {
+                    calls += 1;
+                    assert!(!offline && include_mlat);
+                    Ok(crate::adsblol::ReleaseDiscovery {
+                        releases: vec![f.releases[0].clone()],
+                        mlat_error: Some(DataError("synthetic optional lookup outage".into())),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert!(!got.legs.is_empty());
+            assert_eq!(got.meta.stats["cache_hits"], 1);
+            assert_eq!(got.meta.sources, [f.releases[0].tag.clone()]);
+            assert!(
+                got.meta.stats["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|note| {
+                        note.as_str()
+                            .unwrap()
+                            .contains("synthetic optional lookup outage")
+                    })
+            );
+            assert!(
+                messages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|line| { line.contains("synthetic optional lookup outage") })
+            );
         }
     }
 
@@ -2250,11 +2441,8 @@ mod tests {
                     let published = TrackStore::load(&complete.unwrap().path).unwrap();
                     assert_eq!(published.meta.sources, tags);
                     assert_eq!(published.meta.stats, expected.meta.stats);
-                    assert_eq!(
-                        serde_json::to_value(&published.legs).unwrap(),
-                        serde_json::to_value(&expected.legs).unwrap(),
-                        "cached and fresh raw feeds must build identical reconciled flights"
-                    );
+                    // cached and fresh raw feeds must build identical reconciled flights.
+                    assert_same_legs(&published.legs, &expected.legs);
                     assert!(published.legs.iter().all(|l| l.typ == typ));
                     assert!(
                         published
@@ -2608,9 +2796,12 @@ mod tests {
                 let expected = if good_feed == "prod" {
                     NO_MLATONLY
                 } else {
-                    "prod release missing, using staging"
+                    "prod feed unavailable, using staging"
                 };
-                assert!(notes.iter().any(|n| n.as_str().unwrap().contains(expected)));
+                assert!(
+                    notes.iter().any(|n| n.as_str().unwrap().contains(expected)),
+                    "{good_feed}: expected {expected:?}, got {notes:?}"
+                );
             }
             let log = messages.lock().unwrap().join("\n");
             assert!(log.contains(&format!("unreadable cache {}", bad_path.display())));

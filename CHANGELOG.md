@@ -19,6 +19,37 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep main ADS-B data usable when optional MLAT discovery fails
+
+- Availability checks and main-only fetches discover prod (or staging when prod is
+  absent) without querying MLAT. Default fetches retain a successfully discovered
+  main feed when the optional MLAT lookup fails, including reuse of completed
+  processed stores; the discovery error remains in progress output and final notes.
+  Main-feed lookup errors and the public full-discovery APIs remain strict.
+- Cache partial discovery in `releases-main.json`, leaving the full listing's
+  contents and modification time unchanged. Main-only metadata never certifies
+  optional-feed absence; a later online full request retries MLAT under the existing
+  listing-finality rules. Offline availability and raw reconstruction can use this
+  main metadata, supplementing a cached MLAT-only listing without publishing the
+  combined view as a completed discovery.
+- Add five regressions for prod/staging discovery, optional lookup failure, required
+  main failure, cache provenance and later retry, offline raw reconstruction, and
+  warning retention when reusing a processed main cache.
+- Native validation: all 76 tests in the actual data source's adsblol, fetch, build,
+  ingest and raw_cache modules pass in an offline component under pinned nightly
+  2026-08-31 with LLVM. This includes all five new regressions and the three earlier
+  duplicate-altitude recovery regressions. The component uses the real shared
+  types and production atomic-write implementation; every HTTP operation is disabled
+  and panics. It is not HTTP integration or live-archive evidence.
+- Repair pre-existing data-test compilation by comparing complete leg fields and
+  floating-point bits instead of serializing a non-serializable type, and annotating
+  a weather-test index. Correct one stale cached-staging warning expectation while
+  preserving all recovery and progress assertions.
+- Normal fdop-data compilation and workspace Clippy were killed while compiling
+  locked asupersync 0.6.2. Full workspace tests, release CLI selftest and field
+  replays remain unverified; these component checks establish no field accuracy
+  or performance improvement. Workspace formatting retains pre-existing differences.
+
 ### Match wind-shifted fitted clocks to physical aircraft tracks
 
 - Convert a still-air fit's curve centre to the same moving-medium geometry as its

@@ -200,21 +200,55 @@ pub fn find_release(
     Ok(None)
 }
 
-/// Prod and MLAT-only releases for a UTC day. Staging is looked up only when prod is missing.
-pub fn find_day_releases(net: &Net, y: i64, m: u32, d: u32) -> Result<Vec<DayRelease>, DataError> {
+/// A completed main lookup, optionally with an independently failed MLAT lookup.
+/// An optional failure must never certify a complete release listing.
+#[derive(Debug)]
+pub(crate) struct ReleaseDiscovery {
+    pub releases: Vec<DayRelease>,
+    pub mlat_error: Option<DataError>,
+}
+
+impl ReleaseDiscovery {
+    fn strict(self) -> Result<Vec<DayRelease>, DataError> {
+        match self.mlat_error {
+            Some(error) => Err(error),
+            None => Ok(self.releases),
+        }
+    }
+}
+
+fn discover_day_releases(
+    mut lookup: impl FnMut(Feed) -> Result<Option<DayRelease>, DataError>,
+    include_mlat: bool,
+) -> Result<ReleaseDiscovery, DataError> {
     let mut out = Vec::new();
-    match find_release(net, y, m, d, Feed::Prod)? {
+    match lookup(Feed::Prod)? {
         Some(r) => out.push(r),
         None => {
-            if let Some(r) = find_release(net, y, m, d, Feed::Staging)? {
+            if let Some(r) = lookup(Feed::Staging)? {
                 out.push(r);
             }
         }
     }
-    if let Some(r) = find_release(net, y, m, d, Feed::Mlatonly)? {
-        out.push(r);
+    let mut mlat_error = None;
+    if include_mlat {
+        match lookup(Feed::Mlatonly) {
+            Ok(Some(r)) => out.push(r),
+            Ok(None) => {}
+            Err(error) if !out.is_empty() => mlat_error = Some(error),
+            Err(error) => return Err(error),
+        }
     }
-    Ok(out)
+    Ok(ReleaseDiscovery {
+        releases: out,
+        mlat_error,
+    })
+}
+
+/// Prod and MLAT-only releases for a UTC day. Staging is looked up only when prod is missing.
+/// This public full-discovery API remains strict when either requested lookup fails.
+pub fn find_day_releases(net: &Net, y: i64, m: u32, d: u32) -> Result<Vec<DayRelease>, DataError> {
+    discover_day_releases(|feed| find_release(net, y, m, d, feed), true)?.strict()
 }
 
 /// True when a listing has everything a day can have (prod and mlatonly).
@@ -265,10 +299,7 @@ pub fn find_day_releases_cached(
     offline: bool,
 ) -> Result<Vec<DayRelease>, DataError> {
     let path = dir.join("releases.json");
-    let cached = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Vec<DayRelease>>(&b).ok())
-        .filter(|v| !v.is_empty() && v.iter().all(|r| valid_archive_parts(&r.tag, &r.parts)));
+    let cached = read_cached_listing(&path);
     if let Some(v) = &cached
         && (offline || cached_listing_final(v, y, m, d, &path))
     {
@@ -294,6 +325,106 @@ pub fn find_day_releases_cached(
         )?;
     }
     Ok(rels)
+}
+
+fn read_cached_listing(path: &Path) -> Option<Vec<DayRelease>> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<DayRelease>>(&b).ok())
+        .filter(|v| !v.is_empty() && v.iter().all(|r| valid_archive_parts(&r.tag, &r.parts)))
+}
+
+/// Fetch/availability discovery can use a completed main lookup without MLAT. Its separate
+/// cache records only main-feed evidence; an online full request always retries MLAT unless
+/// the original full listing is reusable under its existing finality rules.
+pub(crate) fn find_day_releases_for_fetch_cached(
+    net: Option<&Net>,
+    y: i64,
+    m: u32,
+    d: u32,
+    dir: &Path,
+    offline: bool,
+    include_mlat: bool,
+) -> Result<ReleaseDiscovery, DataError> {
+    let mut owned = None;
+    cached_fetch_releases(y, m, d, dir, offline, include_mlat, |feed| {
+        let net = match net {
+            Some(net) => net,
+            None => {
+                if owned.is_none() {
+                    owned = Some(Net::new()?);
+                }
+                owned.as_ref().unwrap()
+            }
+        };
+        find_release(net, y, m, d, feed)
+    })
+}
+
+fn cached_fetch_releases(
+    y: i64,
+    m: u32,
+    d: u32,
+    dir: &Path,
+    offline: bool,
+    include_mlat: bool,
+    lookup: impl FnMut(Feed) -> Result<Option<DayRelease>, DataError>,
+) -> Result<ReleaseDiscovery, DataError> {
+    let full_path = dir.join("releases.json");
+    let main_path = dir.join("releases-main.json");
+    if let Some(mut releases) = read_cached_listing(&full_path)
+        && (offline || cached_listing_final(&releases, y, m, d, &full_path))
+    {
+        if !include_mlat {
+            releases.retain(|r| r.feed != Feed::Mlatonly);
+        }
+        // Offline, a completed main lookup can supplement a listing containing only MLAT.
+        // Existing main entries keep their priority, and this combined view is never certified.
+        if offline
+            && !releases.iter().any(|r| r.feed != Feed::Mlatonly)
+            && let Some(main) = read_cached_listing(&main_path)
+            && main.iter().all(|r| r.feed != Feed::Mlatonly)
+        {
+            releases.splice(0..0, main);
+        }
+        if !releases.is_empty() || !offline {
+            return Ok(ReleaseDiscovery {
+                releases,
+                mlat_error: None,
+            });
+        }
+    }
+    // A main-only result cannot prove that a requested optional feed is absent online.
+    if (!include_mlat || offline)
+        && let Some(releases) = read_cached_listing(&main_path)
+        && releases.iter().all(|r| r.feed != Feed::Mlatonly)
+        && (offline || cached_listing_final(&releases, y, m, d, &main_path))
+    {
+        return Ok(ReleaseDiscovery {
+            releases,
+            mlat_error: None,
+        });
+    }
+    if offline {
+        return Ok(ReleaseDiscovery {
+            releases: Vec::new(),
+            mlat_error: None,
+        });
+    }
+    let found = discover_day_releases(lookup, include_mlat)?;
+    if !found.releases.is_empty() {
+        let path = if include_mlat && found.mlat_error.is_none() {
+            &full_path
+        } else {
+            &main_path
+        };
+        std::fs::create_dir_all(dir)?;
+        fdop_http::write_atomic(
+            path,
+            &serde_json::to_vec_pretty(&found.releases).map_err(|e| DataError(e.to_string()))?,
+        )?;
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -334,6 +465,139 @@ mod tests {
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(checked_at))
             .unwrap();
+    }
+
+    #[test]
+    fn main_only_discovery_uses_its_own_cache_and_never_queries_mlat() {
+        for main in [Feed::Prod, Feed::Staging] {
+            let dir = cache_dir(main.tag_word());
+            let release = cached_release(main);
+            let mut calls = Vec::new();
+            let found = cached_fetch_releases(2026, 9, 8, &dir, false, false, |feed| {
+                calls.push(feed);
+                assert_ne!(feed, Feed::Mlatonly);
+                Ok((feed == main).then(|| release.clone()))
+            })
+            .unwrap();
+            assert_eq!(found.releases, [release.clone()]);
+            assert!(found.mlat_error.is_none());
+            assert_eq!(
+                calls,
+                if main == Feed::Prod {
+                    vec![Feed::Prod]
+                } else {
+                    vec![Feed::Prod, Feed::Staging]
+                }
+            );
+            assert!(!dir.join("releases.json").exists());
+            let main_path = dir.join("releases-main.json");
+            assert_eq!(read_cached_listing(&main_path).unwrap(), [release.clone()]);
+            let settled = fdop_types::time::unix_from_utc(2026, 9, 11, 1, 0, 0.0);
+            write_listing(&main_path, std::slice::from_ref(&release), settled);
+            for offline in [false, true] {
+                let cached = cached_fetch_releases(2026, 9, 8, &dir, offline, false, |_| {
+                    panic!("a usable main listing must avoid all network lookups")
+                })
+                .unwrap();
+                assert_eq!(cached.releases, [release.clone()]);
+            }
+            // A completed full listing can serve this narrower request without being rewritten.
+            let path = dir.join("releases.json");
+            write_listing(
+                &path,
+                &[release.clone(), cached_release(Feed::Mlatonly)],
+                settled,
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            let cached = cached_fetch_releases(2026, 9, 8, &dir, false, false, |_| {
+                panic!("the established full listing has priority")
+            })
+            .unwrap();
+            assert_eq!(cached.releases, [release]);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn optional_lookup_outage_keeps_main_without_certifying_a_full_listing() {
+        for main in [Feed::Prod, Feed::Staging] {
+            for existing_full in [false, true] {
+                let dir = cache_dir("optional-outage");
+                let path = dir.join("releases.json");
+                let release = cached_release(main);
+                if existing_full {
+                    let provisional = fdop_types::time::unix_from_utc(2026, 9, 9, 1, 0, 0.0);
+                    write_listing(&path, std::slice::from_ref(&release), provisional);
+                }
+                let before = std::fs::read(&path).ok();
+                let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let found = cached_fetch_releases(2026, 9, 8, &dir, false, true, |feed| {
+                    if feed == Feed::Mlatonly {
+                        Err(DataError("optional API unavailable".into()))
+                    } else {
+                        Ok((feed == main).then(|| release.clone()))
+                    }
+                })
+                .unwrap();
+                assert_eq!(found.releases, [release.clone()]);
+                assert!(
+                    found
+                        .mlat_error
+                        .as_ref()
+                        .unwrap()
+                        .to_string()
+                        .contains("optional API")
+                );
+                assert_eq!(std::fs::read(&path).ok(), before);
+                assert_eq!(
+                    std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
+                    modified,
+                    "an incomplete lookup must not advance the full listing's certification"
+                );
+                assert_eq!(
+                    read_cached_listing(&dir.join("releases-main.json")).unwrap(),
+                    [release.clone()]
+                );
+                assert!(
+                    found
+                        .strict()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("optional API")
+                );
+                // Even a settled main cache must not suppress a later requested MLAT lookup.
+                let mut queried_mlat = false;
+                let complete = cached_fetch_releases(2026, 9, 8, &dir, false, true, |feed| {
+                    if feed == Feed::Mlatonly {
+                        queried_mlat = true;
+                        Ok(Some(cached_release(feed)))
+                    } else {
+                        Ok((feed == main).then(|| release.clone()))
+                    }
+                })
+                .unwrap();
+                assert!(queried_mlat);
+                assert!(complete.mlat_error.is_none());
+                assert_eq!(complete.releases, [release, cached_release(Feed::Mlatonly)]);
+                assert_eq!(
+                    find_day_releases_cached(None, 2026, 9, 8, &dir, true).unwrap(),
+                    complete.releases
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn main_lookup_errors_remain_fatal() {
+        let dir = cache_dir("main-error");
+        let error = cached_fetch_releases(2026, 9, 8, &dir, false, true, |feed| {
+            assert_eq!(feed, Feed::Prod);
+            Err(DataError("main API unavailable".into()))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("main API"));
+        assert!(!dir.join("releases.json").exists());
+        assert!(!dir.join("releases-main.json").exists());
     }
 
     #[test]

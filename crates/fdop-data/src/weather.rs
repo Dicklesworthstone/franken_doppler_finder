@@ -1442,7 +1442,7 @@ mod tests {
                     );
                 }
             }
-            let cell = |index| {
+            let cell = |index: usize| {
                 GriddedAtmosphere::new(
                     vec![0.0],
                     vec![index as f64],
