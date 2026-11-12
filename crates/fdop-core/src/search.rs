@@ -1,8 +1,9 @@
 //! Flight-centric geolocation search over ADS-B tracks.
 //!
 //! Every measured event says: "some tonal aircraft passed its closest point of approach at a
-//! slant distance in `d_gate`, moving at a speed in `v_gate`, and that CPA was *heard* at
-//! recording time `t_rec`". For an aircraft at position p with velocity v, the ground points
+//! slant distance in `d_gate`, moving at a speed in `v_gate`, and with fitted curve centre at
+//! recording time `t_rec`". Wind can shift that centre from the geometric CPA's heard time.
+//! For an aircraft at position p with velocity v, the ground points
 //! whose CPA is *now* lie on the line perpendicular to the horizontal velocity, displaced
 //! along-track by a = H*vU/vH (H = height above the observer), at cross-track offsets b with
 //! a^2 + b^2 + H^2 = d^2. Sampling every track every <= 2 s / 400 m and every such line every
@@ -30,7 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Clone, Debug, Serialize)]
 pub struct SearchEvent {
     pub id: String,
-    /// Recording-clock time of the delayed (heard) CPA, s.
+    /// Recording-clock centre of the fitted still-air curve, s (not geometric CPA in wind).
     pub t_rec: f64,
     /// Half-width of the plausible t_rec interval, s.
     pub t_tol: f64,
@@ -703,25 +704,25 @@ fn hypotheses(
                             {
                                 return None;
                             }
-                            let ts = cpa.t_r_p(&prop) - ev.t_rec;
+                            let ts = cpa.t_r_fit_p(&prop) - ev.t_rec;
                             in_clock(ts).then_some((cpa.t_e, ts))
                         };
                         let ordinary_geometry = hh >= p.min_agl_m && d >= d_lo && d <= d_hi;
                         let (t_e, t_s) = if ordinary_geometry {
                             let observer_z = h - hh;
                             let path = atmo.medium(ola, olo, t, observer_z, h);
-                            let travel = if path.wind_e == 0.0 && path.wind_n == 0.0 {
+                            let centre_offset = if path.wind_e == 0.0 && path.wind_n == 0.0 {
                                 // Preserve the established still-air cloud and sampling exactly.
                                 d / c
                             } else {
-                                // The clock join must see the same wind delay as the exact
-                                // trace scorer, including a candidate's observer-local wind.
+                                // A measured still-air curve is centred at its fitted CPA,
+                                // which oblique wind shifts from the geometric CPA's arrival.
                                 let obs = Enu::new(ola, olo, observer_z);
                                 let prop = Prop::from_medium(&path, &obs);
                                 let rv = sub(pos, obs.to_ecef([0.0; 3]));
-                                prop.travel(rv, norm(rv))
+                                prop.fit_center_offset(rv, vel)
                             };
-                            let ts = t + travel - ev.t_rec;
+                            let ts = t + centre_offset - ev.t_rec;
                             if in_clock(ts) {
                                 (t, ts)
                             } else {
@@ -845,11 +846,24 @@ fn hypotheses(
                 }
                 sampled
             };
-            let scan = |lo, hi, exclusive_end, out: &mut HypBuilder| {
+            let scan = |lo, hi, exclusive_start, exclusive_end, out: &mut HypBuilder| {
                 let mut t = lo;
                 let mut previous = None;
+                let mut last = None;
                 while t <= hi && !(exclusive_end && t == hi) {
-                    let (dt, projection) = sample_at(t, out);
+                    let (dt, projection) = if exclusive_start && t == lo {
+                        // The previous span owns this shared sample. Keep its projection
+                        // to find a narrow region crossed before the suffix's first step.
+                        let (pos, vel) = tr.pv(t);
+                        let (la, ln, _) = ecef_to_geodetic(pos);
+                        let ve = Enu::new(la, ln, 0.0).vec_from_ecef(vel);
+                        let dt = (p.along_step_m / ve[0].hypot(ve[1]).max(1.0))
+                            .clamp(0.2, p.along_dt_max);
+                        (dt, project(t))
+                    } else {
+                        sample_at(t, out)
+                    };
+                    last = Some(t);
                     if let (Some(left), Some(right)) = (previous, projection)
                         && let Some(extra) = skipped_region_time(left, (t, right), project)
                     {
@@ -868,14 +882,27 @@ fn hypotheses(
                     }
                     t = next;
                 }
+                last
             };
-            // Keep the established sampling phase and every ordinary point first. Wind can
-            // delay a valid pass past the still-air crop; inspect that omitted prefix too.
-            // A windy or varying medium retains the track's full early span, not a guessed
-            // factor. The extra work grows with retained track span and event recording time.
-            scan(te_lo, te_hi, false, &mut out);
-            if !ordinary_still_air && tr.t0() < te_lo {
-                scan(tr.t0(), te_lo.min(te_hi), te_lo <= te_hi, &mut out);
+            // Keep the established sampling phase and ordinary points first. Wind can move
+            // the fitted centre to either side of the geometric emission time, so both omitted
+            // spans need inspection. Unknown media provide no certified time bound. Extra work
+            // grows with the retained track span; every recovered point uses the same budget.
+            let mut last = scan(te_lo, te_hi, false, false, &mut out);
+            if !ordinary_still_air {
+                if tr.t0() < te_lo {
+                    let prefix = scan(tr.t0(), te_lo.min(te_hi), false, te_lo <= te_hi, &mut out);
+                    last = last.or(prefix);
+                }
+                if te_hi < tr.t1() {
+                    let _ = scan(
+                        te_hi.max(tr.t0()),
+                        tr.t1(),
+                        last == Some(te_hi),
+                        false,
+                        &mut out,
+                    );
+                }
             }
             out.finish(cap, &count)
         })
@@ -1658,7 +1685,11 @@ fn eval_point_weighted(
         {
             return None;
         }
-        ts_imp.push(cpa.t_r_p(&prop) - ev.t_rec);
+        let ts = cpa.t_r_fit_p(&prop) - ev.t_rec;
+        if !ts.is_finite() {
+            return None;
+        }
+        ts_imp.push(ts);
         cpas.push(cpa);
         props.push(prop);
     }
@@ -1989,7 +2020,10 @@ fn calibrate(
                 if !gates_ok(ev, &cpa, &prop, LOCATING_GATE_SLACK) {
                     continue;
                 }
-                let ts0 = cpa.t_r_p(&prop) - ev.t_rec;
+                let ts0 = cpa.t_r_fit_p(&prop) - ev.t_rec;
+                if !ts0.is_finite() {
+                    continue;
+                }
                 let g = RatioGrid::build(
                     tr,
                     o.x,
@@ -2123,26 +2157,30 @@ fn best_confirmer(
     // A still-air fitted distance is not a physical radius in a moving or varying medium.
     // Keep that shortcut only when its scale is exactly one; otherwise the existing exact
     // CPA gates below decide the range.
-    let reach = if matching_still_air(ev, p, atmo) {
+    let ordinary_still_air = matching_still_air(ev, p, atmo);
+    let reach = if ordinary_still_air {
         1.15 * ev.d_gate[1]
     } else {
         f64::INFINITY
     };
     // Fitting can leave a wide CPA-time profile even when its best curve passed measurement.
     // The exact timing gate permits that interval, so neither preliminary time query may
-    // discard it. Union with the established propagation windows to preserve their sampling
-    // phase wherever they already contain that interval. This retains the existing wind-delay
-    // approximation.
+    // discard it. Preserve the established calm windows. In moving or undeclared media,
+    // a fitted centre supplies no bound on geometric emission time; examine every retained
+    // visit and let the same exact timing, geometry and trace gates decide.
     let earliest = t_heard - 1.2 * ev.d_gate[1] / c - ev.t_tol - 3.0;
     let latest = t_heard + ev.t_tol + 3.0;
+    let (query_lo, query_hi) = if ordinary_still_air {
+        (
+            (t_heard - 1.2 * ev.d_gate[1] / c - 120.0).min(earliest),
+            (t_heard + 30.0).max(latest),
+        )
+    } else {
+        (f64::NEG_INFINITY, f64::INFINITY)
+    };
     let mut best: Option<(f64, EventMatch, u32)> = None;
     let mut scratch = TraceScratch::default();
-    for ti in tix.overlapping_near(
-        (t_heard - 1.2 * ev.d_gate[1] / c - 120.0).min(earliest),
-        (t_heard + 30.0).max(latest),
-        o.x,
-        reach,
-    ) {
+    for ti in tix.overlapping_near(query_lo, query_hi, o.x, reach) {
         let tr = &tracks[ti as usize];
         if p.tonal_only && !tr.engine.tonal() {
             continue;
@@ -2151,17 +2189,23 @@ fn best_confirmer(
         // recording time while a farther return explains this event. Keep one second of scan
         // support outside the new bounds because local_cpas rejects boundary minima (0.5 s).
         let guess = t_heard - 1.1 * ev.d_gate[1].min(12_000.0) / c * 0.5;
-        for cpa in tr.local_cpas(
-            o.x,
-            (guess - 200.0).min(earliest - 1.0),
-            (guess + 200.0).max(latest + 1.0),
-        ) {
+        let (scan_lo, scan_hi) = if ordinary_still_air {
+            (
+                (guess - 200.0).min(earliest - 1.0),
+                (guess + 200.0).max(latest + 1.0),
+            )
+        } else {
+            (tr.t0(), tr.t1())
+        };
+        for cpa in tr.local_cpas(o.x, scan_lo, scan_hi) {
             if cpa.d > reach {
                 continue;
             }
             let prop = prop_for(atmo, o, tr, cpa.t_e);
+            let fitted_time = cpa.t_r_fit_p(&prop);
             if !gates_ok(ev, &cpa, &prop, 0.0)
-                || (cpa.t_r_p(&prop) - t_heard).abs() > ev.t_tol + 3.0
+                || !fitted_time.is_finite()
+                || (fitted_time - t_heard).abs() > ev.t_tol + 3.0
                 || tr.gap_at(cpa.t_e) > p.max_gap_s
             {
                 continue;
@@ -2761,7 +2805,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
         }
         cand.n_explained = cand.events.len();
         cand.fit_score = fit_score(&cand.events, &evs, p.kappa);
-        cand.unheard_close_passes = unheard_passes(cand, &o, tracks, &tix, heard, p);
+        cand.unheard_close_passes = unheard_passes(cand, &o, tracks, &tix, heard, p, atmo);
         let nu = cand.unheard_close_passes.len();
         cand.score = evidence(&mut cand.events, &nulls, nu);
     });
@@ -2776,7 +2820,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
         lock_prune(cand, &evs, tracks, p, atmo, inp.fine_dem);
         let o = observer(cand.lat, cand.lon, inp.fine_dem);
         cand.fit_score = fit_score(&cand.events, &evs, p.kappa);
-        cand.unheard_close_passes = unheard_passes(cand, &o, tracks, &tix, heard, p);
+        cand.unheard_close_passes = unheard_passes(cand, &o, tracks, &tix, heard, p, atmo);
         let nu = cand.unheard_close_passes.len();
         cand.score = evidence(&mut cand.events, &nulls, nu);
     };
@@ -3092,7 +3136,7 @@ fn same_explanation(a: &Candidate, b: &Candidate) -> bool {
 }
 
 /// Tonal aircraft that passed much closer (< half the nearest explained CPA) while recording
-/// and left no detection within 25 s of when they would have been heard.
+/// and left no detection within 25 s of their predicted fitted curve centre.
 fn unheard_passes(
     cand: &Candidate,
     o: &Obs,
@@ -3100,6 +3144,7 @@ fn unheard_passes(
     tix: &TimeIndex,
     heard: &[f64],
     p: &SearchParams,
+    atmo: &dyn Atmosphere,
 ) -> Vec<String> {
     let c = p.c;
     let mut out = Vec::new();
@@ -3113,15 +3158,32 @@ fn unheard_passes(
     }
     let thr = 0.5 * dmin;
     let (ta, tb) = (cand.t_start_utc, cand.t_start_utc + p.duration);
-    for ti in tix.overlapping_near(ta - thr / c - 60.0, tb + 60.0, o.x, thr) {
+    let ordinary_still_air = c.is_finite()
+        && c > 0.0
+        && atmo.uniform_medium() == Some(fdop_types::atmo::Medium::still(c));
+    let (query_lo, query_hi, scan_lo, scan_hi) = if ordinary_still_air {
+        (ta - thr / c - 60.0, tb + 60.0, ta - thr / c, tb)
+    } else {
+        (
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+        )
+    };
+    for ti in tix.overlapping_near(query_lo, query_hi, o.x, thr) {
         let tr = &tracks[ti as usize];
         if p.tonal_only && !tr.engine.tonal() {
             continue;
         }
         // The distance threshold already excludes every explained CPA. The same aircraft
         // can return much closer, so check those other passes against the detections too.
-        for cpa in cpas_in(tr, o.x, ta - thr / c, tb, thr) {
-            let t_rec = cpa.t_r(c) - cand.t_start_utc;
+        for cpa in cpas_in(tr, o.x, scan_lo, scan_hi, thr) {
+            let t_rec = if ordinary_still_air {
+                cpa.t_r(c)
+            } else {
+                cpa.t_r_fit_p(&prop_for(atmo, o, tr, cpa.t_e))
+            } - cand.t_start_utc;
             if !(30.0..=p.duration - 30.0).contains(&t_rec) {
                 continue;
             }
@@ -3242,9 +3304,11 @@ fn refresh_refined_candidate(
             } else {
                 0.0
             };
+            let fitted_time = cpa.t_r_fit_p(&prop);
             if !gates_ok(ev, &cpa, &prop, slack)
                 || tr.gap_at(cpa.t_e) > p.max_gap_s
-                || (cpa.t_r_p(&prop) - fresh.t_start_utc - ev.t_rec).abs() > ev.t_tol + 3.0
+                || !fitted_time.is_finite()
+                || (fitted_time - fresh.t_start_utc - ev.t_rec).abs() > ev.t_tol + 3.0
                 || used_cpas
                     .iter()
                     .any(|&(used, te)| used == ti && (cpa.t_e - te).abs() < SAME_FLIGHT_MIN_DT_S)
@@ -3305,7 +3369,8 @@ fn refresh_refined_candidate(
         .map(|(m, &(ei, _))| evs[ei].n_eff * m.chi)
         .sum::<f64>()
         / fresh.trk.iter().map(|&(ei, _)| evs[ei].n_eff).sum::<f64>();
-    fresh.unheard_close_passes = unheard_passes(&fresh, &o, inp.tracks, tix, &inp.heard_times, p);
+    fresh.unheard_close_passes =
+        unheard_passes(&fresh, &o, inp.tracks, tix, &inp.heard_times, p, inp.atmo);
     fresh.score = evidence(&mut fresh.events, nulls, fresh.unheard_close_passes.len());
     Some(fresh)
 }
@@ -3395,19 +3460,44 @@ pub fn explain_at(
             .ok_or_else(|| format!("no search event {eid}"))?;
         let ev = &inp.events[ei];
         let t_heard = t_start_guess + ev.t_rec;
-        let ti = inp
-            .tracks
-            .iter()
-            .position(|t| {
-                (&t.key == key || t.icao.eq_ignore_ascii_case(key))
-                    && t.t0() < t_heard
-                    && t.t1() > t_heard - 60.0
-            })
-            .ok_or_else(|| format!("no track {key} around {t_heard:.0}"))?;
-        let tr = &inp.tracks[ti];
-        let cpa = tr
-            .cpa_nearest_time(o.x, t_heard - ev.d_gate[1].min(12_000.0) / p.c * 0.5, 300.0)
-            .ok_or("no CPA")?;
+        let (ti, cpa) = if matching_still_air(ev, p, inp.atmo) {
+            let ti = inp
+                .tracks
+                .iter()
+                .position(|t| {
+                    (&t.key == key || t.icao.eq_ignore_ascii_case(key))
+                        && t.t0() < t_heard
+                        && t.t1() > t_heard - 60.0
+                })
+                .ok_or_else(|| format!("no track {key} around {t_heard:.0}"))?;
+            let cpa = inp.tracks[ti]
+                .cpa_nearest_time(o.x, t_heard - ev.d_gate[1].min(12_000.0) / p.c * 0.5, 300.0)
+                .ok_or("no CPA")?;
+            (ti, cpa)
+        } else {
+            // A fitted centre can precede the physical CPA. Choose the named retained
+            // visit by that same fitted clock, including separate legs and returning passes.
+            let obs = &o;
+            inp.tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, tr)| &tr.key == key || tr.icao.eq_ignore_ascii_case(key))
+                .flat_map(|(ti, tr)| {
+                    tr.local_cpas(obs.x, tr.t0(), tr.t1())
+                        .filter_map(move |cpa| {
+                            let prop = prop_for(inp.atmo, obs, tr, cpa.t_e);
+                            let dt = (cpa.t_r_fit_p(&prop) - t_heard).abs();
+                            dt.is_finite().then_some((ti, cpa, dt))
+                        })
+                })
+                .min_by(|a, b| {
+                    b.1.interior
+                        .cmp(&a.1.interior)
+                        .then_with(|| a.2.total_cmp(&b.2))
+                })
+                .map(|(ti, cpa, _)| (ti, cpa))
+                .ok_or_else(|| format!("no track {key} around {t_heard:.0}"))?
+        };
         assign.push((ei, ti as u32, cpa.t_e));
     }
     let mut pp = p.clone();
@@ -4013,7 +4103,9 @@ mod tests {
         prop: &Prop,
     ) -> SearchEvent {
         let cpa = tr.cpa_near(x, cpa_guess, 200.0).unwrap();
-        let t_rec = cpa.t_r_p(prop) - t_s;
+        // Metadata belongs to the still-air fit; the sampled observations below remain
+        // centred on the physical CPA arrival and keep their original reception times.
+        let t_rec = cpa.t_r_fit_p(prop) - t_s;
         let mut tt = Vec::new();
         let mut ff = Vec::new();
         let mut k = 0;
@@ -5228,6 +5320,7 @@ mod tests {
             &tix,
             &[],
             &case.p,
+            &atmo,
         );
         top.score = evidence(&mut top.events, &nulls, top.unheard_close_passes.len());
         assert!(top.unheard_close_passes.is_empty());
@@ -6390,6 +6483,311 @@ mod tests {
         }
     }
 
+    // Supply a synthetic traced ridge to the actual fitter and measured-event adapter.
+    // Detection and spectral tracing are outside these search regressions.
+    #[allow(clippy::too_many_arguments)]
+    fn fitted_wind_event(
+        id: &str,
+        tr: &TrackModel,
+        x: V3,
+        start: f64,
+        emitted: f64,
+        cpa_time: f64,
+        half: usize,
+        prop: &Prop,
+    ) -> SearchEvent {
+        use crate::detect::Detection;
+        use crate::fit::{Side, fit_constant_velocity};
+        use crate::measure::EventQuality;
+        use crate::trace::Trace;
+
+        let cpa = tr.cpa_nearest_time(x, cpa_time, 100.0).unwrap();
+        let heard = cpa.t_r_p(prop);
+        let mut trace = Trace::default();
+        for k in 0..=2 * half {
+            let t = heard - half as f64 + k as f64;
+            let ratio = tr.solve_emission_p(t, x, prop, None).unwrap().2;
+            let noise = 0.02 * (1.7 * k as f64).sin() + 0.01 * (0.41 * k as f64).sin();
+            trace.t.push(t - start);
+            trace.f.push(emitted * ratio + noise);
+            trace.snr.push(20.0);
+        }
+        let fit = fit_constant_velocity(&trace.t, &trace.f, 343.0, Side::Both).unwrap();
+        let b = fit.best;
+        let approach = b.t0r - trace.t[0];
+        let recede = trace.t.last().unwrap() - b.t0r;
+        let drop = (trace.f[0] - trace.f.last().unwrap()) / (0.8 * (fit.f_pre - fit.f_post));
+        assert!(trace.len() >= 80 && approach > 8.0 && recede > 8.0 && drop > 0.15);
+        assert!(b.rmse < 0.03 && (28.0..=0.8 * 343.0).contains(&b.v));
+        assert!((200.0..=12_000.0).contains(&b.d));
+        let measured = MeasuredEvent {
+            id: id.into(),
+            detection: Detection {
+                id: 0,
+                t0r: b.t0r,
+                f0: b.f0,
+                v: b.v,
+                d: b.d,
+                score: 10.0,
+                score_approach: 10.0,
+                score_recede: 10.0,
+                half_s: half as f64,
+                harmonic_of: None,
+                harmonics: vec![],
+                from_contrast: false,
+            },
+            quality: EventQuality {
+                n_points: trace.len(),
+                span_approach_s: approach,
+                span_recede_s: recede,
+                drop_traversed: drop,
+                median_snr_db: 20.0,
+                rmse_hz: b.rmse,
+                score: 20.0 * fit.diagnostics.n_eff.sqrt(),
+                ok: true,
+                reseeded: false,
+                reasons: vec![],
+            },
+            fit: Some(fit),
+            trace,
+            win_s: 1.0,
+            spec: None,
+        };
+        assert!(measured.is_aircraft_like());
+        let ev = SearchEvent::from_measured(&measured, 3.0).unwrap();
+        assert!(
+            ev.t_tol <= 3.001,
+            "the ordinary measured time floor must remain sufficient: {ev:?}"
+        );
+        assert!((start + ev.t_rec - cpa.t_r_fit_p(prop)).abs() < 0.05);
+        assert!(gates_ok(&ev, &cpa, prop, 0.0));
+        ev
+    }
+
+    #[test]
+    fn oblique_wind_fitted_centres_reach_pair_search_confirmation_and_refinement() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let medium = fdop_types::atmo::Medium {
+            c: 343.0,
+            wind_e: 65.0,
+            wind_n: 65.0,
+        };
+        let prop = Prop::from_medium(&medium, &enu);
+        let atmo = fdop_types::atmo::UniformAtmosphere(medium);
+        let dem = FlatElevation(0.0);
+        for start in [0.0, 1_788_895_000.0] {
+            let mut tracks = Vec::new();
+            let mut events = Vec::new();
+            for (key, position, velocity, at, emitted) in [
+                ("A", [0.0, 11_000.0, 1500.0], [70.0, 0.0, 0.0], 240.0, 350.0),
+                ("B", [11_000.0, 0.0, 1500.0], [0.0, 70.0, 0.0], 720.0, 479.0),
+            ] {
+                let mut position = position;
+                position[2] += MIC_HEIGHT_M;
+                let mut tr = straight_track(
+                    &enu,
+                    position,
+                    velocity,
+                    start + at,
+                    start - 200.0,
+                    start + 1300.0,
+                    5.0,
+                );
+                tr.key = key.into();
+                let ev = fitted_wind_event(key, &tr, x, start, emitted, start + at, 180, &prop);
+                let cpa = tr.cpa_nearest_time(x, start + at, 100.0).unwrap();
+                assert!(
+                    (cpa.t_r_p(&prop) - start - ev.t_rec).abs() > ev.t_tol + 3.0,
+                    "the former geometric-arrival gate must reject this measured curve"
+                );
+                tracks.push(tr);
+                events.push(ev);
+            }
+            let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+            let mut p = SearchParams::new(
+                start,
+                start,
+                1100.0,
+                BBox::new(
+                    lat - 25.0 / mlat,
+                    lon - 25.0 / mlon,
+                    lat + 25.0 / mlat,
+                    lon + 25.0 / mlon,
+                ),
+            );
+            p.refine_half_m = 100.0;
+            let case = TwoCase {
+                tracks,
+                events,
+                p,
+                t_s: start,
+                obs: (lat, lon),
+            };
+            let o = observer(lat, lon, &dem);
+            let tix = TimeIndex::new(&case.tracks);
+            for (i, ev) in case.events.iter().enumerate() {
+                let (chi, matched, ti) =
+                    best_confirmer(&o, start, ev, &case.tracks, &tix, &case.p, &atmo, &[])
+                        .expect("a measured oblique-wind curve must confirm at the true clock");
+                assert_eq!(ti as usize, i);
+                assert!(chi < 0.01 && matched.coverage >= 0.99);
+                let cpa = case.tracks[i]
+                    .cpa_nearest_time(x, start + [240.0, 720.0][i], 100.0)
+                    .unwrap();
+                assert!((matched.t_cpa_heard_utc - cpa.t_r_p(&prop)).abs() < 0.002);
+                let mut wrong = ev.clone();
+                wrong.t_rec += 30.0;
+                assert!(
+                    best_confirmer(&o, start, &wrong, &case.tracks, &tix, &case.p, &atmo, &[],)
+                        .is_none()
+                );
+            }
+            let result = check_wind_delayed_case(&case, medium, run_case(&case, medium));
+            let inputs = SearchInputs {
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                heard_times: case.events.iter().map(|ev| ev.t_rec).collect(),
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            let nulls: Vec<_> = case
+                .events
+                .iter()
+                .map(|ev| EventNull {
+                    event: ev.id.clone(),
+                    gate_nats: 6.0,
+                    ..EventNull::default()
+                })
+                .collect();
+            let fresh = refresh_refined_candidate(
+                &result.candidates[0],
+                &refinement_at(lat, lon, start),
+                &inputs,
+                &case.events,
+                &case.p,
+                &nulls,
+                &tix,
+            )
+            .expect("the same fitted clock must survive final candidate reevaluation");
+            assert_eq!(fresh.n_explained, 2);
+            assert!(fresh.events.iter().all(|m| m.chi < 0.01));
+            let explained = explain_at(
+                &inputs,
+                &case.p,
+                lat,
+                lon,
+                start,
+                1.0,
+                &[("A".into(), "A".into()), ("B".into(), "B".into())],
+            )
+            .unwrap();
+            assert!((explained.t_start_utc - start).abs() < 0.1);
+            assert!(explained.events.iter().all(|m| m.chi < 0.01));
+        }
+    }
+
+    #[test]
+    fn fitted_centres_before_emission_keep_late_hypotheses_and_heard_passes() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let medium = fdop_types::atmo::Medium {
+            c: 343.0,
+            wind_e: -85.0,
+            wind_n: -130.0,
+        };
+        let prop = Prop::from_medium(&medium, &enu);
+        let atmo = fdop_types::atmo::UniformAtmosphere(medium);
+        let dem = FlatElevation(0.0);
+        let o = observer(lat, lon, &dem);
+        for start in [0.0, 1_788_895_000.0] {
+            let mut tr = straight_track(
+                &enu,
+                [0.0, 8000.0, 1200.0 + MIC_HEIGHT_M],
+                [25.0, 0.0, 0.0],
+                start + 360.0,
+                start - 400.0,
+                start + 1000.0,
+                5.0,
+            );
+            tr.key = "late-cpa".into();
+            let ev = fitted_wind_event(
+                "late-cpa",
+                &tr,
+                o.x,
+                start,
+                350.0,
+                start + 360.0,
+                240,
+                &prop,
+            );
+            let cpa = tr.cpa_nearest_time(o.x, start + 360.0, 100.0).unwrap();
+            let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+            let p = SearchParams::new(
+                start,
+                start,
+                900.0,
+                BBox::new(
+                    lat - 25.0 / mlat,
+                    lon - 25.0 / mlon,
+                    lat + 25.0 / mlat,
+                    lon + 25.0 / mlon,
+                ),
+            );
+            assert!(
+                start + ev.t_rec + ev.t_tol + 5.0 < cpa.t_e - 8.0,
+                "the former upper crop must end before this region's CPA crossing"
+            );
+            let tracks = [tr];
+            let index = TimeIndex::new(&tracks);
+            let frame = Frame::new(&p.region);
+            let cloud = hypotheses(
+                &ev,
+                &tracks,
+                &p,
+                &frame,
+                &dem,
+                &atmo,
+                start - 86_400.0,
+                10_000,
+            );
+            assert!(cloud.count > 0 && cloud.stored.is_some());
+            let limited = hypotheses(&ev, &tracks, &p, &frame, &dem, &atmo, start - 86_400.0, 0);
+            assert_eq!(cloud.count, limited.count);
+            assert!(limited.stored.is_none());
+            let (chi, matched, _) = best_confirmer(&o, start, &ev, &tracks, &index, &p, &atmo, &[])
+                .expect("the same measured pass must remain available as a confirmer");
+            assert!(chi < 0.01 && matched.coverage >= 0.99);
+            assert!((matched.t_cpa_heard_utc - cpa.t_r_p(&prop)).abs() < 0.002);
+
+            // A nearby detected pass must not become an unheard-aircraft veto merely
+            // because its fitted centre differs from a nominal still-air arrival by >25 s.
+            let candidate = Candidate {
+                t_start_utc: start,
+                events: vec![EventMatch {
+                    d: 20_000.0,
+                    ..EventMatch::default()
+                }],
+                ..Candidate::default()
+            };
+            assert!((cpa.t_r(p.c) - start - ev.t_rec).abs() > 25.0);
+            assert!(
+                unheard_passes(&candidate, &o, &tracks, &index, &[ev.t_rec], &p, &atmo,).is_empty()
+            );
+            for heard in [vec![], vec![ev.t_rec + 30.0]] {
+                let silent = unheard_passes(&candidate, &o, &tracks, &index, &heard, &p, &atmo);
+                assert_eq!(
+                    silent.len(),
+                    1,
+                    "the unchanged hearing window still applies"
+                );
+                assert!(silent[0].starts_with("late-cpa "));
+            }
+        }
+    }
+
     #[test]
     fn narrow_region_between_cross_track_samples_locates_observer() {
         let (lat, lon) = (40.876466, -73.524951);
@@ -6746,7 +7144,7 @@ mod tests {
                         assert!(gates_ok(ev, &cpa, &prop, 0.0));
                         assert!(height - o.z - MIC_HEIGHT_M >= p.min_agl_m);
                         assert!(tr.gap_at(cpa.t_e) <= p.max_gap_s);
-                        assert!((cpa.t_r_p(&prop) - ev.t_rec - start).abs() <= ev.t_tol);
+                        assert!((cpa.t_r_fit_p(&prop) - ev.t_rec - start).abs() <= ev.t_tol);
                     }
                     if expected == 2 {
                         assert!((kept[0].e - kept[1].e).hypot(kept[0].n - kept[1].n) < 50.0);
@@ -8034,10 +8432,12 @@ mod tests {
                 .expect("a closer pass already heard must not hide the farther return");
             assert_eq!(track, 0);
             assert!(chi < 1.0, "{matched:?}");
-            assert!(
-                (matched.t_cpa_heard_utc - case.t_s - case.events[2].t_rec).abs() < 0.01,
-                "{matched:?}"
-            );
+            let cpa = case.tracks[0]
+                .cpa_nearest_time(o.x, case.t_s + 300.0, 30.0)
+                .unwrap();
+            let prop = prop_for(&atmo, &o, &case.tracks[0], cpa.t_e);
+            assert!((matched.t_cpa_heard_utc - cpa.t_r_p(&prop)).abs() < 0.01);
+            assert!((cpa.t_r_fit_p(&prop) - case.t_s - case.events[2].t_rec).abs() < 0.01);
             let emission_seed = matched.t_cpa_heard_utc - matched.d / matched.c_path;
             assert!(
                 explain(&[(0, emission_seed)]).is_none(),
@@ -8161,7 +8561,7 @@ mod tests {
             let heard = silent
                 .cpa_near(o.x, case.t_s + 500.0, 100.0)
                 .unwrap()
-                .t_r(case.p.c)
+                .t_r_fit_p(&prop)
                 - case.t_s;
             case.tracks.push(silent);
             let far_start = case.tracks.len();
@@ -8225,7 +8625,7 @@ mod tests {
                 let unheard: Vec<_> = [vec![], vec![heard], vec![heard + 30.0]]
                     .iter()
                     .map(|heard| {
-                        unheard_passes(&candidate, &o, &case.tracks, index, heard, &case.p)
+                        unheard_passes(&candidate, &o, &case.tracks, index, heard, &case.p, &atmo)
                     })
                     .collect();
                 (matches, unheard)
@@ -8529,7 +8929,7 @@ mod tests {
         .unwrap();
         // Explained passes and an equally distant return cannot fall inside half the
         // nearest explained distance, even without a separate list of heard detections.
-        assert!(unheard_passes(&candidate, &o, &case.tracks, &tix, &[], &case.p).is_empty());
+        assert!(unheard_passes(&candidate, &o, &case.tracks, &tix, &[], &case.p, &atmo).is_empty());
 
         // Between the two circuit passes, smoothly shift the circle 900 m toward the
         // observer and descend 700 m. The original explained traces remain unchanged.
@@ -8552,14 +8952,22 @@ mod tests {
         // Rebuild its bounds, and compare with the original unscreened time query.
         let mut unbounded = tix;
         unbounded.bounds.fill(None);
-        let baseline = unheard_passes(&candidate, &o, &case.tracks, &unbounded, &[], &case.p);
+        let baseline = unheard_passes(
+            &candidate,
+            &o,
+            &case.tracks,
+            &unbounded,
+            &[],
+            &case.p,
+            &atmo,
+        );
         assert_eq!(
             baseline.len(),
             1,
             "the unpruned return was missed: {baseline:?}"
         );
         let tix = TimeIndex::new(&case.tracks);
-        let silent = unheard_passes(&candidate, &o, &case.tracks, &tix, &[], &case.p);
+        let silent = unheard_passes(&candidate, &o, &case.tracks, &tix, &[], &case.p, &atmo);
         assert_eq!(silent, baseline);
         assert_eq!(
             silent.len(),
@@ -8567,10 +8975,21 @@ mod tests {
             "the silent close return was missed: {silent:?}"
         );
         assert!(silent[0].starts_with("circuit "), "{silent:?}");
-        assert!(unheard_passes(&candidate, &o, &case.tracks, &tix, &[t_rec], &case.p).is_empty());
+        assert!(
+            unheard_passes(&candidate, &o, &case.tracks, &tix, &[t_rec], &case.p, &atmo).is_empty()
+        );
         // An unrelated detection outside the existing 25-second hearing window cannot excuse it.
         assert_eq!(
-            unheard_passes(&candidate, &o, &case.tracks, &tix, &[t_rec + 30.0], &case.p).len(),
+            unheard_passes(
+                &candidate,
+                &o,
+                &case.tracks,
+                &tix,
+                &[t_rec + 30.0],
+                &case.p,
+                &atmo,
+            )
+            .len(),
             1
         );
     }

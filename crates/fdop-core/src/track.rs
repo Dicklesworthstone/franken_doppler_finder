@@ -1065,6 +1065,17 @@ impl Cpa {
     pub fn t_r_p(&self, m: &Prop) -> f64 {
         self.t_e + m.travel(self.rv, self.d)
     }
+    /// Centre measured by a still-air constant-velocity fit to this pass's received curve.
+    /// In oblique wind this differs from the geometric CPA's heard time above. A turning
+    /// track uses its local CPA velocity, as do the speed, distance and source-tone gates.
+    pub fn t_r_fit_p(&self, m: &Prop) -> f64 {
+        if m.w == [0.0; 3] {
+            // Preserve the established still-air gate arithmetic exactly.
+            self.t_r(m.c)
+        } else {
+            self.t_e + m.fit_center_offset(self.rv, self.vel)
+        }
+    }
 }
 
 /// Homogeneous propagation medium in ECEF, using path-averaged sound speed and wind
@@ -1127,6 +1138,36 @@ impl Prop {
         let (travel, q) = self.travel_root(rv, r);
         (travel, (dot(rv, v) + dot(self.w, v) * travel) / q)
     }
+    /// Received centre of the equivalent still-air curve, relative to this emission time.
+    /// Completing the wavefront quadratic gives reception as
+    /// `alpha * t + beta + sqrt(A * t² + 2 B * t + C) / a`, where
+    /// `a = c² - |w|²`. Its fitted centre is `beta - alpha * B / A + sqrt(C - B² / A) / a`.
+    /// This also handles a coarse sample with `rv.v != 0`; it need not be the exact CPA.
+    /// The equivalent curve requires a moving source subsonic relative to the medium.
+    #[inline]
+    pub fn fit_center_offset(&self, rv: V3, v: V3) -> f64 {
+        let a = self.c * self.c - dot(self.w, self.w);
+        let relative = sub(v, self.w);
+        if !(self.c > 0.0 && a > 0.0 && a.is_finite())
+            || rv.iter().chain(&v).chain(&self.w).any(|x| !x.is_finite())
+            || dot(relative, relative) >= self.c * self.c
+        {
+            return f64::NAN;
+        }
+        let (b, q) = (dot(self.w, rv), dot(self.w, v));
+        let aa = q * q + a * dot(v, v);
+        let bb = b * q + a * dot(rv, v);
+        let cc = b * b + a * dot(rv, rv);
+        let alpha = 1.0 + q / a;
+        let closest = cc - bb * bb / aa;
+        let centre = b / a - alpha * bb / aa + closest.sqrt() / a;
+        if aa > 0.0 && alpha > 0.0 && closest > 0.0 && centre.is_finite() {
+            centre
+        } else {
+            f64::NAN
+        }
+    }
+
     /// First-order scale for the coarse gates on speeds/distances fitted in still air at
     /// `c_fit`: (c, v, d) -> lambda (c, v, d) leaves a still-air curve invariant, and the
     /// leading wind correction adds v.w/c to the effective c. This is an approximation;
@@ -1275,6 +1316,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fitted_wind_centre_matches_independent_wavefront_observations() {
+        let emitted = 350.0;
+        let rotate = |v: V3| [v[2], v[0], v[1]];
+        for (rv, v, w) in [
+            ([0.0, 11_000.0, 1500.0], [70.0, 0.0, 0.0], [0.0; 3]),
+            ([0.0, 11_000.0, 1500.0], [70.0, 0.0, 0.0], [65.0, 0.0, 0.0]),
+            ([0.0, 11_000.0, 1500.0], [70.0, 0.0, 0.0], [0.0, 65.0, 0.0]),
+            ([0.0, 11_000.0, 1500.0], [70.0, 0.0, 0.0], [65.0, 65.0, 0.0]),
+            (
+                [0.0, 8000.0, 1200.0],
+                [25.0, 0.0, 0.0],
+                [-85.0, -130.0, 0.0],
+            ),
+        ] {
+            for (rv, v, w) in [(rv, v, w), (rotate(rv), rotate(v), rotate(w))] {
+                let prop = Prop { c: 343.0, w };
+                let a = prop.c.powi(2) - dot(w, w);
+                let (b, q) = (dot(w, rv), dot(w, v));
+                let aa = q * q + a * dot(v, v);
+                let bb = b * q + a * dot(rv, v);
+                let cc = b * b + a * dot(rv, rv);
+                let alpha = 1.0 + q / a;
+                let centre = prop.fit_center_offset(rv, v);
+                // A different reference emission time must leave the received centre fixed;
+                // the sampled position is deliberately no longer perpendicular to velocity.
+                assert!(
+                    (50.0 + prop.fit_center_offset(add(rv, scale(v, 50.0)), v) - centre).abs()
+                        < 1e-10
+                );
+                for c_fit in [300.0, 343.0, 360.0] {
+                    let speed = c_fit * aa.sqrt() / (a + q);
+                    let distance = c_fit / a * (cc - bb * bb / aa).sqrt();
+                    for te in [-240.0, -90.0, 0.0, 90.0, 240.0] {
+                        let position = add(rv, scale(v, te));
+                        let heard = te + wavefront_travel(position, w, prop.c);
+                        let dt = 0.01;
+                        let before = wavefront_travel(sub(position, scale(v, dt)), w, prop.c);
+                        let after = wavefront_travel(add(position, scale(v, dt)), w, prop.c);
+                        let observed = emitted / (1.0 + (after - before) / (2.0 * dt));
+                        let fitted = cv_curve(
+                            heard,
+                            emitted / alpha,
+                            speed,
+                            distance,
+                            centre - distance / c_fit,
+                            c_fit,
+                        );
+                        assert!(
+                            (fitted - observed).abs() < 2e-6,
+                            "rv={rv:?}, wind={w:?}, te={te}: {fitted} vs {observed}"
+                        );
+                    }
+                }
+                let cpa = Cpa {
+                    t_e: 1_788_895_000.0,
+                    d: norm(rv),
+                    speed: norm(v),
+                    interior: true,
+                    rv,
+                    vel: v,
+                };
+                assert!((cpa.t_r_fit_p(&prop) - cpa.t_e - centre).abs() < 2e-7);
+                if w == [0.0; 3] {
+                    assert_eq!(cpa.t_r_fit_p(&prop).to_bits(), cpa.t_r(prop.c).to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_wind_centre_requires_a_valid_subsonic_curve() {
+        let rv = [0.0, 8000.0, 1200.0];
+        let v = [25.0, 0.0, 0.0];
+        let prop = Prop {
+            c: 343.0,
+            w: [-85.0, -130.0, 0.0],
+        };
+        assert!(prop.fit_center_offset(rv, v) < -16.0);
+        assert!(prop.travel(rv, norm(rv)) > 17.0);
+        for invalid in [
+            Prop::still(0.0),
+            Prop::still(f64::NAN),
+            Prop {
+                c: 343.0,
+                w: [343.0, 0.0, 0.0],
+            },
+            Prop {
+                c: 343.0,
+                w: [f64::NAN, 0.0, 0.0],
+            },
+        ] {
+            assert!(invalid.fit_center_offset(rv, v).is_nan());
+        }
+        assert!(prop.fit_center_offset(rv, [0.0; 3]).is_nan());
+        assert!(prop.fit_center_offset(rv, [500.0, 0.0, 0.0]).is_nan());
+        assert!(prop.fit_center_offset([f64::NAN, 0.0, 0.0], v).is_nan());
+        assert!(
+            prop.fit_center_offset(rv, [f64::INFINITY, 0.0, 0.0])
+                .is_nan()
+        );
     }
 
     #[test]

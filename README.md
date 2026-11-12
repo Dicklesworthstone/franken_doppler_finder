@@ -205,6 +205,16 @@ source ground velocity `v_s` and acoustic travel time `T`, its predictions satis
 including crosswind displacement. This approximation does not trace refracted rays through atmospheric
 layers. Coarse gates retain the existing first-order wind rescaling of the fitted `v` and `d`.
 
+The fitted still-air curve's centre is also converted to the candidate's moving medium.
+With oblique wind it differs from the arrival of sound emitted at geometric closest approach,
+and can even precede that emission time. The trace search uses the converted centre for
+seeding, joint clocks, calibration, confirmation, refinement and matching detections to
+otherwise unheard passes. Geometric CPA arrival timestamps in reports retain their physical
+meaning. Moving or undeclared media examine the retained track spans beyond the former time
+crops; this can add work, with the existing hypothesis budgets and truncation warnings.
+The conversion is exact for constant velocity in a homogeneous medium and uses the local
+CPA velocity on a turning track. It changes no measurement or confidence threshold.
+
 For recorded flight tracks, an emission-time solve that fails to converge with Newton's method
 retries inside a signed time bracket. A turning aircraft can otherwise make Newton alternate
 between distant parts of its path even when the sound has one valid emission time. The retry

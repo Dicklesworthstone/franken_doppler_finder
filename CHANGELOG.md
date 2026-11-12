@@ -19,6 +19,30 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Match wind-shifted fitted clocks to physical aircraft tracks
+
+- Convert a still-air fit's curve centre to the same moving-medium geometry as its
+  source-tone constraint. Oblique wind separates that centre from the geometric
+  CPA's acoustic arrival; comparing the two directly could reject the true place
+  and recording clock.
+- Apply the conversion through hypotheses, joint-clock scoring, null calibration,
+  confirmation, refined reevaluation, diagnostic explanation and unheard-pass
+  detection checks. Reported geometric CPA arrival times retain their physical meaning.
+- Preserve the established calm-air arithmetic and sampling. Moving or undeclared
+  media inspect both omitted hypothesis spans and retained confirmation visits,
+  because a fitted centre can precede geometric emission. Existing hypothesis
+  budgets and truncation reporting still apply; larger scans can add work.
+- Add independent-wavefront and actual-fitter regressions, including ordinary
+  measured timing tolerances, both relative and Unix-epoch clocks, negative fitted
+  centres, confirmation/refinement, wrong-clock rejection and unheard-pass controls.
+- Native validation with pinned nightly 2026-08-31 and locked dependencies: all four
+  new regressions and four adjacent core controls pass in the actual fdop-core
+  crate with Cranelift. The actual physics/track component also passes 50 tests
+  (one existing timing benchmark ignored), including the previous emission-solver
+  regressions. Workspace formatting still reports pre-existing differences.
+  Workspace Clippy/tests, release CLI selftest and real-recording replays are not
+  established by these focused checks; no field-accuracy or timing claim is made.
+
 ### Recover independent aircraft hidden inside coarse harmonic families
 
 - When fewer than two independent aircraft survive measurement, try unused detected
