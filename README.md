@@ -1365,6 +1365,12 @@ Design notes:
   A band wider than that budget still needs one complete column; parallel FFT scratch is separate.
   The final spectrogram still scales with recording length, but a second complete spectrogram and a
   separate allocation for every frame are no longer retained. Frequency bins and frame centres are unchanged.
+- **Robust fits choose their winner with the robust objective.** Multiple starting geometries
+  are solved with soft-L1 loss at a 0.5 Hz transition scale, and now compete using that same loss.
+  A few large jumps to an unrelated ridge must not select a different aircraft merely by
+  reducing ordinary squared error. The existing outlier trim and final linear fit follow
+  selection; uncertainty profiles still use their original linear residual sums. No measurement
+  gate or confidence threshold changes with this correction.
 - **Guided measurement follows the predicted ridge.** It selects the nearest qualified local spectral
   peak within the existing model band, using the existing SNR and robust-z requirements. A brighter
   neighbouring aircraft no longer automatically takes over the trace when both tones enter that band.
@@ -1677,6 +1683,23 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover the physical pass when a trace jumps to another ridge
+
+The new `fit::tests::robust_multistart_recovers_a_pass_after_a_terminal_ridge_jump` regression
+uses 121 synthetic frequency observations of a 200 Hz source moving at 50 m/s, 3 km from
+the observer, with deterministic 0.08 Hz scatter. Its last six observations jump down by
+120 Hz. The expected result retains the original pass and rejects those six observations.
+A second regression covers clean joint, approach-only and recede-only fits. Existing profile
+and uncertainty tests are unchanged.
+
+An independent SciPy reproduction of the solve/trim/refit sequence found the previous
+selection returning a false 199.8 m/s pass at 255 m, while robust-objective selection
+returned 49.997 m/s at 2999.6 m and retained the 115 uncontaminated observations. These
+are numerical reproduction results, not execution of the Rust fitter or a recording replay.
+The pinned native build lost its execution host during dependency compilation; the new
+Rust regressions, full workspace checks, release selftest and field/reference replays
+remain unverified. No real-recording accuracy improvement is claimed.
 
 ### Aircraft hidden inside coarse harmonic families
 

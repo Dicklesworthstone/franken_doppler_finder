@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover robust Doppler fits despite a short jump to another ridge
+
+- Rank multistart soft-L1 fits by the same robust objective used to solve them. Ranking
+  those fits by linear squared error let a few large ridge errors select a different
+  aircraft before outlier trimming. Share the existing 0.5 Hz loss scale between solves
+  and ranking; preserve the MAD trim, final linear refit, profile residual sums and gates.
+- Add a physical known-answer trace regression with six contaminated observations out
+  of 121, plus clean joint and separate-side controls. Existing tests are unchanged.
+- Independent SciPy reproduction: the old ranking ended at 199.8 m/s and 255 m for a
+  50 m/s, 3000 m pass; the corrected ranking ended at 49.997 m/s and 2999.6 m, rejecting
+  precisely the six contaminated observations. This is numerical reproduction evidence,
+  not native Rust or real-recording validation.
+- Source review and objective arithmetic checks completed. The pinned native build
+  lost its execution host during dependency compilation. The authored Rust regressions,
+  formatting, Clippy, workspace tests, release selftest and reference/field replays
+  remain unverified; no field-accuracy or performance claim is made.
+
 ### Keep main ADS-B data usable when optional MLAT discovery fails
 
 - Availability checks and main-only fetches discover prod (or staging when prod is

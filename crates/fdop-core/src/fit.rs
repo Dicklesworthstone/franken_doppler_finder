@@ -70,6 +70,9 @@ pub struct FitResult {
     pub warnings: Vec<String>,
 }
 
+/// Robust loss transition scale in Hz, shared by the solves and multistart ranking.
+const ROBUST_F_SCALE_HZ: f64 = 0.5;
+
 /// Least local scatter (Hz) the misfit ratio divides by ([`Diagnostics::local_sigma`]).
 const LOCAL_SIGMA_FLOOR_HZ: f64 = 0.03;
 
@@ -221,7 +224,7 @@ fn ls(
     let opts = LeastSquaresOptions {
         method: Some(LeastSquaresMethod::Trf),
         loss,
-        f_scale: 0.5,
+        f_scale: ROBUST_F_SCALE_HZ,
         x_scale_jac: true,
         max_nfev: Some(4000),
         ..Default::default()
@@ -322,7 +325,14 @@ fn robust_point_fit(
                 x0[2] *= dmul;
                 x0[1] = (x0[1] * vmul).min(0.9 * c);
                 x0[3] = (init[3] + init[2] / c) - x0[2] / c;
-                let (p, cost, res) = ls(t, f, c, x0, &free, &[], LossKind::SoftL1);
+                let (p, _, res) = ls(t, f, c, x0, &free, &[], LossKind::SoftL1);
+                // Rank robust solves by their own objective. Linear squared error
+                // lets a few large ridge jumps select a different pass before the
+                // outlier trim can reject them. Profiles/refits still use linear SSE.
+                let cost = res
+                    .iter()
+                    .map(|&r| ROBUST_F_SCALE_HZ * (r.hypot(ROBUST_F_SCALE_HZ) - ROBUST_F_SCALE_HZ))
+                    .sum();
                 if best.as_ref().is_none_or(|b| cost < b.1) {
                     best = Some((p, cost, res));
                 }
@@ -385,7 +395,7 @@ fn fit_split_sides(
             let opts = LeastSquaresOptions {
                 method: Some(LeastSquaresMethod::Trf),
                 loss: LossKind::SoftL1,
-                f_scale: 0.5,
+                f_scale: ROBUST_F_SCALE_HZ,
                 x_scale_jac: true,
                 max_nfev: Some(3000),
                 ..Default::default()
@@ -970,6 +980,71 @@ mod tests {
                 )
             })
             .unzip()
+    }
+
+    fn ridge_jump_trace(jump_hz: f64) -> (Vec<f64>, Vec<f64>) {
+        let c = 343.0;
+        let (f0, v, d, t0e) = (200.0, 50.0, 3000.0, 0.0);
+        let t: Vec<f64> = (0..=120).map(|k| -120.0 + 2.0 * k as f64).collect();
+        let f: Vec<f64> = t
+            .iter()
+            .enumerate()
+            .map(|(k, &tr)| {
+                // Generate the received tone from emission range/radial velocity,
+                // independently of the fit's differentiated retarded-time model.
+                let tau = crate::physics::retarded_tau(tr, t0e, v, d, c);
+                let (range, radial) = crate::physics::cv_radial(tau, v, d);
+                assert!(range > 0.0);
+                let tone = f0 * c / (c + radial) + 0.08 * (1.731 * k as f64).sin();
+                tone - if k >= 115 { jump_hz } else { 0.0 }
+            })
+            .collect();
+        (t, f)
+    }
+
+    #[test]
+    fn robust_multistart_recovers_a_pass_after_a_terminal_ridge_jump() {
+        let (t, f) = ridge_jump_trace(120.0);
+        // The ridge follower switches to an unrelated tone for the final six
+        // frames. Those frames must not choose a different aircraft before trim.
+        let prepared = prepare_constant_velocity(&t, &f, 343.0, Side::Both).unwrap();
+        let best = prepared.best();
+        assert!((best.f0 - 200.0).abs() < 0.05, "{best:?}");
+        assert!((best.v - 50.0).abs() < 0.1, "{best:?}");
+        assert!((best.d - 3000.0).abs() < 10.0, "{best:?}");
+        assert!(best.t0e.abs() < 0.1, "{best:?}");
+        assert!(best.rmse < 0.06, "{best:?}");
+        assert_eq!(prepared.t_i.len(), 115);
+        assert!(prepared.inl[..115].iter().all(|&inlier| inlier));
+        assert!(prepared.inl[115..].iter().all(|&inlier| !inlier));
+    }
+
+    #[test]
+    fn robust_multistart_preserves_clean_and_separate_side_fits() {
+        let c = 343.0;
+        let (t, f) = ridge_jump_trace(0.0);
+        for side in [Side::Both, Side::Approach, Side::Recede] {
+            let prepared = prepare_constant_velocity(&t, &f, c, side).unwrap();
+            let best = prepared.best();
+            assert!((best.f0 - 200.0).abs() < 0.2, "{side:?}: {best:?}");
+            assert!((best.v - 50.0).abs() < 0.5, "{side:?}: {best:?}");
+            assert!((best.d - 3000.0).abs() < 30.0, "{side:?}: {best:?}");
+            assert!((best.t0r - 3000.0 / c).abs() < 0.5, "{side:?}: {best:?}");
+            assert!(best.rmse < 0.06, "{side:?}: {best:?}");
+            assert!(prepared.inl.iter().all(|&inlier| inlier));
+            if side == Side::Both {
+                assert_eq!(prepared.t_i.len(), t.len());
+            } else {
+                assert!(prepared.t_i.len() >= 50);
+                assert!(prepared.t_i.iter().all(|&tr| {
+                    if side == Side::Approach {
+                        tr < 3000.0 / c
+                    } else {
+                        tr >= 3000.0 / c
+                    }
+                }));
+            }
+        }
     }
 
     fn profile_oracle(
