@@ -17,7 +17,7 @@ use fdop_types::store::{FlightLeg, alt_src, pt_flags};
 
 #[derive(Clone, Debug)]
 pub struct TrackModel {
-    /// Original leg/split key; extra parts recovered during cleaning append `#recoveredN`.
+    /// Original leg/split key; cleaning adds `#recoveredN`, corrected-height recovery `#correctedN`.
     pub key: String,
     pub icao: String,
     pub reg: String,
@@ -167,6 +167,22 @@ fn position_speed_limit(
     Some((1.5 * *median + 30.0).min(fdop_types::C_SOUND))
 }
 
+/// Reported-speed envelope shared by chain selection and separated corrected-height recovery.
+fn reported_speed_limit(pts: &[fdop_types::store::TrackPoint]) -> f64 {
+    let mut gs: Vec<f64> = pts
+        .iter()
+        .filter(|p| p.gs_mps.is_finite() && p.gs_mps > 0.0)
+        .map(|p| p.gs_mps as f64)
+        .collect();
+    if gs.is_empty() {
+        200.0
+    } else {
+        gs.sort_by(f64::total_cmp);
+        let med = gs[gs.len() / 2];
+        (1.5 * med + 30.0).max(80.0)
+    }
+}
+
 /// Keep the original longest physically consistent chain, then recover well-separated parts
 /// before or after it. Added parts must have at least two points, be more than `max_gap_s` from
 /// every kept part, and be physically reachable from their kept neighbours. An alternative
@@ -176,18 +192,7 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
     if n < 3 {
         return vec![(0..n).collect()];
     }
-    let mut gs: Vec<f64> = pts
-        .iter()
-        .filter(|p| p.gs_mps.is_finite() && p.gs_mps > 0.0)
-        .map(|p| p.gs_mps as f64)
-        .collect();
-    let mut v_lim = if gs.is_empty() {
-        200.0
-    } else {
-        gs.sort_by(f64::total_cmp);
-        let med = gs[gs.len() / 2];
-        (1.5 * med + 30.0).max(80.0)
-    };
+    let mut v_lim = reported_speed_limit(pts);
     // horizontal position at the leg's mean height (ENU around the first point)
     let enu = Enu::new(pts[0].lat, pts[0].lon, 0.0);
     let xy: Vec<[f64; 2]> = pts
@@ -409,8 +414,27 @@ fn recover_velocity_component(
     }
 }
 
-/// Build track models from one stored leg (possibly several, split at gaps). When GNSS
-/// bridging leaves no usable model, retry corrected-height reports under the same checks.
+/// Separate models may describe the same aircraft only if their endpoints remain reachable
+/// under the chain cleaner's horizontal/vertical limits. No interpolation crosses this gap.
+fn separated_models_reachable(
+    left: &TrackModel,
+    right: &TrackModel,
+    speed_limit: f64,
+    bp: &BuildParams,
+) -> bool {
+    let dt = right.t0() - left.t1();
+    if !dt.is_finite() || dt <= bp.max_gap_s {
+        return false;
+    }
+    let (lat0, lon0, h0) = ecef_to_geodetic(*left.pos.last().unwrap());
+    let (lat1, lon1, h1) = ecef_to_geodetic(right.pos[0]);
+    let horizontal = Enu::new(lat0, lon0, 0.0).from_ecef(geodetic_to_ecef(lat1, lon1, 0.0));
+    horizontal[0].hypot(horizontal[1]) <= speed_limit * dt + bp.pos_slack_m.0
+        && (h1 - h0).abs() <= bp.max_vz_mps * dt + bp.pos_slack_m.1
+}
+
+/// Build track models from one stored leg (possibly several, split at gaps). Corrected-height
+/// recovery keeps preferred models intact and restores only separately supported, reachable parts.
 pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
     let mut pts: Vec<_> = leg
         .points
@@ -510,25 +534,50 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
             start = i;
         }
     }
-    if out.is_empty() && bridge_dropped {
-        // GNSS provenance does not make a corrupt position a usable interpolation
-        // anchor. If every preferred chain failed, recover the corrected-height
-        // reports it hid. Raw pressure altitude is not an MSL reference, and the
-        // rejected GNSS positions must not re-enter through a new mixed chord.
-        // Keep the entire original result whenever any preferred model survived.
-        let mut corrected = leg.clone();
-        corrected
-            .points
-            .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
-        if corrected.points.len() >= 3 {
+    if bridge_dropped {
+        // Preferred models retain their exact samples, motion and keys. Corrected reports
+        // close to their coverage cannot extend or compete with that preferred geometry.
+        let mut kept: Vec<usize> = (0..out.len()).collect();
+        kept.sort_unstable_by(|&a, &b| out[a].t0().total_cmp(&out[b].t0()));
+        let eligible = |p: &fdop_types::store::TrackPoint| {
+            if p.alt_src != alt_src::BARO_CORRECTED || !p.t.is_finite() {
+                return false;
+            }
+            let i = kept.partition_point(|&k| out[k].t0() <= p.t);
+            (i == 0 || p.t - out[kept[i - 1]].t1() > bp.max_gap_s)
+                && (i == kept.len() || out[kept[i]].t0() - p.t > bp.max_gap_s)
+        };
+        // Avoid cloning the leg when ordinary preferred coverage already contains it.
+        if leg.points.iter().filter(|p| eligible(p)).take(3).count() == 3 {
+            let mut corrected = leg.clone();
+            corrected.points.retain(eligible);
             let unbridged = BuildParams {
                 gnss_bridge_s: 0.0,
                 ..*bp
             };
-            out = build(&corrected, &unbridged);
-            // Two points bypass consistency cleaning. This fallback needs two
-            // independently checked chords, not an unsupported two-point segment.
-            out.retain(|model| model.t.len() >= 3);
+            let mut recovered = build(&corrected, &unbridged);
+            // Two points bypass consistency cleaning. Recovery requires two checked chords.
+            recovered.retain(|model| model.t.len() >= 3);
+            if out.is_empty() {
+                // Preserve the established all-preferred-failed fallback, including its keys.
+                out = recovered;
+            } else {
+                let speed_limit = reported_speed_limit(&pts);
+                let original_len = out.len();
+                for mut model in recovered {
+                    let i = kept.partition_point(|&k| out[k].t0() < model.t0());
+                    if (i > 0
+                        && !separated_models_reachable(&out[kept[i - 1]], &model, speed_limit, bp))
+                        || (i < kept.len()
+                            && !separated_models_reachable(&model, &out[kept[i]], speed_limit, bp))
+                    {
+                        continue;
+                    }
+                    model.key = format!("{}#corrected{}", leg.key, out.len() - original_len);
+                    kept.insert(i, out.len());
+                    out.push(model);
+                }
+            }
         }
     }
     out
@@ -3715,6 +3764,111 @@ mod tests {
         }
         assert_same_gap_model(&recovered[0], &expected[0]);
         assert_same_gap_model(&recovered[1], &expected[2]);
+    }
+
+    fn partial_gnss_leg(retain_corrected: impl Fn(f64) -> bool) -> (FlightLeg, Enu) {
+        let (mut leg, enu) = failed_gnss_brackets(1080.0, retain_corrected);
+        for p in &mut leg.points {
+            let t = p.t - 1000.0;
+            if p.alt_src == alt_src::GEOM && (480.0..=520.0).contains(&t) {
+                let (lat, lon, _) = ecef_to_geodetic(enu.to_ecef([100.0 * t, 0.0, 1200.0]));
+                (p.lat, p.lon) = (lat, lon);
+            }
+        }
+        (leg, enu)
+    }
+
+    #[test]
+    fn partial_gnss_recovery_restores_distant_corrected_flyovers() {
+        for gaps in [true, false] {
+            let (leg, enu) = partial_gnss_leg(|t| !gaps || t < 180.0 || t > 900.0);
+            let mut gnss = leg.clone();
+            gnss.points.retain(|p| p.alt_src == alt_src::GEOM);
+            let preferred = build(&gnss, &NO_BRIDGE);
+            assert_eq!(preferred.len(), 1);
+            assert_eq!(preferred[0].t, vec![1480.0, 1500.0, 1520.0]);
+
+            // The supported portions outside 300..700 s are each separated from
+            // the preferred 480..520 s segment by more than the ordinary 180 s gap.
+            let mut corrected = leg.clone();
+            corrected.points.retain(|p| {
+                p.alt_src == alt_src::BARO_CORRECTED && (p.t < 1300.0 || p.t > 1700.0)
+            });
+            let expected = build(&corrected, &NO_BRIDGE);
+            assert_eq!(expected.len(), 2);
+            let recovered = build(&leg, &BuildParams::default());
+            assert_eq!(
+                recovered.len(),
+                3,
+                "both distant physical portions must survive"
+            );
+            assert_same_gap_model(&recovered[0], &preferred[0]);
+            for (k, (model, original)) in recovered[1..].iter().zip(&expected).enumerate() {
+                let mut original = original.clone();
+                original.key = format!("{}#corrected{k}", leg.key);
+                assert_same_gap_model(model, &original);
+                assert!(model.t.len() >= 3);
+                let span = (model.t0() - 1000.0 + 5.0, model.t1() - 1000.0 - 5.0);
+                let state = |t| {
+                    (
+                        enu.to_ecef([100.0 * t, 0.0, 1200.0]),
+                        enu.vec_to_ecef([100.0, 0.0, 0.0]),
+                    )
+                };
+                let observer = enu.to_ecef([50.0 * (span.0 + span.1), 1500.0, 0.0]);
+                let rms = doppler_rms_hz(model, observer, span, state);
+                assert!(rms < 1e-4, "recovered physical Doppler RMS {rms} Hz");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_gnss_recovery_requires_separation_reachability_and_support() {
+        let (leg, enu) = partial_gnss_leg(|t| t < 180.0 || t > 900.0);
+        let mut gnss = leg.clone();
+        gnss.points.retain(|p| p.alt_src == alt_src::GEOM);
+        let preferred = build(&gnss, &NO_BRIDGE);
+        assert_eq!(preferred.len(), 1);
+
+        let (nearby, _) = partial_gnss_leg(|t| (300.0..=700.0).contains(&t));
+        let mut raw = leg.clone();
+        for p in &mut raw.points {
+            if p.alt_src == alt_src::BARO_CORRECTED {
+                p.alt_src = alt_src::BARO_RAW;
+                p.alt_m -= 150.0;
+            }
+        }
+        let mut sparse = leg.clone();
+        sparse
+            .points
+            .retain(|p| p.alt_src == alt_src::GEOM || p.t < 1015.0 || p.t > 2065.0);
+        assert_eq!(
+            sparse
+                .points
+                .iter()
+                .filter(|p| p.alt_src == alt_src::BARO_CORRECTED)
+                .count(),
+            4
+        );
+        let mut unreachable = leg;
+        for p in &mut unreachable.points {
+            if p.alt_src == alt_src::BARO_CORRECTED {
+                let t = p.t - 1000.0;
+                let (lat, lon, _) =
+                    ecef_to_geodetic(enu.to_ecef([500_000.0 + 100.0 * t, 0.0, 1200.0]));
+                (p.lat, p.lon) = (lat, lon);
+            }
+        }
+        let mut isolated = unreachable.clone();
+        isolated
+            .points
+            .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
+        assert_eq!(build(&isolated, &NO_BRIDGE).len(), 2);
+        for input in [nearby, raw, sparse, unreachable] {
+            let got = build(&input, &BuildParams::default());
+            assert_eq!(got.len(), 1);
+            assert_same_gap_model(&got[0], &preferred[0]);
+        }
     }
 
     #[test]

@@ -1283,12 +1283,15 @@ Design notes:
   Each interval becomes a separate model; interpolation never crosses the hole. The original
   model and existing split keys stay intact; additional models use deterministic `#recoveredN`
   suffixes. Overlapping alternatives and a denser ambiguous winning component remain unresolved.
-- **Unusable GNSS reports cannot erase an otherwise supported corrected-height flight.** If
-  preferring GNSS-height reports removed other points and leaves no usable track model, the
-  builder retries the reports whose barometric heights were already corrected to MSL. The retry
-  keeps the same position, velocity and gap checks and requires at least three retained reports
-  in each model. It cannot use raw pressure altitude, join a real coverage gap, or replace any
-  model the preferred path already built.
+- **Unusable GNSS reports cannot erase separately supported corrected-height flights.** If
+  preferring GNSS-height reports removed other points, the builder can retry reports whose
+  barometric heights were already corrected to MSL. Each recovered model needs at least three
+  retained reports under the existing position, velocity and gap checks. When preferred models
+  survive, recovery uses only observations more than the configured gap (180 s by default)
+  outside their time coverage. Added models must also be physically reachable from their nearest
+  kept neighbours under the same motion limits and position allowances. Preferred samples,
+  velocities, order and keys stay intact; added parts use deterministic `#correctedN` suffixes.
+  No spline crosses these gaps, and raw pressure altitudes cannot enter this recovery.
 - **Missing speed reports do not impose a 200 m/s aircraft limit.** If the established track
   cleaner finds no usable model and every groundspeed report is missing, three consecutive
   positions can establish a faster motion scale. Their adjacent horizontal velocity vectors
@@ -1713,6 +1716,30 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover distant corrected-height portions beside a valid GNSS segment
+
+A surviving preferred GNSS segment previously disabled corrected-height recovery for the
+entire flight leg. The builder now preserves that segment while admitting independently
+supported, separated and physically reachable corrected-height portions before or after it.
+Near or overlapping observations cannot modify the preferred geometry.
+
+Two new regressions exercise an 18-minute physical 100 m/s trajectory with a valid 40 s GNSS
+segment. They require both distant corrected-height portions to survive, check their positions
+and Doppler motion against the known trajectory, and compare every preferred-model field and
+floating-point bit with the original result. Controls cover raw altitude, two-point fragments,
+nearby support and internally coherent portions displaced 500 km away.
+
+The before-fix native regression returned one model instead of the expected three; its
+restriction controls already passed. With the fix, both new regressions pass. The complete
+track module passes **54 tests, with 1 ignored timing benchmark and no failures**, using the
+actual `fdop-core` test crate, pinned `nightly-2026-08-31`, the official Cranelift backend and
+unoptimized build profiles. Preferred-model preservation and every existing GNSS/track gate
+test pass with them.
+
+Workspace checks, release selftest and reference/field replays have not completed at this
+validation snapshot. These are synthetic track and Doppler results; no field-accuracy or
+runtime improvement is claimed here.
 
 ### Wind changes fitted speed and distance by different amounts
 

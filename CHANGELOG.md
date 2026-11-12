@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover distant corrected-height portions beside surviving GNSS models
+
+- Extend corrected-height recovery beyond complete preferred-track failure. Keep all
+  preferred models intact and retry only corrected MSL reports separated from their
+  coverage by more than the existing maximum gap. Each added model needs at least
+  three retained reports and must remain reachable from its nearest kept neighbours.
+- Reuse the existing reported-speed envelope, vertical-motion limit and position
+  allowances. Keep recovered portions separate, preserve preferred model order/keys,
+  and give added parts deterministic `#correctedN` suffixes. The existing all-failed
+  fallback keeps its original model keys; raw pressure heights remain excluded.
+- Add physical known-answer regressions for gapped and continuous corrected support
+  around one valid GNSS segment, exact preservation of the preferred model, Doppler
+  agreement and near/raw/two-point/unreachable controls. No confidence thresholds or
+  search budgets change.
+- Native validation reproduces the original one-model result where the positive
+  regression requires three; its restriction controls already passed. Both pass with
+  the fix, and the entire track module passes 54 tests, with 1 ignored timing benchmark
+  and no failures. This uses the actual core crate on pinned `nightly-2026-08-31`,
+  official Cranelift and unoptimized build profiles. Workspace checks, release selftest
+  and real-recording replays have not completed at this snapshot.
+
 ### Validate wind recovery and the physical prerequisites of recovery fixtures
 
 - Resume actual `fdop-core` validation on pinned `nightly-2026-08-31` after the host
