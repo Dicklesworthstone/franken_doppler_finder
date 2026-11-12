@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve wind-supported aircraft through the complete geometry search
+
+- Use separate physical/fitted speed and range conversions in hypothesis reach and
+  sampling. Before the observer direction is known, bound every CPA-direction range
+  for the sampled medium; exact candidate evaluation checks the actual direction.
+- Compare physical aircraft CPAs in the measured curve's fitted coordinates throughout
+  quick/fine scoring, calibration, confirmation, terrain recovery and final reevaluation.
+  Calm arithmetic, confidence thresholds, slack and counted search budgets are unchanged.
+- Add an actual-fitter regression with two subsonic aircraft in oblique headwind,
+  ordinary measured intervals, relative/Unix clocks, pair search, confirmation,
+  refined reevaluation and wrong-speed/distance/clock controls.
+- Correct two earlier synthetic fixtures that encoded the former approximate geometry.
+  Preserve their original assertions and tolerances; adjust the synthetic medium so
+  each still demonstrates its intended reach or omitted-time-window failure.
+- Source review and independent wavefront/bound arithmetic completed. Native builds
+  failed in locked dependencies before project compilation, and the host disconnected
+  before any new Rust regression ran. Workspace checks, release selftest and real
+  replays remain unverified; no field accuracy, timing or native recovery claim is made.
+  The preserved patch was reconstructed through GitHub after the host loss.
+
 ### Recover independent aircraft from refused coarse harmonic families
 
 - When fewer than two independent aircraft remain, also inspect unused detected

@@ -203,7 +203,8 @@ and wind for each pass as a homogeneous moving medium. For `r = source − obser
 source ground velocity `v_s` and acoustic travel time `T`, its predictions satisfy
 `|r + w T| = c T` and `f/f0 = 1 / (1 + dT/dt_e)`. The emission-time solver uses that same derivative,
 including crosswind displacement. This approximation does not trace refracted rays through atmospheric
-layers. Coarse gates retain the existing first-order wind rescaling of the fitted `v` and `d`.
+layers. Physical aircraft speed and distance are converted separately to the equivalent fitted
+coordinates; coarse hypotheses bound the possible distance scales before the observer direction is known.
 
 The fitted still-air curve's centre is also converted to the candidate's moving medium.
 With oblique wind it differs from the arrival of sound emitted at geometric closest approach,
@@ -321,6 +322,16 @@ It applies to quick and exact scoring, chance calibration, confirmation, indepen
 and refined matches, including the allowed tone change for model-misfit events.
 Calm-air intervals stay unchanged. This preserves the existing tolerance instead of discarding
 a physically supported windy pass because its source tone lies outside the unconverted interval.
+
+The speed and distance intervals from a still-air fit also require separate wind conversions.
+Exact candidate checks now predict both fitted quantities from the aircraft's physical CPA and
+compare them with the measured intervals. A common first-order factor could exclude the true
+aircraft even when its propagated frequency curve fitted exactly. Before an observer is known,
+hypothesis generation uses the corresponding speed scale and a distance interval covering all
+CPA directions for the sampled medium. Calm-air arithmetic, search budgets and confidence
+thresholds retain their existing behavior. The conversion is exact for constant velocity in
+homogeneous wind; using a local tangent and sampled weather on a turning or spatially varying
+path remains an approximation.
 
 Between stored Doppler predictions, the search uses a four-point cubic on a finite, monotone stretch,
 bounded by the two bracketing predictions. This reduces curvature bias for close, fast passes without
@@ -1235,8 +1246,8 @@ Design notes:
   for late events on long retained flight tracks; the catalogue's 1200 s pre-padding
   is relative to recording start, not a per-event work limit.
 - **Wind-scaled distances survive the spatial shortcuts.** The coarse search retains its
-  original padded region and expands it using the same local sound-speed/wind scale as
-  its distance gate, including when checking a narrow region between sampling times.
+  original padded region and expands it using the upper physical/fitted distance bound
+  for the locally sampled medium, including narrow regions between sampling times.
   Additional-flight confirmation uses the raw fitted-distance shortcut only for an
   explicitly uniform matching still-air medium; otherwise exact CPA, speed, distance,
   clock and trace checks decide. This can recover a flight that the corrected gates
@@ -1703,6 +1714,36 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Wind changes fitted speed and distance by different amounts
+
+The search now uses the exact homogeneous-wavefront geometry when comparing a physical
+aircraft with the speed and distance fitted in still air. For an independent synthetic example
+with sound speed 320 m/s, aircraft ground speed 180 m/s, headwind 80 m/s and closest distance
+3000 m, the equivalent fit at 343 m/s has speed 242.117647 m/s and distance 3321.083220 m.
+The former shared factor places the ordinary speed gate's lower bound at 182.0065 m/s,
+excluding the true aircraft. Separate conversions retain the original measured intervals.
+
+Three new track regressions check independent moving-wavefront observations, coordinate
+rotations and reference shifts, conservative CPA-direction bounds, calm controls and invalid
+inputs. Independent numerical reproduction passed 450 waveform observations (maximum
+frequency discrepancy 4.843e-7 Hz) and 4332 direction-bound cases. These are arithmetic checks,
+not execution of the authored Rust tests.
+
+A search regression supplies propagated traces to the actual constant-velocity fitter and
+measured-event adapter, then exercises the pair search, confirmation and final reevaluation
+at relative and Unix-epoch clocks. It retains ordinary uncertainty intervals and includes
+wrong-speed, wrong-distance and wrong-clock controls. Two earlier synthetic fixtures now
+use physically fitted geometry instead of the old approximation; their original recovery
+assertions and tolerances remain in place.
+
+Native validation is incomplete: pinned core build attempts were killed while compiling
+locked dependencies `cc` and `wide`, then the execution host disconnected before any new
+Rust regression ran. The changes passed changed-range formatting and whitespace checks before
+that loss; publication reconstructed the preserved patch through GitHub, with a reviewed
+fixture adjustment. Workspace Clippy/tests, release selftest and reference/field replays
+remain unverified. No end-to-end location, field-accuracy or performance improvement is claimed
+from this change.
+
 ### Recover the physical pass when a trace jumps to another ridge
 
 The new `fit::tests::robust_multistart_recovers_a_pass_after_a_terminal_ridge_jump` regression
@@ -2039,8 +2080,14 @@ work, and no end-to-end runtime improvement is claimed.
 
 ### Wind-scaled ranges and early source times: native search recovery
 
+**Archived fixture results.** The native results below used the former approximate gate
+metadata. The current fixtures use equivalent fitted geometry: the reach case uses a
+410 m/s synthetic sound speed and 80 m/s east wind, while the omitted-time-window case
+uses 90 m/s crosswind. Their recovery assertions are unchanged; those updated fixtures
+have not run natively after the execution-host outage.
+
 `wind_scaled_distances_reach_the_pair_join_and_confirmers` places a 230 m/s flight
-12 km laterally from the observer in a synthetic 120 m/s east wind. Its exact medium-scaled
+12 km laterally from the observer in a synthetic 120 m/s east wind. Its then-used approximate
 gates pass, but both preceding raw-distance shortcuts exclude it. The preceding code fails
 the first hypothesis assertion. The repair recovers both intended core flights at zero and
 Unix epochs within 0.163 m and 0.2 s, with no truncation. Direct confirmation also passes;

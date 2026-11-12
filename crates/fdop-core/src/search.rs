@@ -35,7 +35,9 @@ pub struct SearchEvent {
     pub t_rec: f64,
     /// Half-width of the plausible t_rec interval, s.
     pub t_tol: f64,
+    /// Speed interval of the equivalent still-air curve at `c_fit`, m/s.
     pub v_gate: [f64; 2],
+    /// Closest-distance interval of the equivalent still-air curve at `c_fit`, m.
     pub d_gate: [f64; 2],
     /// Tone (Hz) fitted in still air; wind converts this to a candidate's emitted tone.
     pub f0: f64,
@@ -47,7 +49,7 @@ pub struct SearchEvent {
     pub quality: f64,
     /// Model-misfit flag from the fit (wider gates, larger t_tol).
     pub misfit: bool,
-    /// Sound speed the fit assumed (still air): fitted v and d scale by c_true / c_fit.
+    /// Sound speed the still-air fit assumed. Wind maps its speed and distance separately.
     pub c_fit: f64,
     #[serde(skip)]
     pub tr_t: Vec<f64>,
@@ -591,8 +593,8 @@ fn hypotheses(
     cap: usize,
 ) -> HypSet {
     let count = AtomicUsize::new(0);
-    // Keep the established reach, expanding it when the same local scale used by the
-    // distance gate permits a farther pass. Testing the unscaled box first loses that pass
+    // Keep the established reach, expanding it when the local distance bound permits
+    // a farther pass. Testing the unscaled box first loses that pass
     // before its atmosphere can be evaluated. This remains an approximate CPA locus.
     let reach = p.region.padded_km(1.1 * ev.d_gate[1] / 1000.0 + 0.5);
     let in_reach = |lat, lon, d_hi: f64| {
@@ -619,7 +621,8 @@ fn hypotheses(
             let project = |t| {
                 let (pos, vel) = tr.pv(t);
                 let (la, lo, h) = ecef_to_geodetic(pos);
-                let ve = Enu::new(la, lo, 0.0).vec_from_ecef(vel);
+                let local = Enu::new(la, lo, 0.0);
+                let ve = local.vec_from_ecef(vel);
                 let vh = ve[0].hypot(ve[1]);
                 if vh <= 12.0
                     || (ordinary_still_air && !reach.contains(la, lo))
@@ -629,8 +632,14 @@ fn hypotheses(
                 }
                 let z0 = dem.elev_m(la, lo);
                 let med = atmo.medium(la, lo, t, z0 + MIC_HEIGHT_M, h);
-                let lam = (med.c + (ve[0] * med.wind_e + ve[1] * med.wind_n) / med.c) / ev.c_fit;
-                if !in_reach(la, lo, ev.d_gate[1] * lam) {
+                let distance_scale = if med.wind_e == 0.0 && med.wind_n == 0.0 {
+                    med.c / ev.c_fit
+                } else {
+                    Prop::from_medium(&med, &local)
+                        .fit_gate_scales(vel, ev.c_fit)?
+                        .1[1]
+                };
+                if !in_reach(la, lo, ev.d_gate[1] * distance_scale) {
                     return None;
                 }
                 let (mlat, mlon) = fdop_types::geo::m_per_deg(la);
@@ -660,13 +669,28 @@ fn hypotheses(
                 let z0 = dem.elev_m(la, lo);
                 let med = atmo.medium(la, lo, t, z0 + MIC_HEIGHT_M, h);
                 let c = med.c;
-                let lam = (c + (ve[0] * med.wind_e + ve[1] * med.wind_n) / c) / ev.c_fit;
-                let (d_lo, d_hi) = (ev.d_gate[0] * lam, ev.d_gate[1] * lam);
+                let (speed_scale, distance_scale) = if med.wind_e == 0.0 && med.wind_n == 0.0 {
+                    let scale = c / ev.c_fit;
+                    (scale, [scale; 2])
+                } else if let Some(scales) =
+                    Prop::from_medium(&med, &local).fit_gate_scales(vel, ev.c_fit)
+                {
+                    scales
+                } else {
+                    return (dt, None);
+                };
+                // Wind gives speed one exact scale, but range also depends on the unknown
+                // observer's direction. Seed its conservative annulus here; exact scoring
+                // compares the candidate's equivalent fitted speed and range separately.
+                let (d_lo, d_hi) = (
+                    ev.d_gate[0] * distance_scale[0],
+                    ev.d_gate[1] * distance_scale[1],
+                );
                 if !in_reach(la, lo, d_hi) {
                     return (dt, None);
                 }
-                if speed >= ev.v_gate[0] * lam
-                    && speed <= ev.v_gate[1] * lam
+                if speed >= ev.v_gate[0] * speed_scale
+                    && speed <= ev.v_gate[1] * speed_scale
                     && vh > 12.0
                     && tr.gap_at(t) <= p.max_gap_s
                 {
@@ -1630,14 +1654,26 @@ struct PointEval {
 /// without gates, so its minimum can land just past a bound that a nearby grid cell passed.
 const LOCATING_GATE_SLACK: f64 = 0.05;
 
-/// Gate check of one CPA against an event (fitted v, d rescaled to the true medium).
+/// Compare one physical CPA in the still-air coordinates of the measured curve.
 fn gates_ok(ev: &SearchEvent, cpa: &crate::track::Cpa, prop: &Prop, slack: f64) -> bool {
-    let lam = prop.fit_scale(cpa.vel, ev.c_fit);
-    cpa.interior
-        && cpa.d >= ev.d_gate[0] * lam * (1.0 - slack)
-        && cpa.d <= ev.d_gate[1] * lam * (1.0 + slack)
-        && cpa.speed >= ev.v_gate[0] * lam * (1.0 - slack)
-        && cpa.speed <= ev.v_gate[1] * lam * (1.0 + slack)
+    if !cpa.interior {
+        return false;
+    }
+    if prop.w == [0.0; 3] {
+        // Keep the established calm-air arithmetic and boundary comparisons exactly.
+        let lam = prop.c / ev.c_fit;
+        return cpa.d >= ev.d_gate[0] * lam * (1.0 - slack)
+            && cpa.d <= ev.d_gate[1] * lam * (1.0 + slack)
+            && cpa.speed >= ev.v_gate[0] * lam * (1.0 - slack)
+            && cpa.speed <= ev.v_gate[1] * lam * (1.0 + slack);
+    }
+    let Some((speed, distance)) = prop.fit_geometry(cpa.rv, cpa.vel, ev.c_fit) else {
+        return false;
+    };
+    distance >= ev.d_gate[0] * (1.0 - slack)
+        && distance <= ev.d_gate[1] * (1.0 + slack)
+        && speed >= ev.v_gate[0] * (1.0 - slack)
+        && speed <= ev.v_gate[1] * (1.0 + slack)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6595,6 +6631,130 @@ mod tests {
     }
 
     #[test]
+    fn measured_wind_geometry_reaches_search_and_confirmation() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let medium = fdop_types::atmo::Medium {
+            c: 320.0,
+            wind_e: -80.0,
+            wind_n: -60.0,
+        };
+        let prop = Prop::from_medium(&medium, &enu);
+        let atmo = fdop_types::atmo::UniformAtmosphere(medium);
+        let dem = FlatElevation(0.0);
+        let o = observer(lat, lon, &dem);
+        for start in [0.0, 1_788_895_000.0] {
+            let mut tracks = Vec::new();
+            let mut events = Vec::new();
+            for (key, position, velocity, at, emitted) in [
+                ("A", [0.0, 2800.0, 1200.0], [180.0, 0.0, 0.0], 180.0, 180.0),
+                ("B", [2800.0, 0.0, 1200.0], [0.0, 170.0, 0.0], 480.0, 230.0),
+            ] {
+                let mut position = position;
+                position[2] += MIC_HEIGHT_M;
+                let mut tr = straight_track(
+                    &enu,
+                    position,
+                    velocity,
+                    start + at,
+                    start - 100.0,
+                    start + 900.0,
+                    5.0,
+                );
+                tr.key = key.into();
+                // Use the actual fit and its ordinary generous intervals; no test-only
+                // widening may hide the former speed-gate rejection.
+                let ev = fitted_wind_event(key, &tr, o.x, start, emitted, start + at, 90, &prop);
+                let cpa = tr.cpa_nearest_time(o.x, start + at, 100.0).unwrap();
+                let old_scale = (prop.c + dot(cpa.vel, prop.w) / prop.c) / ev.c_fit;
+                assert!(
+                    cpa.speed < ev.v_gate[0] * old_scale,
+                    "the former common scale must exclude the real aircraft: {key}"
+                );
+                assert!(gates_ok(&ev, &cpa, &prop, 0.0));
+                for speed in [true, false] {
+                    let mut wrong = ev.clone();
+                    let gate = if speed {
+                        &mut wrong.v_gate
+                    } else {
+                        &mut wrong.d_gate
+                    };
+                    for bound in gate {
+                        *bound *= 0.5;
+                    }
+                    assert!(!gates_ok(&wrong, &cpa, &prop, 0.0));
+                }
+                tracks.push(tr);
+                events.push(ev);
+            }
+            let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+            let mut p = SearchParams::new(
+                start,
+                start,
+                800.0,
+                BBox::new(
+                    lat - 25.0 / mlat,
+                    lon - 25.0 / mlon,
+                    lat + 25.0 / mlat,
+                    lon + 25.0 / mlon,
+                ),
+            );
+            p.refine_half_m = 100.0;
+            let case = TwoCase {
+                tracks,
+                events,
+                p,
+                t_s: start,
+                obs: (lat, lon),
+            };
+            let tix = TimeIndex::new(&case.tracks);
+            for (i, ev) in case.events.iter().enumerate() {
+                let (chi, matched, ti) =
+                    best_confirmer(&o, start, ev, &case.tracks, &tix, &case.p, &atmo, &[])
+                        .expect("the measured wind geometry must reach exact confirmation");
+                assert_eq!(ti as usize, i);
+                assert!(chi < 0.01 && matched.coverage >= 0.99);
+                let mut wrong = ev.clone();
+                wrong.t_rec += 30.0;
+                assert!(
+                    best_confirmer(&o, start, &wrong, &case.tracks, &tix, &case.p, &atmo, &[])
+                        .is_none()
+                );
+            }
+            let result = check_wind_delayed_case(&case, medium, run_case(&case, medium));
+            let inputs = SearchInputs {
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                heard_times: case.events.iter().map(|ev| ev.t_rec).collect(),
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            let nulls: Vec<_> = case
+                .events
+                .iter()
+                .map(|ev| EventNull {
+                    event: ev.id.clone(),
+                    gate_nats: 6.0,
+                    ..EventNull::default()
+                })
+                .collect();
+            let fresh = refresh_refined_candidate(
+                &result.candidates[0],
+                &refinement_at(lat, lon, start),
+                &inputs,
+                &case.events,
+                &case.p,
+                &nulls,
+                &tix,
+            )
+            .expect("the recovered matches must survive final exact reevaluation");
+            assert_eq!(fresh.n_explained, 2);
+            assert!(fresh.events.iter().all(|m| m.chi < 0.01));
+        }
+    }
+
+    #[test]
     fn oblique_wind_fitted_centres_reach_pair_search_confirmation_and_refinement() {
         let (lat, lon) = (40.876466, -73.524951);
         let enu = Enu::new(lat, lon, 0.0);
@@ -7576,11 +7736,12 @@ mod tests {
         {
             let tr = &case.tracks[i];
             let cpa = tr.cpa_nearest_time(x, start + dt, 30.0).unwrap();
-            let scale = prop.fit_scale(cpa.vel, 343.0);
+            let (fitted_speed, fitted_distance) =
+                prop.fit_geometry(cpa.rv, cpa.vel, 343.0).unwrap();
             let mut ev = synth_event(id, tr, x, start, f0, 343.0, start + dt, &prop);
             ev.t_tol = 1.0;
-            ev.v_gate = [0.99 * cpa.speed / scale, 1.01 * cpa.speed / scale];
-            ev.d_gate = [0.99 * cpa.d / scale, 1.01 * cpa.d / scale];
+            ev.v_gate = [0.99 * fitted_speed, 1.01 * fitted_speed];
+            ev.d_gate = [0.99 * fitted_distance, 1.01 * fitted_distance];
             assert!(gates_ok(&ev, &cpa, &prop, 0.0));
             if i == 0 {
                 let ((lat, lon, _), _) = tr.geo_at(cpa.t_e);
@@ -7596,8 +7757,10 @@ mod tests {
     #[test]
     fn wind_scaled_distances_reach_the_pair_join_and_confirmers() {
         let med = fdop_types::atmo::Medium {
-            c: 343.0,
-            wind_e: 120.0,
+            // A deliberately different sound speed makes the physical range exceed
+            // the fitted range; wind alone cannot do so at the same sound speed.
+            c: 410.0,
+            wind_e: 80.0,
             wind_n: 0.0,
         };
         for start in [0.0, 1_788_895_000.0] {
@@ -7887,7 +8050,9 @@ mod tests {
         let med = fdop_types::atmo::Medium {
             c: 343.0,
             wind_e: 0.0,
-            wind_n: 75.0,
+            // With the physical fitted distance, this keeps the old crop more than
+            // two seconds after the true CPA instead of relying on unscaled metadata.
+            wind_n: 90.0,
         };
         for start in [0.0, 1_788_895_000.0] {
             let mut case = wind_delayed_case(med, start);
@@ -7910,11 +8075,12 @@ mod tests {
             {
                 let tr = &case.tracks[i];
                 let cpa = tr.cpa_nearest_time(x, start + dt, 30.0).unwrap();
-                let scale = prop.fit_scale(cpa.vel, 343.0);
+                let (fitted_speed, fitted_distance) =
+                    prop.fit_geometry(cpa.rv, cpa.vel, 343.0).unwrap();
                 let mut ev = synth_event(id, tr, x, start, f0, 343.0, start + dt, &prop);
                 ev.t_tol = 1.0;
-                ev.v_gate = [0.99 * cpa.speed / scale, 1.01 * cpa.speed / scale];
-                ev.d_gate = [0.99 * cpa.d / scale, 1.01 * cpa.d / scale];
+                ev.v_gate = [0.99 * fitted_speed, 1.01 * fitted_speed];
+                ev.d_gate = [0.99 * fitted_distance, 1.01 * fitted_distance];
                 assert!(gates_ok(&ev, &cpa, &prop, 0.0));
                 if i == 0 {
                     let old_lo = start + ev.t_rec - ev.t_tol - 1.1 * ev.d_gate[1] / 343.0 - 5.0;
