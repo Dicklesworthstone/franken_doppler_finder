@@ -488,6 +488,21 @@ fn region_cross_track_offset(
         return None;
     }
     let (lo, hi) = region_cross_track_interval(d_hi, region, origin, direction)?;
+    interval_cross_track_offset(lo, hi, d_lo, d_hi, distance)
+}
+
+/// Find an actual gate-passing point in a physical cross-track interval. The quantity
+/// being bracketed can depend on the atmosphere at each observer, not just its distance.
+fn interval_cross_track_offset(
+    lo: f64,
+    hi: f64,
+    d_lo: f64,
+    d_hi: f64,
+    distance: impl Fn(f64) -> f64,
+) -> Option<f64> {
+    if ![lo, hi, d_lo, d_hi].into_iter().all(f64::is_finite) || lo > hi || d_lo >= d_hi {
+        return None;
+    }
     let middle = 0.5 * (lo + hi);
     let dm = distance(middle);
     if !dm.is_finite() {
@@ -594,17 +609,57 @@ fn hypotheses(
     cap: usize,
 ) -> HypSet {
     let count = AtomicUsize::new(0);
-    // Keep the established reach, expanding it when the local distance bound permits
-    // a farther pass. Testing the unscaled box first loses that pass
-    // before its atmosphere can be evaluated. This remains an approximate CPA locus.
+    let uniform_calm = atmo.uniform_medium().filter(|medium| {
+        medium.c.is_finite() && medium.c > 0.0 && medium.wind_e == 0.0 && medium.wind_n == 0.0
+    });
+    let medium_bounds = atmo.medium_bounds().filter(|bounds| {
+        bounds.c[0].is_finite()
+            && bounds.c[0] > 0.0
+            && bounds.c[1].is_finite()
+            && bounds.c[1] >= bounds.c[0]
+            && bounds.wind_max.is_finite()
+            && bounds.wind_max >= 0.0
+    });
+    // For every valid moving medium, physical/fitted range is at most c/c_fit.
+    // Only a provider's certified bound may crop the unknown observer's weather.
+    // Without one, the requested region supplies the finite cross-track interval.
+    let distance_limit = uniform_calm
+        .map(|medium| ev.d_gate[1] * (medium.c / ev.c_fit))
+        .or_else(|| {
+            medium_bounds
+                .map(|bounds| (ev.d_gate[1] * (bounds.c[1] / ev.c_fit).next_up()).next_up())
+        })
+        .filter(|limit| limit.is_finite() && *limit >= 0.0);
+    let speed_limits = medium_bounds.and_then(|bounds| {
+        let lo = (ev.v_gate[0]
+            * ((bounds.c[0] - bounds.wind_max).next_down().max(0.0) / ev.c_fit)
+                .next_down()
+                .max(0.0))
+        .next_down()
+        .max(0.0);
+        let hi = (ev.v_gate[1] * ((bounds.c[1] + bounds.wind_max).next_up() / ev.c_fit).next_up())
+            .next_up();
+        (lo.is_finite() && hi.is_finite() && lo >= 0.0 && hi >= lo).then_some((lo, hi))
+    });
+    let scales_for = |medium: &fdop_types::atmo::Medium, local: &Enu, velocity: V3| {
+        if medium.wind_e == 0.0 && medium.wind_n == 0.0 {
+            let scale = medium.c / ev.c_fit;
+            (scale.is_finite() && scale > 0.0).then_some((scale, [scale; 2]))
+        } else {
+            Prop::from_medium(medium, local).fit_gate_scales(velocity, ev.c_fit)
+        }
+    };
+    // Retain the established padding and calm-air arithmetic. A bound hit only
+    // permits sampling: each observer's own medium still has to pass its gates.
     let reach = p.region.padded_km(1.1 * ev.d_gate[1] / 1000.0 + 0.5);
-    let in_reach = |lat, lon, d_hi: f64| {
-        reach.contains(lat, lon)
-            || (d_hi.is_finite()
-                && d_hi > ev.d_gate[1]
-                && p.region
-                    .padded_km(1.1 * d_hi / 1000.0 + 0.5)
-                    .contains(lat, lon))
+    let in_reach = |lat, lon| {
+        distance_limit.is_none_or(|d_hi| {
+            reach.contains(lat, lon)
+                || (d_hi > ev.d_gate[1]
+                    && p.region
+                        .padded_km(1.1 * d_hi / 1000.0 + 0.5)
+                        .contains(lat, lon))
+        })
     };
     let t_lo_all = p.start_lo + ev.t_rec - ev.t_tol - 1.1 * ev.d_gate[1] / p.c - 5.0;
     // Preserve the established calm path only at the same sound speed used by the fit.
@@ -625,24 +680,10 @@ fn hypotheses(
                 let local = Enu::new(la, lo, 0.0);
                 let ve = local.vec_from_ecef(vel);
                 let vh = ve[0].hypot(ve[1]);
-                if vh <= 12.0
-                    || (ordinary_still_air && !reach.contains(la, lo))
-                    || tr.gap_at(t) > p.max_gap_s
-                {
+                if vh <= 12.0 || !in_reach(la, lo) || tr.gap_at(t) > p.max_gap_s {
                     return None;
                 }
                 let z0 = dem.elev_m(la, lo);
-                let med = atmo.medium(la, lo, t, z0 + MIC_HEIGHT_M, h);
-                let distance_scale = if med.wind_e == 0.0 && med.wind_n == 0.0 {
-                    med.c / ev.c_fit
-                } else {
-                    Prop::from_medium(&med, &local)
-                        .fit_gate_scales(vel, ev.c_fit)?
-                        .1[1]
-                };
-                if !in_reach(la, lo, ev.d_gate[1] * distance_scale) {
-                    return None;
-                }
                 let (mlat, mlon) = fdop_types::geo::m_per_deg(la);
                 let (ux, uy) = (ve[0] / vh, ve[1] / vh);
                 let a0 = (h - z0 - MIC_HEIGHT_M) * ve[2] / vh;
@@ -660,7 +701,7 @@ fn hypotheses(
                 let ve = local.vec_from_ecef(vel);
                 let vh = ve[0].hypot(ve[1]);
                 let dt = (p.along_step_m / vh.max(1.0)).clamp(0.2, p.along_dt_max);
-                if ordinary_still_air && !reach.contains(la, lo) {
+                if !in_reach(la, lo) {
                     // A close fast pass can enter and leave this entire box in ten seconds.
                     // Keep the usual along-track sampling outside too, so entry is not skipped.
                     return (dt, None);
@@ -668,30 +709,17 @@ fn hypotheses(
                 let mut projection = None;
                 let speed = norm(vel);
                 let z0 = dem.elev_m(la, lo);
-                let med = atmo.medium(la, lo, t, z0 + MIC_HEIGHT_M, h);
-                let c = med.c;
-                let (speed_scale, distance_scale) = if med.wind_e == 0.0 && med.wind_n == 0.0 {
-                    let scale = c / ev.c_fit;
-                    (scale, [scale; 2])
-                } else if let Some(scales) =
-                    Prop::from_medium(&med, &local).fit_gate_scales(vel, ev.c_fit)
-                {
-                    scales
-                } else {
-                    return (dt, None);
-                };
-                // Wind gives speed one exact scale, but range also depends on the unknown
-                // observer's direction. Seed its conservative annulus here; exact scoring
-                // compares the candidate's equivalent fitted speed and range separately.
-                let (d_lo, d_hi) = (
-                    ev.d_gate[0] * distance_scale[0],
-                    ev.d_gate[1] * distance_scale[1],
-                );
-                if !in_reach(la, lo, d_hi) {
-                    return (dt, None);
-                }
-                if speed >= ev.v_gate[0] * speed_scale
-                    && speed <= ev.v_gate[1] * speed_scale
+                // This column still supplies the established interior proposals. It can
+                // propose a point but cannot reject an observer under different weather.
+                let med =
+                    uniform_calm.unwrap_or_else(|| atmo.medium(la, lo, t, z0 + MIC_HEIGHT_M, h));
+                let proposal_gate = scales_for(&med, &local, vel).map(|(_, distance_scale)| {
+                    (
+                        ev.d_gate[0] * distance_scale[0],
+                        ev.d_gate[1] * distance_scale[1],
+                    )
+                });
+                if speed_limits.is_none_or(|(lo, hi)| speed >= lo && speed <= hi)
                     && vh > 12.0
                     && tr.gap_at(t) <= p.max_gap_s
                 {
@@ -708,10 +736,22 @@ fn hypotheses(
                         let d = (a * a + b * b + hh * hh).sqrt();
                         (ola, olo, hh, d)
                     };
+                    let path_scales = |(ola, olo, hh, _): (f64, f64, f64, f64)| {
+                        let path =
+                            uniform_calm.unwrap_or_else(|| atmo.medium(ola, olo, t, h - hh, h));
+                        let scales = if path.wind_e == 0.0 && path.wind_n == 0.0 {
+                            scales_for(&path, &local, vel)
+                        } else {
+                            // A constant ENU wind still rotates in ECEF with the observer.
+                            scales_for(&path, &Enu::new(ola, olo, h - hh), vel)
+                        }?;
+                        Some((path, scales))
+                    };
                     let to_hyp = |(ola, olo, hh, d): (f64, f64, f64, f64)| {
                         if !p.region.contains(ola, olo) {
                             return None;
                         }
+                        let (path, (speed_scale, distance_scale)) = path_scales((ola, olo, hh, d))?;
                         let in_clock =
                             |ts: f64| ts >= p.start_lo - ev.t_tol && ts <= p.start_hi + ev.t_tol;
                         let exact_terrain_cpa = || {
@@ -738,10 +778,13 @@ fn hypotheses(
                             let ts = cpa.t_r_fit_p(&prop) - ev.t_rec;
                             in_clock(ts).then_some((cpa.t_e, ts))
                         };
-                        let ordinary_geometry = hh >= p.min_agl_m && d >= d_lo && d <= d_hi;
+                        let ordinary_geometry = hh >= p.min_agl_m
+                            && speed >= ev.v_gate[0] * speed_scale
+                            && speed <= ev.v_gate[1] * speed_scale
+                            && d >= ev.d_gate[0] * distance_scale[0]
+                            && d <= ev.d_gate[1] * distance_scale[1];
                         let (t_e, t_s) = if ordinary_geometry {
                             let observer_z = h - hh;
-                            let path = atmo.medium(ola, olo, t, observer_z, h);
                             let centre_offset = if path.wind_e == 0.0 && path.wind_n == 0.0 {
                                 // Arrival time belongs to this observer's path average, which
                                 // can differ from the column beneath the aircraft. Uniform
@@ -796,10 +839,27 @@ fn hypotheses(
                         }
                     };
                     for side in [1.0f64, -1.0] {
+                        let direction = (side * ny / mlat, side * nx / mlon);
+                        let interval = region_cross_track_interval(
+                            distance_limit.unwrap_or(f64::MAX),
+                            &p.region,
+                            (center.0, center.1),
+                            direction,
+                        );
                         // The central grid point is shared by both sides.
                         let mut has_hypothesis = center_ok;
                         let mut b = if side > 0.0 { 0.0 } else { p.cross_step_m };
-                        while b <= d_hi {
+                        let last = if uniform_calm.is_some() {
+                            // Keep the existing sampling phase and arithmetic for calm,
+                            // certified-constant providers, including their boundary probes.
+                            distance_limit.unwrap_or(0.0)
+                        } else if let Some((lo, hi)) = interval {
+                            b = b.max((lo / p.cross_step_m).ceil() * p.cross_step_m);
+                            hi
+                        } else {
+                            continue;
+                        };
+                        while b <= last {
                             let point = if b == 0.0 {
                                 center
                             } else {
@@ -817,47 +877,69 @@ fn hypotheses(
                         // Only an accepted hypothesis replaces the interior sample: a point
                         // outside the region or clock window cannot cover this side.
                         if !has_hypothesis {
-                            let fallback = interior_cross_track_offset(d_lo, d_hi, |b| {
-                                if b == 0.0 {
-                                    center.3
-                                } else {
-                                    cross_point(side, b).3
-                                }
-                            })
-                            .and_then(|b| to_hyp(cross_point(side, b)))
-                            .or_else(|| {
-                                region_cross_track_offset(
-                                    d_lo,
-                                    d_hi,
-                                    &p.region,
-                                    (center.0, center.1),
-                                    (side * ny / mlat, side * nx / mlon),
-                                    |b| cross_point(side, b).3,
-                                )
+                            let fallback = proposal_gate
+                                .and_then(|(d_lo, d_hi)| {
+                                    interior_cross_track_offset(d_lo, d_hi, |b| {
+                                        if b == 0.0 {
+                                            center.3
+                                        } else {
+                                            cross_point(side, b).3
+                                        }
+                                    })
+                                })
                                 .and_then(|b| to_hyp(cross_point(side, b)))
-                            })
-                            .or_else(|| {
-                                // A terrain-dependent distance rejection must not hide every
-                                // point in a narrow box before its exact CPA can be checked.
-                                let (lo, hi) = region_cross_track_interval(
-                                    d_hi,
-                                    &p.region,
-                                    (center.0, center.1),
-                                    (side * ny / mlat, side * nx / mlon),
-                                )?;
-                                let point = cross_point(side, 0.5 * (lo + hi));
-                                if retry {
-                                    to_hyp(point)
-                                } else {
-                                    // Preserve the ordinary cloud before checking this
-                                    // rejected point's actual terrain-dependent CPA.
-                                    let z = dem.elev_m(point.0, point.1);
-                                    if z.is_finite() && z != z0 && ve[2] != 0.0 {
-                                        needs_terrain_retry.set(true);
+                                .or_else(|| {
+                                    let (d_lo, d_hi) = proposal_gate?;
+                                    region_cross_track_offset(
+                                        d_lo,
+                                        d_hi,
+                                        &p.region,
+                                        (center.0, center.1),
+                                        direction,
+                                        |b| cross_point(side, b).3,
+                                    )
+                                    .and_then(|b| to_hyp(cross_point(side, b)))
+                                })
+                                .or_else(|| {
+                                    if uniform_calm.is_some() {
+                                        return None;
                                     }
-                                    None
-                                }
-                            });
+                                    let (lo, hi) = interval?;
+                                    // Express each observer's own range interval as [0, 1].
+                                    // Every bisection probe queries actual weather and must
+                                    // pass the actual gates; no interpolated weather is trusted.
+                                    interval_cross_track_offset(lo, hi, 0.0, 1.0, |b| {
+                                        let point = cross_point(side, b);
+                                        let Some((_, (_, scale))) = path_scales(point) else {
+                                            return f64::NAN;
+                                        };
+                                        let (low, high) =
+                                            (ev.d_gate[0] * scale[0], ev.d_gate[1] * scale[1]);
+                                        if high > low {
+                                            (point.3 - low) / (high - low)
+                                        } else {
+                                            f64::NAN
+                                        }
+                                    })
+                                    .and_then(|b| to_hyp(cross_point(side, b)))
+                                })
+                                .or_else(|| {
+                                    // A terrain-dependent distance rejection must not hide every
+                                    // point in a narrow box before its exact CPA can be checked.
+                                    let (lo, hi) = interval?;
+                                    let point = cross_point(side, 0.5 * (lo + hi));
+                                    if retry {
+                                        to_hyp(point)
+                                    } else {
+                                        // Preserve the ordinary cloud before checking this
+                                        // rejected point's actual terrain-dependent CPA.
+                                        let z = dem.elev_m(point.0, point.1);
+                                        if z.is_finite() && z != z0 && ve[2] != 0.0 {
+                                            needs_terrain_retry.set(true);
+                                        }
+                                        None
+                                    }
+                                });
                             if let Some((hyp, recovered)) = fallback {
                                 retain(hyp, recovered);
                             }
@@ -7884,6 +7966,236 @@ mod tests {
     }
 
     #[test]
+    fn spatial_weather_keeps_speed_and_range_supported_aircraft() {
+        struct SpatialMedium {
+            centre: (f64, f64),
+            near: fdop_types::atmo::Medium,
+            far: fdop_types::atmo::Medium,
+            bounds: Option<fdop_types::atmo::MediumBounds>,
+        }
+        impl Atmosphere for SpatialMedium {
+            fn medium(
+                &self,
+                lat: f64,
+                lon: f64,
+                _: f64,
+                _: f64,
+                _: f64,
+            ) -> fdop_types::atmo::Medium {
+                let distance = haversine_m(self.centre.0, self.centre.1, lat, lon);
+                let weight = ((distance - 500.0) / 2000.0).clamp(0.0, 1.0);
+                fdop_types::atmo::Medium {
+                    c: self.near.c + weight * (self.far.c - self.near.c),
+                    wind_e: self.near.wind_e + weight * (self.far.wind_e - self.near.wind_e),
+                    wind_n: self.near.wind_n + weight * (self.far.wind_n - self.near.wind_n),
+                }
+            }
+            fn describe(&self) -> String {
+                "synthetic spatially varying propagation medium".into()
+            }
+            fn medium_bounds(&self) -> Option<fdop_types::atmo::MediumBounds> {
+                self.bounds
+            }
+        }
+        let dem = FlatElevation(0.0);
+        for start in [0.0, 1_788_895_000.0] {
+            for scenario in ["wind gate", "range gate", "measured wind gate"] {
+                let range_case = scenario == "range gate";
+                let measured_floors = scenario == "measured wind gate";
+                let med = if range_case {
+                    // Deliberately exceed the regional reference c to exercise physical
+                    // reach as well as a cross-track annulus outside its old fitted radius.
+                    fdop_types::atmo::Medium::still(410.0)
+                } else if measured_floors {
+                    fdop_types::atmo::Medium {
+                        c: 343.0,
+                        wind_e: 60.0,
+                        wind_n: 0.0,
+                    }
+                } else {
+                    fdop_types::atmo::Medium {
+                        c: 343.0,
+                        wind_e: 0.0,
+                        wind_n: 35.0,
+                    }
+                };
+                let mut case = if range_case {
+                    wind_scaled_reach_case(med, start)
+                } else {
+                    wind_delayed_case(med, start)
+                };
+                let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+                let o = observer(case.obs.0, case.obs.1, &dem);
+                let prop = Prop::from_medium(&med, &enu);
+                if measured_floors {
+                    let mut tr = straight_track(
+                        &enu,
+                        [0.0, 8000.0, 1200.0],
+                        [215.0, 0.0, 0.0],
+                        start + 120.0,
+                        start - 200.0,
+                        start + 800.0,
+                        5.0,
+                    );
+                    tr.key = "A".into();
+                    case.events[0] =
+                        synth_event("A", &tr, o.x, start, 112.7, 343.0, start + 120.0, &prop);
+                    case.tracks[0] = tr;
+                }
+                let far = fdop_types::atmo::Medium::still(343.0);
+                let bounds = fdop_types::atmo::MediumBounds {
+                    c: [far.c.min(med.c), far.c.max(med.c)],
+                    wind_max: med.wind_e.hypot(med.wind_n),
+                };
+                let lost_event = if range_case || measured_floors { 0 } else { 1 };
+                for (i, event) in case.events.iter_mut().enumerate() {
+                    let tr = &case.tracks[i];
+                    let cpa = tr
+                        .cpa_nearest_time(o.x, start + event.t_rec, 100.0)
+                        .unwrap();
+                    let (speed, distance) = prop.fit_geometry(cpa.rv, cpa.vel, 343.0).unwrap();
+                    event.v_gate = if measured_floors {
+                        // fit.rs's ordinary minimum profile padding, plus the pipeline's
+                        // additional 3 m/s allowance when winds aloft are available.
+                        [0.95 * speed - 3.0, 1.05 * speed + 3.0]
+                    } else if range_case {
+                        [0.6 * speed, 1.5 * speed]
+                    } else {
+                        [0.99 * speed, 1.01 * speed]
+                    };
+                    event.d_gate = if measured_floors {
+                        [distance / 1.25, distance * 1.25]
+                    } else if range_case {
+                        [0.9995 * distance, 1.0005 * distance]
+                    } else {
+                        [0.99 * distance, 1.01 * distance]
+                    };
+                    if measured_floors {
+                        event.t_tol = 3.0;
+                    }
+                    assert!(gates_ok(event, &cpa, &prop, 0.0));
+                    if i == lost_event {
+                        let ((lat, lon, _), _) = tr.geo_at(cpa.t_e);
+                        let old_prop = Prop::from_medium(&far, &Enu::new(lat, lon, 0.0));
+                        let (old_speed, old_distance) =
+                            old_prop.fit_gate_scales(cpa.vel, 343.0).unwrap();
+                        let old_speed_ok = cpa.speed >= event.v_gate[0] * old_speed
+                            && cpa.speed <= event.v_gate[1] * old_speed;
+                        if range_case {
+                            assert!(old_speed_ok, "this case isolates the old range exclusion");
+                            let horizontal = enu.from_ecef(tr.pos_at(cpa.t_e));
+                            assert!(
+                                event.d_gate[1] * old_distance[1] + 100.0
+                                    < horizontal[0].hypot(horizontal[1])
+                            );
+                            let old_reach = case
+                                .p
+                                .region
+                                .padded_km(1.1 * event.d_gate[1] / 1000.0 + 0.5);
+                            assert!(!old_reach.contains(lat, lon));
+                        } else {
+                            assert!(!old_speed_ok, "the old speed gate must lose this aircraft");
+                        }
+                    }
+                }
+                if range_case {
+                    // Put the observer away from the box's centre. Its narrow annulus lies
+                    // between regular samples, and the interval midpoint misses it too.
+                    let (mlat, mlon) = fdop_types::geo::m_per_deg(case.obs.0);
+                    case.p.region = BBox::new(
+                        case.obs.0 - 20.0 / mlat,
+                        case.obs.1 - 20.0 / mlon,
+                        case.obs.0 + 80.0 / mlat,
+                        case.obs.1 + 80.0 / mlon,
+                    );
+                    // These deliberately precise direct-API gates are much narrower than
+                    // fit.rs's minimum 25% distance padding. Resolve their 6-12 m annuli
+                    // with a fine grid suited to those inputs, without widening any gate.
+                    case.p.fine_step_m = 2.0;
+                    case.p.fine_half_m = 100.0;
+                }
+                let frame = Frame::new(&case.p.region);
+                let t_base = start - 86_400.0;
+                for certified in [false, true] {
+                    let atmo = SpatialMedium {
+                        centre: case.obs,
+                        near: med,
+                        far,
+                        bounds: certified.then_some(bounds),
+                    };
+                    for (i, event) in case.events.iter().enumerate() {
+                        let cloud = hypotheses(
+                            event,
+                            &case.tracks,
+                            &case.p,
+                            &frame,
+                            &dem,
+                            &atmo,
+                            t_base,
+                            10_000,
+                        );
+                        assert!(
+                            cloud
+                                .stored
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .any(|h| h.trk as usize == i),
+                            "range={range_case}, certified={certified}, start={start}, flight {}: {} hypotheses",
+                            event.id,
+                            cloud.count
+                        );
+                        let limited = hypotheses(
+                            event,
+                            &case.tracks,
+                            &case.p,
+                            &frame,
+                            &dem,
+                            &atmo,
+                            t_base,
+                            0,
+                        );
+                        assert_eq!(limited.count, cloud.count);
+                        assert!(limited.stored.is_none());
+                    }
+                    let result = run(
+                        &SearchInputs {
+                            events: case.events.clone(),
+                            tracks: &case.tracks,
+                            heard_times: case.events.iter().map(|event| event.t_rec).collect(),
+                            coarse_dem: &dem,
+                            fine_dem: &dem,
+                            atmo: &atmo,
+                        },
+                        &case.p,
+                        &|_| {},
+                    );
+                    check_wind_delayed_case(&case, med, result);
+                }
+                // The envelope admits a comparison, never a match. The same certified
+                // bounds cannot rescue a candidate whose actual observer path fails.
+                let wrong_path = SpatialMedium {
+                    centre: case.obs,
+                    near: far,
+                    far,
+                    bounds: Some(bounds),
+                };
+                let rejected = hypotheses(
+                    &case.events[lost_event],
+                    &case.tracks,
+                    &case.p,
+                    &frame,
+                    &dem,
+                    &wrong_path,
+                    t_base,
+                    10_000,
+                );
+                assert_eq!(rejected.count, 0);
+            }
+        }
+    }
+
+    #[test]
     fn wind_scaled_distances_reach_the_pair_join_and_confirmers() {
         let med = fdop_types::atmo::Medium {
             // A deliberately different sound speed makes the physical range exceed
@@ -8331,12 +8643,12 @@ mod tests {
             let (unknown, unknown_calls, unknown_time) = evaluate(false);
             assert_eq!(known.count, unknown.count);
             assert_eq!(bits(&known), bits(&unknown));
+            // A certified constant medium now also supplies spatial/speed bounds,
+            // regardless of which sound speed fitted the event. An unknown provider
+            // must query candidate paths instead; both still produce the identical cloud.
+            assert!(unknown_calls > known_calls);
             if c_fit == 343.0 {
                 assert!(known.count > 0);
-                assert!(unknown_calls > known_calls);
-            } else {
-                // A different fitting speed must not take the nominal still-air shortcut.
-                assert_eq!(unknown_calls, known_calls);
             }
             eprintln!(
                 "fit c={c_fit}: known {known_calls} atmosphere evaluations in {known_time:?}; unknown {unknown_calls} in {unknown_time:?}; {} identical hypotheses",

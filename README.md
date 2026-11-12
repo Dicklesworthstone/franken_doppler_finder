@@ -327,9 +327,12 @@ The speed and distance intervals from a still-air fit also require separate wind
 Exact candidate checks now predict both fitted quantities from the aircraft's physical CPA and
 compare them with the measured intervals. A common first-order factor could exclude the true
 aircraft even when its propagated frequency curve fitted exactly. Before an observer is known,
-hypothesis generation uses the corresponding speed scale and a distance interval covering all
-CPA directions for the sampled medium. Calm-air arithmetic, search budgets and confidence
-thresholds retain their existing behavior. The conversion is exact for constant velocity in
+hypothesis generation prunes only with conservative bounds certified by the complete weather
+provider. A column sampled beneath the aircraft may propose a location, but cannot exclude an
+observer in another column. Each candidate then uses its own medium for speed, distance and
+recording-clock checks. Without a certified envelope, the finite requested region bounds the
+cross-track scan. Uniform calm arithmetic, search budgets and confidence thresholds retain
+their existing behavior. The conversion is exact for constant velocity in
 homogeneous wind; using a local tangent and sampled weather on a turning or spatially varying
 path remains an approximation.
 
@@ -1237,13 +1240,14 @@ Design notes:
   flights that the search itself permits. Larger ranges now request larger cached
   footprints and can retain more tracks. This removes that cap; the fixed context
   padding is not a proof of complete coverage for arbitrary wind or curved paths.
-- **Candidate clocks use the observer's propagation medium.** After a candidate ground point
-  passes the existing geometry gates, its source-to-observer propagation uses the path-averaged
-  atmosphere at that observer, with wind in the observer's frame. The same moving-medium travel
-  model is used by exact trace scoring. Calm paths also use that observer's path-averaged sound
-  speed: a different weather column beneath the aircraft must not shift the implied recording
-  start before the pair join. Uniform calm arithmetic is unchanged. The coarse geometry remains
-  approximate; search budgets and confidence gates are unchanged.
+- **Candidate geometry and clocks use the observer's propagation medium.** Each candidate
+  ground point uses the path-averaged atmosphere at that observer for its speed, distance and
+  recording-clock checks, with wind in the observer's frame. A constant local east/north wind
+  still rotates in ECEF as the observer moves. The same moving-medium travel model is used by
+  exact trace scoring. A different column beneath the aircraft can supply an initial proposal,
+  but cannot reject that candidate's supported geometry or shift its implied recording start.
+  Uniform calm arithmetic is unchanged. The coarse CPA locus remains approximate; search
+  budgets and confidence gates are unchanged.
 - **Wind-delayed passes survive the early source-time crop.** The search first keeps its
   existing scan and sampling phase, then also examines the earlier retained track span
   when the atmosphere is windy, varying or unknown. Only an explicitly uniform calm
@@ -1255,15 +1259,21 @@ Design notes:
   reach or establish complete terrain coverage. Extra coarse work can be substantial
   for late events on long retained flight tracks; the catalogue's 1200 s pre-padding
   is relative to recording start, not a per-event work limit.
-- **Wind-scaled distances survive the spatial shortcuts.** The coarse search retains its
-  original padded region and expands it using the upper physical/fitted distance bound
-  for the locally sampled medium, including narrow regions between sampling times.
+- **Weather-dependent geometry survives the spatial shortcuts.** The coarse search retains
+  its original padded region and expands it using the complete provider's certified upper
+  sound-speed bound. Physical CPA distance cannot exceed fitted distance times that bound
+  divided by the fit's sound speed. A certified wind-magnitude bound also supplies conservative
+  speed limits before the observer is known. Without a certificate, the requested box supplies
+  the finite cross-track interval. Narrow regions between sampling times remain eligible;
+  bounded interval probes also use each observer's actual weather when its permitted range
+  falls between regular cross-track samples. These probes must pass the original gates.
   Additional-flight confirmation uses the raw fitted-distance shortcut only for an
   explicitly uniform matching still-air medium; otherwise exact CPA, speed, distance,
   clock and trace checks decide. This can recover a flight that the corrected gates
   permit but the uncorrected distance excluded. Weather-dependent confirmation can
   require more CPA evaluations. Its existing emission-time windows and the coarse
-  terrain approximation remain unchanged; this is not complete coverage of all media.
+  terrain approximation remain unchanged. Unknown providers can require more weather queries;
+  a finite sampling grid does not guarantee recovery through arbitrary discontinuous weather.
 - **Hillside rejections can reach the observer's exact closest approach.** The initial CPA line
   uses terrain beneath the aircraft. A climb or descent over a slope can therefore imply the
   wrong distance or recording start at a candidate observer, even when the real pass fits. If that point
@@ -1740,6 +1750,30 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Retain aircraft supported by the observer's actual weather
+
+`spatial_weather_keeps_speed_and_range_supported_aircraft` runs twelve complete synthetic
+two-aircraft searches: three weather/geometry cases, relative and Unix clocks, and providers
+with and without certified bounds. All recover both intended core matches; location errors
+are below 0.4 m and recording-clock errors below 0.005 s. The unchanged regression against
+the preceding search implementation fails because the second aircraft gets zero hypotheses.
+
+The cases isolate an incorrect aircraft-column speed rejection, an incorrect range/reach
+rejection, and a 215 m/s pass in 60 m/s wind using the fitter's actual uncertainty floors
+and the pipeline's additional wind allowance. The latter retains the default fine grid.
+The deliberately much narrower direct-API range fixture uses a 2 m fine grid to resolve its
+6–12 m intersection; it does not represent a range interval the ordinary fitter produces.
+Wrong observer weather still rejects the match, and exhausting hypothesis storage preserves
+the same candidate counts. Uniform calm clouds retain their exact count and stored bits.
+
+The available native search component passes 91 tests with no failures and three intentionally
+ignored benchmarks, using the full production search implementation and genuine pinned Rust,
+serde, serde_json, Rayon and Crossbeam. Four existing tests requiring
+unavailable numerical fitting dependencies are excluded from this component route. This
+does not establish a full core/workspace pass or real-recording recovery rate. Existing
+workspace formatting differences, release selftest and reference/field replays remain
+unresolved; search budgets and confidence thresholds are unchanged.
 
 ### Stable path averages and conservative weather envelopes
 

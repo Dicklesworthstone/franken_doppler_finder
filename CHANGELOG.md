@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain candidates supported by weather at the observer
+
+- Replace aircraft-column speed and reach rejection with conservative whole-provider
+  envelopes. Without a certificate, clip the cross-track scan to the finite requested
+  region. Every proposed observer uses its own weather and wind frame for the existing
+  geometry and recording-clock checks; the old column can propose but cannot reject.
+- Probe actual weather-dependent range intervals when a narrow permitted annulus falls
+  between regular samples. Preserve uniform calm arithmetic, terrain retries, counted
+  hypothesis budgets, exact scoring and confidence thresholds. A constant local ENU wind
+  is evaluated in each observer's ECEF frame.
+- Add twelve complete synthetic pair recoveries across three physical scenarios, two
+  epochs and certified/unknown providers. Include a fast pass using the fitter's actual
+  uncertainty floors and pipeline wind allowance, wrong-weather rejection and exact
+  storage-budget counts. Keep bitwise calm-cloud compatibility; update only the obsolete
+  premise that certified constant weather needs as many queries as an unknown provider.
+- The new regression passes natively with errors below 0.4 m and 0.005 s. Unchanged tests
+  against the prior search fail with zero hypotheses for the second aircraft. The unusually
+  precise direct-API range case uses a 2 m fine grid; the floor-compatible case uses defaults.
+  The exact production search component passes 91 tests with no failures and three ignored
+  benchmarks, using genuine pinned Rust and dependencies. Four existing tests requiring
+  unavailable numerical fitting crates are excluded. Whole-workspace
+  checks, release selftest and reference/field replays remain incomplete; no field claim.
+
 ### Stabilize path averages and certify conservative weather envelopes
 
 - Expose optional sound-speed and wind bounds over each provider's complete profiles.
