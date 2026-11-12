@@ -1269,6 +1269,12 @@ Design notes:
   Each interval becomes a separate model; interpolation never crosses the hole. The original
   model and existing split keys stay intact; additional models use deterministic `#recoveredN`
   suffixes. Overlapping alternatives and a denser ambiguous winning component remain unresolved.
+- **Unusable GNSS reports cannot erase an otherwise supported corrected-height flight.** If
+  preferring GNSS-height reports removed other points and leaves no usable track model, the
+  builder retries the reports whose barometric heights were already corrected to MSL. The retry
+  keeps the same position, velocity and gap checks and requires at least three retained reports
+  in each model. It cannot use raw pressure altitude, join a real coverage gap, or replace any
+  model the preferred path already built.
 - **Missing speed reports do not impose a 200 m/s aircraft limit.** If the established track
   cleaner finds no usable model and every groundspeed report is missing, three consecutive
   positions can establish a faster motion scale. Their adjacent horizontal velocity vectors

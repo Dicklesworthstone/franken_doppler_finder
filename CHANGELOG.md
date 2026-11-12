@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover corrected-height flights hidden by unusable GNSS reports
+
+- If GNSS bridging removed other reports and the preferred reconstruction yields no
+  track, retry the already corrected barometric reports under the same consistency,
+  velocity and gap checks. Require at least three retained reports per recovered model.
+  Raw pressure altitudes and rejected GNSS positions cannot enter the retry, and any
+  usable preferred model keeps its exact original result.
+- Add a physical 100 m/s flight whose finite but wrong GNSS positions previously
+  erased its coherent corrected-height reports. Controls cover Doppler/position truth,
+  raw altitude, insufficient and inconsistent support, coverage gaps, and exact
+  preservation of partial and complete usable GNSS models.
+- Validation: source review, an independent cross-review and patch whitespace checks
+  completed. Native LLVM and Cranelift builds both stopped with SIGKILL in pinned
+  `fsci-stats 0.4.0`, before core tests compiled; the execution host then disconnected.
+  The new regressions, workspace Clippy/tests, release CLI selftest and reference/field
+  replays remain unverified. No real-recording accuracy or timing improvement is claimed.
+
 ### Derive exact fitted geometry for aircraft in wind
 
 - Add the homogeneous-wavefront conversion from physical aircraft motion to the

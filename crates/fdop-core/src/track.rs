@@ -409,7 +409,8 @@ fn recover_velocity_component(
     }
 }
 
-/// Build track models from one stored leg (possibly several, split at gaps).
+/// Build track models from one stored leg (possibly several, split at gaps). When GNSS
+/// bridging leaves no usable model, retry corrected-height reports under the same checks.
 pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
     let mut pts: Vec<_> = leg
         .points
@@ -421,7 +422,9 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
         .collect();
     pts.sort_by(|a, b| a.t.total_cmp(&b.t));
     pts.dedup_by(|b, a| (b.t - a.t).abs() < 1e-3);
+    let original_len = pts.len();
     drop_bracketed_non_gnss(&mut pts, bp.gnss_bridge_s);
+    let bridge_dropped = pts.len() < original_len;
     let mut out = Vec::new();
     let mut start = 0;
     let mut part = 0;
@@ -505,6 +508,27 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
                 part += 1;
             }
             start = i;
+        }
+    }
+    if out.is_empty() && bridge_dropped {
+        // GNSS provenance does not make a corrupt position a usable interpolation
+        // anchor. If every preferred chain failed, recover the corrected-height
+        // reports it hid. Raw pressure altitude is not an MSL reference, and the
+        // rejected GNSS positions must not re-enter through a new mixed chord.
+        // Keep the entire original result whenever any preferred model survived.
+        let mut corrected = leg.clone();
+        corrected
+            .points
+            .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
+        if corrected.points.len() >= 3 {
+            let unbridged = BuildParams {
+                gnss_bridge_s: 0.0,
+                ..*bp
+            };
+            out = build(&corrected, &unbridged);
+            // Two points bypass consistency cleaning. This fallback needs two
+            // independently checked chords, not an unsupported two-point segment.
+            out.retain(|model| model.t.len() >= 3);
         }
     }
     out
@@ -3546,6 +3570,161 @@ mod tests {
         assert_eq!(source(&[4, 16]).len(), times.len() - 11);
         // Only one side covered: the stretch from 25 s to 100 s is too wide.
         assert_eq!(source(&[0, 5, 20]).len(), times.len() - 4);
+    }
+
+    fn failed_gnss_brackets(
+        end_s: f64,
+        retain_corrected: impl Fn(f64) -> bool,
+    ) -> (FlightLeg, Enu) {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let mut leg = mixed_leg((0.0, end_s), 20.0, false, |t| {
+            (
+                enu.to_ecef([100.0 * t, 0.0, 1200.0]),
+                enu.vec_to_ecef([100.0, 0.0, 0.0]),
+            )
+        });
+        for p in &mut leg.points {
+            let t = p.t - 1000.0;
+            if p.alt_src == alt_src::GEOM || !retain_corrected(t) {
+                p.alt_src = alt_src::GEOM;
+                // Finite, wrong positions whose 300 m/s chords contradict their
+                // unchanged 100 m/s reports. Height itself remains correctly referenced.
+                let (lat, lon, _) =
+                    ecef_to_geodetic(enu.to_ecef([60_000.0 + 300.0 * t, 60_000.0, 1200.0]));
+                (p.lat, p.lon) = (lat, lon);
+            }
+        }
+        (leg, enu)
+    }
+
+    #[test]
+    fn rejected_gnss_brackets_cannot_erase_a_corrected_height_flyover() {
+        let (leg, enu) = failed_gnss_brackets(120.0, |_| true);
+        let mut preferred = leg.clone();
+        preferred.points.retain(|p| p.alt_src == alt_src::GEOM);
+        assert!(build(&preferred, &BuildParams::default()).is_empty());
+        let mut corrected = leg.clone();
+        corrected
+            .points
+            .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
+        let expected = build(&corrected, &NO_BRIDGE);
+        assert_eq!(expected.len(), 1);
+
+        let recovered = build(&leg, &BuildParams::default());
+        assert_eq!(recovered.len(), 1);
+        assert_same_gap_model(&recovered[0], &expected[0]);
+        // The same physical path was available before the GNSS bridge removed it.
+        let unbridged = build(&leg, &NO_BRIDGE);
+        assert_eq!(unbridged.len(), 1);
+        assert_same_gap_model(&recovered[0], &unbridged[0]);
+        let state = |t| {
+            (
+                enu.to_ecef([100.0 * t, 0.0, 1200.0]),
+                enu.vec_to_ecef([100.0, 0.0, 0.0]),
+            )
+        };
+        for t in 10..=110 {
+            let error = norm(sub(
+                recovered[0].pos_at(1000.0 + t as f64),
+                state(t as f64).0,
+            ));
+            assert!(error < 0.01, "{error} m at {t} s");
+        }
+        let doppler = doppler_rms_hz(
+            &recovered[0],
+            enu.to_ecef([6000.0, 1500.0, 0.0]),
+            (10.0, 110.0),
+            state,
+        );
+        assert!(doppler < 1e-4, "recovered Doppler RMS {doppler} Hz");
+    }
+
+    #[test]
+    fn gnss_bridge_recovery_needs_consistent_corrected_height_support() {
+        let (leg, _) = failed_gnss_brackets(120.0, |_| true);
+        let mut raw = leg.clone();
+        for p in &mut raw.points {
+            if p.alt_src == alt_src::BARO_CORRECTED {
+                p.alt_src = alt_src::BARO_RAW;
+                p.alt_m -= 150.0;
+            }
+        }
+        assert!(build(&raw, &BuildParams::default()).is_empty());
+
+        // Two unverified reports, or only two that agree out of three, cannot
+        // exploit the ordinary builder's two-point shortcut in this retry.
+        for corrected_count in [2, 3] {
+            let mut sparse = leg.clone();
+            let mut kept = 0;
+            sparse.points.retain(|p| {
+                if p.alt_src == alt_src::GEOM {
+                    true
+                } else {
+                    kept += 1;
+                    kept <= corrected_count
+                }
+            });
+            if corrected_count == 3 {
+                sparse
+                    .points
+                    .iter_mut()
+                    .rfind(|p| p.alt_src == alt_src::BARO_CORRECTED)
+                    .unwrap()
+                    .alt_m += 5000.0;
+            }
+            assert!(build(&sparse, &BuildParams::default()).is_empty());
+        }
+    }
+
+    #[test]
+    fn gnss_bridge_recovery_preserves_gaps_and_discards_two_point_fragments() {
+        let (leg, _) = failed_gnss_brackets(720.0, |t| {
+            t < 120.0 || (300.0..312.0).contains(&t) || t > 600.0
+        });
+        let recovered = build(&leg, &BuildParams::default());
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered[0].t1() < 1120.0);
+        assert!(recovered[1].t0() > 1600.0);
+        for model in &recovered {
+            assert!(model.t.len() >= 3);
+            assert!(
+                model
+                    .t
+                    .windows(2)
+                    .all(|t| t[1] - t[0] <= BuildParams::default().max_gap_s)
+            );
+        }
+        let mut corrected = leg;
+        corrected
+            .points
+            .retain(|p| p.alt_src == alt_src::BARO_CORRECTED);
+        let expected = build(&corrected, &NO_BRIDGE);
+        assert_eq!(expected.len(), 3);
+        assert_eq!(expected[1].t.len(), 2);
+        assert_same_gap_model(&recovered[0], &expected[0]);
+        assert_same_gap_model(&recovered[1], &expected[2]);
+    }
+
+    #[test]
+    fn usable_gnss_models_keep_exact_priority_over_bridge_recovery() {
+        for repair_all in [false, true] {
+            let (mut leg, enu) = failed_gnss_brackets(120.0, |_| true);
+            for p in &mut leg.points {
+                let t = p.t - 1000.0;
+                if p.alt_src == alt_src::GEOM && (repair_all || (40.0..=60.0).contains(&t)) {
+                    let (lat, lon, _) = ecef_to_geodetic(enu.to_ecef([100.0 * t, 0.0, 1200.0]));
+                    (p.lat, p.lon) = (lat, lon);
+                }
+            }
+            let mut preferred = leg.clone();
+            preferred.points.retain(|p| p.alt_src == alt_src::GEOM);
+            let expected = build(&preferred, &NO_BRIDGE);
+            assert_eq!(expected.len(), 1);
+            assert_eq!(expected[0].t.len(), if repair_all { 7 } else { 2 });
+            let got = build(&leg, &BuildParams::default());
+            assert_eq!(got.len(), expected.len());
+            assert_same_gap_model(&got[0], &expected[0]);
+        }
     }
 
     #[test]
