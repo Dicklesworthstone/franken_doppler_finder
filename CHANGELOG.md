@@ -19,6 +19,19 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep valid fine-grid alternatives when the aggregate winner fails an event
+
+- Apply the existing per-event trace-fit and coverage gates before ranking fine-grid
+  points. A low aggregate loss from one well-fit aircraft can no longer erase a nearby
+  point that explains both seeding aircraft.
+- Preserve each seed's already valid minimum, strict loss comparison and traversal-order
+  ties. No grid, budget, acceptance threshold or confidence calibration changes.
+- Add focused selection regressions for invalid low-loss winners, valid alternatives,
+  boundary gates, NaN rejection and equal-loss stability.
+- Native Rust checks, selftest and recording replays remain unrun for this change: the
+  execution environment went offline during the pinned dependency build. Source review
+  and scalar selection checks do not establish compilation or field accuracy.
+
 ### Recover valid locations after a rejected join representative
 
 - A failed quick check no longer rejects every compatible seed in the same flight-pair,

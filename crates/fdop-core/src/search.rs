@@ -1882,6 +1882,18 @@ struct PointEval {
     total: f64,
 }
 
+fn fine_trace_fits(chis: &[TraceFit], kappa: f64) -> bool {
+    !chis
+        .iter()
+        .any(|fit| fit.chi.is_nan() || fit.chi > kappa || fit.cov < 0.6)
+}
+
+// A lower weighted loss can sacrifice one aircraft. Only eligible points may
+// own the fine grid; preserve the original strict comparison and tie order.
+fn fine_point_is_better(point: &PointEval, incumbent: Option<&PointEval>, kappa: f64) -> bool {
+    fine_trace_fits(&point.chis, kappa) && incumbent.is_none_or(|best| point.total < best.total)
+}
+
 /// How far past its distance and speed gates a hypothesis, or a refined locating match, may sit.
 /// The gates bound the search; the trace fit is what scores a match. Refinement profiles the fit
 /// without gates, so its minimum can land just past a bound that a nearby grid cell passed.
@@ -3054,20 +3066,12 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
                     p.region.contains(gla, glo),
                     true,
                     false,
-                ) && best.as_ref().is_none_or(|b| pe.total < b.1.total)
+                ) && fine_point_is_better(&pe, best.as_ref().map(|(_, point)| point), p.kappa)
                 {
                     best = Some((o, pe));
                 }
             }
             let (o, pe) = best?;
-            // NaN chi fails too
-            if pe
-                .chis
-                .iter()
-                .any(|c| c.chi.is_nan() || c.chi > p.kappa || c.cov < 0.6)
-            {
-                return None;
-            }
             let mut events: Vec<EventMatch> = assign
                 .iter()
                 .enumerate()
@@ -4230,6 +4234,76 @@ mod tests {
     use crate::physics::cv_curve;
     use crate::track::straight_track;
     use fdop_types::FlatElevation;
+
+    // Selection-only fixtures: these supplied losses do not model audio or flight physics.
+    fn fine_selection_point(chis: [f64; 2], coverage: [f64; 2], clock: f64) -> PointEval {
+        PointEval {
+            t_s: clock,
+            total: 21.0 * chis[0] + 4.0 * chis[1],
+            chis: chis
+                .into_iter()
+                .zip(coverage)
+                .map(|(chi, cov)| TraceFit {
+                    chi,
+                    cov,
+                    f0: 100.0,
+                    rms: 0.0,
+                    brk: None,
+                })
+                .collect(),
+            cpas: Vec::new(),
+            props: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fine_grid_does_not_let_a_rejected_minimum_hide_an_eligible_point() {
+        let valid = fine_selection_point([5.0, 5.0], [1.0, 1.0], 2.0);
+        for rejected in [
+            fine_selection_point([0.1, 20.0], [1.0, 1.0], 1.0),
+            fine_selection_point([0.1, 0.1], [1.0, 0.59], 1.0),
+        ] {
+            // The original aggregate-only minimizer selected this cheaper point,
+            // then discarded the entire grid when one aircraft failed its gate.
+            assert!(rejected.total < valid.total);
+            for order in [[&rejected, &valid], [&valid, &rejected]] {
+                let mut selected: Option<&PointEval> = None;
+                for point in order {
+                    if fine_point_is_better(point, selected, 12.0) {
+                        selected = Some(point);
+                    }
+                }
+                assert!(std::ptr::eq(selected.unwrap(), &valid));
+            }
+        }
+    }
+
+    #[test]
+    fn fine_grid_keeps_strict_order_among_eligible_points() {
+        let first = fine_selection_point([4.0, 4.0], [1.0, 1.0], 1.0);
+        let tie = fine_selection_point([4.0, 4.0], [1.0, 1.0], 2.0);
+        let worse = fine_selection_point([5.0, 5.0], [1.0, 1.0], 3.0);
+        let better = fine_selection_point([3.0, 3.0], [1.0, 1.0], 4.0);
+        assert!(fine_point_is_better(&first, None, 12.0));
+        assert!(!fine_point_is_better(&tie, Some(&first), 12.0));
+        assert!(!fine_point_is_better(&worse, Some(&first), 12.0));
+        assert!(fine_point_is_better(&better, Some(&first), 12.0));
+    }
+
+    #[test]
+    fn fine_grid_uses_unchanged_trace_and_coverage_boundaries() {
+        let boundary = fine_selection_point([12.0, 0.0], [0.6, 1.0], 1.0);
+        assert!(fine_point_is_better(&boundary, None, 12.0));
+        for rejected in [
+            fine_selection_point([12.0_f64.next_up(), 0.0], [1.0, 1.0], 2.0),
+            fine_selection_point([0.0, 0.0], [0.6_f64.next_down(), 1.0], 2.0),
+            fine_selection_point([f64::NAN, 0.0], [1.0, 1.0], 2.0),
+            fine_selection_point([f64::INFINITY, 0.0], [1.0, 1.0], 2.0),
+        ] {
+            assert!(!fine_point_is_better(&rejected, None, 12.0));
+            assert!(!fine_point_is_better(&rejected, Some(&boundary), 12.0));
+        }
+    }
 
     // Collect only in tests, so the exhaustive oracle still checks the complete ordered
     // output. The production caller scores and releases each bounded output batch.

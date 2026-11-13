@@ -1679,6 +1679,12 @@ allowance runs out, the funnel records the cut and the margin gate fails. Recove
 at most 4,096 pending seeds, without collecting raw pairs; its hash keys and accepted cells
 still grow with the input. Hypothesis clouds are released after both passes.
 
+The fine grid selects the lowest-loss location where both seeding aircraft pass the
+existing per-event trace-fit and coverage gates. A lower combined loss at a point that
+fails one aircraft no longer discards a nearby valid pair. Each seed's already valid
+minimum and equal-loss traversal order are preserved; grid spacing, search budgets,
+acceptance thresholds and confidence calibration are unchanged.
+
 **Pair-join component measurement, 2026-11-07.** The
 `dense_pair_join_with_one_million_raw_matches` workload has 1,024 hypotheses on each side,
 1,048,576 compatible raw pairs and one retained seed. Exact original and updated join source
