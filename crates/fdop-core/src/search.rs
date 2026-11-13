@@ -785,14 +785,17 @@ fn hypotheses(
                             && d <= ev.d_gate[1] * distance_scale[1];
                         let (t_e, t_s) = if ordinary_geometry {
                             let observer_z = h - hh;
-                            let centre_offset = if path.wind_e == 0.0 && path.wind_n == 0.0 {
-                                // Arrival time belongs to this observer's path average, which
-                                // can differ from the column beneath the aircraft. Uniform
-                                // still-air providers retain exactly the same arithmetic.
+                            let centre_offset = if path.wind_e == 0.0
+                                && path.wind_n == 0.0
+                                && (ve[2] == 0.0 || hh == h - z0 - MIC_HEIGHT_M)
+                            {
+                                // Preserve the existing path-average delay when terrain leaves
+                                // the coarse CPA line unchanged.
                                 d / path.c
                             } else {
-                                // A measured still-air curve is centred at its fitted CPA,
-                                // which oblique wind shifts from the geometric CPA's arrival.
+                                // Terrain can shift this sample off CPA even in calm air. Use the
+                                // actual source/observer vector to recover its fitted centre,
+                                // including the existing oblique-wind correction.
                                 let obs = Enu::new(ola, olo, observer_z);
                                 let prop = Prop::from_medium(&path, &obs);
                                 let rv = sub(pos, obs.to_ecef([0.0; 3]));
@@ -8211,6 +8214,131 @@ mod tests {
     }
 
     #[test]
+    fn a_wider_clock_window_keeps_hillside_flyovers_joinable() {
+        struct Basin {
+            lat: f64,
+            lon: f64,
+            relief: f64,
+        }
+        impl Elevation for Basin {
+            fn elev_m(&self, lat: f64, lon: f64) -> f64 {
+                let (mlat, mlon) = fdop_types::geo::m_per_deg(self.lat);
+                let radius = ((lat - self.lat) * mlat).hypot((lon - self.lon) * mlon);
+                1000.0 + self.relief * (radius / 6000.0).clamp(0.0, 1.0)
+            }
+            fn describe(&self) -> String {
+                "synthetic basin and surrounding plateau".into()
+            }
+        }
+        let (lat, lon) = (40.876466, -73.524951);
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+        let enu = Enu::new(lat, lon, 1000.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let prop = Prop::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        // Flat terrain and level flight preserve their successful searches. Only the
+        // combination of relief and vertical motion shifts the coarse CPA materially.
+        for (relief, climb) in [(0.0, 25.0), (3000.0, 0.0), (3000.0, 25.0)] {
+            let dem = Basin { lat, lon, relief };
+            for start in [0.0, 1_788_895_000.0] {
+                let mut tracks = Vec::new();
+                let mut events = Vec::new();
+                for (key, pos, vel, dt, f0) in [
+                    (
+                        "A",
+                        [-6000.0 * climb / 70.0, 6500.0, 6000.0 + MIC_HEIGHT_M],
+                        [70.0, 0.0, climb],
+                        120.0,
+                        112.7,
+                    ),
+                    (
+                        "B",
+                        [6500.0, 6000.0 * climb / 65.0, 6000.0 + MIC_HEIGHT_M],
+                        [0.0, 65.0, -climb],
+                        360.0,
+                        149.3,
+                    ),
+                ] {
+                    let mut tr = straight_track(
+                        &enu,
+                        pos,
+                        vel,
+                        start + dt,
+                        start + dt - 100.0,
+                        start + dt + 100.0,
+                        5.0,
+                    );
+                    tr.key = key.into();
+                    // The whole retained pass stays airborne over the plateau and within
+                    // the track builder's default vertical-speed limit.
+                    for &t in &tr.t {
+                        let ((la, lo, height), velocity) = tr.geo_at(t);
+                        assert!(height - dem.elev_m(la, lo) > 500.0);
+                        assert!(
+                            velocity[2].abs() < crate::track::BuildParams::default().max_vz_mps
+                        );
+                    }
+                    let mut ev = synth_event(key, &tr, x, start, f0, 343.0, start + dt, &prop);
+                    ev.sigma_hz = (0.002 * ev.f0).max(0.12);
+                    ev.f0_tol = (0.04 * ev.f0).max(4.0);
+                    let cpa = tr.cpa_nearest_time(x, start + dt, 100.0).unwrap();
+                    assert!(gates_ok(&ev, &cpa, &prop, 0.0));
+                    tracks.push(tr);
+                    events.push(ev);
+                }
+                for clock_half in [0.0, 60.0] {
+                    let mut p = SearchParams::new(
+                        start - clock_half,
+                        start + clock_half,
+                        600.0,
+                        BBox::new(
+                            lat - 200.0 / mlat,
+                            lon - 200.0 / mlon,
+                            lat + 200.0 / mlat,
+                            lon + 200.0 / mlon,
+                        ),
+                    );
+                    p.refine_half_m = 100.0;
+                    let result = run(
+                        &SearchInputs {
+                            events: events.clone(),
+                            tracks: &tracks,
+                            heard_times: events.iter().map(|ev| ev.t_rec).collect(),
+                            coarse_dem: &dem,
+                            fine_dem: &dem,
+                            atmo: &atmo,
+                        },
+                        &p,
+                        &|_| {},
+                    );
+                    let top = result.candidates.first().unwrap_or_else(|| {
+                        panic!(
+                            "relief {relief}, climb {climb}, clock half-width {clock_half} at {start} lost the hillside pair: {:?}",
+                            result.funnel
+                        )
+                    });
+                    for key in ["A", "B"] {
+                        assert!(top.events.iter().any(|m| {
+                            m.event == key && m.flight == key && m.core && m.chi < 1.0
+                        }));
+                    }
+                    let error = haversine_m(lat, lon, top.lat, top.lon);
+                    assert!(
+                        error < 75.0,
+                        "relief {relief}, climb {climb}: error {error} m"
+                    );
+                    assert!((top.t_start_utc - start).abs() < 0.2);
+                    assert!(result.funnel.truncated.is_empty());
+                    eprintln!(
+                        "relief {relief}, climb {climb}, clock half-width {clock_half}, epoch {start}: error {error:.6} m, clock {:.6} s",
+                        top.t_start_utc - start
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hillside_cpa_survives_an_approximate_distance_rejection() {
         struct Slope {
             lat: f64,
@@ -8305,7 +8433,7 @@ mod tests {
                     // At these two lattice-aligned offsets the original in-box fallback
                     // survives alongside the exact recovery of the central grid point.
                     // The former whole-track retry guard silently omitted that second
-                    // valid point, although its recording-clock hypothesis is different.
+                    // valid point. Both stored clocks must agree with their actual CPAs.
                     let expected = if i == 0 && grade == 0.2 && across != 6500.0 {
                         2
                     } else {
@@ -8330,11 +8458,16 @@ mod tests {
                         assert!(gates_ok(ev, &cpa, &prop, 0.0));
                         assert!(height - o.z - MIC_HEIGHT_M >= p.min_agl_m);
                         assert!(tr.gap_at(cpa.t_e) <= p.max_gap_s);
-                        assert!((cpa.t_r_fit_p(&prop) - ev.t_rec - start).abs() <= ev.t_tol);
+                        let cpa_clock = cpa.t_r_fit_p(&prop) - ev.t_rec;
+                        assert!((cpa_clock - start).abs() <= ev.t_tol);
+                        if expected == 2 {
+                            // Hyp stores an f32 offset near one day: allow one 1/128 s ULP.
+                            let stored_clock = t_base + f64::from(h.t_s);
+                            assert!((stored_clock - cpa_clock).abs() <= 1.0 / 128.0);
+                        }
                     }
                     if expected == 2 {
                         assert!((kept[0].e - kept[1].e).hypot(kept[0].n - kept[1].n) < 50.0);
-                        assert!((kept[0].t_s - kept[1].t_s).abs() > 1.0);
                     }
                     if grade == 0.4 {
                         let limited = generate(ev, &p, 0);

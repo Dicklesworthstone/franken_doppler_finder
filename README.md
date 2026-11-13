@@ -1282,7 +1282,13 @@ Design notes:
   a finite sampling grid does not guarantee recovery through arbitrary discontinuous weather.
 - **Hillside rejections can reach the observer's exact closest approach.** The initial CPA line
   uses terrain beneath the aircraft. A climb or descent over a slope can therefore imply the
-  wrong distance or recording start at a candidate observer, even when the real pass fits. If that point
+  wrong distance or recording start at a candidate observer, even when the real pass fits.
+  When observer terrain differs and the aircraft has vertical motion, the coarse clock uses
+  the actual source-to-observer vector in the existing propagation calculation. It no longer
+  assumes that this sampled position is closest approach merely because a broad clock window
+  accepts it; two otherwise valid flyovers can therefore retain a shared recording clock.
+  Flat-terrain and zero-vertical-motion calm points keep their existing clock arithmetic.
+  If that point
   passes the coarse geometry and region checks but fails the clock check, and the observer's
   terrain differs, the search retries the nearest exact CPA in its existing 150 s window.
   A geometry rejection can use that same retry even when another point or a later visit by
@@ -1292,7 +1298,7 @@ Design notes:
   even when the approximate distances all fail. Nearby points with different recording-clock
   evidence remain eligible; proximity alone does not make their hypotheses interchangeable.
   The exact pass must still pass the original clock, speed, distance, track-gap, interior-CPA
-  and terrain-clearance gates. Already accepted hypotheses keep their original arithmetic;
+  and terrain-clearance gates. The clock correction uses the existing sample grid and retry windows;
   recovered points count against the existing hypothesis budgets, and confidence rules are
   unchanged. The extra exact-CPA work can increase search cost. This retry does not replace the
   approximate terrain projection or guarantee complete coverage of a hillside.
@@ -1798,6 +1804,21 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover a hillside pair when the recording clock is uncertain
+
+`a_wider_clock_window_keeps_hillside_flyovers_joinable` runs twelve physical two-aircraft
+searches: known and ±60 s clocks at relative and Unix epochs, with flat-terrain and
+level-flight controls. The tracks remain airborne and within the default vertical-speed
+limit. On the preceding source, the climbing/descending hillside case has six hypotheses
+per aircraft but zero joined pairs at the wider clock, while its known-clock search locates
+the observer within 1.159 m. Correcting the coarse fitted-curve centre recovers both intended
+core matches within 1.159 m and 0.003 s at the wider clock, with no truncation. All twelve
+cases pass natively; the control results are unchanged. This is synthetic search evidence,
+not a reference-recording or field-accuracy result.
+
+The final source also passes all 112 search and 59 track tests on the pinned nightly with
+locked dependencies. Four explicitly annotated benchmark/resource tests remain ignored.
 
 ### Fine grids can recover from a misleading quick representative
 
@@ -2528,8 +2549,9 @@ ordinary point lies farther across the same sampling slice.
 
 All three hillside regressions and six neighboring budget/region controls pass natively on the
 pinned nightly. Two existing scenes now correctly retain two hypotheses instead of one: the
-points lie within 50 m but carry different coarse clocks. The tests require the explicit counts,
-exact zero-slack physical validity of every point, the original location and clock bounds, and
+points lie within 50 m and remain separate samples. Their stored clocks now also have to agree
+with the actual CPAs to the stored offsets' `f32` precision. The tests require the explicit
+counts, exact zero-slack physical validity of every point, the original location and clock bounds, and
 the existing wrong-clock, gap, clearance, speed and range refusals. Zero, one and exactly enough
 storage budgets report the same total count. This is synthetic search validation; additional
 exact evaluations may increase search cost, and no reference or field replay is claimed.

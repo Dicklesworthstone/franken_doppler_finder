@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep hillside flyovers joinable when the recording clock is less certain
+
+- For a climbing or descending track above different observer terrain, compute the coarse
+  fitted-curve centre from the actual source-to-observer vector. A broad clock window can no
+  longer admit an erroneous closest-approach assumption that separates two valid flyovers'
+  recording clocks before exact scoring.
+- Reuse the existing propagation formula without adding a sampling or retry pass. Preserve
+  flat-terrain and zero-vertical-motion calm arithmetic, wind handling, physical gates,
+  budgets and confidence thresholds.
+- Add a physical two-aircraft search regression for known and wider clocks, at relative and
+  Unix epochs, with flat-terrain and level-flight controls. It requires both correct core
+  matches, a location within 75 m, clock error below 0.2 s and no truncation.
+- Native before/after: the preceding source loses the hillside pair at a ±60 s clock window
+  (six hypotheses per aircraft, zero joined pairs), although the known-clock case passes.
+  The correction passes all twelve searches; the recovered wide-clock cases are within
+  1.159 m and 0.003 s at both epochs. Control results are unchanged. These are synthetic
+  search results; reference and field recordings have not been replayed.
+- The final source passes all 112 search and 59 track tests; four annotated benchmarks or
+  resource tests remain ignored. Validation uses pinned nightly-2026-08-31 and locked
+  dependencies through RCH, one build job, and command-line optimization overrides for
+  `fsci-linalg`, `fsci-special` and `fsci-stats` under the available build memory.
+
 ### Recover valid pairs from failed fine-grid representatives
 
 - Retain deterministic alternatives within each 1 km / 20 s fine-stage cell. Finish
