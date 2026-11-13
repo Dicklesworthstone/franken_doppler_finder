@@ -1758,6 +1758,15 @@ recomputed at the returned clock. A window with no eligible sampled clock is rej
 without another scan. Quick screening and ungated confidence refinement keep their
 existing clock objective and evaluation sequence.
 
+If no sampled fine-grid location passes, a geometrically eligible node can now supply its
+already computed rejected trace fit as the starting point for the existing bounded spatial
+polisher. Probes stay inside that grid's original extent and the requested region. Every
+retained point must pass the original geometry, gap, shared-clock, coverage and per-event
+trace gates; a rejected fit itself never becomes a candidate. A grid that already succeeds
+keeps its original result exactly and skips this fallback. Each attempted grid still consumes
+the same `max_fine` allowance. Failed grids can require up to 64 eight-direction polishing
+iterations, so this recovery can add runtime; no real-recording timing improvement is claimed.
+
 **Pair-join component measurement, 2026-11-07.** The
 `dense_pair_join_with_one_million_raw_matches` workload has 1,024 hypotheses on each side,
 1,048,576 compatible raw pairs and one retained seed. Exact original and updated join source
@@ -1846,6 +1855,33 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Locate a short flyover pair between the fine grid's samples
+
+`compact_flyovers_survive_between_fine_grid_points` uses two physical tracks at 88 and
+95 m/s, approximately 292 m closest range, and twenty seconds of retarded-frequency
+observations per pass, with the recording start supplied. Each ridge has at least eighty
+samples and more than eight seconds
+on either side; the ordinary 0.2% tone-error floor and all original gates remain in force.
+The requested 120 m region contains the observer, but its eligible short-pass intersection
+lies between the default 100 m fine-grid samples.
+
+The previous search generates both hypotheses, joins the pair and passes the quick check,
+then loses it at the fine stage with zero survivors and no comparison truncation. The bounded
+spatial fallback recovers both actual aircraft as core matches, keeps refinement, and locates
+the synthetic observer within 0.203810 m. A Unix-epoch case with reflected headings recovers
+within 0.204260 m. Both retain zero clock error and no truncation.
+
+All 118 active native search tests pass, including the three new tests and the existing
+physical fine-alternative regression; three annotated benchmark/resource tests are ignored.
+Controls retain an original successful grid bit for bit, refuse incompatible clocks, speeds,
+track gaps, missing coverage and reversed curves, stay inside the region and grid extent,
+and preserve the zero-fine-budget cut and failed margin gate. Core Clippy passes with warnings
+denied. The unchanged native engine selftest retains its previous result: 1.520666 m error,
+75 m radius, +0.014271 s clock error, four measured events and both intended aircraft.
+UBS reports no critical findings; changed formatting adds no differences to the existing
+baseline. These are synthetic search and native-engine results; reference/field replays and
+full workspace/release-CLI validation remain incomplete.
 
 ### Keep a supported faster flyover after a long slow flight segment
 

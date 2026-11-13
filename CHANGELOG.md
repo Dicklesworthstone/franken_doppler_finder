@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover close flight pairs that fit between the fine grid's sample points
+
+- Preserve every successful original fine grid exactly. If all nodes fail their trace gates,
+  reuse the best geometrically eligible node's already computed rejected fit as a seed for
+  the existing bounded spatial polisher. Probes stay within the original grid and requested
+  region, and only points passing every original geometry, clock, coverage and trace gate
+  can become candidates. No extra clock/grid construction is needed to retain the seed.
+- The existing fine-seed allowance and truncation behavior remain in force. Failed grids can
+  add up to 64 eight-direction polishing iterations, so runtime is not claimed unchanged.
+- Two twenty-second physical flyovers at 88/95 m/s and about 292 m closest range, with the
+  recording start supplied, previously
+  joined and passed the quick check but produced no fine survivor in a valid 120 m region.
+  With the unchanged default 100 m grid, both zero-epoch and reflected Unix-epoch cases now
+  recover both actual core aircraft within 0.203810/0.204260 m, at the correct clock, with
+  refinement and no truncation.
+- All 118 active native search tests pass, with three annotated benchmark/resource tests
+  ignored. New controls preserve bit-exact old success and clock, speed, gap, coverage,
+  reversed-curve, region, grid-extent and budget limits. Core Clippy passes with warnings denied.
+  The unchanged native engine selftest retains 1.520666 m error, 75 m radius, +0.014271 s clock
+  error, four measured events and both intended aircraft. UBS reports no critical findings;
+  changed formatting introduces no differences from the existing baseline. Reference/field
+  replays and full workspace/release-CLI validation remain incomplete; these are synthetic results.
+
 ### Preserve a supported faster pass within a flight dominated by slower reports
 
 - Keep the original median-derived track envelope, then allow an incomplete winning chain

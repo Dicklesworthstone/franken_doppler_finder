@@ -2067,7 +2067,7 @@ fn eval_point(
     quick: bool,
 ) -> Option<PointEval> {
     eval_point_weighted(
-        o, assign, evs, tracks, p, atmo, region_ok, gates, quick, None,
+        o, assign, evs, tracks, p, atmo, region_ok, gates, quick, None, false,
     )
 }
 
@@ -2085,6 +2085,7 @@ fn eval_point_weighted(
     gates: bool,
     quick: bool,
     weights: Option<&[f64]>,
+    keep_rejected_fit: bool,
 ) -> Option<PointEval> {
     debug_assert!(weights.is_none_or(|w| w.len() == assign.len()));
     if !region_ok {
@@ -2153,6 +2154,7 @@ fn eval_point_weighted(
         .collect();
     let mut scratch = TraceScratch::default();
     let mut chis = Vec::with_capacity(assign.len());
+    let mut last_profile = None;
     let mut cost = |t_s: f64| -> (f64, bool) {
         let mut tot = 0.0;
         chis.clear();
@@ -2190,13 +2192,23 @@ fn eval_point_weighted(
             chis.push(r);
         }
         let eligible = fine_trace_fits(&chis, p.kappa);
+        last_profile = Some((t_s, tot));
         (tot, eligible)
     };
-    let (bt, total) = if gates && !quick {
+    let profiled = if gates && !quick {
         profile_valid_clock(lo, hi, cost)
     } else {
         profile_clock(lo, hi, quick, |ts| cost(ts).0)
-    }?;
+    };
+    // A failed fine-grid trace fit still supplies an exact objective for looking
+    // between grid nodes. Its geometry, coverage, clock and observations stay intact;
+    // only the fine-grid caller may retain it, and it must reapply the trace gates
+    // before accepting a candidate. Ordinary callers keep their previous refusal.
+    let (bt, total) = profiled.or(if keep_rejected_fit {
+        last_profile
+    } else {
+        None
+    })?;
     Some(PointEval {
         t_s: bt,
         chis,
@@ -3007,10 +3019,13 @@ fn fine_candidate(
 ) -> Option<Candidate> {
     let (la, lo) = frame.latlon(j.e, j.n);
     let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
+    let grid = local_grid(la, lo, p.fine_half_m, p.fine_step_m);
+    let half = grid.last()?.2;
     let mut best: Option<(Obs, PointEval)> = None;
-    for (gla, glo, _, _) in local_grid(la, lo, p.fine_half_m, p.fine_step_m) {
+    let mut rejected: Option<(f64, f64, f64)> = None;
+    for &(gla, glo, e, n) in &grid {
         let o = observer(gla, glo, inp.fine_dem);
-        if let Some(pe) = eval_point(
+        if let Some(pe) = eval_point_weighted(
             &o,
             &assign,
             evs,
@@ -3020,10 +3035,49 @@ fn fine_candidate(
             p.region.contains(gla, glo),
             true,
             false,
-        ) && fine_point_is_better(&pe, best.as_ref().map(|(_, point)| point), p.kappa)
-        {
-            best = Some((o, pe));
+            None,
+            true,
+        ) {
+            if fine_point_is_better(&pe, best.as_ref().map(|(_, point)| point), p.kappa) {
+                best = Some((o, pe));
+            } else if best.is_none()
+                && pe.total.is_finite()
+                && rejected.is_none_or(|old| pe.total < old.2)
+            {
+                rejected = Some((e, n, pe.total));
+            }
         }
+    }
+    if best.is_none()
+        && let Some(seed) = rejected
+    {
+        // A short, close pass can fit only between the 100 m nodes. Preserve any
+        // original success; otherwise reuse the existing bounded spatial polisher
+        // within this same grid and region. Every retained point passes the original
+        // geometry, shared-clock, coverage and per-event trace gates.
+        let local = Enu::new(la, lo, 0.0);
+        polish_grid_minimum(seed, half, p.fine_step_m, |e, n| {
+            let (lat, lon, _) = local.to_geodetic([e, n, 0.0]);
+            let o = observer(lat, lon, inp.fine_dem);
+            let pe = eval_point_weighted(
+                &o,
+                &assign,
+                evs,
+                inp.tracks,
+                p,
+                inp.atmo,
+                p.region.contains(lat, lon),
+                true,
+                false,
+                None,
+                true,
+            )?;
+            let total = pe.total;
+            if fine_point_is_better(&pe, best.as_ref().map(|(_, point)| point), p.kappa) {
+                best = Some((o, pe));
+            }
+            Some(total)
+        });
     }
     let (o, pe) = best?;
     let mut events: Vec<EventMatch> = assign
@@ -4174,7 +4228,7 @@ fn polish_grid_minimum(
     mut best: (f64, f64, f64),
     half_m: f64,
     grid_step_m: f64,
-    score: impl Fn(f64, f64) -> Option<f64>,
+    mut score: impl FnMut(f64, f64) -> Option<f64>,
 ) -> (f64, f64, f64) {
     let mut step = grid_step_m * 0.5;
     for _ in 0..64 {
@@ -4273,6 +4327,7 @@ fn refine_on(
             false,
             false,
             w,
+            false,
         )
     };
     let evaluate = |w: Option<&[f64]>| -> Vec<Option<PointEval>> {
@@ -4290,6 +4345,7 @@ fn refine_on(
                     false,
                     false,
                     w,
+                    false,
                 )
             })
             .collect()
@@ -6268,6 +6324,7 @@ mod tests {
                     true,
                     false,
                     weights,
+                    false,
                 )
                 .expect("both physical flyovers remain eligible");
                 assert!(
@@ -7450,6 +7507,276 @@ mod tests {
             atmo: &atmo,
         };
         run(&inp, &case.p, &|_s| {})
+    }
+
+    fn compact_fine_grid_case(start: f64, reflected: bool) -> TwoCase {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = observer(lat, lon, &FlatElevation(0.0)).x;
+        let prop = Prop::still(343.0);
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        let sign = if reflected { -1.0 } else { 1.0 };
+        for (key, position, velocity, when, tone) in [
+            ("A", [0.0, 250.0, 150.0], [88.0, 0.0, 0.0], 120.0, 112.7),
+            ("B", [250.0, 0.0, 150.0], [0.0, 95.0, 0.0], 360.0, 149.3),
+        ] {
+            let mut track = straight_track(
+                &enu,
+                [sign * position[0], sign * position[1], position[2]],
+                [sign * velocity[0], sign * velocity[1], velocity[2]],
+                start + when,
+                start - 200.0,
+                start + 800.0,
+                5.0,
+            );
+            track.key = key.into();
+            let mut event = synth_event(key, &track, x, start, tone, prop.c, start + when, &prop);
+            // A complete short ridge has ten seconds on each side and at least the
+            // measurement gate's eighty observations. Keep the physical retarded samples
+            // and the usual 0.2% model-error floor; neither gate nor noise is relaxed.
+            let points: Vec<_> = event
+                .tr_t
+                .iter()
+                .copied()
+                .zip(event.tr_f.iter().copied())
+                .filter(|&(t, _)| (t - event.t_rec).abs() <= 10.0)
+                .collect();
+            (event.tr_t, event.tr_f) = points.into_iter().unzip();
+            assert!(event.tr_t.len() >= 80);
+            assert!(event.t_rec - event.tr_t[0] > 8.0);
+            assert!(event.tr_t.last().unwrap() - event.t_rec > 8.0);
+            (event.q_t, event.q_f) = subsample(&event.tr_t, &event.tr_f, 40);
+            event.sigma_hz = 0.002 * event.f0;
+            let cpa = track.cpa_nearest_time(x, start + when, 30.0).unwrap();
+            assert!(cpa.d > 250.0);
+            assert!(gates_ok(&event, &cpa, &prop, 0.0));
+            tracks.push(track);
+            events.push(event);
+        }
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+        // This 120 m region contains the observer, but the short-pass intersection
+        // lies between the fine grid's 100 m samples. Its centre is 50 m away in both
+        // axes, and the only regular in-region fine point does not fit both ridges.
+        let (low, high) = if reflected {
+            (-110.0, 10.0)
+        } else {
+            (-10.0, 110.0)
+        };
+        let mut p = SearchParams::new(
+            start,
+            start,
+            600.0,
+            BBox::new(
+                lat + low / mlat,
+                lon + low / mlon,
+                lat + high / mlat,
+                lon + high / mlon,
+            ),
+        );
+        p.refine_half_m = 100.0;
+        TwoCase {
+            tracks,
+            events,
+            p,
+            t_s: start,
+            obs: (lat, lon),
+        }
+    }
+
+    #[test]
+    fn compact_flyovers_survive_between_fine_grid_points() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        for (start, reflected) in [(0.0, false), (1_788_895_000.0, true)] {
+            let case = compact_fine_grid_case(start, reflected);
+            let assignments = [(0, 0, start + 120.0), (1, 1, start + 360.0)];
+            let truth = eval_point(
+                &observer(case.obs.0, case.obs.1, &dem),
+                &assignments,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                true,
+                true,
+                false,
+            )
+            .expect("both physical traces must pass at the actual observer");
+            assert!(truth.chis.iter().all(|fit| fit.chi < 0.1 && fit.cov == 1.0));
+            let inp = SearchInputs {
+                heard_times: case.events.iter().map(|event| event.t_rec).collect(),
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            let result = run(&inp, &case.p, &|line| eprintln!("{line}"));
+            let top = result.candidates.first().unwrap_or_else(|| {
+                panic!(
+                    "short physical pair was lost between fine nodes: {:?}",
+                    result.funnel
+                )
+            });
+            let error = haversine_m(case.obs.0, case.obs.1, top.lat, top.lon);
+            eprintln!(
+                "compact grid start={start} reflected={reflected}: error={error:.6} clock={:.6}, {:?}",
+                top.t_start_utc - start,
+                result.funnel
+            );
+            assert!(error < 5.0);
+            assert!((top.t_start_utc - start).abs() < 0.05);
+            for key in ["A", "B"] {
+                assert!(top.events.iter().any(|event| event.event == key
+                    && event.flight == key
+                    && event.core
+                    && event.chi < 0.1
+                    && event.coverage == 1.0));
+            }
+            assert!(result.funnel.truncated.is_empty());
+            assert!(result.refine.is_some());
+
+            let no_fine = SearchParams {
+                max_fine: 0,
+                ..case.p.clone()
+            };
+            let cut = run(&inp, &no_fine, &|_| {});
+            assert!(cut.candidates.is_empty());
+            assert_eq!(cut.funnel.fine_scored, 0);
+            assert!(
+                cut.funnel
+                    .truncated
+                    .iter()
+                    .any(|cut| cut.starts_with("fine:"))
+            );
+            assert!(!cut.margin_passes(3.0));
+        }
+    }
+
+    #[test]
+    fn fine_subcell_recovery_keeps_an_original_success_exactly() {
+        let case = compact_fine_grid_case(0.0, false);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let frame = Frame::new(&case.p.region);
+        let (e, n) = frame.en(case.obs.0, case.obs.1);
+        let seed = Joined {
+            ei: 0,
+            ej: 1,
+            ti: 0,
+            tj: 1,
+            te_i: 120.0,
+            te_j: 360.0,
+            e,
+            n,
+            t_s: 0.0,
+        };
+        let (la, lo) = frame.latlon(e, n);
+        let centre = local_grid(la, lo, case.p.fine_half_m, case.p.fine_step_m)
+            .into_iter()
+            .find(|&(_, _, e, n)| e == 0.0 && n == 0.0)
+            .unwrap();
+        let before = eval_point(
+            &observer(centre.0, centre.1, &dem),
+            &[(0, 0, 120.0), (1, 1, 360.0)],
+            &case.events,
+            &case.tracks,
+            &case.p,
+            &atmo,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(before.chis.iter().all(|fit| fit.chi < 0.1));
+        let inp = SearchInputs {
+            events: case.events.clone(),
+            tracks: &case.tracks,
+            heard_times: vec![],
+            coarse_dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let after = fine_candidate(&seed, &frame, &case.events, &inp, &case.p, &[]).unwrap();
+        assert_eq!(after.lat.to_bits(), centre.0.to_bits());
+        assert_eq!(after.lon.to_bits(), centre.1.to_bits());
+        assert_eq!(after.t_start_utc.to_bits(), before.t_s.to_bits());
+        for (event, fit) in after.events.iter().zip(&before.chis) {
+            assert_eq!(event.chi.to_bits(), fit.chi.to_bits());
+            assert_eq!(event.f0.to_bits(), fit.f0.to_bits());
+            assert_eq!(event.rms_hz.to_bits(), fit.rms.to_bits());
+            assert_eq!(event.coverage.to_bits(), fit.cov.to_bits());
+        }
+    }
+
+    #[test]
+    fn fine_subcell_recovery_preserves_physical_and_search_limits() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        for control in [
+            "clock", "speed", "gap", "coverage", "curve", "region", "extent",
+        ] {
+            let mut case = compact_fine_grid_case(0.0, false);
+            let frame = Frame::new(&case.p.region);
+            let local = Enu::new(case.obs.0, case.obs.1, 0.0);
+            let (lat, lon, _) = local.to_geodetic([60.0, 60.0, 0.0]);
+            let (e, n) = frame.en(lat, lon);
+            let seed = Joined {
+                ei: 0,
+                ej: 1,
+                ti: 0,
+                tj: 1,
+                te_i: 120.0,
+                te_j: 360.0,
+                e,
+                n,
+                t_s: 0.0,
+            };
+            match control {
+                "clock" => {
+                    case.p.start_lo = 30.0;
+                    case.p.start_hi = 30.0;
+                }
+                "speed" => case.events[1].v_gate = [5.0, 30.0],
+                "gap" => case.p.max_gap_s = 4.0,
+                "coverage" => {
+                    // Actual aircraft positions only cover ten of the twenty seconds.
+                    // A good central CPA cannot compensate for absent outer observations.
+                    for (track, when) in case.tracks.iter_mut().zip([120.0, 360.0]) {
+                        let lo = track.t.partition_point(|&t| t < when - 5.0);
+                        let hi = track.t.partition_point(|&t| t <= when + 5.0);
+                        track.t = track.t[lo..hi].to_vec();
+                        track.pos = track.pos[lo..hi].to_vec();
+                        track.vel = track.vel[lo..hi].to_vec();
+                    }
+                }
+                "curve" => case.events[1].tr_f.reverse(),
+                "region" => {
+                    let (mlat, mlon) = fdop_types::geo::m_per_deg(case.obs.0);
+                    case.p.region = BBox::new(
+                        case.obs.0 + 55.0 / mlat,
+                        case.obs.1 + 55.0 / mlon,
+                        case.obs.0 + 65.0 / mlat,
+                        case.obs.1 + 65.0 / mlon,
+                    );
+                }
+                "extent" => case.p.fine_half_m = 0.0,
+                _ => unreachable!(),
+            }
+            let inp = SearchInputs {
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                heard_times: vec![],
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            assert!(
+                fine_candidate(&seed, &frame, &case.events, &inp, &case.p, &[]).is_none(),
+                "the {control} limit must remain enforced"
+            );
+        }
     }
 
     fn close_flyover_case(start: f64, swap_axes: bool) -> TwoCase {
@@ -12780,6 +13107,7 @@ mod tests {
                         false,
                         false,
                         Some(&[1.0, 1.0]),
+                        false,
                     )
                     .map(|pe| pe.total)
                 };
@@ -12840,6 +13168,7 @@ mod tests {
                 false,
                 false,
                 weights,
+                false,
             )
             .unwrap()
         };
@@ -13036,6 +13365,7 @@ mod tests {
                 false,
                 false,
                 weights.as_deref(),
+                false,
             )
             .unwrap()
             .total
