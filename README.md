@@ -1132,6 +1132,12 @@ are retained, rather than losing the entire aircraft. Invalid JSON still fails p
 recoveries apply during fresh ingestion; existing day stores are not automatically rebuilt to
 restore previously discarded aircraft or improve their cached type metadata.
 
+Missing, malformed or blank aircraft IDs fall back to the ID in each `trace_full_<id>.json`
+member name. This keeps independently named aircraft separate during feed merging even when
+their metadata IDs contain only whitespace. Nonblank metadata remains authoritative; IDs are
+trimmed and lowercased, retaining readsb's `~` prefix. Existing day stores need fresh ingestion
+to recover tracks previously merged under a blank ID.
+
 When neighboring track stores overlap, reports within the existing 0.05 s duplicate interval
 prefer non-MLAT positions even if an MLAT report arrived slightly earlier. The merge preserves
 the previous flight-leg joins and same-quality choices, including interleaved overlaps from

@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve independent aircraft when archive metadata has blank IDs
+
+- Treat an empty or whitespace-only metadata ID as missing before applying the existing
+  archive-member filename fallback. Unrelated aircraft no longer share a blank feed-merge
+  key and lose simultaneous reports as duplicates. Nonblank metadata keeps its existing
+  precedence, case normalization and non-ICAO prefix.
+- Add a real gzip/tar ingestion-to-store regression covering two simultaneous aircraft
+  with absent, malformed, blank and authoritative IDs. Each case requires two flight legs,
+  all eight original positions and zero duplicate or feed-merge losses.
+- This repairs fresh ingestion; previously built day stores need fresh source ingestion
+  to recover aircraft already merged under an empty key.
+- All 36 exact-source ingestion/store-builder component tests pass natively with pinned
+  Rust and checksum-verified dependencies. Unrelated data modules, workspace checks and
+  recording replays remain outside this result; it does not establish field recovery rates.
+
 ### Recover an eligible shared clock after an event fails at the aggregate minimum
 
 - At gated fine-grid evaluations, preserve the original clock and evaluation sequence

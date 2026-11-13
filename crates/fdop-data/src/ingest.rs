@@ -690,10 +690,13 @@ fn parse_member(
     }
     let points = retain_with_neighbours(&pts, &keep, 2);
     leg_boundaries.normalize();
+    // Blank metadata is missing identity, not a shared key for unrelated aircraft.
     let icao = tf
         .icao
         .0
-        .clone()
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
         .unwrap_or_else(|| {
             name_hint
                 .rsplit('/')
@@ -701,7 +704,6 @@ fn parse_member(
                 .unwrap_or(name_hint)
                 .trim_start_matches("trace_full_")
                 .trim_end_matches(".json")
-                .to_string()
         })
         .trim()
         .to_ascii_lowercase();
@@ -1217,6 +1219,92 @@ pub(crate) mod tests {
         assert!(
             old.points[0].alt_geom_msl.is_nan() && (old.points[0].alt_baro_m - 1219.2).abs() < 0.01
         );
+    }
+
+    #[test]
+    fn missing_aircraft_ids_preserve_separate_tracks_from_member_names() {
+        let sp = IngestSpec {
+            bbox: BBox::new(0.0, 0.0, 0.1, 0.1),
+            t_start: T0,
+            t_end: T0 + 30.0,
+            ..spec()
+        };
+        let names = [
+            "./traces/01/trace_full_000001.json",
+            "./traces/02/trace_full_~000002.json",
+        ];
+        for (ids, expected) in [
+            ([None, None], ["000001", "~000002"]),
+            (
+                [Some(serde_json::Value::Null), Some(serde_json::json!(17))],
+                ["000001", "~000002"],
+            ),
+            (
+                [Some(serde_json::json!({})), Some(serde_json::json!([]))],
+                ["000001", "~000002"],
+            ),
+            (
+                [
+                    Some(serde_json::json!("")),
+                    Some(serde_json::json!(" \t\n ")),
+                ],
+                ["000001", "~000002"],
+            ),
+            (
+                [
+                    Some(serde_json::json!(" \tAbCdEf ")),
+                    Some(serde_json::json!(" ~AaBbCc\n")),
+                ],
+                ["abcdef", "~aabbcc"],
+            ),
+        ] {
+            let members: Vec<_> = ids
+                .into_iter()
+                .enumerate()
+                .map(|(aircraft, id)| {
+                    let rows: Vec<_> = (0..4)
+                        .map(|i| {
+                            serde_json::json!([
+                                i * 10,
+                                0.02 + aircraft as f64 * 0.05,
+                                0.02 + i as f64 * 0.005,
+                                4000,
+                                100,
+                                90,
+                                0,
+                                0,
+                                null,
+                                "adsb_icao",
+                                4100,
+                                0
+                            ])
+                        })
+                        .collect();
+                    let mut value = serde_json::json!({"t":"PC12", "timestamp":T0, "trace":rows});
+                    if let Some(id) = id {
+                        value["icao"] = id;
+                    }
+                    (names[aircraft], gz(&value.to_string()))
+                })
+                .collect();
+            let bytes = tar_of(&members);
+            let (aircraft, stats) = ingest_reader(bytes.as_slice(), "prod", &sp, &|_| {}).unwrap();
+            assert_eq!(stats.parse_errors, 0);
+            assert_eq!(stats.kept_aircraft, 2);
+            let store = crate::build::build_store(vec![(aircraft, stats)], &sp, vec![]);
+            assert_eq!(store.legs.len(), 2);
+            assert_eq!(store.meta.stats["feed_merges"], 0);
+            assert_eq!(store.meta.stats["dedup_dropped"], 0);
+            for (aircraft, id) in expected.into_iter().enumerate() {
+                let leg = store.legs.iter().find(|l| l.icao == id).unwrap();
+                assert_eq!(leg.points.len(), 4);
+                for (i, point) in leg.points.iter().enumerate() {
+                    assert_eq!(point.t, T0 + i as f64 * 10.0);
+                    assert_eq!(point.lat, 0.02 + aircraft as f64 * 0.05);
+                    assert_eq!(point.lon, 0.02 + i as f64 * 0.005);
+                }
+            }
+        }
     }
 
     #[test]
