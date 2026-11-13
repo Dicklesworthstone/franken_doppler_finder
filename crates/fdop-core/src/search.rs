@@ -1729,6 +1729,10 @@ pub struct EventMatch {
     pub speed: f64,
     pub alt_m: f64,
     pub t_cpa_heard_utc: f64,
+    /// Geometric CPA emission time in a moving medium. Retained internally because
+    /// subtracting d/c from the heard time does not undo wind-dependent travel.
+    #[serde(skip)]
+    pub t_cpa_emitted_utc: Option<f64>,
     /// Path-averaged sound speed (m/s) and wind component along the flight (m/s) used.
     pub c_path: f64,
     pub wind_along: f64,
@@ -1753,6 +1757,15 @@ pub struct EventMatch {
     /// Fits cleanly (chi <= 4), locks within 4 s and beats chance matches by >= 2 nats: the
     /// matches that locate the observer.
     pub core: bool,
+}
+
+impl EventMatch {
+    /// Emission-time seed identifying the physical pass. Calm media and manually
+    /// constructed matches retain the established still-air arithmetic exactly.
+    pub fn cpa_emission_utc(&self) -> f64 {
+        self.t_cpa_emitted_utc
+            .unwrap_or_else(|| self.t_cpa_heard_utc - self.d / self.c_path)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -2195,6 +2208,7 @@ fn make_match(
         speed: cpa.speed,
         alt_m: alt,
         t_cpa_heard_utc: cpa.t_r_p(prop),
+        t_cpa_emitted_utc: (prop.w != [0.0; 3]).then_some(cpa.t_e),
         c_path: prop.c,
         wind_along: dot(prop.w, cpa.vel) / cpa.speed.max(1.0),
         misfit_event: ev.misfit,
@@ -3193,7 +3207,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
                 .trk
                 .iter()
                 .zip(&cand.events)
-                .map(|(&(_, ti), m)| (ti, m.t_cpa_heard_utc - m.d / m.c_path))
+                .map(|(&(_, ti), m)| (ti, m.cpa_emission_utc()))
                 .collect();
             if let Some((_, m, ti)) =
                 best_confirmer(&o, cand.t_start_utc, ev, tracks, &tix, p, atmo, &excl)
@@ -3612,7 +3626,7 @@ fn free_clocks(
         .map(|(&(ei, ti), m)| {
             let ev = &evs[ei];
             let tr = &tracks[ti as usize];
-            let cpa = tr.cpa_nearest_time(o.x, m.t_cpa_heard_utc - m.d / m.c_path, 30.0)?;
+            let cpa = tr.cpa_nearest_time(o.x, m.cpa_emission_utc(), 30.0)?;
             let prop = prop_for(atmo, o, tr, cpa.t_e);
             let (lo, hi) = (cand.t_start_utc - 30.0, cand.t_start_utc + 30.0);
             let g = RatioGrid::build(
@@ -3695,7 +3709,7 @@ fn refresh_refined_candidate(
         let fitted = (|| {
             let ev = evs.get(ei)?;
             let tr = inp.tracks.get(ti as usize)?;
-            let cpa = tr.cpa_nearest_time(o.x, old.t_cpa_heard_utc - old.d / old.c_path, 150.0)?;
+            let cpa = tr.cpa_nearest_time(o.x, old.cpa_emission_utc(), 150.0)?;
             let prop = prop_for(inp.atmo, &o, tr, cpa.t_e);
             // An optional confirmer stays under `best_confirmer`'s rule, with no slack.
             let slack = if required(k) {
@@ -3813,7 +3827,7 @@ fn lock_prune(
             .trk
             .iter()
             .zip(&cand.events)
-            .map(|(&(ei, ti), m)| (ei, ti, m.t_cpa_heard_utc - m.d / m.c_path))
+            .map(|(&(ei, ti), m)| (ei, ti, m.cpa_emission_utc()))
             .collect();
         let Some(pe) = eval_point(&o, &assign, evs, tracks, p, atmo, true, false, false) else {
             break;
@@ -3962,14 +3976,14 @@ fn refine_winner(
         .iter()
         .zip(&top.events)
         .filter(|(_, m)| m.core)
-        .map(|(&(ei, ti), m)| (ei, ti, m.t_cpa_heard_utc - m.d / m.c_path))
+        .map(|(&(ei, ti), m)| (ei, ti, m.cpa_emission_utc()))
         .collect();
     if assign.len() < 2 {
         assign = top
             .trk
             .iter()
             .zip(&top.events)
-            .map(|(&(ei, ti), m)| (ei, ti, m.t_cpa_heard_utc - m.d / m.c_path))
+            .map(|(&(ei, ti), m)| (ei, ti, m.cpa_emission_utc()))
             .collect();
     }
     // Expand clipped contours; resample contours too narrow for the current grid.
@@ -9876,7 +9890,7 @@ mod tests {
             let prop = prop_for(&atmo, &o, &case.tracks[0], cpa.t_e);
             assert!((matched.t_cpa_heard_utc - cpa.t_r_p(&prop)).abs() < 0.01);
             assert!((cpa.t_r_fit_p(&prop) - case.t_s - case.events[2].t_rec).abs() < 0.01);
-            let emission_seed = matched.t_cpa_heard_utc - matched.d / matched.c_path;
+            let emission_seed = matched.cpa_emission_utc();
             assert!(
                 explain(&[(0, emission_seed)]).is_none(),
                 "a second tone cannot count the same physical pass twice"
@@ -10279,6 +10293,136 @@ mod tests {
     }
 
     #[test]
+    fn wind_delayed_pass_identity_keeps_a_returning_confirmer() {
+        let medium = fdop_types::atmo::Medium {
+            c: 343.0,
+            wind_e: 80.0,
+            wind_n: 0.0,
+        };
+        let atmo = fdop_types::atmo::UniformAtmosphere(medium);
+        let dem = FlatElevation(0.0);
+        for start in [0.0, 1_788_895_000.0] {
+            let case = circuit_flyover_case(medium);
+            let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let prop = Prop::from_medium(&medium, &enu);
+            let mut circuit = case.tracks[0].clone();
+            for (i, t) in circuit.t.iter_mut().enumerate() {
+                *t += start - case.t_s;
+                let mut pos = enu.from_ecef(circuit.pos[i]);
+                // Keep the same subsonic flight farther east. Sound traveling back
+                // against the wind has a delay over 30 seconds longer than d/c at 40 km.
+                // This exercises the supported search envelope, not audibility.
+                pos[0] += 39_000.0;
+                circuit.pos[i] = enu.to_ecef(pos);
+            }
+            let first = synth_event(
+                "first",
+                &circuit,
+                o.x,
+                start,
+                112.7,
+                343.0,
+                start + 400.0,
+                &prop,
+            );
+            let returning = synth_event(
+                "returning",
+                &circuit,
+                o.x,
+                start,
+                114.5,
+                343.0,
+                start + 1200.0,
+                &prop,
+            );
+            let p = SearchParams::new(start, start, 1600.0, case.p.region);
+            let tracks = [circuit];
+            let tix = TimeIndex::new(&tracks);
+            let explain = |ev: &SearchEvent, exclude: &[(u32, f64)]| {
+                best_confirmer(&o, start, ev, &tracks, &tix, &p, &atmo, exclude)
+            };
+            let (_, original, ti) = explain(&first, &[]).expect("the first physical pass fits");
+            let cpa = tracks[0]
+                .cpa_nearest_time(o.x, start + 400.0, 100.0)
+                .unwrap();
+            assert_eq!(ti, 0);
+            assert!((original.cpa_emission_utc() - cpa.t_e).abs() < 0.001);
+            let old_seed = original.t_cpa_heard_utc - original.d / original.c_path;
+            assert!(old_seed - cpa.t_e > 30.0);
+            assert!(
+                explain(&returning, &[(ti, old_seed)]).is_none(),
+                "the old seed mistakes a missing prior CPA for an excluded whole track"
+            );
+            let used = [(ti, original.cpa_emission_utc())];
+            let (chi, recovered, recovered_track) = explain(&returning, &used)
+                .expect("retaining the original CPA must leave a separate return eligible");
+            assert_eq!(recovered_track, ti);
+            assert!(chi < 1.0 && recovered.coverage >= 0.99, "{recovered:?}");
+            assert!((recovered.cpa_emission_utc() - start - 1200.0).abs() < 0.002);
+            assert!(
+                explain(&first, &used).is_none(),
+                "retaining emission time must still exclude the already matched pass"
+            );
+        }
+    }
+
+    #[test]
+    fn emission_identity_preserves_calm_arithmetic_and_report_fields() {
+        let dem = FlatElevation(0.0);
+        for medium in [
+            fdop_types::atmo::Medium::still(343.0),
+            fdop_types::atmo::Medium {
+                c: 339.0,
+                wind_e: 7.0,
+                wind_n: -5.0,
+            },
+        ] {
+            let case = narrow_circuit_case(medium);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let atmo = fdop_types::atmo::UniformAtmosphere(medium);
+            let tix = TimeIndex::new(&case.tracks);
+            let (_, matched, _) = best_confirmer(
+                &o,
+                case.t_s,
+                &case.events[0],
+                &case.tracks,
+                &tix,
+                &case.p,
+                &atmo,
+                &[],
+            )
+            .unwrap();
+            let cpa = case.tracks[0]
+                .cpa_nearest_time(o.x, case.t_s + 420.0, 30.0)
+                .unwrap();
+            if medium == fdop_types::atmo::Medium::still(343.0) {
+                assert!(matched.t_cpa_emitted_utc.is_none());
+                assert_eq!(
+                    matched.cpa_emission_utc().to_bits(),
+                    (matched.t_cpa_heard_utc - matched.d / matched.c_path).to_bits()
+                );
+            } else {
+                assert_eq!(
+                    matched.cpa_emission_utc().to_bits(),
+                    matched.t_cpa_emitted_utc.unwrap().to_bits()
+                );
+                assert!((matched.cpa_emission_utc() - cpa.t_e).abs() < 0.002);
+            }
+            let report = serde_json::to_value(&matched).unwrap();
+            assert!(report.get("t_cpa_emitted_utc").is_none());
+            assert_eq!(report["t_cpa_heard_utc"], matched.t_cpa_heard_utc);
+        }
+        let manual = EventMatch {
+            t_cpa_heard_utc: 30.0,
+            d: 3430.0,
+            c_path: 343.0,
+            ..EventMatch::default()
+        };
+        assert_eq!(manual.cpa_emission_utc(), 20.0);
+    }
+
+    #[test]
     fn returning_aircraft_pass_can_confirm_a_candidate() {
         let med = fdop_types::atmo::Medium::still(343.0);
         let case = circuit_flyover_case(med);
@@ -10329,7 +10473,7 @@ mod tests {
                 )
             };
             let (_, original, _) = explain(&[]).expect("the original pass must fit");
-            let emission_seed = original.t_cpa_heard_utc - original.d / original.c_path;
+            let emission_seed = original.cpa_emission_utc();
             assert!(
                 explain(&[(0, emission_seed)]).is_none(),
                 "one pass cannot supply two matches"

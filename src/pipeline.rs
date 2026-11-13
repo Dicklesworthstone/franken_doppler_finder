@@ -2561,7 +2561,7 @@ fn locate_with_clock(
             {
                 let z = fine.elev_m(lat, lon);
                 let xo = fdop_types::geo::geodetic_to_ecef(lat, lon, z + fdop_types::MIC_HEIGHT_M);
-                let t_cpa_e = m.t_cpa_heard_utc - m.d / m.c_path;
+                let t_cpa_e = m.cpa_emission_utc();
                 let (_, _, h) = fdop_types::geo::ecef_to_geodetic(tm.pos_at(t_cpa_e));
                 let enu_o = fdop_types::geo::Enu::new(lat, lon, z + fdop_types::MIC_HEIGHT_M);
                 let prop = track::Prop::from_medium(

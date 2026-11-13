@@ -3658,6 +3658,15 @@ confirmer; the synthetic observer is recovered within 60 m and the clock within 
 from one pass remain excluded in still air and wind. A closer return with no detection counts against
 the candidate, while the original explained passes and a detected return do not.
 
+Windy matches retain their geometric closest-approach emission time internally. Confirmation,
+clock locking, refinement and event-plot weather lookup use that physical pass identity;
+subtracting a calm-air `d/c` delay from a wind-adjusted arrival can identify the wrong moment.
+The returning-pass regression also covers a 40 km, 80 m/s crosswind search case at relative
+and Unix clocks: the old time seed excludes the returning aircraft, while the retained CPA
+recovers its separate visit and still excludes duplicate use of the original pass. Calm
+arithmetic and serialized report fields stay compatible. This checks the search model's
+supported domain, not audibility or an end-to-end recording at that range.
+
 Together, the targeted and integrated runs pass all **49 default `fdop-core` tests**, all **13
 `fdop-types` tests** and **both opt-in media integration tests**: 64 test cases, with no failures.
 The long same-tone audio and detection-cap regressions ran separately; the remaining tests then ran

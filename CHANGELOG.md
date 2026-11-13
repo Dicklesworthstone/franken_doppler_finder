@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep the physical pass identity through wind-dependent search refinement
+
+- Retain the geometric CPA emission time when a match uses a moving medium. Confirmation,
+  per-event clock checks, locked refits, spatial refinement and event-plot weather lookup
+  now use that original pass rather than subtracting the calm-air `d/c` delay from its
+  wind-adjusted arrival time. Calm arithmetic and serialized report fields are preserved.
+- Add a returning-aircraft regression at relative and Unix clocks. In its supported
+  long-range/high-wind search case, the old seed misses the prior CPA by over 30 seconds
+  and excludes the whole track. The retained identity recovers the separate return while
+  still excluding the already matched pass. Routine wind/calm and serialization controls
+  cover compatibility; this is synthetic search evidence, not audio or field validation.
+- The exact-source search/track/physics component passes 167 tests with no failures and
+  four ignored benchmarks. Four existing numerical-fitter tests are outside that component.
+  Workspace checks, release selftest and reference/field replays remain incomplete.
+
 ### Preserve independent aircraft when archive metadata has blank IDs
 
 - Treat an empty or whitespace-only metadata ID as missing before applying the existing
@@ -33,6 +48,8 @@ at that commit, not per-change commits.
 - All 36 exact-source ingestion/store-builder component tests pass natively with pinned
   Rust and checksum-verified dependencies. Unrelated data modules, workspace checks and
   recording replays remain outside this result; it does not establish field recovery rates.
+  The identical new regression fails against the original production ingester: one flight
+  leg survives where two independent aircraft are required.
 
 ### Recover an eligible shared clock after an event fails at the aggregate minimum
 
