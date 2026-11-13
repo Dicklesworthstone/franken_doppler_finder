@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve a supported faster pass within a flight dominated by slower reports
+
+- Keep the original median-derived track envelope, then allow an incomplete winning chain
+  to extend through a faster chord only when both endpoint speed/heading reports independently
+  support its observed motion within the existing 25 m/s consistency limit. Reports must be
+  positive and no faster than the nominal sound speed; existing vertical and gap bounds apply.
+  The longer chain retains every original winning report and cannot absorb independently
+  supported separated parts. Complete original chains and missing-speed recovery are preserved.
+- A physical 45-to-145 m/s flight at 20 s report intervals previously retained only 25 of
+  38 reports and ended at 480 s, discarding the later flyover. Four accelerating/decelerating
+  cases along two headings now retain all 38 reports through 740 s, with maximum analytic
+  position error 0.0000599 m and received-frequency error 0.00000792 Hz.
+- All 62 active native track tests pass, including new local-motion refusal and separated-part
+  controls; one timing benchmark is ignored. Core Clippy passes with warnings denied. The
+  native engine selftest passes at 1.520666 m error, 75 m radius, +0.014271 s clock error and
+  both intended aircraft. These checks do not establish field accuracy or a full workspace/
+  release-CLI build; reference and field recordings have not been replayed.
+
 ### Recover short contrast flyovers at the recording's real boundaries
 
 - After all five existing short-window recovery stages, reuse the short survey's contrast

@@ -1357,9 +1357,17 @@ Design notes:
   must retain every report of that winner in order. A few closely spaced valid reports therefore
   cannot suppress recovery of the rest of a fast flyover. Existing supported parts separated
   from the winner keep the original selection; an extension cannot swallow their coverage.
-  Complete tracks, finite speed reports and displaced supported rivals also keep their treatment.
+  Complete tracks and displaced supported rivals also keep their treatment.
   Velocities still come from the retained positions; unsupported fast turns remain unresolved.
   This supplies geometry to both searches without changing engine selection or confidence gates.
+- **A slow portion cannot erase a separately corroborated faster pass in the same leg.** When
+  the original median-speed envelope leaves a chain incomplete, an additional faster chord
+  can use its two endpoint speed/heading reports. Each report must independently agree with
+  the observed horizontal motion within the existing 25 m/s limit, be positive and no faster
+  than the nominal sound speed, and respect the existing vertical and gap bounds. The global
+  envelope is unchanged for other chords. The longer chain must retain every original winning
+  report and cannot absorb a separately supported part. Complete original chains stay intact;
+  missing or contradictory local motion does not qualify for this additional recovery.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
@@ -1838,6 +1846,27 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Keep a supported faster flyover after a long slow flight segment
+
+`changing_speed_reports_preserve_a_supported_faster_pass` supplies accurate positions and
+motion reports at 20 s intervals. The aircraft flies at 45 m/s for 420 s, accelerates at
+1 m/s² to 145 m/s, then supplies the faster pass. The original cleaner's leg-wide median
+envelope keeps only 25 of 38 reports in the accelerating baseline, ending coverage at
+480 s and losing the later flyover. The corrected cleaner retains all 38 reports through
+740 s in four cases: acceleration and deceleration along two headings.
+
+Maximum reconstructed position error is 0.0000599 m and maximum received-frequency error
+is 0.00000792 Hz against the analytic trajectories. The new controls retain the earlier
+supported portion while refusing extensions based on one usable speed report, absent or
+wrong headings, supersonic reports or an excessive height jump. Independently supported
+parts retain their original selection in both time directions.
+
+All 62 active native track tests pass; one timing benchmark is intentionally ignored.
+Core Clippy passes with warnings denied. The unchanged native engine selftest also passes
+at 1.520666 m location error, 75 m radius, +0.014271 s clock error and both intended aircraft.
+These are synthetic trajectory and native-engine checks; they do not establish field
+accuracy or a full workspace/release-CLI build. Reference and field recordings remain unreplayed.
 
 ### Recover short contrast flyovers at both recording boundaries
 

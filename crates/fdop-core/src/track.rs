@@ -208,7 +208,36 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
         let dz = (pts[j].alt_m - pts[i].alt_m).abs() as f64;
         dh <= limit * dt + bp.pos_slack_m.0 && dz <= bp.max_vz_mps * dt + bp.pos_slack_m.1
     };
-    let select = |limit| {
+    // A long slow portion can set the leg-wide median below a later genuine cruise speed.
+    // Both endpoint reports must independently support the faster position chord. Keep the
+    // same velocity residual and vertical bounds; one fast report cannot widen the leg.
+    let reported_reachable = |i: usize, j: usize| {
+        let dt = pts[j].t - pts[i].t;
+        if (pts[j].alt_m - pts[i].alt_m).abs() as f64 > bp.max_vz_mps * dt + bp.pos_slack_m.1 {
+            return false;
+        }
+        let chord = [(xy[j][0] - xy[i][0]) / dt, (xy[j][1] - xy[i][1]) / dt];
+        [i, j].into_iter().all(|k| {
+            let p = &pts[k];
+            let speed = p.gs_mps as f64;
+            if !speed.is_finite()
+                || speed <= 0.0
+                || speed > fdop_types::C_SOUND
+                || !p.track_deg.is_finite()
+            {
+                return false;
+            }
+            let heading = (p.track_deg as f64).to_radians();
+            let local = Enu::new(p.lat, p.lon, 0.0);
+            let velocity = enu.vec_from_ecef(local.vec_to_ecef([
+                speed * heading.sin(),
+                speed * heading.cos(),
+                0.0,
+            ]));
+            (velocity[0] - chord[0]).hypot(velocity[1] - chord[1]) <= bp.vel_consistency_mps
+        })
+    };
+    let select = |limit, allow_reported| {
         let mut best = vec![1usize; n];
         let mut prev = vec![usize::MAX; n];
         let mut prefix_best = vec![1usize; n];
@@ -221,7 +250,9 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                 if pts[j].t - pts[i].t > bp.max_gap_s || prefix_best[i] < best[j] {
                     break;
                 }
-                if best[i] + 1 > best[j] && reachable(i, j, limit) {
+                if best[i] + 1 > best[j]
+                    && (reachable(i, j, limit) || (allow_reported && reported_reachable(i, j)))
+                {
                     best[j] = best[i] + 1;
                     prev[j] = i;
                 }
@@ -231,16 +262,20 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
         let winner = (0..n).max_by_key(|&k| (best[k], k)).unwrap_or(0);
         (best, prev, winner)
     };
-    let (mut best, mut prev, mut winner) = select(v_lim);
+    let (mut best, mut prev, mut winner) = select(v_lim, false);
     // A few closely spaced reports can pass the default envelope even when the rest of a
     // coherent fast flyover does not. Recover missing coverage only by extending the legacy
     // winner, never by replacing a supported rival. A finite zero must not be reinterpreted,
     // because the later sparse-sample velocity rule can still trust that report.
-    if best[winner] < n
-        && pts.iter().all(|p| !p.gs_mps.is_finite())
-        && let Some(limit) = position_speed_limit(pts, &xy, bp)
-        && limit > v_lim
-    {
+    let position_limit = (best[winner] < n && pts.iter().all(|p| !p.gs_mps.is_finite()))
+        .then(|| position_speed_limit(pts, &xy, bp))
+        .flatten()
+        .filter(|&limit| limit > v_lim);
+    let allow_reported = pts.iter().any(|p| {
+        p.gs_mps as f64 > v_lim && p.gs_mps as f64 <= fdop_types::C_SOUND && p.track_deg.is_finite()
+    });
+    if best[winner] < n && (allow_reported || position_limit.is_some()) {
+        let limit = position_limit.unwrap_or(v_lim);
         let mut first = winner;
         while prev[first] != usize::MAX {
             first = prev[first];
@@ -254,7 +289,7 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                     || pts[k].t - pts[winner].t > bp.max_gap_s)
         });
         if !disjoint_support {
-            let (expanded_best, expanded_prev, expanded_winner) = select(limit);
+            let (expanded_best, expanded_prev, expanded_winner) = select(limit, allow_reported);
             let mut old = winner;
             let mut expanded = expanded_winner;
             while expanded != usize::MAX && old != usize::MAX {
@@ -3118,6 +3153,161 @@ mod tests {
             })
             .collect();
         (gap_fixture_leg(points), truth, enu)
+    }
+
+    #[test]
+    fn changing_speed_reports_preserve_a_supported_faster_pass() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let distance = |t: f64| {
+            45.0 * t + 0.5 * (t - 420.0).clamp(0.0, 100.0).powi(2) + 100.0 * (t - 520.0).max(0.0)
+        };
+        let times: Vec<_> = (0..=37).map(|k| k as f64 * 20.0).collect();
+        for reverse in [false, true] {
+            for [east, north] in [[1.0, 0.0], [0.6, 0.8]] {
+                let state = |t: f64| {
+                    let q = if reverse { 740.0 - t } else { t };
+                    let s = if reverse {
+                        distance(740.0) - distance(q)
+                    } else {
+                        distance(q)
+                    };
+                    let speed = 45.0 + (q - 420.0).clamp(0.0, 100.0);
+                    (
+                        enu.to_ecef([east * s, north * s, 1200.0]),
+                        enu.vec_to_ecef([east * speed, north * speed, 0.0]),
+                    )
+                };
+                let leg = leg_from_states(&times, state);
+                let models = build(&leg, &BuildParams::default());
+                assert_eq!(models.len(), 1);
+                let model = &models[0];
+                eprintln!(
+                    "changing-speed reverse={reverse} heading=({east},{north}): retained {} of {} reports, {:.1}..{:.1} s",
+                    model.t.len(),
+                    times.len(),
+                    model.t0() - 1000.0,
+                    model.t1() - 1000.0
+                );
+                assert_eq!(
+                    model.t.len(),
+                    times.len(),
+                    "the faster physical pass was lost"
+                );
+                assert_eq!(model.reported_vel_frac, 1.0);
+                let pass = if reverse { 90.0 } else { 650.0 };
+                let observer = add(
+                    state(pass).0,
+                    enu.vec_to_ecef([-800.0 * north, 800.0 * east, -1200.0]),
+                );
+                let errors = analytic_flight_errors(model, observer, state);
+                eprintln!("changing-speed physical errors: {errors:?}");
+                assert!(errors.0 < 0.01, "position error: {errors:?}");
+                assert!(errors.1 < 0.001, "Doppler error: {errors:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn changing_speed_recovery_requires_independent_local_motion_support() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let times: Vec<_> = (0..=37).map(|k| k as f64 * 20.0).collect();
+        let state = |t: f64| {
+            let ramp = (t - 420.0).clamp(0.0, 100.0);
+            (
+                enu.to_ecef([
+                    45.0 * t + 0.5 * ramp * ramp + 100.0 * (t - 520.0).max(0.0),
+                    0.0,
+                    1200.0,
+                ]),
+                enu.vec_to_ecef([45.0 + ramp, 0.0, 0.0]),
+            )
+        };
+        let physical = leg_from_states(&times, state);
+        for invalid in [
+            "single speed",
+            "heading absent",
+            "wrong heading",
+            "supersonic",
+            "height jump",
+        ] {
+            let mut leg = physical.clone();
+            for p in &mut leg.points {
+                if p.t < 1500.0 {
+                    continue;
+                }
+                match invalid {
+                    "single speed" => {
+                        if p.t != 1640.0 {
+                            p.gs_mps = f32::NAN;
+                        }
+                    }
+                    "heading absent" => p.track_deg = f32::NAN,
+                    "wrong heading" => p.track_deg += 90.0,
+                    "supersonic" => p.gs_mps = 400.0,
+                    "height jump" => p.alt_m += 10_000.0,
+                    _ => unreachable!(),
+                }
+            }
+            let models = build(&leg, &BuildParams::default());
+            assert!(!models.is_empty(), "the earlier supported portion was lost");
+            assert!(
+                models.iter().all(|m| !(m.t0() < 1650.0 && m.t1() > 1650.0)),
+                "{invalid} justified unsupported cruise coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn reported_speed_extension_preserves_separated_legacy_support() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        for reverse in [false, true] {
+            let time = |t: f64| if reverse { 1500.0 - t } else { t };
+            let point = |t: f64, east: f64, speed: f32| {
+                let (lat, lon, alt) = ecef_to_geodetic(enu.to_ecef([east, 0.0, 900.0]));
+                fdop_types::store::TrackPoint {
+                    t: time(t),
+                    lat,
+                    lon,
+                    alt_m: alt as f32,
+                    gs_mps: speed,
+                    track_deg: if reverse { 270.0 } else { 90.0 },
+                    vrate_mps: 0.0,
+                    alt_src: alt_src::GEOM,
+                    flags: 0,
+                }
+            };
+            let mut primary: Vec<_> = (0..100).map(|i| f64::from(i) * 0.1).collect();
+            let secondary: Vec<_> = (0..99).map(|i| 500.05 + f64::from(i) * 0.1).collect();
+            let mut points: Vec<_> = primary
+                .iter()
+                .chain(&secondary)
+                .map(|&t| point(t, 45.0 * t, 45.0))
+                .collect();
+            // An early fast report belongs to the old winner. Extending it through the
+            // later coherent fast reports would displace an independently kept slow part.
+            points.extend((2..=150).map(|i| {
+                let t = f64::from(i) * 10.0;
+                point(t, 1000.0 + 145.0 * (t - 20.0), 145.0)
+            }));
+            primary.push(if reverse { 20.0 } else { 30.0 });
+            points.sort_by(|a, b| a.t.total_cmp(&b.t));
+            let actual: Vec<Vec<_>> = consistent_chains(&points, &BuildParams::default())
+                .iter()
+                .map(|chain| chain.iter().map(|&i| points[i].t).collect())
+                .collect();
+            let expected: Vec<Vec<_>> = [primary, secondary]
+                .into_iter()
+                .map(|times| {
+                    let mut times: Vec<_> = times.into_iter().map(time).collect();
+                    times.sort_by(f64::total_cmp);
+                    times
+                })
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "reported extension lost a supported part, reverse={reverse}"
+            );
+        }
     }
 
     #[test]
