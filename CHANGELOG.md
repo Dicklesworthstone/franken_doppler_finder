@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover valid pairs from failed fine-grid representatives
+
+- Retain deterministic alternatives within each 1 km / 20 s fine-stage cell. Finish
+  every original representative before retrying failed cells, stop a cell at its first
+  valid grid and preserve successful originals. Exact duplicate seeds consume no retry.
+- Count every additional grid against the remaining `max_fine` budget and in
+  `funnel.fine_scored`; warn and fail the existing margin gate when real alternatives
+  remain unchecked. Keep the physical scorer, grids, gates and confidence thresholds.
+- Add a physical two-aircraft fine-stage regression with coherent contamination in
+  the quick trace subset, plus deterministic-order, budget, duplicate and bounded-batch
+  controls. The test requires the alternative to recover both actual source tracks.
+- Native validation: all eight fine-stage selection, ranking and recovery tests pass
+  on pinned nightly-2026-08-31 with locked dependencies. RCH used one build job and a
+  command-line `fsci-special` optimization override after the standard-profile compiler
+  was killed before tests. No field-accuracy or performance claim is made.
+
 ### Keep the physical pass identity through wind-dependent search refinement
 
 - Retain the geometric CPA emission time when a match uses a moving medium. Confirmation,

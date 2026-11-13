@@ -1685,6 +1685,17 @@ allowance runs out, the funnel records the cut and the margin gate fails. Recove
 at most 4,096 pending seeds, without collecting raw pairs; its hash keys and accepted cells
 still grow with the input. Hypothesis clouds are released after both passes.
 
+A fine-stage cell (1 km in position and 20 s in clock) now retains its other quick-passing
+seeds until its representative's fine grid succeeds. Every original representative runs
+before recovery. If a grid finds no eligible pair, the cell can try its next deterministic
+seed; failed cells take turns, and each stops at its first successful grid. Additional grids
+consume only the remaining `max_fine` allowance and count in `funnel.fine_scored`. Untested
+alternatives at budget exhaustion produce a warning and a truncation that fails the existing
+margin gate. Successful representatives retain their original candidate. Exact duplicate
+seeds are tried once; different grid phases and source-time hypotheses remain eligible.
+Retaining alternatives and evaluating failed cells can add memory and runtime, bounded by
+the existing input and comparison budgets; no speedup or field-accuracy claim is made.
+
 The fine grid selects the lowest-loss location where both seeding aircraft pass the
 existing per-event trace-fit and coverage gates. A lower combined loss at a point that
 fails one aircraft no longer discards a nearby valid pair. Eligible points retain the
@@ -1787,6 +1798,31 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Fine grids can recover from a misleading quick representative
+
+The new fine-stage regressions exercise the production grid scorer and retry scheduler.
+The physical case uses two perpendicular 200 m/s tracks, with 1,000 m horizontal offsets
+and a 1,200 m local height near a synthetic observer. A coherent competing curve contaminates
+the points selected by the quick trace subset, while most full-trace observations retain the
+actual passes. Both seeds pass the quick check. The misleading seed wins that ranking but
+its 500 m half-width grid stops short of the observer; an alternative in the same merged cell
+can explain both aircraft. The test requires recovery with two grid attempts and an explicit
+cut when only the failed representative can be tried. It uses generated frequency traces,
+not PCM, and does not exercise detection or fitting.
+
+Scheduling controls cover deterministic representative priority, successful-cell preservation,
+round-robin retry order, exact duplicate removal, clock-cell separation, the 4,096-seed delivery
+boundary, and exact completion versus budget exhaustion. The grids, physical gates, trace
+thresholds and confidence rules are unchanged.
+
+All eight fine-stage selection, ranking and recovery tests pass on the pinned
+nightly-2026-08-31 toolchain with locked dependencies, including the four new regressions.
+They ran through RCH with one build job, development debug symbols disabled and the
+command-line override `--config 'profile.dev.package.fsci-special.opt-level=0'`. The
+standard-profile attempt was killed while compiling that dependency, before tests ran;
+the retry retains its exact source and version. These synthetic frequency-trace checks
+do not establish real-recording recovery or whole-recording performance.
 
 ### A rejected join midpoint can retain a valid two-aircraft location
 

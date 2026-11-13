@@ -1347,8 +1347,13 @@ fn recover_joined(
     (attempted, truncated)
 }
 
-/// Merge duplicate place/clock seeds and rank every flight pair's best cell before its next.
-fn ranked_fine_seeds(quick: Vec<(Joined, f64)>) -> Vec<(Joined, f64)> {
+/// Quick-score-ordered seeds sharing one fine-stage place/clock cell.
+type FineSeedGroup = Vec<(Joined, f64)>;
+
+/// Rank every flight pair's best cell before its next. Keep the other seeds of a cell
+/// in the same deterministic score order: its best quick score does not prove that its
+/// fine grid covers every location reachable from the other seeds.
+fn ranked_fine_seeds(quick: Vec<(Joined, f64)>) -> Vec<FineSeedGroup> {
     // Hash-map iteration and exact score ties must not choose which clock or seed survives.
     let compare = |a: &(Joined, f64), b: &(Joined, f64)| {
         b.1.total_cmp(&a.1).then_with(|| {
@@ -1362,7 +1367,7 @@ fn ranked_fine_seeds(quick: Vec<(Joined, f64)>) -> Vec<(Joined, f64)> {
                 .then(a.te_j.total_cmp(&b.te_j))
         })
     };
-    let mut best_by: HashMap<CellKey, (Joined, f64)> = HashMap::new();
+    let mut cells: HashMap<CellKey, FineSeedGroup> = HashMap::new();
     for (j, s) in quick {
         let Some(clock) = clock_cell(j.t_s) else {
             continue;
@@ -1376,32 +1381,92 @@ fn ranked_fine_seeds(quick: Vec<(Joined, f64)>) -> Vec<(Joined, f64)> {
             (j.n / 1000.0).floor() as i32,
             clock,
         );
-        match best_by.get(&k) {
-            Some(o) if !compare(&(j, s), o).is_lt() => {}
-            _ => {
-                best_by.insert(k, (j, s));
-            }
-        }
+        cells.entry(k).or_default().push((j, s));
     }
     // Every flight pair's best cell is scored before any pair's second-best cell, so a budget
     // cut cannot starve the true pair behind many cells of a few look-alike pairs.
-    let mut groups: HashMap<PairKey, Vec<(Joined, f64)>> = HashMap::new();
-    for (j, s) in best_by.into_values() {
+    let mut groups: HashMap<PairKey, Vec<FineSeedGroup>> = HashMap::new();
+    for mut cell in cells.into_values() {
+        cell.sort_by(compare);
+        // Rechecking identical geometry, clocks and score cannot recover a failed grid.
+        // Nearby seeds and distinct CPA assignments remain independent alternatives.
+        cell.dedup_by(|a, b| compare(a, b).is_eq());
+        let j = cell[0].0;
         groups
             .entry((j.ei, j.ej, j.ti, j.tj))
             .or_default()
-            .push((j, s));
+            .push(cell);
     }
-    let mut ranked: Vec<(usize, Joined, f64)> = Vec::new();
+    let mut ranked: Vec<(usize, FineSeedGroup)> = Vec::new();
     for (_, mut g) in groups {
-        g.sort_by(compare);
-        ranked.extend(g.into_iter().enumerate().map(|(r, (j, s))| (r, j, s)));
+        g.sort_by(|a, b| compare(&a[0], &b[0]));
+        ranked.extend(g.into_iter().enumerate());
     }
-    ranked.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| compare(&(a.1, a.2), &(b.1, b.2)))
-    });
-    ranked.into_iter().map(|(_, j, s)| (j, s)).collect()
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| compare(&a.1[0], &b.1[0])));
+    ranked.into_iter().map(|(_, seeds)| seeds).collect()
+}
+
+/// Score the original representatives before retrying failed cells. A successful grid
+/// releases its alternatives immediately; failed cells cycle through their next seeds.
+/// The caller has already applied the original representative budget and reported its cut.
+fn score_fine_seeds<T: Send>(
+    groups: Vec<FineSeedGroup>,
+    budget: usize,
+    score: &(impl Fn(&Joined) -> Option<T> + Sync),
+) -> (Vec<T>, usize, bool) {
+    debug_assert!(groups.len() <= budget && groups.iter().all(|g| !g.is_empty()));
+    let mut attempted = groups.len();
+    let originals: Vec<_> = groups
+        .into_par_iter()
+        .map(|group| {
+            let result = score(&group[0].0);
+            let rest = if result.is_none() {
+                let mut rest = group.into_iter();
+                rest.next();
+                (rest.len() > 0).then_some(rest)
+            } else {
+                None
+            };
+            (result, rest)
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut pending = std::collections::VecDeque::new();
+    for (result, rest) in originals {
+        if let Some(result) = result {
+            out.push(result);
+        }
+        if let Some(rest) = rest {
+            pending.push_back(rest);
+        }
+    }
+    // This is only the delivery buffer, never an additional search limit.
+    const BATCH_SEEDS: usize = 4096;
+    while !pending.is_empty() {
+        let n = pending
+            .len()
+            .min(budget.saturating_sub(attempted))
+            .min(BATCH_SEEDS);
+        if n == 0 {
+            return (out, attempted, true);
+        }
+        let mut batch = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut rest = pending.pop_front().unwrap();
+            let seed = rest.next().unwrap().0;
+            batch.push((rest, seed));
+        }
+        let results: Vec<_> = batch.par_iter().map(|(_, j)| score(j)).collect();
+        attempted += n;
+        for ((rest, _), result) in batch.into_iter().zip(results) {
+            if let Some(result) = result {
+                out.push(result);
+            } else if rest.len() > 0 {
+                pending.push_back(rest);
+            }
+        }
+    }
+    (out, attempted, false)
 }
 
 /// Frequency-ratio curve f/f0 through the propagation medium on a uniform reception-time
@@ -1804,6 +1869,7 @@ pub struct Funnel {
     pub hypotheses: Vec<(String, Option<usize>)>,
     pub joined: usize,
     pub quick_passed: usize,
+    /// Fine grids actually attempted, including alternatives for failed representatives.
     pub fine_scored: usize,
     pub fine_passed: usize,
     pub truncated: Vec<String>,
@@ -2876,6 +2942,68 @@ fn independent_events_by(
     keep
 }
 
+/// Score one joined seed on its original fine grid and per-event gates.
+fn fine_candidate(
+    j: &Joined,
+    frame: &Frame,
+    evs: &[SearchEvent],
+    inp: &SearchInputs,
+    p: &SearchParams,
+    nulls: &[EventNull],
+) -> Option<Candidate> {
+    let (la, lo) = frame.latlon(j.e, j.n);
+    let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
+    let mut best: Option<(Obs, PointEval)> = None;
+    for (gla, glo, _, _) in local_grid(la, lo, p.fine_half_m, p.fine_step_m) {
+        let o = observer(gla, glo, inp.fine_dem);
+        if let Some(pe) = eval_point(
+            &o,
+            &assign,
+            evs,
+            inp.tracks,
+            p,
+            inp.atmo,
+            p.region.contains(gla, glo),
+            true,
+            false,
+        ) && fine_point_is_better(&pe, best.as_ref().map(|(_, point)| point), p.kappa)
+        {
+            best = Some((o, pe));
+        }
+    }
+    let (o, pe) = best?;
+    let mut events: Vec<EventMatch> = assign
+        .iter()
+        .enumerate()
+        .map(|(k, &(ei, ti, _))| {
+            make_match(
+                &evs[ei],
+                &inp.tracks[ti as usize],
+                &pe.cpas[k],
+                pe.chis[k],
+                &pe.props[k],
+                "pair",
+            )
+        })
+        .collect();
+    let score = evidence(&mut events, nulls, 0);
+    Some(Candidate {
+        lat: o.lat,
+        lon: o.lon,
+        elev_m: o.z,
+        t_start_utc: pe.t_s,
+        n_explained: 2,
+        score,
+        fit_score: fit_score(&events, evs, p.kappa),
+        pair_chi: pe.total / (evs[j.ei].n_eff + evs[j.ej].n_eff),
+        unheard_close_passes: Vec::new(),
+        trk: vec![(j.ei, j.ti), (j.ej, j.tj)],
+        lock_checked: false,
+        fine_score: None,
+        events,
+    })
+}
+
 pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync)) -> SearchResult {
     let c = p.c;
     let frame = Frame::new(&p.region);
@@ -3104,71 +3232,37 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
         ));
         fine_in.truncate(p.max_fine);
     }
-    funnel.fine_scored = fine_in.len();
-    // fine grid + full scoring
+    let primary_fine = fine_in.len();
+    // Finish the established representative pass before any recovery spends its budget.
     let done = AtomicUsize::new(0);
-    let fine: Vec<Candidate> = fine_in
-        .par_iter()
-        .filter_map(|(j, _)| {
-            let k = done.fetch_add(1, Ordering::Relaxed);
-            if k.is_multiple_of(20_000) && k > 0 {
-                progress(&format!("fine grid {k}/{}", fine_in.len()));
+    let (fine, attempted, alternatives_cut) = score_fine_seeds(fine_in, p.max_fine, &|j| {
+        let k = done.fetch_add(1, Ordering::Relaxed);
+        if k.is_multiple_of(20_000) && k > 0 {
+            if k < primary_fine {
+                progress(&format!("fine grid {k}/{primary_fine}"));
+            } else {
+                progress(&format!("fine alternatives: {} scored", k - primary_fine));
             }
-            let (la, lo) = frame.latlon(j.e, j.n);
-            let assign = [(j.ei, j.ti, j.te_i), (j.ej, j.tj, j.te_j)];
-            let mut best: Option<(Obs, PointEval)> = None;
-            for (gla, glo, _, _) in local_grid(la, lo, p.fine_half_m, p.fine_step_m) {
-                let o = observer(gla, glo, inp.fine_dem);
-                if let Some(pe) = eval_point(
-                    &o,
-                    &assign,
-                    &evs,
-                    tracks,
-                    p,
-                    atmo,
-                    p.region.contains(gla, glo),
-                    true,
-                    false,
-                ) && fine_point_is_better(&pe, best.as_ref().map(|(_, point)| point), p.kappa)
-                {
-                    best = Some((o, pe));
-                }
-            }
-            let (o, pe) = best?;
-            let mut events: Vec<EventMatch> = assign
-                .iter()
-                .enumerate()
-                .map(|(k, &(ei, ti, _))| {
-                    make_match(
-                        &evs[ei],
-                        &tracks[ti as usize],
-                        &pe.cpas[k],
-                        pe.chis[k],
-                        &pe.props[k],
-                        "pair",
-                    )
-                })
-                .collect();
-            let score = evidence(&mut events, &nulls, 0);
-            Some(Candidate {
-                lat: o.lat,
-                lon: o.lon,
-                elev_m: o.z,
-                t_start_utc: pe.t_s,
-                n_explained: 2,
-                score,
-                fit_score: fit_score(&events, &evs, p.kappa),
-                pair_chi: pe.total / (evs[j.ei].n_eff + evs[j.ej].n_eff),
-                unheard_close_passes: Vec::new(),
-                trk: vec![(j.ei, j.ti), (j.ej, j.tj)],
-                lock_checked: false,
-                fine_score: None,
-                events,
-            })
-        })
-        .collect();
-    // Only the fine survivors are needed from here on.
-    drop(fine_in);
+        }
+        fine_candidate(j, &frame, &evs, inp, p, &nulls)
+    });
+    funnel.fine_scored = attempted;
+    let recovered_grids = attempted - primary_fine;
+    if recovered_grids > 0 {
+        progress(&format!(
+            "fine alternatives: {recovered_grids} additional grids scored"
+        ));
+    }
+    if alternatives_cut {
+        warnings.push(format!(
+            "fine-grid alternatives remain unchecked after {recovered_grids} additional grids exhausted the fine-stage budget ({}); narrow the region or dates",
+            p.max_fine
+        ));
+        funnel.truncated.push(format!(
+            "fine alternatives: budget {} exhausted",
+            p.max_fine
+        ));
+    }
     funnel.fine_passed = fine.len();
     progress(&format!("fine survivors: {}", fine.len()));
     let mut fine = fine;
@@ -10161,12 +10255,18 @@ mod tests {
             (better, 0.9),
             (other_pair, 0.1),
         ];
-        let summarize = |seeds: Vec<(Joined, f64)>| {
-            seeds
+        let summarize = |groups: Vec<FineSeedGroup>| {
+            groups
                 .into_iter()
-                .map(|(j, s)| (j.tj, j.t_s, j.e, s))
+                .map(|g| {
+                    let (j, s) = g[0];
+                    (j.tj, j.t_s, j.e, s)
+                })
                 .collect::<Vec<_>>()
         };
+        let groups = ranked_fine_seeds(input.clone());
+        assert_eq!(groups[0], [(better, 0.9), (tied, 0.9), (seed, 0.4)]);
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), input.len());
         let expected = vec![
             (1, seed.t_s, better.e, 0.9),
             // The other flight pair still gets its first cell before this pair's second.
@@ -10176,11 +10276,333 @@ mod tests {
         ];
         assert_eq!(summarize(ranked_fine_seeds(input.clone())), expected);
         input.reverse();
+        assert_eq!(ranked_fine_seeds(input.clone()), groups);
         assert_eq!(summarize(ranked_fine_seeds(input.clone())), expected);
         for t_s in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300] {
             input.push((Joined { t_s, ..seed }, 1.0));
         }
         assert_eq!(summarize(ranked_fine_seeds(input)), expected);
+    }
+
+    #[test]
+    fn fine_recovery_preserves_original_priority_and_counts_only_unchecked_work() {
+        let seed = |id| {
+            (
+                Joined {
+                    ei: 0,
+                    ej: 1,
+                    ti: 0,
+                    tj: 1,
+                    te_i: id as f64,
+                    te_j: 0.0,
+                    e: 0.0,
+                    n: 0.0,
+                    t_s: 0.0,
+                },
+                1.0,
+            )
+        };
+        // Supplied outcomes test scheduling only; physical scoring is exercised below.
+        let groups = vec![
+            vec![seed(0), seed(1)],
+            vec![seed(2), seed(3), seed(4)],
+            vec![seed(5), seed(6)],
+            vec![seed(7), seed(8)],
+        ];
+        for budget in 4..=7 {
+            let originals = AtomicUsize::new(0);
+            let visited = std::sync::Mutex::new(Vec::new());
+            let (out, attempted, cut) = score_fine_seeds(groups.clone(), budget, &|j| {
+                let id = j.te_i as usize;
+                if [0, 2, 5, 7].contains(&id) {
+                    originals.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    assert_eq!(originals.load(Ordering::SeqCst), 4);
+                }
+                visited.lock().unwrap().push(id);
+                [0, 4, 6, 7].contains(&id).then_some(id)
+            });
+            let expected = match budget {
+                4 | 5 => vec![0, 7],
+                6 => vec![0, 7, 6],
+                _ => vec![0, 7, 6, 4],
+            };
+            assert_eq!(out, expected);
+            assert_eq!(attempted, budget);
+            assert_eq!(cut, budget < 7);
+            let mut visited = visited.into_inner().unwrap();
+            // Worker completion order is deliberately unconstrained.
+            visited.sort_unstable();
+            let expected_visited = match budget {
+                4 => vec![0, 2, 5, 7],
+                5 => vec![0, 2, 3, 5, 7],
+                6 => vec![0, 2, 3, 5, 6, 7],
+                _ => vec![0, 2, 3, 4, 5, 6, 7],
+            };
+            assert_eq!(visited, expected_visited);
+        }
+
+        // Reaching the budget with no untested seed is a complete failed comparison.
+        let (out, attempted, cut) =
+            score_fine_seeds(vec![vec![seed(0)], vec![seed(2)]], 2, &|_| None::<usize>);
+        assert!(out.is_empty());
+        assert_eq!(attempted, 2);
+        assert!(!cut);
+        let (out, attempted, cut) = score_fine_seeds(Vec::new(), 0, &|_| None::<usize>);
+        assert!(out.is_empty());
+        assert_eq!(attempted, 0);
+        assert!(!cut);
+    }
+
+    #[test]
+    fn fine_recovery_keeps_clock_cells_and_skips_exact_duplicate_retries() {
+        for base in [-20.0, 0.0, 1_788_895_000.0] {
+            let seed = Joined {
+                ei: 0,
+                ej: 1,
+                ti: 0,
+                tj: 1,
+                te_i: base + 120.0,
+                te_j: base + 360.0,
+                e: 100.0,
+                n: 100.0,
+                t_s: base + 0.125,
+            };
+            let other = Joined { e: 900.0, ..seed };
+            let prior = Joined {
+                t_s: base - 0.125,
+                ..seed
+            };
+            let mut input = vec![(seed, 2.0), (seed, 2.0), (other, 1.0), (prior, 0.5)];
+            let groups = ranked_fine_seeds(input.clone());
+            input.reverse();
+            assert_eq!(ranked_fine_seeds(input), groups);
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0], [(seed, 2.0), (other, 1.0)]);
+            assert_eq!(groups[1], [(prior, 0.5)]);
+            let (out, attempted, cut) = score_fine_seeds(groups, 3, &|j| {
+                (j.e == other.e || j.t_s == prior.t_s).then_some(*j)
+            });
+            assert_eq!(out, [prior, other]);
+            assert_eq!(attempted, 3);
+            assert!(!cut, "the exact duplicate must not spend the recovery slot");
+        }
+    }
+
+    #[test]
+    fn fine_recovery_batches_preserve_priority_and_exact_exhaustion() {
+        let n = 4097;
+        let seed = |id: usize, phase: usize| {
+            (
+                Joined {
+                    ei: 0,
+                    ej: 1,
+                    ti: 0,
+                    tj: 1,
+                    te_i: id as f64,
+                    te_j: phase as f64,
+                    e: id as f64,
+                    n: 0.0,
+                    t_s: 0.0,
+                },
+                1.0,
+            )
+        };
+        let groups: Vec<_> = (0..n)
+            .map(|id| vec![seed(id, 0), seed(id, 1), seed(id, 2)])
+            .collect();
+        let expected: Vec<_> = (0..n).map(|id| (id as f64).to_bits()).collect();
+        // All successes retain their original indexed order and release every fallback.
+        let (out, attempted, cut) = score_fine_seeds(groups.clone(), n, &|j| {
+            assert_eq!(j.te_j, 0.0);
+            Some(j.e.to_bits())
+        });
+        assert_eq!(out, expected);
+        assert_eq!(attempted, n);
+        assert!(!cut);
+
+        for (budget, succeeds) in [(2 * n, false), (3 * n, false), (3 * n, true)] {
+            let calls = [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ];
+            let (out, attempted, cut) = score_fine_seeds(groups.clone(), budget, &|j| {
+                let phase = j.te_j as usize;
+                calls[phase].fetch_add(1, Ordering::SeqCst);
+                if phase > 0 {
+                    assert_eq!(calls[0].load(Ordering::SeqCst), n);
+                }
+                (succeeds && phase == 2).then_some(j.e.to_bits())
+            });
+            assert_eq!(attempted, budget);
+            assert_eq!(calls[0].load(Ordering::SeqCst), n);
+            assert_eq!(calls[1].load(Ordering::SeqCst), n);
+            assert_eq!(
+                calls[2].load(Ordering::SeqCst),
+                if budget == 2 * n { 0 } else { n }
+            );
+            assert_eq!(cut, budget == 2 * n);
+            assert_eq!(
+                out,
+                if succeeds {
+                    expected.clone()
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn fine_recovery_finds_the_two_flyovers_outside_the_best_quick_seeds_grid() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let prop = Prop::still(343.0);
+        let x = observer(lat, lon, &dem).x;
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+        // Both quick seeds lie in the same 1 km cell. Their 800 m separation on
+        // each axis leaves the truth 300 m beyond the leading seed's fine grid.
+        let centre = (lat - 900.0 / mlat, lon - 900.0 / mlon);
+        let region = BBox::new(
+            centre.0 - 2500.0 / mlat,
+            centre.1 - 2500.0 / mlon,
+            centre.0 + 2500.0 / mlat,
+            centre.1 + 2500.0 / mlon,
+        );
+        for base in [0.0, 1_788_895_000.0] {
+            let start = base + 10.0;
+            let p = SearchParams::new(start - 10.0, start + 10.0, 600.0, region);
+            let frame = Frame::new(&region);
+            let (e, n) = frame.en(lat, lon);
+            let good = Joined {
+                ei: 0,
+                ej: 1,
+                ti: 0,
+                tj: 1,
+                te_i: start + 120.0,
+                te_j: start + 360.0,
+                e,
+                n,
+                t_s: start,
+            };
+            let bad = Joined {
+                e: e - 800.0,
+                n: n - 800.0,
+                ..good
+            };
+            let (bla, blo) = frame.latlon(bad.e, bad.n);
+            let wrong = observer(bla, blo, &dem);
+            let mut tracks = Vec::new();
+            let mut events = Vec::new();
+            for (key, position, velocity, t_cpa, f0) in [
+                ("A", [0.0, 1000.0, 1200.0], [200.0, 0.0, 0.0], 120.0, 300.0),
+                ("B", [1000.0, 0.0, 1200.0], [0.0, 200.0, 0.0], 360.0, 420.0),
+            ] {
+                let mut tr = straight_track(
+                    &enu,
+                    position,
+                    velocity,
+                    start + t_cpa,
+                    start - 200.0,
+                    start + 800.0,
+                    5.0,
+                );
+                tr.key = key.into();
+                let mut ev = synth_event(key, &tr, x, start, f0, 343.0, start + t_cpa, &prop);
+                ev.sigma_hz = (0.002 * ev.f0).max(0.12);
+                ev.f0_tol = (0.04 * ev.f0).max(4.0);
+                ev.tr_t = (0..360)
+                    .map(|k| ev.t_rec - 20.0 + 40.0 * k as f64 / 359.0)
+                    .collect();
+                ev.tr_f = ev
+                    .tr_t
+                    .iter()
+                    .map(|&t| f0 * tr.solve_emission_p(start + t, x, &prop, None).unwrap().2)
+                    .collect();
+                // A minority of observed points has jumped to a coherent competing
+                // curve. Every quick sample comes from those actual trace points;
+                // the dense robust fit still sees 320 points from the true pass.
+                let (quick_times, _) = subsample(&ev.tr_t, &ev.tr_f, 40);
+                for t in quick_times {
+                    let k = ev.tr_t.iter().position(|&tt| tt == t).unwrap();
+                    ev.tr_f[k] = f0
+                        * tr.solve_emission_p(start + t, wrong.x, &prop, None)
+                            .unwrap()
+                            .2;
+                }
+                (ev.q_t, ev.q_f) = subsample(&ev.tr_t, &ev.tr_f, 40);
+                tracks.push(tr);
+                events.push(ev);
+            }
+            let inp = SearchInputs {
+                events: events.clone(),
+                tracks: &tracks,
+                heard_times: events.iter().map(|ev| ev.t_rec).collect(),
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            let quick: Vec<_> = [bad, good]
+                .into_iter()
+                .map(|mut j| {
+                    let (la, lo) = frame.latlon(j.e, j.n);
+                    let pe = eval_point(
+                        &observer(la, lo, &dem),
+                        &[(0, 0, j.te_i), (1, 1, j.te_j)],
+                        &events,
+                        &tracks,
+                        &p,
+                        &atmo,
+                        true,
+                        true,
+                        true,
+                    )
+                    .expect("both physical seeds must pass the unchanged quick gates");
+                    assert!(pe.chis.iter().all(|fit| fit.chi <= p.quick_chi));
+                    j.t_s = pe.t_s;
+                    let score = pe
+                        .chis
+                        .iter()
+                        .zip(&events)
+                        .map(|(fit, ev)| ev_weight(ev) * (1.0 - fit.chi / p.quick_chi).max(0.0))
+                        .sum();
+                    (j, score)
+                })
+                .collect();
+            assert!(
+                quick[0].1 > quick[1].1,
+                "the actual quick fit must prefer the wrong seed"
+            );
+            let groups = ranked_fine_seeds(quick);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].len(), 2);
+            assert_eq!(groups[0][0].0.e, bad.e);
+            let score = |j: &Joined| fine_candidate(j, &frame, &events, &inp, &p, &[]);
+            let (old, attempted, cut) = score_fine_seeds(groups.clone(), 1, &score);
+            assert!(
+                old.is_empty(),
+                "the original representative's whole fine grid must fail"
+            );
+            assert_eq!(attempted, 1);
+            assert!(cut);
+            let (recovered, attempted, cut) = score_fine_seeds(groups, 2, &score);
+            assert_eq!(attempted, 2);
+            assert!(!cut);
+            assert_eq!(recovered.len(), 1);
+            let found = &recovered[0];
+            assert!(haversine_m(lat, lon, found.lat, found.lon) < 150.0);
+            assert!((found.t_start_utc - start).abs() < 1.0);
+            assert_eq!(found.trk, [(0, 0), (1, 1)]);
+            for key in ["A", "B"] {
+                assert!(found.events.iter().any(|m| m.event == key
+                    && m.flight == key
+                    && m.chi <= p.kappa
+                    && m.coverage >= 0.99));
+            }
+        }
     }
 
     #[test]
