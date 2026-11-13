@@ -410,11 +410,13 @@ fn build_store_inner(
         }
         pts.sort_by(|a, b| a.p.t.total_cmp(&b.p.t).then(a.rank.cmp(&b.rank)));
         let mut dd: Vec<MPoint> = Vec::with_capacity(pts.len());
+        let mut duplicate_ends = Vec::with_capacity(pts.len());
         let mut duplicate_times = HashMap::new();
-        for q in pts {
+        for (i, &q) in pts.iter().enumerate() {
             if let Some(last) = dd.last_mut()
                 && (q.p.t - last.p.t).abs() < DEDUPE_S
             {
+                *duplicate_ends.last_mut().unwrap() = i + 1;
                 dedup_dropped += 1;
                 if q.rank < last.rank {
                     if last.p.t != q.p.t {
@@ -434,8 +436,38 @@ fn build_store_inner(
                 continue;
             }
             dd.push(q);
+            duplicate_ends.push(i + 1);
         }
         boundaries.remap_duplicates(&duplicate_times);
+        // Keep the established rank-driven duplicate groups: choosing a better
+        // position must not extend a group through another nearby report. Once a
+        // group is fixed, observed non-MLAT positions take precedence over feed rank.
+        let mut duplicate_start = 0;
+        let mut preferred_times = HashMap::new();
+        for (q, duplicate_end) in dd.iter_mut().zip(duplicate_ends) {
+            let duplicates = &pts[duplicate_start..duplicate_end];
+            duplicate_start = duplicate_end;
+            if q.p.flags & pt_flags::MLAT != 0
+                && let Some(&preferred) = duplicates
+                    .iter()
+                    .filter(|p| p.p.flags & pt_flags::MLAT == 0)
+                    .min_by_key(|p| p.rank)
+            {
+                let original = *q;
+                *q = preferred;
+                q.p.new_leg |= original.p.new_leg;
+                recover_duplicate_altitude(q, &original);
+                for donor in duplicates {
+                    recover_duplicate_altitude(q, donor);
+                }
+                if q.p.t != original.p.t {
+                    preferred_times.insert(original.p.t.to_bits(), q.p.t);
+                }
+            }
+        }
+        // Resolve the original remaps first, then the quality replacements. Combining
+        // both maps could cycle when the final choice was an earlier discarded report.
+        boundaries.remap_duplicates(&preferred_times);
         // split into legs
         let mut cur: Vec<MPoint> = Vec::new();
         let flush = |cur: &mut Vec<MPoint>, drafts: &mut Vec<LegDraft>| {
@@ -1441,6 +1473,284 @@ mod tests {
             seam_part(T0, T0, "prod", &rows),
             seam_part(T0, T0, "mlat", &[donor]),
         ]
+    }
+
+    fn position_quality_part(
+        feed: &str,
+        samples: &[(f64, &str, f64)],
+        cached: bool,
+    ) -> (Vec<RawAircraft>, IngestStats) {
+        let enu = fdop_types::geo::Enu::new(40.876466, -73.524951, 0.0);
+        let sp = spec();
+        let rows: Vec<_> = samples
+            .iter()
+            .map(|&(dt, source, north_error)| {
+                let (lat, lon, height) = enu.to_geodetic([
+                    90.0 * (dt - 70_000.0),
+                    800.0 + north_error,
+                    if north_error == 0.0 { 1000.0 } else { 800.0 },
+                ]);
+                serde_json::json!([
+                    dt,
+                    lat,
+                    lon,
+                    (height + sp.geoid_n_m) / fdop_types::FT_TO_M,
+                    90.0 / fdop_types::KT_TO_MPS,
+                    90,
+                    8,
+                    0,
+                    null,
+                    source
+                ])
+            })
+            .collect();
+        let context = DayContext::new(T0, 300.0, 3600.0);
+        let part = crate::ingest::ingest_day_reader(
+            std::io::Cursor::new(seam_tar(T0, &rows)),
+            feed,
+            &sp,
+            &|_| {},
+            context,
+        )
+        .unwrap();
+        assert_eq!(part.0.len(), 1);
+        assert_eq!(part.0[0].points.len(), samples.len());
+        for (p, &(_, source, _)) in part.0[0].points.iter().zip(samples) {
+            assert_eq!(p.flags & pt_flags::MLAT != 0, source == "mlat");
+        }
+        if !cached {
+            return part;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-raw-position-quality-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rel = crate::adsblol::DayRelease {
+            feed: Feed::from_label(feed).unwrap(),
+            repo: "synthetic".into(),
+            tag: format!("synthetic-{feed}"),
+            parts: vec![crate::adsblol::AssetPart {
+                name: "synthetic.tar".into(),
+                url: "https://example.invalid/synthetic.tar".into(),
+                size: part.1.bytes,
+            }],
+        };
+        crate::raw_cache::save(&dir, &rel, &sp, context, &part).unwrap();
+        crate::raw_cache::load(&dir, &rel, &sp, context)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn raw_position_quality_recovers_adsb_geometry_before_day_publication() {
+        use fdop_types::geo::{Enu, norm, sub};
+
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let truth =
+            [70_000.0, 70_010.0, 70_020.0, 70_030.0, 70_040.0].map(|t| (t, "adsb_icao", 0.0));
+        let expected = build_store(
+            vec![position_quality_part("prod", &truth, false)],
+            &spec(),
+            vec![],
+        )
+        .legs
+        .remove(0)
+        .points;
+        for cached in [false, true] {
+            for (mlat_feed, adsb_feed) in [
+                ("prod", "prod"),
+                ("prod", "staging"),
+                ("prod", "mlat"),
+                ("mlat", "prod"),
+            ] {
+                for dt in [-0.03125, 0.0, 0.03125] {
+                    for reverse in [false, true] {
+                        let displaced = truth.map(|(t, _, _)| (t + dt, "mlat", 1100.0));
+                        let parts = if mlat_feed == adsb_feed {
+                            // Competing positions may be in one trace, as well as in
+                            // separate feeds. Equal timestamps retain source row order.
+                            let mut rows = if reverse {
+                                [truth.as_slice(), displaced.as_slice()].concat()
+                            } else {
+                                [displaced.as_slice(), truth.as_slice()].concat()
+                            };
+                            rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+                            vec![position_quality_part(mlat_feed, &rows, cached)]
+                        } else {
+                            let mut parts = vec![
+                                position_quality_part(mlat_feed, &displaced, cached),
+                                position_quality_part(adsb_feed, &truth, cached),
+                            ];
+                            if reverse {
+                                parts.reverse();
+                            }
+                            parts
+                        };
+                        let store = build_day_store(
+                            parts,
+                            &spec(),
+                            vec![],
+                            DayContext::new(T0, 300.0, 3600.0),
+                        );
+                        assert_eq!(store.legs.len(), 1);
+                        let points = &store.legs[0].points;
+                        assert_eq!(points.len(), truth.len());
+                        for p in points {
+                            let actual = enu.from_geodetic(p.lat, p.lon, p.alt_m as f64);
+                            let position = [90.0 * (p.t - T0 - 70_000.0), 800.0, 1000.0];
+                            let error = norm(sub(actual, position));
+                            assert!(
+                                error < 0.01,
+                                "{mlat_feed}/{adsb_feed}, cached={cached}, dt={dt}, reverse={reverse}: trajectory error {error:.1} m"
+                            );
+                        }
+                        assert_eq!(points, &expected);
+                        assert_eq!(store.meta.stats["dedup_dropped"], truth.len());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_position_quality_preserves_rank_driven_duplicate_intervals() {
+        let sp = spec();
+        let build = |parts| build_day_store(parts, &sp, vec![], DayContext::new(T0, 300.0, 3600.0));
+        let times = |store: &TrackStore| {
+            store.legs[0]
+                .points
+                .iter()
+                .map(|p| p.t - T0)
+                .collect::<Vec<_>>()
+        };
+
+        // Rank improvements moved the old anchor twice. The final quality choice
+        // is earlier, but must not resurrect a report from that established group.
+        let chained = build(vec![
+            position_quality_part("mlat", &[(70_000.0, "mlat", 1100.0)], false),
+            position_quality_part("staging", &[(70_000.03125, "adsb_icao", 0.0)], false),
+            position_quality_part(
+                "prod",
+                &[(70_000.0625, "mlat", 1100.0), (70_010.0, "adsb_icao", 0.0)],
+                false,
+            ),
+        ]);
+        assert_eq!(chained.legs.len(), 1);
+        assert_eq!(times(&chained), [70_000.03125, 70_010.0]);
+        assert_eq!(chained.meta.stats["dedup_dropped"], 2);
+        assert!(
+            chained.legs[0]
+                .points
+                .iter()
+                .all(|p| p.flags & pt_flags::MLAT == 0)
+        );
+
+        // A quality improvement alone must not extend the old group through its
+        // next report. Same-feed duplicates never moved the old time anchor.
+        let separate = build(vec![position_quality_part(
+            "prod",
+            &[
+                (70_000.0, "mlat", 1100.0),
+                (70_000.03125, "adsb_icao", 0.0),
+                (70_000.0625, "adsb_icao", 0.0),
+                (70_010.0, "adsb_icao", 0.0),
+            ],
+            false,
+        )]);
+        assert_eq!(separate.legs.len(), 1);
+        assert_eq!(times(&separate), [70_000.03125, 70_000.0625, 70_010.0]);
+        assert_eq!(separate.meta.stats["dedup_dropped"], 1);
+
+        // Without better observed position evidence, the original rank/time
+        // winner and its complete payload remain the fallback.
+        let first = position_quality_part("prod", &[(70_000.03125, "mlat", 1100.0)], false);
+        let second = position_quality_part(
+            "mlat",
+            &[(70_000.0, "mlat", 0.0), (70_010.0, "mlat", 0.0)],
+            false,
+        );
+        let expected = first.0[0].points[0];
+        let fallback = build(vec![second, first]);
+        let point = fallback.legs[0].points[0];
+        assert_eq!(
+            (point.t, point.lat, point.lon),
+            (expected.t, expected.lat, expected.lon)
+        );
+        assert_eq!(point.alt_m, expected.alt_geom_msl);
+        assert_eq!(point.flags, expected.flags);
+        assert_eq!(times(&fallback), [70_000.03125, 70_010.0]);
+    }
+
+    #[test]
+    fn raw_position_quality_retains_observed_altitude_donations() {
+        for missing_geom in [true, false] {
+            for dt in [-0.02, 0.0, 0.02] {
+                let mut parts = duplicate_altitude_parts(dt, missing_geom);
+                let expected = build_store(parts.clone(), &seam_spec(T0), vec![]);
+                // Reverse only feed priority: the non-MLAT report is still the
+                // position to retain, with a coherent altitude pair in its duplicate.
+                parts[0].0[0].feed = "mlat".into();
+                parts[1].0[0].feed = "prod".into();
+                let recovered = build_store(parts, &seam_spec(T0), vec![]);
+                assert_eq!(recovered.legs.len(), expected.legs.len());
+                assert_eq!(recovered.legs[0].points, expected.legs[0].points);
+                assert_eq!(recovered.legs[0].source, "prod+mlat");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_position_quality_remaps_boundaries_to_selected_report_times() {
+        for ground in [false, true] {
+            for gap in [29.96875, 30.0, 30.03125] {
+                for dt in [-0.03125, 0.0, 0.03125] {
+                    let mut rows = vec![seam_row(-10.0, 0.02), seam_row(0.0, 0.03)];
+                    if ground {
+                        let mut row = seam_row(15.0, 0.04);
+                        row[3] = serde_json::json!("ground");
+                        rows.push(row);
+                    }
+                    let mut marked = seam_row(gap + dt, 0.05);
+                    marked[9] = serde_json::json!("mlat");
+                    if !ground {
+                        marked[6] = serde_json::json!(2);
+                    }
+                    rows.extend([marked, seam_row(gap + 10.0, 0.06)]);
+                    let parts = vec![
+                        seam_part(T0, T0, "prod", &rows),
+                        seam_part(
+                            T0,
+                            T0,
+                            "mlat",
+                            &[seam_row(gap, 0.05), seam_row(gap + 10.0, 0.06)],
+                        ),
+                    ];
+                    let store = seam_day(T0, parts);
+                    let expected_legs = if gap >= NEW_LEG_MIN_GAP_S { 2 } else { 1 };
+                    // The threshold is unchanged and applies to the selected report's
+                    // observed time, including either side of the original 30 s edge.
+                    assert_eq!(store.legs.len(), expected_legs, "{ground}/{gap}/{dt}");
+                    let boundaries: LegBoundaries =
+                        serde_json::from_value(store.meta.stats["leg_boundaries"].clone()).unwrap();
+                    let events = &boundaries["000001"];
+                    if ground {
+                        assert_eq!(events.ground, [(T0 + 15.0, T0 + 15.0)]);
+                    } else {
+                        assert_eq!(events.new_leg, [T0 + gap]);
+                    }
+                    let expected: Vec<_> = store.legs.iter().map(|l| l.points.clone()).collect();
+                    let merged = merge_stores(vec![store], 300.0);
+                    assert_eq!(merged.legs.len(), expected_legs);
+                    for (leg, points) in merged.legs.iter().zip(expected) {
+                        assert_eq!(leg.points, points);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

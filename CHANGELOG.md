@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep observed ADS-B geometry when constructing a day from duplicate reports
+
+- Prefer an observed non-MLAT position over an explicitly MLAT duplicate before a day
+  store is published, even within the same feed. Retain feed rank for equal position
+  quality and the original fallback when no better observation is available.
+- Preserve the existing rank-driven duplicate groups. Carry ground/new-leg events through
+  separate timestamp remaps, then apply the unchanged gap thresholds to the selected
+  reports' observed times. Preserve coherent altitude donation and the store/cache formats.
+- Add real gzip/tar and raw-checkpoint regressions. The unchanged physical test fails
+  on the preceding builder with 1118.0 m trajectory error; all 48 combinations now retain
+  the exact canonical ADS-B points within 0.01 m of truth. Controls cover duplicate chains,
+  altitude evidence and boundary consistency through a subsequent store merge.
+- All 49 native build/ingest/raw-cache component tests pass with original production
+  modules and dependencies verified against the repository lockfile. The complete data
+  package remains unvalidated after its earlier `asupersync` compiler SIGKILL. This is
+  synthetic trajectory recovery, not a recording-location accuracy result. Existing
+  processed day stores are not automatically rebuilt; fresh builds and reconstruction
+  from saved raw checkpoints use the correction.
+
 ### Preserve preferred-feed geometry across overlapping cached days
 
 - Retain joined points' unambiguous feed origins before combining leg-level source labels.

@@ -976,8 +976,12 @@ leg-boundary provenance. A later online `locate` or `fetch` can reuse a complete
 when another feed failed, including an MLAT feed whose main feed failed. The archive stream
 is opened only when no usable checkpoint exists.
 
-When building a day from raw reports, duplicate reconciliation keeps the preferred report's
-time, position, motion and position-source flags. A lower-priority duplicate can supply a missing
+When building a day from raw reports, duplicate reconciliation prefers an observed non-MLAT
+position over an explicitly MLAT position, including competing reports within one feed.
+The established feed preference decides when position quality ties. Selection stays within
+the original duplicate groups and keeps the chosen report's time, position, motion and
+position-source flags. Ground and new-leg events remain available, with the existing gap
+thresholds applied to the selected reports' observed times. A lower-priority duplicate can supply a missing
 GNSS or barometric altitude only when its exact coordinates and one shared altitude agree,
 and it carries a complete, nonstale altitude pair. This retains observed altitude offsets for
 the existing leg and regional barometric corrections, with the contributing feed recorded in
@@ -1814,6 +1818,26 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover ADS-B positions before a day store discards them
+
+`raw_position_quality_recovers_adsb_geometry_before_day_publication` sends physical
+90 m/s trajectories through real gzip/tar ingestion, day construction and, in half the
+cases, a saved raw-checkpoint round trip. On the preceding builder, a correctly labeled
+MLAT duplicate wins over the available ADS-B observation and leaves a point 1118.0 m
+from the known trajectory. The correction passes all 48 feed/timestamp/order/cache
+combinations, requiring every point within 0.01 m of truth and exact equality with the
+canonical ADS-B sequence.
+
+Three further regressions preserve rank-driven duplicate membership, prevent a quality
+replacement from swallowing the next report, retain coherent altitude donations and
+check ground/new-leg events on both sides of the unchanged 30 s gap rule. A subsequent
+store merge agrees with the day builder's selected observation times and boundaries.
+All 49 native build/ingest/raw-cache component tests pass with the original production
+modules and lockfile-verified dependencies. The full data package and HTTP/fetch path
+remain outside this component; its earlier `asupersync` build was SIGKILLed. These are
+synthetic trajectory results. Existing processed day stores need rebuilding from raw
+reports to recover positions they previously discarded.
 
 ### Recover preferred-feed positions across cached days
 
