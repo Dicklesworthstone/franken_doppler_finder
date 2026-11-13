@@ -1301,6 +1301,7 @@ pub(crate) fn measure_recording(
             detect::FastRecoveryStage::OrdinaryShortInterior,
             detect::FastRecoveryStage::OrdinaryEdges,
             detect::FastRecoveryStage::CompactContrast,
+            detect::FastRecoveryStage::CompactContrastEdges,
         ] {
             let measured_aircraft = search::independent_measured_events(&events, 0.0).len();
             if measured_aircraft >= 2 {
@@ -1421,7 +1422,7 @@ pub(crate) fn measure_recording(
         let recovered_count = dets.len() - first_recovery;
         if recovered_count > 0 || ordinary_aircraft == 0 {
             warnings.push(format!(
-                "short-window recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; the recording's fast edges and refused detections, followed by brief fast and ordinary-speed interior passes, ordinary-speed true edges and short contrast curves as needed, supplied {recovered_count} candidates within the remaining detection budget; only accepted measured ridges and harmonic families own evidence between stages; all use the existing measurement gates and count as measured past the old line",
+                "short-window recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; the recording's fast edges and refused detections, followed by brief fast and ordinary-speed interior passes, ordinary-speed true edges and short contrast curves through the interior and true edges as needed, supplied {recovered_count} candidates within the remaining detection budget; only accepted measured ridges and harmonic families own evidence between stages; all use the existing measurement gates and count as measured past the old line",
             ));
         }
         if interior_incomplete {
@@ -3015,6 +3016,55 @@ mod tests {
         assert_eq!(detection.half_s, dp.edge_half_s);
         assert!(measured.added.contains(&event.id));
         assert_measurement_bookkeeping(&measured);
+    }
+
+    #[test]
+    fn short_contrast_edges_reach_recording_measurement() {
+        let (f0, v, d) = (450.0, 88.0, 250.0);
+        for t0r in [9.13, 110.87] {
+            let mut seed = 4242u64;
+            let x: Vec<f32> = (0..120 * 4000)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let t = i as f64 / 4000.0;
+                    let tau = physics::retarded_tau(t, t0r - d / 343.0, v, d, 343.0);
+                    let range = physics::cv_radial(tau, v, d).0;
+                    let source = 0.16 * d / range * (std::f64::consts::TAU * f0 * tau).sin();
+                    let noise = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+                    let swell = 10.0f64.powf((-0.5 * ((t - t0r) / 26.4).powi(2)).exp());
+                    (swell * (source + noise)) as f32
+                })
+                .collect();
+            let dp = DetectParams::default();
+            let (ls, _) = detect::survey(&x, 4000, &dp).unwrap();
+            assert!(detect::detect(&ls, &dp).is_empty());
+            let log = Log::new(true);
+            let measured = measure_recording(&x, 4000, &log, None).unwrap();
+            let independent = search::independent_measured_events(&measured.events, 0.0);
+            assert_eq!(independent.len(), 1, "{t0r}: {:?}", log.lines());
+            let event = measured
+                .events
+                .iter()
+                .find(|event| event.id == independent[0].id)
+                .unwrap();
+            let best = event.fit.as_ref().unwrap().best;
+            eprintln!(
+                "contrast edge recording at {t0r}: {best:?}, {:?}",
+                event.quality
+            );
+            assert!((best.f0 - f0).abs() < 0.3, "{best:?}");
+            assert!((best.v - v).abs() < 4.0, "{best:?}");
+            assert!((best.d / d - 1.0).abs() < 0.08, "{best:?}");
+            assert!((best.t0r - t0r).abs() < 0.3, "{best:?}");
+            let detection = &measured.detections[event.detection.id];
+            assert!(detection.from_contrast);
+            assert!(detection.score >= dp.thr_db);
+            assert_eq!(detection.half_s, dp.edge_half_s);
+            assert!(measured.added.contains(&event.id));
+            assert_measurement_bookkeeping(&measured);
+        }
     }
 
     #[test]

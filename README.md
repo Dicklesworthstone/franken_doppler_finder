@@ -1450,13 +1450,19 @@ Design notes:
   crop seams cannot masquerade as recording ends. It uses the same compact-duration domain and
   strong line, so a short ordinary-speed transition can be proposed near an end without
   relaxing its subsequent eight-second measurement requirements.
-  If an independent aircraft is still missing after those four stages, a final compact bank
+  If an independent aircraft is still missing after those four stages, a compact bank
   uses any existing contrast-first image from the short survey. It checks complete ten-second
   paths at ordinary and supported fast speeds, with the same strong line and continuous-ridge
   corroboration used by contrast edges. A broad recording-level swell can hide a short pass
   in the original image while leaving that contrast ridge measurable. Earlier stages retain
-  their candidates and priority; this final stage uses only the remaining proposals and slots,
+  their candidates and priority; this stage uses only the remaining proposals and slots,
   respects accepted observed ridges and marks every added seed `from_contrast`.
+  After its measurements, a final compact contrast bank checks the true recording ends in
+  the same at-most-48-second crops. Both ordinary and enabled fast templates retain their
+  full-template coverage guards and continuous-ridge corroboration. A cropped interior seam
+  cannot supply a recording edge. These seeds also need the original eight-second measured
+  approach and recede coverage; their provenance, ownership and remaining budgets are shared
+  with the earlier stages.
   An accepted aircraft keeps its original measurement and owns its
   observed ridge and detected harmonic family, even when its fitted geometry is inaccurate.
   Ownership interpolates only across traced gaps of at most three seconds and never extrapolates;
@@ -1832,6 +1838,39 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover short contrast flyovers at both recording boundaries
+
+`compact_contrast_edges_recover_short_physical_passes` uses a 120 s PCM recording with a
+450 Hz source moving at 88 m/s, closest range 250 m, and a heard centre at either 9.13 s
+or 110.87 s. Exact retarded phase, inverse-range amplitude, fixed-seed noise and the same
+20 dB source-and-noise level swell as the interior contrast regression supply the evidence.
+Main detection and all five earlier recovery stages find no aircraft at source amplitude
+0.16. The new final stage clears the existing sparse and continuous-ridge strong checks.
+
+Ordinary refinement and measurement recover the beginning pass at 450.000956 Hz,
+87.998246 m/s, 250.046937 m and 9.129908 s, with 0.013971 Hz RMS. The ending pass is
+450.003195 Hz, 88.002021 m/s, 250.072481 m and 110.870035 s, with 0.026874 Hz RMS.
+Both retain more than eight seconds of measured support on the clipped side and pass
+every original quality gate. An accepted ridge still counts once on a repeated scan.
+
+All three new detector tests, six related detector checks and five exact-source recording-
+measurement checks pass. Controls cover noise, steady tones, one-sided and reversed passes,
+crop seams, ownership, the fast-template opt-out and remaining limits. The new recording
+integration assertion fails with zero measurements against the previous pipeline and passes
+at both ends after the added stage. Core and recording-component Clippy pass with warnings
+denied. The unchanged native engine selftest passes at 1.520666 m error, 75 m radius,
++0.014271 s clock error and both intended aircraft; its standalone entry point is not a
+full release CLI build.
+
+The earlier no-swell tail-test failure has a different cause: it requires an added event,
+while diagnostics show the original detector already measures all five attenuation cases
+accurately. That assertion remains unchanged; the level-swell scenes above demonstrate the
+new capability independently.
+
+These are synthetic PCM recovery results, not measured field accuracy. Reference and
+field recordings have not been replayed; full workspace and release-CLI validation remain
+incomplete.
 
 ### Recover a short flyover from the short survey's unused contrast image
 

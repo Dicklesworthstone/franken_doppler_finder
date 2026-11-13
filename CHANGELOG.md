@@ -19,6 +19,30 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover short contrast flyovers at the recording's real boundaries
+
+- After all five existing short-window recovery stages, reuse the short survey's contrast
+  image in bounded true-edge crops. Compact ordinary and enabled fast templates keep their
+  existing strong line, full-template coverage guards and continuous-ridge corroboration.
+  Preserve original candidates, observed-ridge ownership, shared budgets and event limits.
+- Wire the final stage into recording measurement with `from_contrast` and expanded-search
+  provenance. Every seed still needs ordinary refinement and all measurement gates,
+  including eight seconds of approach and recede evidence.
+- A physical 450 Hz/88 m/s/250 m source under a 20 dB level swell is missed by all earlier
+  stages at both 9.13 s and 110.87 s in a 120 s recording. The final stage recovers those
+  passes at 250.046937 m and 250.072481 m, with 0.013971 Hz and 0.026874 Hz RMS respectively.
+  Repeated ownership keeps one aircraft. The exact-source pipeline regression fails on the
+  previous implementation and passes at both ends with the added stage.
+- Three new detector tests, six related detector checks and five recording-measurement
+  checks pass. Core and recording-component Clippy pass with warnings denied. The unchanged
+  native engine selftest passes at 1.520666 m error, 75 m radius, +0.014271 s clock error and
+  both intended aircraft. UBS reports no critical findings; changed formatting introduces
+  no differences from the existing baseline.
+- The previous no-swell tail assertion requires an added event even though the original
+  detector already measures all five tail cases accurately; it remains unchanged. Reference
+  and field recordings remain unreplayed. This is synthetic recovery evidence, with full
+  workspace/release-CLI validation incomplete.
+
 ### Recover supported short flyovers from the remaining contrast evidence
 
 - After all four existing short-window recovery stages, use the short survey's existing
