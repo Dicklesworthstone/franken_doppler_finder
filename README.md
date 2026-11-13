@@ -313,6 +313,13 @@ when it improves the same capped residual objective. This prevents a minority of
 shifting the fitted tone enough to escape the existing outlier trim. Tone bounds, missing-coverage penalties,
 the raw RMS diagnostic and the core-match thresholds remain in force.
 
+For an event already allowed one engine-tone change, the scorer also robustly refits each
+side of the existing selected split. A real power change can otherwise broaden the initial
+residual mask enough that stray ridge points bias both tones and reject the correct flight.
+The alternative must improve the same capped objective, and a segment whose trim rejects
+no observations keeps its original coefficient exactly. Split selection, source-tone bounds,
+coverage penalties and confidence gates are unchanged; chance calibration uses the same scorer.
+
 A still-air fit's reference tone can differ from the aircraft's physical source tone in wind.
 For each candidate flight, trace scoring converts the fitted tone and its permitted interval into
 source-frequency units using the same path medium and aircraft velocity as its Doppler prediction.
@@ -1818,6 +1825,32 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover a location through a contaminated engine-tone change
+
+`contaminated_rpm_change_keeps_the_physical_confirmer` and
+`two_flyovers_locate_through_a_contaminated_rpm_change` use two physical aircraft paths
+and retarded-time frequency observations. One source changes between 121 and 131 Hz,
+with 6.7% of traced samples on a stray ridge. The fixture uses the ordinary 0.2% noise
+floor and the original physical and match gates.
+
+On the preceding scorer, the actual changing-tone aircraft cannot confirm at the known
+observer. The full rising-tone search moves 142.548307 m away, has a -1.0 s clock error
+and retains zero core matches. Robustly refitting the existing split recovers both real
+core matches within 0.122366 m, with zero clock error, in both rising and falling cases.
+Both retain refinement with no comparison truncation. The direct match has chi
+1.673273494 and full coverage; its raw RMS still exposes the stray samples.
+
+All 115 native search tests pass; three annotated benchmark/resource tests remain ignored.
+The controls include the exact-bit clean-fit oracle, source-tone conversion, wrong-curve
+rejection, original tone bounds and missing-coverage penalties. Core Clippy passes with
+`--all-targets --no-deps -- -D warnings` on the pinned nightly and locked dependencies.
+
+The unchanged native `src/selftest.rs` also passes the synthetic-audio decode, detection,
+measurement, search and refinement chain: 1.520666 m error, 75 m radius, +0.014271 s clock
+error, four measured events and both intended aircraft. Its standalone entry point does
+not establish the full release CLI build. The new RPM regressions use frequency traces;
+neither these tests nor the selftest establish field accuracy or confidence calibration.
 
 ### Recover ADS-B positions before a day store discards them
 

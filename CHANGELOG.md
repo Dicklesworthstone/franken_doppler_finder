@@ -19,6 +19,29 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover correct flight pairs through a contaminated engine-tone change
+
+- Robustly refit the two source tones at the existing selected change point for an
+  already flagged model-misfit event. Keep the original fit and use the alternative
+  only when it improves the same capped residual objective. A segment that trims no
+  finite observations keeps its original coefficient exactly.
+- Preserve split selection, source-frequency bounds, missing-coverage penalties, quick
+  scoring and confidence thresholds. Raw RMS still reports the contaminants, and chance
+  calibration uses the same robust scorer.
+- Add native physical confirmation and two-aircraft search regressions with a 121/131 Hz
+  power change and 6.7% stray ridge samples. Before the correction, the actual aircraft
+  cannot confirm; the rising-tone search lands 142.548307 m off with -1.0 s clock error
+  and zero core matches. Both corrected tone directions recover both actual core matches
+  within 0.122366 m and zero clock error, retaining refinement without truncation.
+- All 115 native search tests pass, with three annotated benchmarks/resource tests ignored.
+  Controls retain exact clean-fit behavior, wind/source-tone bounds, wrong-curve rejection
+  and full missing-data penalties. Focused core Clippy passes with warnings denied.
+- The unchanged native synthetic-audio engine selftest also passes: 1.520666 m error,
+  75 m radius, +0.014271 s clock error, four measured events and both intended aircraft.
+  Validation uses the pinned nightly and locked dependencies; the standalone selftest
+  entry point does not establish a full release CLI build. Reference and field recordings
+  have not been replayed, so no field-accuracy or confidence-calibration claim is added.
+
 ### Keep observed ADS-B geometry when constructing a day from duplicate reports
 
 - Prefer an observed non-MLAT position over an explicitly MLAT duplicate before a day

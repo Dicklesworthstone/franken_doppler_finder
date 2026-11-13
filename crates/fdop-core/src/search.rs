@@ -1779,6 +1779,57 @@ fn trace_chi(
                     brk: Some((tt[k], fb)),
                 };
             }
+            // A real RPM change broadens the single-tone residuals used above. Stray
+            // ridge points can then survive that mask and bias both segment tones.
+            // Refit this same split with each side's median/MAD mask; keep its original
+            // coefficients exactly when no finite observation is rejected. This adds
+            // no split, tone range or acceptance slack to the capped objective.
+            let mut refit = |start: usize, end: usize, original: f64| {
+                let finite = (start..end).filter(|&i| rr[i].is_finite()).count();
+                ad.clear();
+                ad.extend((start..end).filter_map(|i| {
+                    let tone = ff[i] / rr[i];
+                    (rr[i].is_finite() && rr[i] > 0.0 && tone.is_finite()).then_some(tone)
+                }));
+                if ad.is_empty() || ad.len() != finite {
+                    return original;
+                }
+                let centre = seg_clamp(crate::spectro::median_f64(ad));
+                ad.clear();
+                ad.extend(
+                    (start..end)
+                        .filter(|&i| rr[i].is_finite())
+                        .map(|i| (ff[i] - centre * rr[i]).abs()),
+                );
+                let mad = 1.4826 * crate::spectro::median_f64(ad);
+                let limit = (4.0 * mad).max(3.0 * sigma);
+                let (mut a, mut b, mut kept) = (0.0, 0.0, 0usize);
+                for i in start..end {
+                    if rr[i].is_finite() && (ff[i] - centre * rr[i]).abs() <= limit {
+                        a += ff[i] * rr[i];
+                        b += rr[i] * rr[i];
+                        kept += 1;
+                    }
+                }
+                if kept < finite && b > 0.0 {
+                    seg_clamp(a / b)
+                } else {
+                    original
+                }
+            };
+            let (robust_a, robust_b) = (refit(0, k, fa), refit(k, n, fb));
+            if robust_a != fa || robust_b != fb {
+                let (chi, rms, m) = score(robust_a, robust_b, k);
+                if chi < out.chi {
+                    out = TraceFit {
+                        chi,
+                        f0: robust_a,
+                        rms,
+                        cov: m as f64 / n as f64,
+                        brk: Some((tt[k], robust_b)),
+                    };
+                }
+            }
         }
     }
     out
@@ -5239,6 +5290,218 @@ mod tests {
             &mut scratch,
         );
         assert!(one.chi < 1e-6, "{one:?}");
+    }
+
+    fn contaminated_rpm_case(falling: bool, start: f64) -> TwoCase {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = observer(lat, lon, &FlatElevation(0.0)).x;
+        let prop = Prop::still(343.0);
+        let mut tracks = Vec::new();
+        let mut events = Vec::new();
+        for (key, position, velocity, when, f0) in [
+            (
+                "rpm-change",
+                [0.0, 2400.0, 700.0],
+                [110.0, 0.0, 0.0],
+                120.0,
+                126.0,
+            ),
+            (
+                "steady",
+                [1800.0, 0.0, 700.0],
+                [0.0, 85.0, 0.0],
+                360.0,
+                149.3,
+            ),
+        ] {
+            let mut track = straight_track(
+                &enu,
+                position,
+                velocity,
+                start + when,
+                start + when - 100.0,
+                start + when + 100.0,
+                5.0,
+            );
+            track.key = key.into();
+            let mut event = synth_event(key, &track, x, start, f0, prop.c, start + when, &prop);
+            event.sigma_hz = 0.002 * f0;
+            if key == "rpm-change" {
+                let cpa = track.cpa_nearest_time(x, start + when, 30.0).unwrap();
+                event.misfit = true;
+                event.tr_t.clear();
+                event.tr_f.clear();
+                for k in 0..360 {
+                    let received = cpa.t_r_p(&prop) - 60.0 + 120.0 * k as f64 / 359.0;
+                    let (emitted, _, ratio) =
+                        track.solve_emission_p(received, x, &prop, None).unwrap();
+                    let later = emitted >= cpa.t_e + 10.0;
+                    let tone = if later != falling { 131.0 } else { 121.0 };
+                    // A minority of traced ridge points follows a nearby tone instead.
+                    // Both the real RPM change and these observations propagate from
+                    // emission time through the aircraft's actual Doppler ratio.
+                    let stray = if k % 30 < 2 {
+                        if falling { -14.0 } else { 14.0 }
+                    } else {
+                        0.0
+                    };
+                    let noise = 0.03 * (k as f64 * 1.7).sin();
+                    event.tr_t.push(received - start);
+                    event.tr_f.push((tone + stray) * ratio + noise);
+                }
+                (event.q_t, event.q_f) = subsample(&event.tr_t, &event.tr_f, 40);
+            }
+            tracks.push(track);
+            events.push(event);
+        }
+        let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
+        let mut p = SearchParams::new(
+            start,
+            start,
+            600.0,
+            BBox::new(
+                lat - 200.0 / mlat,
+                lon - 200.0 / mlon,
+                lat + 200.0 / mlat,
+                lon + 200.0 / mlon,
+            ),
+        );
+        p.fine_half_m = 200.0;
+        p.refine_half_m = 100.0;
+        TwoCase {
+            tracks,
+            events,
+            p,
+            t_s: start,
+            obs: (lat, lon),
+        }
+    }
+
+    #[test]
+    fn contaminated_rpm_change_keeps_the_physical_confirmer() {
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        for falling in [false, true] {
+            let case = contaminated_rpm_case(falling, 0.0);
+            let o = observer(case.obs.0, case.obs.1, &FlatElevation(0.0));
+            let matched = best_confirmer(
+                &o,
+                case.t_s,
+                &case.events[0],
+                &case.tracks,
+                &TimeIndex::new(&case.tracks),
+                &case.p,
+                &atmo,
+                &[],
+            );
+            eprintln!("contaminated RPM change, falling={falling}: {matched:?}");
+            let (_, found, track) =
+                matched.expect("the physical changing-tone flight must confirm");
+            assert_eq!(track, 0);
+            assert!(found.chi < 2.0, "{found:?}");
+            assert_eq!(found.coverage, 1.0);
+            let (_, after) = found.f0_change.expect("one physical RPM change");
+            let expected = if falling {
+                [131.0, 121.0]
+            } else {
+                [121.0, 131.0]
+            };
+            assert!((found.f0 - expected[0]).abs() < 0.05, "{found:?}");
+            assert!((after - expected[1]).abs() < 0.05, "{found:?}");
+            assert!(found.rms_hz > 2.0, "raw residuals retain the stray ridge");
+        }
+    }
+
+    #[test]
+    fn robust_rpm_change_keeps_bounds_coverage_and_wrong_curve_penalties() {
+        let case = contaminated_rpm_case(false, 0.0);
+        let x = observer(case.obs.0, case.obs.1, &FlatElevation(0.0)).x;
+        let prop = Prop::still(343.0);
+        let event = &case.events[0];
+        let ratio = |t| {
+            case.tracks[0]
+                .solve_emission_p(t, x, &prop, None)
+                .unwrap()
+                .2
+        };
+        let check = |ev: &SearchEvent, ff: &[f64], prediction: &dyn Fn(f64) -> f64| {
+            trace_chi(
+                &ev.tr_t,
+                ff,
+                &prediction,
+                0.0,
+                ev,
+                1.0,
+                ev.sigma_hz,
+                DEFAULT_CAP_SIGMA,
+                true,
+                &mut TraceScratch::default(),
+            )
+        };
+        let mut single = event.clone();
+        single.misfit = false;
+        let unpermitted = check(&single, &single.tr_f, &ratio);
+        assert!(unpermitted.brk.is_none());
+        assert!(unpermitted.chi > CORE_CHI, "{unpermitted:?}");
+        let wrong = check(event, &event.tr_f, &|_| 1.0);
+        assert!(wrong.chi > case.p.kappa, "{wrong:?}");
+        let partial = check(event, &event.tr_f, &|t| {
+            if t < event.tr_t[180] {
+                ratio(t)
+            } else {
+                f64::NAN
+            }
+        });
+        assert_eq!(partial.cov, 0.5);
+        assert!(
+            partial.chi >= 12.5,
+            "missing points keep their full penalty"
+        );
+        let outside: Vec<f64> = event
+            .tr_t
+            .iter()
+            .enumerate()
+            .map(|(k, &t)| {
+                let (emitted, _, ratio) =
+                    case.tracks[0].solve_emission_p(t, x, &prop, None).unwrap();
+                let tone = if emitted < 130.0 { 105.0 } else { 131.0 };
+                (tone + if k % 30 < 2 { 14.0 } else { 0.0 }) * ratio
+            })
+            .collect();
+        let bounded = check(event, &outside, &ratio);
+        assert!(bounded.chi > case.p.kappa, "{bounded:?}");
+        assert!((0.85 * event.f0..=1.15 * event.f0).contains(&bounded.f0));
+        if let Some((_, after)) = bounded.brk {
+            assert!((0.85 * event.f0..=1.15 * event.f0).contains(&after));
+        }
+    }
+
+    #[test]
+    fn two_flyovers_locate_through_a_contaminated_rpm_change() {
+        let medium = fdop_types::atmo::Medium::still(343.0);
+        for falling in [false, true] {
+            let case = contaminated_rpm_case(falling, 1_788_895_000.0);
+            let result = run_case(&case, medium);
+            let top = result
+                .candidates
+                .first()
+                .expect("both actual flights must locate");
+            let error = haversine_m(top.lat, top.lon, case.obs.0, case.obs.1);
+            eprintln!(
+                "contaminated RPM location, falling={falling}: {error:.6} m, clock {:.6} s, {:?}",
+                top.t_start_utc - case.t_s,
+                top.events
+            );
+            assert!(result.funnel.truncated.is_empty(), "{:?}", result.funnel);
+            assert!(error < 75.0, "{error} m");
+            assert!((top.t_start_utc - case.t_s).abs() < 0.5);
+            assert_eq!(top.n_explained, 2);
+            assert!(top.events.iter().all(|m| m.event == m.flight && m.core));
+            let changed = top.events.iter().find(|m| m.event == "rpm-change").unwrap();
+            assert!(changed.f0_change.is_some());
+            assert!(changed.chi < 2.0, "{changed:?}");
+            assert!(result.refine.is_some());
+        }
     }
 
     #[test]
