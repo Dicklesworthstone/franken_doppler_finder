@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover supported short flyovers from the remaining contrast evidence
+
+- After all four existing short-window recovery stages, use the short survey's existing
+  contrast image for complete compact ordinary/fast paths when a second aircraft is still
+  missing. Preserve earlier candidates, accepted-ridge ownership, shared budgets, detection
+  and event limits, the strong line and continuous-ridge corroboration.
+- Send recovered seeds through ordinary refinement and measurement, carrying `from_contrast`
+  and the existing expanded-search provenance into the recording pipeline and its warning.
+- Add a physical 120 s PCM regression with an inverse-range 450 Hz/88 m/s/250 m pass under
+  a 20 dB recording-level swell. Main detection and all four preceding recovery stages find
+  no aircraft. The new stage measures 450.009987 Hz, 88.016016 m/s, 250.227703 m and
+  60.129611 s, with 0.051412 Hz RMS and 340 trace points. The unchanged pipeline integration
+  test also fails with zero aircraft against the previous production stage sequence.
+- All three new native detector tests and twelve related controls pass, including weaker continuous-support refusal,
+  noise/steady/reversed controls, repeated ownership and exact remaining-limit behavior.
+- The exact-source recording-measurement component passes 10 of 11 integration tests.
+  Its existing ordinary-edge fixture at 110.87 s still fails on both the current and the
+  previous four-stage pipeline with identical native libraries; the assertion is unchanged.
+  Core Clippy and Clippy on the exact-source recording-measurement component both pass with
+  warnings denied. Thresholds and confidence rules are unchanged; real recordings remain
+  unreplayed, and whole-workspace/release-CLI validation is incomplete.
+
 ### Recover correct flight pairs through a contaminated engine-tone change
 
 - Robustly refit the two source tones at the existing selected change point for an

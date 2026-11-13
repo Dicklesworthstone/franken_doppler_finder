@@ -1444,12 +1444,19 @@ Design notes:
   ends. Both short interior banks scan complete paths on the half-second survey, including centers
   with no ordinary seed and neighborhoods the longer bank already tried. Every scored interior
   center has actual STFT support on both sides. Tiles cover at most 120 seconds of centers, with
-  at most 141 seconds of working audio under the defaults. After interior measurement, a final
+  at most 141 seconds of working audio under the defaults. After interior measurement, an
   ordinary-speed bank checks the true recording ends, using the same at-most-48-second edge
   crops. It retains the existing full-template coverage guard and partial-edge coverage rule:
   crop seams cannot masquerade as recording ends. It uses the same compact-duration domain and
   strong line, so a short ordinary-speed transition can be proposed near an end without
   relaxing its subsequent eight-second measurement requirements.
+  If an independent aircraft is still missing after those four stages, a final compact bank
+  uses any existing contrast-first image from the short survey. It checks complete ten-second
+  paths at ordinary and supported fast speeds, with the same strong line and continuous-ridge
+  corroboration used by contrast edges. A broad recording-level swell can hide a short pass
+  in the original image while leaving that contrast ridge measurable. Earlier stages retain
+  their candidates and priority; this final stage uses only the remaining proposals and slots,
+  respects accepted observed ridges and marks every added seed `from_contrast`.
   An accepted aircraft keeps its original measurement and owns its
   observed ridge and detected harmonic family, even when its fitted geometry is inaccurate.
   Ownership interpolates only across traced gaps of at most three seconds and never extrapolates;
@@ -1825,6 +1832,36 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover a short flyover from the short survey's unused contrast image
+
+`compact_contrast_recovers_a_short_pass_in_a_broadband_swell` synthesizes a 120 s recording
+with a 450 Hz source moving at 88 m/s, closest range 250 m and heard centre 60.13 s. Its
+emitted phase is propagated through the retarded-time equation with inverse-range amplitude.
+A 20 dB Gaussian level envelope multiplies source and noise together, leaving their ratio
+unchanged. Main detection and all four earlier recovery stages produce no aircraft.
+
+The final compact contrast stage clears the existing sparse and continuous-ridge strong
+checks, then ordinary refinement and measurement recover 450.009987 Hz, 88.016016 m/s,
+250.227703 m and 60.129611 s, with 0.051412 Hz RMS and 340 trace points. The same recording
+also passes through the actual `measure_recording` pipeline; its byte-identical integration
+test fails with zero aircraft against the previous four-stage implementation.
+
+All three new native detector tests and twelve related recovery/contrast controls pass.
+Controls keep a weaker ridge without enough
+continuous support, swell noise, steady tones and reversed passes out. Reusing the accepted
+ridge still counts one aircraft. Zero remaining allowances retain the incomplete-coverage
+warning, while spending the last proposal on a genuinely complete scan does not invent a cut.
+The original detection/event caps and expanded-search confidence rules remain in force.
+
+The exact-source recording-measurement component passes 10 of its 11 integration tests,
+including the new recovery, existing two-aircraft location cases, nulls, ownership and
+provenance controls. The existing ordinary-edge fixture still fails its requirement to
+find an added ordinary-speed event at 110.87 s. The identical assertion also fails with
+the previous four-stage pipeline and identical native libraries; it has not been weakened.
+Core Clippy and Clippy on the exact-source recording-measurement component both pass with
+warnings denied. Whole-workspace and release-CLI validation remain incomplete. This is
+synthetic PCM recovery; reference and field recordings have not been replayed.
 
 ### Recover a location through a contaminated engine-tone change
 

@@ -1172,8 +1172,11 @@ pub enum FastRecoveryStage {
     ShortInterior,
     /// Compact bank at the primary survey's speeds, after both fast stages were measured.
     OrdinaryShortInterior,
-    /// Final compact primary-speed bank at true recording ends, after interior measurement.
+    /// Compact primary-speed bank at true recording ends, after interior measurement.
     OrdinaryEdges,
+    /// Complete short paths on the contrast image, after every original recovery stage.
+    /// A broadband swell can compress the ordinary short image while leaving a tonal ridge.
+    CompactContrast,
 }
 
 /// One recovery stage's detections and its use of the original shared limits.
@@ -1194,8 +1197,10 @@ pub struct FastRecoveryBatch {
 /// `EdgeAndRefused` preserves the true-edge and refused-seed searches. The two short interior
 /// stages ignore `refused` and do not rerun an earlier search. `OrdinaryShortInterior` uses the
 /// primary speed grid: a close ordinary-speed pass can also fade before a full template ends.
-/// `OrdinaryEdges` runs last, for the same compact passes too close to a real recording end
+/// `OrdinaryEdges` completes the original stages, for compact passes too close to a real recording end
 /// to have complete short-template support. Measure the interior stage before calling it.
+/// `CompactContrast` follows all four stages, using only their remaining limits and evidence
+/// for ordinary and fast complete short paths on each tile's contrast image.
 /// Only the supplied accepted measurements and detections made within this stage own its
 /// evidence. After measuring the earlier stage,
 /// callers pass its accepted observed ridges as `owners`; its refused detections still consume
@@ -1272,9 +1277,14 @@ fn recover_fast_stages_impl(
             interior_incomplete: slots.min(p.max_detections) == 0 || remaining_candidates == 0,
         });
     }
+    let contrast_short = stage == Some(FastRecoveryStage::CompactContrast);
     let short_only = matches!(
         stage,
-        Some(FastRecoveryStage::ShortInterior | FastRecoveryStage::OrdinaryShortInterior)
+        Some(
+            FastRecoveryStage::ShortInterior
+                | FastRecoveryStage::OrdinaryShortInterior
+                | FastRecoveryStage::CompactContrast
+        )
     );
     let ordinary_short = stage == Some(FastRecoveryStage::OrdinaryShortInterior);
     let (mut out, mut cut, mut remaining_candidates) = if short_only {
@@ -1289,7 +1299,7 @@ fn recover_fast_stages_impl(
         hop_s: 0.5,
         ..p.clone()
     };
-    let templates = if ordinary_short {
+    let templates = if ordinary_short || contrast_short {
         Vec::new()
     } else {
         build_fast_templates(&short, short.hop_s)
@@ -1299,11 +1309,15 @@ fn recover_fast_stages_impl(
     // Reuse edge paths only for transitions whose natural shortest support fits
     // inside their short half. Here both complete sides must fit inside the recording.
     let k_min = p.k_tau.iter().copied().fold(f64::INFINITY, f64::min);
-    let compact_bank = if ordinary_short {
+    let mut compact_bank = if ordinary_short || contrast_short {
         build_edge_templates(&short, short.hop_s)
     } else {
         build_fast_edge_templates(&short, short.hop_s)
     };
+    if contrast_short {
+        compact_bank.retain(|t| t.v > 0.0 && t.v <= PRIMARY_MAX_SPEED_MPS);
+        compact_bank.extend(build_fast_edge_templates(&short, short.hop_s));
+    }
     let compact: Vec<_> = compact_bank
         .into_iter()
         .filter_map(|mut t| {
@@ -1318,6 +1332,27 @@ fn recover_fast_stages_impl(
             }
         })
         .collect();
+    let dense: Vec<_> = if contrast_short {
+        let dense_params = DetectParams {
+            path_dt: short.hop_s,
+            ..short.clone()
+        };
+        compact
+            .iter()
+            .map(|t| {
+                template(
+                    &dense_params,
+                    short.hop_s,
+                    t.v,
+                    t.d,
+                    t.half,
+                    EdgeRole::Plain,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if (templates.is_empty() && compact.is_empty()) || !duration.is_finite() {
         return Ok(FastRecoveryBatch {
             detections: out,
@@ -1388,6 +1423,12 @@ fn recover_fast_stages_impl(
             let start = (from * f64::from(sr)) as usize;
             let end = (((hi + support + short.win_s) * f64::from(sr)).ceil() as usize).min(x.len());
             let (mut ls, _) = survey(&x[start..end], sr, &short)?;
+            if contrast_short {
+                let Some(contrast) = ls.contrast.take() else {
+                    continue;
+                };
+                ls.data = contrast;
+            }
             for t in &mut ls.t {
                 *t += start as f64 / f64::from(sr);
             }
@@ -1425,6 +1466,19 @@ fn recover_fast_stages_impl(
                     incomplete |= short_stage;
                     break;
                 }
+                if contrast_short {
+                    let ti = bi[k] as usize;
+                    if !corroborate_contrast_edge(
+                        &ls,
+                        &short,
+                        (k / nt, k % nt),
+                        (&templates[ti], &dense[ti]),
+                        &known,
+                        threshold,
+                    ) {
+                        continue;
+                    }
+                }
                 accept_candidates(
                     &ls,
                     &short,
@@ -1440,6 +1494,11 @@ fn recover_fast_stages_impl(
         // Preserve edge -> refused-seed -> short-bank priority, even when a later stage's
         // score is larger. A new family may name an earlier primary, never replace it.
         let mut added = out.split_off(first);
+        if contrast_short {
+            for detection in &mut added {
+                detection.from_contrast = true;
+            }
+        }
         added.sort_by(|a, b| b.score.total_cmp(&a.score));
         cut += added.len().saturating_sub(slots - first);
         added.truncate(slots - first);
@@ -2616,6 +2675,192 @@ mod tests {
             crate::search::independent_measured_events(&events, 0.0).len(),
             1
         );
+    }
+
+    /// A close source's exact retarded phase and inverse-range amplitude in a broadband
+    /// swell. Source and noise rise together, so the swell changes image normalization,
+    /// not the signal-to-noise ratio that measurement must establish.
+    fn compact_swell_scene(
+        (f0, v, d, t0r): (f64, f64, f64, f64),
+        amplitude: f64,
+        steady: bool,
+    ) -> Vec<f32> {
+        let (sr, duration, c) = (4000.0, 120.0, 343.0);
+        let mut seed = 4242u64;
+        (0..(sr * duration) as usize)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / sr;
+                let tau = crate::physics::retarded_tau(t, t0r - d / c, v, d, c);
+                let range = crate::physics::cv_radial(tau, v, d).0;
+                let phase = std::f64::consts::TAU * f0 * if steady { t } else { tau };
+                let swell = 10f64.powf((-0.5 * ((t - t0r) / (0.22 * duration)).powi(2)).exp());
+                (swell
+                    * (amplitude * d / range * phase.sin()
+                        + 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0))) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compact_contrast_recovers_a_short_pass_in_a_broadband_swell() {
+        let pass = (450.0, 88.0, 250.0, 60.13);
+        let x = compact_swell_scene(pass, 0.10, false);
+        let p = DetectParams::default();
+        let (ls, lin) = survey(&x, 4000, &p).unwrap();
+        let (mut detections, cut, mut budget) = detect_counted_with_budget(&ls, &p);
+        assert_eq!(cut, 0);
+        let mut events = measure_edge_families(&x, &lin, &detections);
+        for stage in [
+            FastRecoveryStage::EdgeAndRefused,
+            FastRecoveryStage::ShortInterior,
+            FastRecoveryStage::OrdinaryShortInterior,
+            FastRecoveryStage::OrdinaryEdges,
+        ] {
+            budget =
+                measured_recovery_stage(&x, &lin, &p, &mut detections, &mut events, budget, stage);
+        }
+        assert!(crate::search::independent_measured_events(&events, 0.0).is_empty());
+        let before = detections.len();
+        let previous = serde_json::to_value(&detections).unwrap();
+        budget = measured_recovery_stage(
+            &x,
+            &lin,
+            &p,
+            &mut detections,
+            &mut events,
+            budget,
+            FastRecoveryStage::CompactContrast,
+        );
+        assert_eq!(
+            serde_json::to_value(&detections[..before]).unwrap(),
+            previous
+        );
+        assert!(
+            detections[before..]
+                .iter()
+                .all(|d| { d.from_contrast && d.score >= p.thr_db && d.half_s == p.edge_half_s })
+        );
+        let independent = crate::search::independent_measured_events(&events, 0.0);
+        assert_eq!(independent.len(), 1, "{events:?}");
+        let best = events
+            .iter()
+            .find(|event| event.id == independent[0].id)
+            .unwrap()
+            .fit
+            .as_ref()
+            .unwrap()
+            .best;
+        eprintln!("compact contrast {pass:?}: {best:?}");
+        assert!((best.f0 - pass.0).abs() < 0.3, "{best:?}");
+        assert!((best.v - pass.1).abs() < 4.0, "{best:?}");
+        assert!((best.d / pass.2 - 1.0).abs() < 0.08, "{best:?}");
+        assert!((best.t0r - pass.3).abs() < 0.3, "{best:?}");
+
+        // The same observed ridge owns its evidence on a repeated recovery; it cannot
+        // manufacture the independent second aircraft a location needs.
+        let before = detections.len();
+        let previous = serde_json::to_value(&detections).unwrap();
+        measured_recovery_stage(
+            &x,
+            &lin,
+            &p,
+            &mut detections,
+            &mut events,
+            budget,
+            FastRecoveryStage::CompactContrast,
+        );
+        assert_eq!(
+            serde_json::to_value(&detections[..before]).unwrap(),
+            previous
+        );
+        assert_eq!(
+            crate::search::independent_measured_events(&events, 0.0).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn compact_contrast_keeps_unsupported_and_false_ridges_out() {
+        let pass = (450.0, 88.0, 250.0, 60.13);
+        let mut reversed = compact_swell_scene(pass, 0.10, false);
+        reversed.reverse();
+        for (label, x) in [
+            ("swell noise", compact_swell_scene(pass, 0.0, false)),
+            ("steady tone", compact_swell_scene(pass, 0.10, true)),
+            ("reversed pass", reversed),
+            // This physical ridge clears the sparse bank, but not the same strong line
+            // between its samples. Measurement could fit it if offered the seed; the
+            // dense evidence requirement must still refuse that seed.
+            (
+                "insufficient continuous support",
+                compact_swell_scene(pass, 0.08, false),
+            ),
+        ] {
+            let p = DetectParams::default();
+            let (ls, lin) = survey(&x, 4000, &p).unwrap();
+            let (mut detections, cut, mut budget) = detect_counted_with_budget(&ls, &p);
+            assert_eq!(cut, 0, "{label}");
+            let mut events = measure_edge_families(&x, &lin, &detections);
+            for stage in [
+                FastRecoveryStage::EdgeAndRefused,
+                FastRecoveryStage::ShortInterior,
+                FastRecoveryStage::OrdinaryShortInterior,
+                FastRecoveryStage::OrdinaryEdges,
+                FastRecoveryStage::CompactContrast,
+            ] {
+                budget = measured_recovery_stage(
+                    &x,
+                    &lin,
+                    &p,
+                    &mut detections,
+                    &mut events,
+                    budget,
+                    stage,
+                );
+            }
+            assert!(
+                crate::search::independent_measured_events(&events, 0.0).is_empty(),
+                "{label}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_contrast_uses_only_the_original_remaining_limits() {
+        let x = compact_swell_scene((450.0, 88.0, 250.0, 60.13), 0.10, false);
+        let p = DetectParams::default();
+        for (slots, proposals) in [(0, 400_000), (p.max_detections, 0), (1, 1)] {
+            let batch = recover_fast_passes_stage_with_owners(
+                &x,
+                4000,
+                &p,
+                slots,
+                proposals,
+                &[],
+                &[],
+                FastRecoveryStage::CompactContrast,
+            )
+            .unwrap();
+            assert!(batch.detections.len() <= slots);
+            assert!(batch.remaining_candidates <= proposals);
+            if slots == 0 || proposals == 0 {
+                assert!(
+                    batch.interior_incomplete,
+                    "{slots} slots, {proposals} proposals"
+                );
+                assert!(batch.detections.is_empty());
+                assert_eq!(batch.remaining_candidates, proposals);
+            } else {
+                // This clip has exactly one proposal; spending its last available place
+                // finishes coverage rather than making a complete scan look truncated.
+                assert!(!batch.interior_incomplete);
+                assert_eq!(batch.detections.len(), 1);
+                assert_eq!(batch.remaining_candidates, 0);
+            }
+        }
     }
 
     #[test]
