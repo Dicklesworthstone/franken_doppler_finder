@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover an eligible shared clock after an event fails at the aggregate minimum
+
+- At gated fine-grid evaluations, preserve the original clock and evaluation sequence
+  whenever its per-event fits are eligible. Otherwise retain the best eligible clock
+  already examined and polish only its neighboring scan interval.
+- Reuse the same per-event gate as fine-grid selection; reject windows with no eligible
+  sample without another scan. Keep a known eligible clock if local polishing misses it,
+  and recompute the returned clock's trace fits before building the candidate.
+- Leave quick screening, ungated diagnostics and confidence refinement on their existing
+  objective. No physical gates, search grids, acceptance thresholds or confidence
+  calibration changes.
+- Add three scalar regressions for exact successful/invalid-only callback preservation,
+  local recovery and final-fit restoration, and retention of a narrow eligible sample.
+  Equivalent scalar checks passed separately; the added Rust tests, workspace checks,
+  selftest and recording replays remain unrun because the execution environment is offline.
+  These selection checks do not establish compilation, pipeline recovery or field accuracy.
+
 ### Keep valid fine-grid alternatives when the aggregate winner fails an event
 
 - Apply the existing per-event trace-fit and coverage gates before ranking fine-grid

@@ -1681,9 +1681,17 @@ still grow with the input. Hypothesis clouds are released after both passes.
 
 The fine grid selects the lowest-loss location where both seeding aircraft pass the
 existing per-event trace-fit and coverage gates. A lower combined loss at a point that
-fails one aircraft no longer discards a nearby valid pair. Each seed's already valid
-minimum and equal-loss traversal order are preserved; grid spacing, search budgets,
+fails one aircraft no longer discards a nearby valid pair. Eligible points retain the
+original strict loss comparison and traversal-order ties; grid spacing, search budgets,
 acceptance thresholds and confidence calibration are unchanged.
+
+At each fine-grid point, the original shared-clock fit is retained exactly when both
+aircraft pass those same gates. If that minimum fails an event, the fitter keeps the
+best eligible clock it already examined and polishes only its neighboring scan interval.
+A failed local polish cannot erase that retained clock, and the returned trace fits are
+recomputed at the returned clock. A window with no eligible sampled clock is rejected
+without another scan. Quick screening and ungated confidence refinement keep their
+existing clock objective and evaluation sequence.
 
 **Pair-join component measurement, 2026-11-07.** The
 `dense_pair_join_with_one_million_raw_matches` workload has 1,024 hypotheses on each side,

@@ -2020,7 +2020,7 @@ fn eval_point_weighted(
         .collect();
     let mut scratch = TraceScratch::default();
     let mut chis = Vec::with_capacity(assign.len());
-    let cost = |t_s: f64| -> f64 {
+    let mut cost = |t_s: f64| -> (f64, bool) {
         let mut tot = 0.0;
         chis.clear();
         for (k, &(ei, _, _)) in assign.iter().enumerate() {
@@ -2056,9 +2056,14 @@ fn eval_point_weighted(
             tot += ev.n_eff * r.chi * weights.map_or(1.0, |w| w[k]);
             chis.push(r);
         }
-        tot
+        let eligible = fine_trace_fits(&chis, p.kappa);
+        (tot, eligible)
     };
-    let (bt, total) = profile_clock(lo, hi, quick, cost)?;
+    let (bt, total) = if gates && !quick {
+        profile_valid_clock(lo, hi, cost)
+    } else {
+        profile_clock(lo, hi, quick, |ts| cost(ts).0)
+    }?;
     Some(PointEval {
         t_s: bt,
         chis,
@@ -2120,6 +2125,50 @@ fn profile_clock(
         }
     }
     Some((bt, cost(bt)))
+}
+
+/// Preserve an eligible original clock minimum. Otherwise recover the best eligible
+/// clock already examined, then polish only its neighboring scan interval. A failed
+/// minimum cannot erase a sampled clock that explains every assigned event.
+fn profile_valid_clock(
+    lo: f64,
+    hi: f64,
+    mut cost: impl FnMut(f64) -> (f64, bool),
+) -> Option<(f64, f64)> {
+    let mut kept: Option<(f64, f64)> = None;
+    let mut winner_valid = false;
+    let original = profile_clock(lo, hi, false, |t| {
+        let (value, valid) = cost(t);
+        winner_valid = valid;
+        if valid && value.is_finite() && kept.is_none_or(|b| value < b.1) {
+            kept = Some((t, value));
+        }
+        value
+    })?;
+    if winner_valid {
+        return Some(original);
+    }
+    let mut best = kept?;
+    // Match the original full profile's scan spacing, including its 400-step cap.
+    // Invalid-only windows stop above without another evaluation or broad rescan.
+    let step = 0.25;
+    let n = (((hi - lo) / step).ceil() as usize).clamp(1, 400);
+    let half = step.max((hi - lo) / n as f64);
+    if let Some(polished) = profile_clock(
+        (best.0 - half).max(lo),
+        (best.0 + half).min(hi),
+        false,
+        |t| {
+            let (value, valid) = cost(t);
+            if valid { value } else { f64::INFINITY }
+        },
+    ) && polished.1 < best.1
+    {
+        best = polished;
+    }
+    // The caller retains the last clock's trace fits, even if local polishing failed.
+    let (value, valid) = cost(best.0);
+    valid.then_some((best.0, value))
 }
 
 fn engine_str(tr: &TrackModel) -> String {
@@ -5739,6 +5788,81 @@ mod tests {
             Some((12.0, 7.0))
         );
         assert_eq!(last, 12.0);
+    }
+
+    #[test]
+    fn valid_clock_preserves_eligible_and_rejects_invalid_profiles() {
+        let mut original_calls = Vec::new();
+        let original = profile_clock(-400.0, 400.0, false, |t| {
+            original_calls.push(t);
+            t * t
+        });
+        for valid in [true, false] {
+            let mut calls = Vec::new();
+            let result = profile_valid_clock(-400.0, 400.0, |t| {
+                calls.push(t);
+                (t * t, valid)
+            });
+            assert_eq!(calls, original_calls);
+            assert_eq!(result, if valid { original } else { None });
+        }
+    }
+
+    #[test]
+    fn valid_clock_recovers_locally_and_restores_the_returned_clock() {
+        let mut original_calls = Vec::new();
+        profile_clock(-400.0, 400.0, false, |t| {
+            original_calls.push(t);
+            t * t
+        })
+        .unwrap();
+        let seed = original_calls
+            .iter()
+            .copied()
+            .filter(|&t| t >= 1.0)
+            .min_by(f64::total_cmp)
+            .unwrap();
+        let mut calls = Vec::new();
+        let result = profile_valid_clock(-400.0, 400.0, |t| {
+            calls.push(t);
+            (t * t, t >= 1.0)
+        })
+        .unwrap();
+        assert_eq!(&calls[..original_calls.len()], &original_calls);
+        // This 800-second window has two-second scan spacing. Recovery stays in
+        // the eligible sample's neighborhood and avoids another full-window scan.
+        assert!(calls[original_calls.len()..]
+            .iter()
+            .all(|&t| (seed - 2.0..=seed + 2.0).contains(&t)));
+        assert!(calls.len() <= original_calls.len() + 40);
+        assert!((1.0..=1.01).contains(&result.0));
+        assert_eq!(result.1, result.0 * result.0);
+        assert_eq!(calls.last().copied(), Some(result.0));
+    }
+
+    #[test]
+    fn valid_clock_retains_a_sample_missed_by_local_polishing() {
+        let mut initial = Vec::new();
+        profile_clock(0.0, 1.0, false, |t| {
+            initial.push(t);
+            t * t
+        })
+        .unwrap();
+        // Only this original polish sample is eligible. Clipping its neighboring
+        // interval changes the local scan nodes, so none rediscovers the sample.
+        let island = *initial.iter().find(|&&t| t > 0.0 && t < 0.25).unwrap();
+        let mut calls = Vec::new();
+        let result = profile_valid_clock(0.0, 1.0, |t| {
+            calls.push(t);
+            (t * t, (t - island).abs() < 1e-12)
+        })
+        .unwrap();
+        assert_eq!(result, (island, island * island));
+        assert_eq!(&calls[..initial.len()], &initial);
+        assert!(calls[initial.len()..calls.len() - 1]
+            .iter()
+            .all(|&t| (t - island).abs() >= 1e-12));
+        assert_eq!(calls.last().copied(), Some(island));
     }
 
     #[test]
