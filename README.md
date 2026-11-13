@@ -1126,6 +1126,16 @@ precedence over an unrecognized designator from another feed. If no feed recogni
 the first nonempty designator is retained and the usual unknown-type policy applies. This does
 not change which feed supplies duplicate positions; boundary-only records cannot supply identity.
 
+Across overlapping cached days, duplicate positions first follow the per-position MLAT flags.
+When those flags tie and both original legs identify one known feed, the existing preference
+for prod, then staging, then mlat applies within the original 50 ms duplicate intervals.
+The merger keeps those original feed ranks while combining leg-level source labels, so adding
+another day to the same merge cannot erase that preference. Mixed or unknown original sources
+retain the existing representative. Position flags keep their observed values, and the selection preserves flight
+boundaries and join limits. This also works with existing day stores when both reports and
+their unambiguous origins remain available; it cannot restore points already discarded within
+a cached day.
+
 Malformed scalar entries inside an otherwise valid aircraft trace are skipped individually,
 like the existing null and object entries. Valid surrounding reports and ground/new-leg markers
 are retained, rather than losing the entire aircraft. Invalid JSON still fails parsing. These
@@ -1805,6 +1815,22 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Recover preferred-feed positions across cached days
+
+`cross_day_feed_priority_recovers_unlabelled_geometry` sends synthetic gzip/tar traces
+through the real ingester, store builder and multi-store merger. The preceding merger
+retains a duplicate position 1118.0 m from the known trajectory when the optional position
+source is absent. The correction passes all 36 source/feed/timestamp/order combinations,
+requiring every retained point within 0.01 m of truth and exactly the canonical point sequence.
+Controls preserve explicit position-source precedence, ambiguous origins, duplicate intervals
+and the five-minute join limit.
+
+All 45 tests in the native build/ingest/raw-cache component pass with the original full
+modules and tests and dependencies verified against the repository lockfile. The complete
+`fdop-data` build was SIGKILLed while compiling `asupersync`; HTTP, fetch integration and
+full-package Clippy remain unvalidated. These tests establish synthetic trajectory recovery,
+not location accuracy on a recording.
+
 ### Recover a hillside pair when the recording clock is uncertain
 
 `a_wider_clock_window_keeps_hillside_flyovers_joinable` runs twelve physical two-aircraft
@@ -1819,6 +1845,10 @@ not a reference-recording or field-accuracy result.
 
 The final source also passes all 112 search and 59 track tests on the pinned nightly with
 locked dependencies. Four explicitly annotated benchmark/resource tests remain ignored.
+The unchanged `src/selftest.rs`, compiled against the actual native core and type libraries,
+passes its synthetic-audio decode → detect → measure → search → refine chain: 1.520666 m
+error, a 75 m radius, +0.014271 s clock error and both intended aircraft. This establishes the
+engine integration; the standalone entry point does not validate a full release CLI build.
 
 ### Fine grids can recover from a misleading quick representative
 

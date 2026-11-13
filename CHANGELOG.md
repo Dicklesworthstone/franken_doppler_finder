@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve preferred-feed geometry across overlapping cached days
+
+- Retain joined points' unambiguous feed origins before combining leg-level source labels.
+  After the existing per-position MLAT comparison, use prod, staging, then mlat preference
+  when both origins are unambiguous. Mixed or unknown origins preserve the legacy tie.
+- Select within the existing duplicate intervals, with unchanged join limits, ground and
+  new-leg boundaries, clipping flags and timestamp remapping. Unjoined legs retain their
+  original allocation; the store format and observed position flags are unchanged.
+- Add real gzip/tar ingestion-to-merge regressions for displaced overlapping positions,
+  missing or blank position-source fields, all known feed pairings, both store orders,
+  nearby timestamps, explicit position quality, ambiguous origins and three-store joins.
+- Native before/after: the preceding merger retains a position 1118.0 m from the known
+  trajectory. The unchanged regression now passes all 36 combinations, requiring every
+  point within 0.01 m of truth and exact equality with the canonical point sequence.
+- All 45 native component tests pass: 27 build, 12 ingest and six raw-cache tests. They
+  compile the full original modules and tests with real dependencies, each verified against
+  the repository lockfile. Full `fdop-data` compilation was SIGKILLed in `asupersync`, so
+  HTTP/fetch integration and full-package Clippy remain unvalidated. Component Clippy
+  reports only unused private entry points whose fetch consumers are outside that target.
+  This is synthetic trajectory evidence, not a geolocation or field-accuracy result.
+
 ### Keep hillside flyovers joinable when the recording clock is less certain
 
 - For a climbing or descending track above different observer terrain, compute the coarse
@@ -40,6 +61,11 @@ at that commit, not per-change commits.
   resource tests remain ignored. Validation uses pinned nightly-2026-08-31 and locked
   dependencies through RCH, one build job, and command-line optimization overrides for
   `fsci-linalg`, `fsci-special` and `fsci-stats` under the available build memory.
+- The unchanged native `src/selftest.rs` also passes the complete synthetic-audio engine
+  chain: 1.520666 m error, 75 m radius, +0.014271 s clock error, four measured events and
+  both intended aircraft. Focused core Clippy (`--all-targets --no-deps`, `-D warnings`)
+  passes. The standalone selftest entry point does not establish the full release CLI
+  build; no reference-recording or field-accuracy claim is added.
 
 ### Recover valid pairs from failed fine-grid representatives
 

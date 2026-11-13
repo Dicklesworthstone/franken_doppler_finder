@@ -625,41 +625,67 @@ fn build_store_inner(
     TrackStore { meta, legs }
 }
 
-/// Prefer non-MLAT reports inside the surviving original duplicate intervals. Keep the exact
-/// legacy representative when quality ties: a report discarded during an earlier merge must
-/// not reappear merely because a later store shifts the interval anchors. The raw point array
-/// is append-only until these representative indices have been materialized.
-fn dedupe_store_points(
-    mut points: Vec<TrackPoint>,
+/// Bookkeeping allocated only for an actual cross-store join. Keep each original point's
+/// unambiguous feed before combining the leg-level source labels; mixed sources stay unknown.
+struct StoreMerge {
     anchors: Vec<usize>,
+    feed_ranks: Vec<Option<u8>>,
+}
+
+/// Prefer non-MLAT reports inside the surviving original duplicate intervals, then the
+/// established feed preference when both origins are known. A mixed/unknown origin supplies
+/// no feed tie-break. Keep the exact legacy representative when quality ties: a report
+/// discarded during an earlier merge must not reappear merely because a later store shifts
+/// the interval anchors. Raw points and their origins stay append-only until this pass.
+fn dedupe_store_points(
+    points: Vec<TrackPoint>,
+    merge: StoreMerge,
     duplicate_times: &mut HashMap<u64, f64>,
 ) -> Vec<TrackPoint> {
-    let mut kept: Vec<TrackPoint> = anchors.into_iter().map(|i| points[i]).collect();
-    points.sort_by(|a, b| {
+    let StoreMerge {
+        mut anchors,
+        feed_ranks,
+    } = merge;
+    let mut kept: Vec<TrackPoint> = anchors.iter().map(|&i| points[i]).collect();
+    let kept_ranks: Vec<_> = anchors.iter().map(|&i| feed_ranks[i]).collect();
+    // Reuse the original index allocation to sort reports without separating any point
+    // from its originating feed. Feed rank never changes the original duplicate intervals.
+    anchors.clear();
+    anchors.extend(0..points.len());
+    anchors.sort_by(|&i, &j| {
+        let (a, b) = (&points[i], &points[j]);
         a.t.total_cmp(&b.t)
             .then((a.flags & pt_flags::MLAT).cmp(&(b.flags & pt_flags::MLAT)))
     });
-    let mut reports = points.into_iter().peekable();
-    for preferred in &mut kept {
+    let mut reports = anchors.into_iter().peekable();
+    for (preferred, mut preferred_rank) in kept.iter_mut().zip(kept_ranks) {
         let group_start = preferred.t;
         // Some reports were already discarded before a later store changed the anchors.
         // They remain discarded unless they belong to a surviving original interval.
         while reports
             .peek()
-            .is_some_and(|p| p.t.total_cmp(&group_start).is_lt())
+            .is_some_and(|&i| points[i].t.total_cmp(&group_start).is_lt())
         {
             let _ = reports.next();
         }
-        while let Some(p) = reports.next_if(|p| (p.t - group_start).abs() < DEDUPE_S) {
+        while let Some(i) = reports.next_if(|&i| (points[i].t - group_start).abs() < DEDUPE_S) {
+            let p = points[i];
             let boundary =
                 (preferred.flags | p.flags) & (pt_flags::NEW_LEG | pt_flags::NEW_LEG_AFTER);
             let clipped =
                 (preferred.flags & p.flags) & (pt_flags::CLIPPED_BEFORE | pt_flags::CLIPPED_AFTER);
-            if (p.flags & pt_flags::MLAT) < (preferred.flags & pt_flags::MLAT) {
+            let position_quality =
+                (p.flags & pt_flags::MLAT).cmp(&(preferred.flags & pt_flags::MLAT));
+            let better_feed = match (feed_ranks[i], preferred_rank) {
+                (Some(candidate), Some(current)) => candidate < current,
+                _ => false,
+            };
+            if position_quality.is_lt() || (position_quality.is_eq() && better_feed) {
                 if preferred.t != p.t {
                     duplicate_times.insert(preferred.t.to_bits(), p.t);
                 }
                 *preferred = p;
+                preferred_rank = feed_ranks[i];
             } else if p.t != preferred.t {
                 duplicate_times.insert(p.t.to_bits(), preferred.t);
             }
@@ -675,7 +701,8 @@ fn dedupe_store_points(
 /// Merge stores (e.g. consecutive UTC days). Legs of the same aircraft from DIFFERENT stores
 /// are joined when they overlap in time or the gap is <= `join_gap_s` (a flight crossing
 /// midnight UTC); legs from the same store are never joined. Duplicate instants (< 0.05 s)
-/// keep the non-MLAT point. Keys are re-assigned `{icao}_{YYYYMMDD}_{n}`.
+/// keep the non-MLAT point, then prefer prod/staging over mlat when both original feeds are
+/// unambiguous. Keys are re-assigned `{icao}_{YYYYMMDD}_{n}`.
 pub fn merge_stores(stores: Vec<TrackStore>, join_gap_s: f64) -> TrackStore {
     let mut meta = match stores.first() {
         Some(s) => s.meta.clone(),
@@ -746,16 +773,16 @@ pub fn merge_stores(stores: Vec<TrackStore>, join_gap_s: f64) -> TrackStore {
     for (icao, mut legs) in by_icao {
         let boundaries = leg_boundaries.get_mut(&icao).unwrap();
         legs.sort_by(|a, b| a.1.t0().total_cmp(&b.1.t0()));
-        // groups: (set of store ids, leg, original representative indices). Allocate indices
-        // only for an actual join. They preserve the old join boundaries, duplicate groups
-        // and exact-timestamp payloads while raw points stay available for quality selection.
-        // An unjoined leg keeps its original allocation and never runs the duplicate pass.
-        let mut groups: Vec<(Vec<usize>, FlightLeg, Option<Vec<usize>>)> = Vec::new();
+        // groups: (set of store ids, leg, original representatives and point origins).
+        // Allocate bookkeeping only for an actual join. It preserves the old join boundaries,
+        // duplicate groups and exact-timestamp payloads while raw points stay available for
+        // quality selection. An unjoined leg keeps its original allocation and skips this pass.
+        let mut groups: Vec<(Vec<usize>, FlightLeg, Option<StoreMerge>)> = Vec::new();
         for (si, l) in legs {
-            if let Some((ids, g, anchors)) = groups.last_mut() {
-                let last_t = anchors.as_ref().map_or_else(
+            if let Some((ids, g, merge)) = groups.last_mut() {
+                let last_t = merge.as_ref().map_or_else(
                     || g.t1(),
-                    |indices| indices.last().map_or(f64::NAN, |&i| g.points[i].t),
+                    |m| m.anchors.last().map_or(f64::NAN, |&i| g.points[i].t),
                 );
                 let overlap_or_close = l.t0() <= last_t + join_gap_s;
                 let gap = l.t0() - last_t;
@@ -788,15 +815,24 @@ pub fn merge_stores(stores: Vec<TrackStore>, join_gap_s: f64) -> TrackStore {
                     joins += 1;
                     ids.push(si);
                     let previous_len = g.points.len();
-                    let anchors = anchors.get_or_insert_with(|| (0..previous_len).collect());
+                    let merge = merge.get_or_insert_with(|| StoreMerge {
+                        anchors: (0..previous_len).collect(),
+                        feed_ranks: vec![Feed::from_label(&g.source).map(Feed::rank); previous_len],
+                    });
+                    merge.feed_ranks.extend(std::iter::repeat_n(
+                        Feed::from_label(&l.source).map(Feed::rank),
+                        l.points.len(),
+                    ));
                     g.points.extend(l.points);
-                    anchors.extend(previous_len..g.points.len());
-                    anchors.sort_by(|&i, &j| {
+                    merge.anchors.extend(previous_len..g.points.len());
+                    merge.anchors.sort_by(|&i, &j| {
                         let (a, b) = (&g.points[i], &g.points[j]);
                         a.t.total_cmp(&b.t)
                             .then((a.flags & pt_flags::MLAT).cmp(&(b.flags & pt_flags::MLAT)))
                     });
-                    anchors.dedup_by(|b, a| (g.points[*b].t - g.points[*a].t).abs() < DEDUPE_S);
+                    merge
+                        .anchors
+                        .dedup_by(|b, a| (g.points[*b].t - g.points[*a].t).abs() < DEDUPE_S);
                     // An unrecognized designator is no stronger than a missing one.
                     // Prefer a recognized adjoining-day type without changing the
                     // first recognized type's precedence over another known type.
@@ -820,14 +856,11 @@ pub fn merge_stores(stores: Vec<TrackStore>, join_gap_s: f64) -> TrackStore {
             groups.push((vec![si], l, None));
         }
         let mut n = 0;
-        for (_, mut g, anchors) in groups {
-            if let Some(anchors) = anchors {
+        for (_, mut g, merge) in groups {
+            if let Some(merge) = merge {
                 let mut duplicate_times = HashMap::new();
-                g.points = dedupe_store_points(
-                    std::mem::take(&mut g.points),
-                    anchors,
-                    &mut duplicate_times,
-                );
+                g.points =
+                    dedupe_store_points(std::mem::take(&mut g.points), merge, &mut duplicate_times);
                 boundaries.remap_duplicates(&duplicate_times);
             }
             mark_boundaries(&mut g.points, boundaries);
@@ -1743,6 +1776,191 @@ mod tests {
                 points,
             }],
         }
+    }
+
+    fn merge_feed_store(
+        feed: &str,
+        samples: &[(f64, f64, f64)],
+        position_source: Option<&str>,
+    ) -> TrackStore {
+        let midnight = T0 + 86_400.0;
+        let enu = fdop_types::geo::Enu::new(40.876466, -73.524951, 0.0);
+        let rows: Vec<_> = samples
+            .iter()
+            .map(|&(dt, north_error, height_error)| {
+                let (lat, lon, height) =
+                    enu.to_geodetic([90.0 * dt, 800.0 + north_error, 1000.0 + height_error]);
+                let mut row = serde_json::json!([
+                    dt,
+                    lat,
+                    lon,
+                    height / fdop_types::FT_TO_M,
+                    90.0 / fdop_types::KT_TO_MPS,
+                    90,
+                    12,
+                    0,
+                    null
+                ]);
+                if let Some(source) = position_source {
+                    row.as_array_mut()
+                        .unwrap()
+                        .extend([serde_json::json!(source), serde_json::Value::Null]);
+                }
+                row
+            })
+            .collect();
+        let sp = IngestSpec {
+            bbox: fdop_types::BBox::new(40.7, -73.8, 41.1, -73.0),
+            t_start: midnight - 60.0,
+            t_end: midnight + 360.0,
+            geoid_n_m: 0.0,
+            keep_unknown: false,
+            include_jets: false,
+        };
+        let raw = ingest_reader(
+            std::io::Cursor::new(seam_tar(midnight, &rows)),
+            feed,
+            &sp,
+            &|_| {},
+        )
+        .unwrap();
+        let store = build_store(vec![raw], &sp, vec![feed.into()]);
+        assert_eq!(store.legs.len(), 1);
+        assert_eq!(store.n_points(), samples.len());
+        store
+    }
+
+    #[test]
+    fn cross_day_feed_priority_recovers_unlabelled_geometry() {
+        use fdop_types::geo::{Enu, norm, sub};
+
+        let midnight = T0 + 86_400.0;
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let truth = [-20.0, -10.0, 0.0, 10.0, 20.0].map(|t| (t, 0.0, 0.0));
+        let expected = merge_feed_store("prod", &truth, None).legs.remove(0).points;
+        // The feed and the per-position source are different evidence. Real trace rows may
+        // omit the latter or leave it blank; that must not erase a known feed preference.
+        for position_source in [None, Some("")] {
+            for (secondary, primary) in [("mlat", "prod"), ("mlat", "staging"), ("staging", "prod")]
+            {
+                for offset in [-0.03125, 0.0, 0.03125] {
+                    let secondary_store = merge_feed_store(
+                        secondary,
+                        &[
+                            (-20.0, 0.0, 0.0),
+                            (-10.0, 0.0, 0.0),
+                            (offset, 1100.0, -200.0),
+                            (10.0 + offset, 1100.0, -200.0),
+                        ],
+                        position_source,
+                    );
+                    let primary_store = merge_feed_store(primary, &truth[2..], position_source);
+                    for reverse in [false, true] {
+                        let mut stores = vec![secondary_store.clone(), primary_store.clone()];
+                        if reverse {
+                            stores.reverse();
+                        }
+                        let merged = merge_stores(stores, 300.0);
+                        assert_eq!(merged.legs.len(), 1);
+                        for p in &merged.legs[0].points {
+                            let position = enu.from_geodetic(p.lat, p.lon, p.alt_m as f64);
+                            let error =
+                                norm(sub(position, [90.0 * (p.t - midnight), 800.0, 1000.0]));
+                            assert!(
+                                error < 0.01,
+                                "{secondary}/{primary}, source={position_source:?}, offset={offset}, reverse={reverse}: trajectory error {error:.1} m at {}",
+                                p.t - midnight
+                            );
+                            assert_eq!(p.flags & pt_flags::MLAT, 0);
+                        }
+                        assert_eq!(merged.legs[0].points, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cross_day_feed_priority_respects_position_source_and_ambiguous_origins() {
+        let first_samples = [(-10.0, 0.0, 0.0), (0.0, 1100.0, -200.0), (10.0, 0.0, 0.0)];
+        let next_samples = [(-5.0, 0.0, 0.0), (0.0, 0.0, 0.0), (20.0, 0.0, 0.0)];
+        let first = merge_feed_store("mlat", &first_samples, Some("adsb_icao"));
+        let next = merge_feed_store("prod", &next_samples, Some("mlat"));
+        let retained = first.legs[0].points[1];
+        for reverse in [false, true] {
+            let mut stores = vec![first.clone(), next.clone()];
+            if reverse {
+                stores.reverse();
+            }
+            let merged = merge_stores(stores, 300.0);
+            assert_eq!(
+                merged.legs[0].points[2], retained,
+                "explicit position quality wins"
+            );
+        }
+        // A mixed leg cannot identify the originating feed of any individual point.
+        // Neither an ambiguous incumbent nor an ambiguous challenger supplies a tie-break.
+        for (first_source, next_source) in [
+            ("prod+mlat", "prod"),
+            ("unknown", "prod"),
+            ("mlat", "prod+mlat"),
+            ("mlat", "unknown"),
+        ] {
+            let mut first = merge_feed_store("mlat", &first_samples, None);
+            let mut next = merge_feed_store("prod", &next_samples, None);
+            first.legs[0].source = first_source.into();
+            next.legs[0].source = next_source.into();
+            let merged = merge_stores(vec![first, next], 300.0);
+            assert_eq!(
+                merged.legs[0].points[2], retained,
+                "{first_source}/{next_source}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_day_feed_priority_preserves_duplicate_intervals_and_join_limit() {
+        let store = |feed, times: &[f64]| {
+            let samples: Vec<_> = times.iter().map(|&t| (t, 0.0, 0.0)).collect();
+            merge_feed_store(feed, &samples, None)
+        };
+        let offsets = |leg: &FlightLeg| -> Vec<_> {
+            leg.points.iter().map(|p| p.t - (T0 + 86_400.0)).collect()
+        };
+        let merged = merge_stores(
+            vec![
+                store("mlat", &[-10.0, 0.0, 0.0625, 10.0]),
+                store("prod", &[-5.0, 0.03125, 10.0]),
+                store("staging", &[5.0, 20.0]),
+            ],
+            300.0,
+        );
+        assert_eq!(
+            offsets(&merged.legs[0]),
+            [-10.0, -5.0, 0.03125, 0.0625, 5.0, 10.0, 20.0]
+        );
+        let shifted = merge_stores(
+            vec![
+                store("mlat", &[-10.0, 0.0, 0.09375, 10.0]),
+                store("prod", &[-5.0, 0.03125, 10.0]),
+                store("mlat", &[-1.0, -0.03125, 20.0]),
+            ],
+            300.0,
+        );
+        assert_eq!(
+            offsets(&shifted.legs[0]),
+            [-10.0, -5.0, -1.0, -0.03125, 0.09375, 10.0, 20.0]
+        );
+        let separated = merge_stores(
+            vec![
+                store("mlat", &[-10.0, 0.0]),
+                store("prod", &[-5.0, 0.03125]),
+                store("prod", &[300.015625, 320.0]),
+            ],
+            300.0,
+        );
+        assert_eq!(separated.legs.len(), 2);
+        assert_eq!(offsets(&separated.legs[0]), [-10.0, -5.0, 0.03125]);
     }
 
     #[test]
