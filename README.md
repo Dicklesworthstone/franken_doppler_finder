@@ -1556,7 +1556,11 @@ Design notes:
   neighbouring aircraft no longer automatically takes over the trace when both tones enter that band.
   The peak must also stand the SNR requirement above the valley separating it from any stronger bin, so
   ripple on a stronger ridge's top does not qualify, while a separate aircraft's ridge still does.
-  Standalone unguided ridge tracing retains its strongest-peak rule.
+  Standalone unguided ridge tracing retains the strongest peak within each slope's profile.
+  Across slopes it ranks candidates that pass both existing SNR and robust-z requirements
+  before ineligible peaks: a weak peak with a tiny noise spread cannot hide a qualifying
+  ridge. An already eligible winning slope stays identical. If none qualifies, the original
+  seed direction remains available, and the unchanged point gate still refuses its peak.
 - **Frequency estimates preserve the spectral peak's shape.** Ordinary and short windows integrate
   along the full Doppler curve. Noise exclusion accounts for the Hann main lobe and chirp smear, so
   narrowing the frequency tolerance does not count the signal as its own noise. Normalized spectra
@@ -1920,6 +1924,22 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover qualifying ridges hidden by weak high-z interference
+
+`free_trace_recovers_a_qualified_ridge_beside_a_weak_high_z_tone` independently solves the
+received frequency of a 100 Hz, 100 m/s flyover at 1500 m, then constructs spectral evidence
+with a weaker steady interferer. The original maximum-z candidate fails the unchanged SNR
+gate even though another slope qualifies; native execution returns no trace. Eligibility-aware
+selection now follows 401 points across 40 seconds, with RMS frequency error below one
+0.25 Hz spectral bin. This is analytic spectral evidence, not a PCM or localization result.
+
+All 10 native trace tests pass, including exact preservation of eligible winning slopes,
+the original nonzero seed when no slope qualifies, and refusal of weak-only and blank input.
+The production fix also compiles and passes its physical regression in the actual `fdop-core`
+crate with the pinned numerical dependencies; the final complete trace module was checked
+in an exact-source native component. Full workspace checks, CLI selftest and reference/field
+replays remain incomplete. No quality gate, calibration, slope grid or search budget changes.
 
 ### Preserve flyovers across intermittent speed reports
 

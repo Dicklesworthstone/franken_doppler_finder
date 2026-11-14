@@ -381,16 +381,23 @@ fn best_slope(
     half: usize,
 ) -> Option<(f64, (f64, f64, f64))> {
     let mut best: Option<(f64, (f64, f64, f64))> = None;
+    let mut qualified: Option<(f64, (f64, f64, f64))> = None;
     let n = ((2.0 * span + 1e-9) / step).floor() as usize + 1;
     for i in 0..n {
         let sl = center - span + i as f64 * step;
-        if let Some(r) = ridge_peak(spec, j, fc, sl, p.band, nb, half)
-            && best.is_none_or(|b| r.2 > b.1.2)
-        {
-            best = Some((sl, r));
+        if let Some(r) = ridge_peak(spec, j, fc, sl, p.band, nb, half) {
+            if best.is_none_or(|b| r.2 > b.1.2) {
+                best = Some((sl, r));
+            }
+            if r.1 >= p.min_snr && r.2 >= p.min_z && qualified.is_none_or(|b| r.2 > b.1.2) {
+                qualified = Some((sl, r));
+            }
         }
     }
-    best
+    // A weak peak with a tiny noise MAD can outrank a usable ridge by z alone.
+    // Prefer an eligible slope; if none qualifies, retain the original seed
+    // direction and let the caller's unchanged acceptance gate refuse its peak.
+    qualified.or(best)
 }
 
 fn polyfit_slope(x: &[f64], y: &[f64]) -> f64 {
@@ -525,6 +532,155 @@ mod tests {
                 norm: "analytic profile".into(),
             },
         }
+    }
+
+    /// Analytic spectral evidence for a received aircraft tone, a weaker steady
+    /// interferer and low-level spectral texture following the aircraft. This is
+    /// a ridge-selection fixture, not a synthesized PCM or localization result.
+    fn qualified_slope_scene(aircraft_height: f64) -> (Spec, Vec<f64>) {
+        let t: Vec<_> = (0..=400).map(|i| i as f64 * 0.1).collect();
+        let f: Vec<_> = (0..=560).map(|i| 40.0 + i as f64 * 0.25).collect();
+        let received: Vec<_> = t
+            .iter()
+            .map(|&heard| {
+                // Solve heard = emitted + range / c independently of the model
+                // used by detection, with emitted time relative to geometric CPA.
+                let relative = heard - (20.0 - 1500.0 / 343.0);
+                let (mut lo, mut hi) = (-1000.0, relative);
+                for _ in 0..70 {
+                    let emitted = 0.5 * (lo + hi);
+                    let range = 1500.0_f64.hypot(100.0 * emitted);
+                    if emitted + range / 343.0 < relative {
+                        lo = emitted;
+                    } else {
+                        hi = emitted;
+                    }
+                }
+                let emitted = 0.5 * (lo + hi);
+                let range = 1500.0_f64.hypot(100.0 * emitted);
+                100.0 * 343.0 / (343.0 + 100.0 * 100.0 * emitted / range)
+            })
+            .collect();
+        let db = f
+            .iter()
+            .flat_map(|&frequency| {
+                received.iter().map(move |&ridge| {
+                    let offset = frequency - ridge;
+                    (aircraft_height * (-0.5 * (offset / 0.5).powi(2)).exp()
+                        + 2.0 * (-0.5 * ((frequency - 102.0) / 0.35).powi(2)).exp()
+                        + 0.3 * (std::f64::consts::PI * offset).cos()) as f32
+                })
+            })
+            .collect();
+        (
+            Spec {
+                t,
+                f,
+                db,
+                meta: SpecMeta {
+                    sr: 1000,
+                    win_s: 2.0,
+                    hop_s: 0.1,
+                    nfft: 4000,
+                    df: 0.25,
+                    fmin: 40.0,
+                    fmax: 180.0,
+                    norm: "analytic received Doppler ridge".into(),
+                },
+            },
+            received,
+        )
+    }
+
+    #[test]
+    fn free_trace_recovers_a_qualified_ridge_beside_a_weak_high_z_tone() {
+        let (spec, received) = qualified_slope_scene(4.0);
+        let p = TraceParams {
+            integ_s: 1.5,
+            ..Default::default()
+        };
+        let (j, half) = (200, 15);
+        let mut candidates: Vec<_> = (0..=200)
+            .filter_map(|i| {
+                let slope = -25.0 + i as f64 * 0.25;
+                ridge_peak(&spec, j, received[j], slope, p.band, 4.0 * p.band, half)
+                    .map(|peak| (slope, peak))
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.1.2.total_cmp(&a.1.2));
+        assert!(candidates[0].1.1 < p.min_snr);
+        assert!(
+            candidates
+                .iter()
+                .any(|(_, peak)| { peak.1 >= p.min_snr && peak.2 >= p.min_z })
+        );
+        let trace = ridge_trace(&spec, &[(spec.t[j], received[j])], &p);
+        eprintln!(
+            "qualified slope: old winner {:?}, traced {} points over {:.3} s",
+            candidates[0],
+            trace.len(),
+            trace.span()
+        );
+        assert!(trace.t.first().is_some_and(|&t| t <= 12.0));
+        assert!(trace.t.last().is_some_and(|&t| t >= 28.0));
+        let rms = (trace
+            .t
+            .iter()
+            .zip(&trace.f)
+            .map(|(&time, &frequency)| (frequency - received[spec.frame_index(time)]).powi(2))
+            .sum::<f64>()
+            / trace.len() as f64)
+            .sqrt();
+        assert!(
+            rms < spec.df(),
+            "ridge RMS {rms} Hz exceeds one spectral bin"
+        );
+    }
+
+    #[test]
+    fn slope_selection_preserves_eligible_winners_and_unqualified_seed_directions() {
+        // The same physical fixture has a nonzero old winner. A deliberately
+        // higher requested SNR leaves every candidate ineligible and must retain
+        // that seed direction. The production default remains unchanged.
+        for (height, min_snr) in [(4.0, 10.0), (40.0, 3.0)] {
+            let p = TraceParams {
+                min_snr,
+                integ_s: 1.5,
+                ..Default::default()
+            };
+            let (spec, received) = qualified_slope_scene(height);
+            let mut original: Option<(f64, (f64, f64, f64))> = None;
+            let mut eligible = 0;
+            for i in 0..=200 {
+                let slope = -25.0 + i as f64 * 0.25;
+                if let Some(peak) = ridge_peak(&spec, 200, received[200], slope, p.band, 24.0, 15) {
+                    if original.is_none_or(|best| peak.2 > best.1.2) {
+                        original = Some((slope, peak));
+                    }
+                    eligible += usize::from(peak.1 >= p.min_snr && peak.2 >= p.min_z);
+                }
+            }
+            let original = original.unwrap();
+            if height == 4.0 {
+                assert_eq!(eligible, 0, "no candidate meets the requested SNR");
+                assert_ne!(original.0, 0.0, "the fallback must preserve a nonzero seed");
+                assert!(ridge_trace(&spec, &[(20.0, received[200])], &p).is_empty());
+            } else {
+                assert!(original.1.1 >= p.min_snr && original.1.2 >= p.min_z);
+            }
+            assert_eq!(
+                best_slope(&spec, 200, received[200], 0.0, 25.0, 0.25, &p, 24.0, 15),
+                Some(original)
+            );
+        }
+        let p = TraceParams {
+            integ_s: 1.5,
+            ..Default::default()
+        };
+        let (mut blank, _) = qualified_slope_scene(0.0);
+        assert!(ridge_trace(&blank, &[(20.0, 100.0)], &p).is_empty());
+        blank.db.fill(0.0);
+        assert!(ridge_trace(&blank, &[(20.0, 100.0)], &p).is_empty());
     }
 
     #[test]

@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep qualifying aircraft ridges beside weak high-z interference
+
+- Select the highest-z slope that satisfies both existing tracing gates. A weak peak over
+  a tiny noise spread previously won the ranking, then failed SNR and hid an available
+  qualifying ridge. Already eligible winning slopes remain identical; when none qualifies,
+  preserve the original seed direction and the caller's refusal behavior.
+- Keep the same slope proposals, integration, gates and calibration, with no additional
+  allocation or dependency. The existing measurement free-trace recovery uses this selector.
+- A native analytic Doppler-profile regression returns zero points before the fix and
+  401 points across 40 seconds afterward, with RMS below one 0.25 Hz spectral bin. All
+  10 trace tests pass, including eligible-winner, nonzero-seed, weak-interference and blank
+  controls. This is spectral tracing evidence, not PCM, localization or field accuracy.
+- The production change also compiles and passes its physical regression in the actual
+  pinned `fdop-core` crate; final module coverage uses an exact-source native component.
+  New code follows the pinned formatter. Full workspace checks, CLI selftest and
+  reference/field replays remain incomplete.
+
 ### Continue a search when an optional MLAT download fails
 
 - A completely ingested and successfully published prod/staging main catalogue now
