@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Seed fine-grid recovery when exact geometry falls between samples
+
+- Preserve original fine-grid successes and the earlier rejected-trace fallback. When no
+  geometrically eligible node exists, reuse the joined centre inside the existing 12%
+  quick-check speed/range envelope to seed one bounded spatial polish.
+- Keep the same envelope during exploration, then require the original zero-slack geometry
+  and trace gates for every accepted point. Interior CPA, gap, shared-clock, region,
+  coverage, grid-extent and fine-seed budget limits remain unchanged.
+- Add a physical two-flight regression at relative and reflected Unix epochs, requiring
+  both actual tracks within 2 m and 0.05 s. Extend the existing physical/search-limit
+  controls to the new seed, including an impossible distance interval.
+- Native validation did not run: the shared build disk was full and the executor then
+  became unavailable. Formatting, Clippy, workspace tests, selftest, UBS and reference/field
+  replays are unrun; no native recovery, timing or field-accuracy result is claimed.
+
 ### Recover close flight pairs that fit between the fine grid's sample points
 
 - Preserve every successful original fine grid exactly. If all nodes fail their trace gates,

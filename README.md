@@ -1767,6 +1767,14 @@ keeps its original result exactly and skips this fallback. Each attempted grid s
 the same `max_fine` allowance. Failed grids can require up to 64 eight-direction polishing
 iterations, so this recovery can add runtime; no real-recording timing improvement is claimed.
 
+If every fine node also fails the exact fitted speed/range intervals, a final fallback
+can instead start at the original joined location inside the existing 12% quick-check
+geometry envelope. The bounded polisher keeps that envelope during exploration and applies
+the original zero-slack intervals before retaining any candidate. Interior CPA, track-gap,
+shared-clock, coverage, trace, region and grid-extent checks remain in force. Original grid
+successes and the earlier trace-fit recovery retain their behavior. This adds at most one
+bounded polish per failed grid, under the same fine-seed budget.
+
 **Pair-join component measurement, 2026-11-07.** The
 `dense_pair_join_with_one_million_raw_matches` workload has 1,024 hypotheses on each side,
 1,048,576 compatible raw pairs and one retained seed. Exact original and updated join source
@@ -1855,6 +1863,20 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover a pair when exact distance intervals meet between fine nodes
+
+`fine_geometry_between_grid_nodes_retains_the_physical_pair` extends the existing
+physical short-pass fixture to a joined seed 75 m toward both aircraft. The only
+in-region 100 m fine node lies just below the ordinary distance intervals, inside
+the existing quick-check slack. The test requires both actual flights within 2 m and
+0.05 s, at relative and reflected Unix epochs. The existing refusal controls now
+exercise both the 60 m and 75 m seeds, including an impossible distance interval.
+
+These new checks have **not run**: the shared build disk filled and the execution
+environment then disconnected. Formatting, Clippy, workspace tests, the native selftest,
+UBS and reference/field replays remain unrun for this change. The prior measured
+results below belong to their recorded versions, not this extension.
 
 ### Locate a short flyover pair between the fine grid's samples
 
