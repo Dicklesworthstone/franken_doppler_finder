@@ -972,7 +972,11 @@ Availability checks look up only the main feed (prod, or staging when prod is ab
 Fetches with MLAT disabled also skip its release lookup. With MLAT enabled, an optional
 MLAT lookup failure keeps the successfully discovered main feed and records the error in
 progress and final notes, so a usable main cache or archive can still supply the day.
-Required main-feed lookup errors remain fatal.
+A failed main-feed lookup can also reuse a readable, covering processed main-feed catalogue.
+The report retains its existing missing-feed warnings and adds that newer or additional feeds
+could not be checked. Feed preference, aircraft policy, certified jet coverage and midnight
+coverage checks still apply. Without an acceptable main-feed cache, the original lookup error
+remains fatal, including when missing days would otherwise be allowed.
 
 Main-only discoveries use `releases-main.json`. They never replace `releases.json` or
 certify that MLAT is absent. A later online request for both feeds retries MLAT unless an

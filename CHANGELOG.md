@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep cached flight catalogues usable during a release lookup outage
+
+- Defer an online ADS-B release-discovery error until the existing partial day-cache
+  policy has checked for a readable covering main-feed catalogue. Reuse an eligible
+  catalogue with an explicit warning that newer or additional feeds could not be checked.
+- Preserve feed preference, aircraft and jet coverage, time/region coverage, midnight
+  context checks and the existing missing-feed warnings. Without an eligible main cache,
+  return the original discovery error, even when missing days are otherwise allowed.
+- Add regressions using real compressed stores across eight feed/MLAT/jet combinations,
+  plus absent, MLAT-only, corrupt, spatially/temporally incomplete, uncertified-jet and
+  unverified-midnight caches. They require unchanged cached bytes and flight provenance.
+- Source review and whitespace checks completed. Native package tests and full quality
+  checks remain unverified: the execution host disconnected during dependency compilation.
+  No native test pass, end-to-end recovery or recording-accuracy result is claimed.
+
 ### Keep distinct recorded flyovers when their extrapolated curves overlap
 
 - Restrict the curve match's shared-pixel test to recorded frames and valid received

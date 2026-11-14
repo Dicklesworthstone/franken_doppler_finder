@@ -757,10 +757,11 @@ fn fetch_window_with_discovery(
             continue;
         }
         // a store built while a release was missing: use it when nothing better exists
+        let mut discovery_error = None;
         let rels = if opts.offline {
             Vec::new()
         } else {
-            let found = discover(
+            match discover(
                 net.as_ref(),
                 day.0,
                 day.1,
@@ -768,13 +769,22 @@ fn fetch_window_with_discovery(
                 &dir,
                 false,
                 opts.include_mlat,
-            )?;
-            if let Some(error) = found.mlat_error {
-                notes.push(format!(
-                    "{label}: MLAT-only release lookup failed; using the available main feed: {error}"
-                ));
+            ) {
+                Ok(found) => {
+                    if let Some(error) = found.mlat_error {
+                        notes.push(format!(
+                            "{label}: MLAT-only release lookup failed; using the available main feed: {error}"
+                        ));
+                    }
+                    found.releases
+                }
+                Err(error) => {
+                    // Discovery cannot invalidate an already verified local catalogue.
+                    // Keep the error until the existing partial-cache policy has run.
+                    discovery_error = Some(error);
+                    Vec::new()
+                }
             }
-            found.releases
         };
         let available = feedset_available(&rels, opts.include_mlat);
         for fs in partial_feedsets(feedset) {
@@ -794,7 +804,15 @@ fn fetch_window_with_discovery(
             }
         }
         if day_stores[i].is_some() {
+            if let Some(error) = discovery_error {
+                notes.push(format!(
+                    "{label}: release lookup failed; using the cached main-feed catalogue; newer or additional feeds could not be checked: {error}"
+                ));
+            }
             continue;
+        }
+        if let Some(error) = discovery_error {
+            return Err(error);
         }
         if opts.offline {
             // Processed full and partial stores above retain their existing priority.
@@ -2084,6 +2102,162 @@ mod tests {
                     .iter()
                     .any(|line| { line.contains("synthetic optional lookup outage") })
             );
+        }
+    }
+
+    #[test]
+    fn main_discovery_outage_recovers_verified_partial_day_caches() {
+        for (main, cached_mlat, include_mlat) in [
+            (Feed::Prod, false, true),
+            (Feed::Staging, false, true),
+            (Feed::Staging, true, true),
+            (Feed::Staging, false, false),
+        ] {
+            for include_jets in [false, true] {
+                let f = offline_raw_fixture(main, include_jets);
+                let count = if cached_mlat { 2 } else { 1 };
+                let store = build_day_store(
+                    f.parts[..count].to_vec(),
+                    &f.spec,
+                    f.releases[..count].iter().map(|r| r.tag.clone()).collect(),
+                    day_context((2026, 9, 8)),
+                );
+                let fs = cache_feedset(&feedset_name(main, cached_mlat), include_jets);
+                let path = f
+                    .dir
+                    .join(format!("{fs}_{}.fdtrk", bbox_key(&f.spec.bbox).1));
+                store.save(&path).unwrap();
+                let original = std::fs::read(&path).unwrap();
+                let want = IngestSpec {
+                    keep_unknown: true,
+                    ..f.want
+                };
+                let messages = Arc::new(Mutex::new(Vec::new()));
+                let log = messages.clone();
+                let opts = FetchOptions {
+                    include_mlat,
+                    progress: Some(Arc::new(move |line| {
+                        log.lock().unwrap().push(line.to_owned())
+                    })),
+                    ..Default::default()
+                };
+                let expected = fetch_window(
+                    &want,
+                    &f.cache,
+                    &FetchOptions {
+                        offline: true,
+                        ..opts.clone()
+                    },
+                )
+                .unwrap();
+                assert!(!expected.legs.is_empty());
+                // Both CLI entry points run this availability preflight first.
+                // A completed recent day's cache must avoid the failing lookup here too.
+                assert_eq!(
+                    published_until(
+                        want.t_start,
+                        want.t_end,
+                        &f.cache,
+                        false,
+                        crate::ingest::tests::T0 + 86_400.0 + 1.0,
+                    )
+                    .unwrap(),
+                    (want.t_end, Vec::new())
+                );
+                let mut calls = 0;
+                let got = fetch_window_with_discovery(
+                    &want,
+                    &f.cache,
+                    &opts,
+                    |_, _, _, _, _, offline, requested_mlat| {
+                        calls += 1;
+                        assert!(!offline);
+                        assert_eq!(requested_mlat, include_mlat);
+                        Err(DataError("synthetic main release lookup outage".into()))
+                    },
+                )
+                .unwrap();
+                assert_eq!(calls, 1);
+                assert_same_legs(&got.legs, &expected.legs);
+                assert_eq!(got.meta.sources, expected.meta.sources);
+                assert_eq!(got.meta.stats["cache_hits"], 1);
+                let notes = got.meta.stats["notes"].as_array().unwrap();
+                for prior in expected.meta.stats["notes"].as_array().unwrap() {
+                    assert!(notes.contains(prior), "lost coverage warning: {prior}");
+                }
+                assert!(notes.iter().any(|note| {
+                    let s = note.as_str().unwrap();
+                    s.contains("synthetic main release lookup outage")
+                        && s.contains("using the cached main-feed catalogue")
+                        && s.contains("additional feeds could not be checked")
+                }));
+                assert!(
+                    messages
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|line| { line.contains("synthetic main release lookup outage") })
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn main_discovery_outage_stays_fatal_without_a_usable_main_cache() {
+        for failure in [
+            "absent", "mlatonly", "corrupt", "bbox", "time", "jets", "midnight",
+        ] {
+            let f = offline_raw_fixture(Feed::Prod, false);
+            let mut want = f.want;
+            let mut store = synthetic_store(&f.spec);
+            match failure {
+                "bbox" => store.meta.bbox.west = want.bbox.west + 0.1,
+                "time" => store.meta.t_start = want.t_start + 1.0,
+                "jets" => want.include_jets = true,
+                "midnight" => want.t_end = f.spec.t_end,
+                _ => {}
+            }
+            let fs = if failure == "mlatonly" {
+                "mlatonly"
+            } else {
+                "prod"
+            };
+            let path = f.dir.join(format!(
+                "{}_{}.fdtrk",
+                cache_feedset(fs, want.include_jets),
+                bbox_key(&want.bbox).1,
+            ));
+            if failure == "corrupt" {
+                std::fs::write(&path, b"incomplete track store").unwrap();
+            } else if failure != "absent" {
+                store.save(&path).unwrap();
+            }
+            let original = std::fs::read(&path).ok();
+            for allow_missing in [false, true] {
+                let error = fetch_window_with_discovery(
+                    &want,
+                    &f.cache,
+                    &FetchOptions {
+                        allow_missing,
+                        ..Default::default()
+                    },
+                    |_, _, _, _, _, offline, _| {
+                        assert!(
+                            !offline,
+                            "a discovery failure must not silently change policy"
+                        );
+                        Err(DataError("synthetic main release lookup outage".into()))
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "synthetic main release lookup outage",
+                    "{failure}"
+                );
+                assert_eq!(std::fs::read(&path).ok(), original);
+            }
         }
     }
 
