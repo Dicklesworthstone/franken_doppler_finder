@@ -522,11 +522,12 @@ in `crates/fdop-core/src/curvematch.rs`:
   Coarse and exact scoring refine a sampled local minimum before applying the physical reach limit,
   so a pass just inside the limit can survive when its nearby samples are outside. Coarse refinement
   keeps the original sampled point if its proposed time is no closer on the actual trajectory.
-  If both remain outside reach, a conservative bound on the neighboring flight segments can
-  admit one exact closest-approach retry inside those same sample times (at most eight seconds
-  at the default spacing). This recovers turning paths whose sampled-range quadratic misses
-  the real approach. The original range and speed gates still apply; an already accepted
-  coarse vote keeps its time and geometry. Clearly unreachable cells skip the retry, and
+  If the proposal fails the range or speed gate, a conservative bound on the neighboring
+  flight segments can admit one exact closest-approach retry inside those same sample times
+  (at most eight seconds at the default spacing). This recovers turning or accelerating paths
+  whose sampled-range quadratic misses the real approach, including a valid approach whose
+  approximate time has an ineligible speed. The original range and speed gates still apply;
+  an already accepted coarse vote keeps its time and geometry. Clearly unreachable cells skip the retry, and
   artificial catalogue boundaries and track gaps remain excluded.
   An actual closest approach outside the reach remains excluded.
   Exact trajectories between bank shapes use interpolated fitted null quantiles on the existing
@@ -1893,6 +1894,33 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover valid closest approaches hidden by an ineligible sampled speed
+
+`coarse_speed_recovery_uses_the_actual_cpa_within_the_sample_bracket` covers two mirrored
+headings at each speed boundary. The approximate closest approach has a speed below 15 m/s
+or above the unchanged bank limit, while an independently calculated closest approach inside
+the neighboring sample interval passes both speed and range gates. The original native code
+produces zero votes in all four cases. The corrected code emits one vote per case with the
+expected arrival time and template. No sampling grid, speed limit or evidence threshold changes.
+
+`coarse_speed_recovery_preserves_accepted_votes_and_physical_limits` verifies bit-identical
+timestamps for already accepted votes, rejection of genuinely out-of-range or out-of-speed
+passes, and clipped-window limits. All 16 focused curve tests pass, covering these cases and
+existing coarse sampling, wind, range, gap and pixel-ownership behavior. All 68 active track
+tests also pass; one existing timing benchmark is ignored.
+
+The existing `grazing_passes_are_heard_across_exact_clock_seeds` test still fails at its
+audibility prerequisite: 6.2907996 nats against the unchanged 6.9-nat hearing line. An immutable
+copy of upstream `051a168` produces the identical score and failure; the within-range pass
+already reaches exact scoring. Its fixture and calibration remain unchanged.
+
+Validation compiles the complete production curve, track, physics and spectrogram modules
+with the real pinned dependencies in an external component. Component Clippy passes with
+warnings denied except unused declarations whose callers are outside that component. Full
+workspace checks, CLI selftest and reference/field replays remain incomplete. These synthetic
+geometry results do not establish field accuracy; existing repository-wide formatting
+differences remain, while the new code follows the pinned formatter.
 
 ### Preserve supported fast turns after a slower flight segment
 

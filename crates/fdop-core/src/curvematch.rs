@@ -1346,7 +1346,8 @@ fn stamp_track(
                     let mut d = dist2(g.enu.from_ecef(pos)).sqrt();
                     let mut v = norm(vel);
                     let v_cap = p.v_grid.last().copied().unwrap_or(200.0) * 1.15;
-                    if d.is_finite() && d > reach && v >= 15.0 && v <= v_cap {
+                    if d.is_finite() && v.is_finite() && (d > reach || !(15.0..=v_cap).contains(&v))
+                    {
                         let observer = g.enu.to_ecef(x);
                         if interval_bounds.is_none_or(|bounds| bounds.may_reach(observer, reach))
                             && let Some(cpa) = tr.cpa_near(
@@ -1355,9 +1356,10 @@ fn stamp_track(
                                 0.5 * (bracket.1 - bracket.0),
                             )
                         {
-                            // Squared range is not quadratic on a turning Hermite path.
-                            // Only a rejected proposal takes this single bounded retry;
-                            // every original success keeps its exact time and geometry.
+                            // A turning or accelerating path can reach CPA at a different
+                            // range and speed from the approximate proposal. Only a rejected
+                            // proposal takes this bounded retry; original successes keep
+                            // their exact time and geometry.
                             bt = cpa.t_e;
                             (pos, vel) = tr.pv(bt);
                             d = dist2(g.enu.from_ecef(pos)).sqrt();
@@ -1366,7 +1368,8 @@ fn stamp_track(
                     }
                     // The closest sample can be outside reach while the interpolated pass
                     // enters it. Apply the range gate to that pass, after finding its CPA.
-                    if !d.is_finite() || d > reach || v < 15.0 || v > v_cap {
+                    if !d.is_finite() || !v.is_finite() || d > reach || !(15.0..=v_cap).contains(&v)
+                    {
                         continue;
                     }
                     let c = c_at(bt);
@@ -4429,6 +4432,184 @@ mod tests {
                     assert_eq!(stamped[0].1.arrive.to_bits(), (expected as f32).to_bits());
                 }
             }
+        }
+    }
+
+    /// Symmetric sampled ranges put the quadratic proposal at 100 s. The actual
+    /// Hermite path turns inward after that report and reaches CPA at another speed.
+    fn speed_boundary_track(fast: bool, direction: f64) -> TrackModel {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let cap = MatchParams::default().v_grid.last().unwrap() * 1.15;
+        let (step, centre_v, radial_v, outer_north, outer_radial_v) = if fast {
+            let v = ((cap + 0.04).powi(2) - 12.0_f64.powi(2)).sqrt();
+            (4.0 * v, v, -12.0, 5010.0, 2.0)
+        } else {
+            (64.0, 14.8, -0.5, 5001.0, 0.5)
+        };
+        let mut tr = scene_track(
+            [0.0, 5000.0, 600.0 + MIC_HEIGHT_M],
+            [direction * step / 4.0, 0.0, 0.0],
+            100.0,
+            80.0,
+            120.0,
+        );
+        for (offset, north, east_v, north_v) in [
+            (-4.0, outer_north, step / 4.0, -outer_radial_v),
+            (0.0, 5000.0, centre_v, radial_v),
+            (4.0, outer_north, step / 4.0, outer_radial_v),
+        ] {
+            let k =
+                tr.t.iter()
+                    .position(|&t| t == clock + 100.0 + offset)
+                    .unwrap();
+            tr.pos[k] = enu.to_ecef([direction * step * offset / 4.0, north, 600.0 + MIC_HEIGHT_M]);
+            tr.vel[k] = enu.vec_to_ecef([direction * east_v, north_v, 0.0]);
+        }
+        tr
+    }
+
+    #[test]
+    fn coarse_speed_recovery_uses_the_actual_cpa_within_the_sample_bracket() {
+        let (lat, lon, clock) = SCENE_AT;
+        let observer = Enu::new(lat, lon, 0.0).to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let p = MatchParams::default();
+        let cap = p.v_grid.last().unwrap() * 1.15;
+        let mut missed = Vec::new();
+        for fast in [false, true] {
+            for direction in [-1.0, 1.0] {
+                let tr = speed_boundary_track(fast, direction);
+                let sample_v = norm(tr.pv(clock + 100.0).1);
+                assert!(if fast {
+                    sample_v > cap
+                } else {
+                    sample_v < 15.0
+                });
+                let cpa = tr.cpa_near(observer, clock + 100.0, p.sample_s).unwrap();
+                assert!(cpa.interior && cpa.d < p.reach_m);
+                assert!((15.0..=cap).contains(&cpa.speed), "{cpa:?}");
+                // Independent roots of r(t).v(t)=0 for these cubic segments; the
+                // production golden-section CPA solver terminates at one millisecond.
+                let (expected_time, expected_speed, expected_range) = if fast {
+                    (100.398647318, 286.962723859, 5033.525801492)
+                } else {
+                    (100.842029416, 15.650958885, 5035.671150522)
+                };
+                assert!((cpa.t_e - clock - expected_time).abs() < 0.001);
+                assert!((cpa.speed - expected_speed).abs() < 0.001);
+                assert!((cpa.d - expected_range).abs() < 0.001);
+                let mut stamped = Vec::new();
+                stamp_track(
+                    &tr,
+                    &observer_cell(&p),
+                    &p,
+                    &|_| BASE_C,
+                    None,
+                    clock,
+                    (clock + 80.0, clock + 120.0),
+                    &mut stamped,
+                );
+                if stamped.len() != 1 {
+                    missed.push((fast, direction, stamped.len()));
+                    continue;
+                }
+                let expected_arrival = cpa.t_e - clock + cpa.d / BASE_C;
+                assert!((f64::from(stamped[0].1.arrive) - expected_arrival).abs() < 0.001);
+                assert_eq!(
+                    stamped[0].1.tpl as usize,
+                    nearest_log(&p.v_grid, cpa.speed) * p.d_grid.len()
+                        + nearest_log(&p.d_grid, cpa.d)
+                );
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "lost supported passes (fast, direction, votes): {missed:?}"
+        );
+    }
+
+    #[test]
+    fn coarse_speed_recovery_preserves_accepted_votes_and_physical_limits() {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let observer = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let p = MatchParams::default();
+        let cap = p.v_grid.last().unwrap() * 1.15;
+        let stamped = |tr: &TrackModel, params: &MatchParams, span| {
+            let mut out = Vec::new();
+            stamp_track(
+                tr,
+                &observer_cell(params),
+                params,
+                &|_| BASE_C,
+                None,
+                clock,
+                span,
+                &mut out,
+            );
+            out
+        };
+        let span = (clock + 80.0, clock + 120.0);
+        for fast in [false, true] {
+            let mut tr = speed_boundary_track(fast, 1.0);
+            for clip in [(span.0, clock + 100.0), (clock + 104.0, span.1)] {
+                assert!(
+                    stamped(&tr, &p, clip).is_empty(),
+                    "recovered outside {clip:?}"
+                );
+            }
+            // Move the same otherwise eligible pass beyond the unchanged slant-range gate.
+            let mut distant = tr.clone();
+            for position in &mut distant.pos {
+                let mut local = enu.from_ecef(*position);
+                local[1] += 3000.0;
+                *position = enu.to_ecef(local);
+            }
+            assert!(
+                distant
+                    .cpa_near(observer, clock + 100.0, p.sample_s)
+                    .unwrap()
+                    .d
+                    > p.reach_m
+            );
+            assert!(stamped(&distant, &p, span).is_empty());
+            // If the original sampled proposal already passes, its exact timestamp and
+            // bank entry must stay unchanged even though the refined CPA is different.
+            let k = tr.t.iter().position(|&t| t == clock + 100.0).unwrap();
+            tr.vel[k] = enu.vec_to_ecef(if fast {
+                [cap - 2.0, -12.0, 0.0]
+            } else {
+                [15.5, -0.5, 0.0]
+            });
+            let (position, velocity) = tr.pv(clock + 100.0);
+            let (d, v) = (norm(sub(position, observer)), norm(velocity));
+            assert!((15.0..=cap).contains(&v));
+            let got = stamped(&tr, &p, span);
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                got[0].1.arrive.to_bits(),
+                ((100.0 + d / BASE_C) as f32).to_bits()
+            );
+            assert_eq!(
+                got[0].1.tpl as usize,
+                nearest_log(&p.v_grid, v) * p.d_grid.len() + nearest_log(&p.d_grid, d)
+            );
+        }
+        // A retry cannot waive either speed boundary at the actual closest approach.
+        for speed in [14.0, cap + 1.0] {
+            let tr = scene_track(
+                [0.0, 5000.0, 600.0 + MIC_HEIGHT_M],
+                [speed, 0.0, 0.0],
+                100.0,
+                80.0,
+                120.0,
+            );
+            let cpa = tr.cpa_near(observer, clock + 100.0, p.sample_s).unwrap();
+            assert!(!(15.0..=cap).contains(&cpa.speed));
+            assert!(
+                stamped(&tr, &p, span).is_empty(),
+                "retained {speed} m/s pass"
+            );
         }
     }
 

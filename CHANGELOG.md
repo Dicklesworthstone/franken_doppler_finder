@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover closest approaches whose sampled speed fails the coarse gate
+
+- Extend the existing bounded closest-approach retry to finite proposals rejected by either
+  the range or speed gate. A turning or accelerating trajectory can reach its actual closest
+  approach at a valid speed even when the approximate proposal is too slow or too fast.
+- Keep the retry inside the original neighboring sample interval and reuse its conservative
+  path bounds. Reapply the original range and speed limits, explicitly reject nonfinite
+  speeds, and preserve every previously accepted valid vote's time and geometry. No grid,
+  budget, template, null calibration or confidence threshold changes.
+- The native regression loses all four physical cases on the original implementation and
+  recovers each with the expected arrival and template after the fix. Independent cubic
+  roots verify the true closest-approach time, speed and range. Controls retain exact accepted
+  timestamps and refuse truly invalid speed/range or clipped-window cases.
+- All 16 focused curve tests and 68 active track tests pass in the pinned exact-source native
+  component; one existing track benchmark is ignored. Component Clippy passes with warnings
+  denied except unused declarations from omitted callers. New code follows the pinned formatter.
+- The existing grazing PCM test still fails at 6.2907996 nats against the unchanged 6.9-nat
+  heard threshold. An immutable upstream `051a168` component produces the identical score
+  and failure; no fixture or scoring threshold is adjusted. Full workspace checks, CLI
+  selftest and reference/field replays remain incomplete, so no field-accuracy claim is made.
+
 ### Preserve supported fast turns in flights dominated by slower reports
 
 - After the existing faster-chord recovery fails, require independent turning-arc support
