@@ -381,6 +381,14 @@ distance constraints. This prevents a valid recording clock from being discarded
 was inferred only from the nuisance fits along the speed and distance profiles. The F cutoff and generous
 floors are unchanged; the extra profiles run once on the final retained trace.
 
+Every solution accepted during any of these profiles also contributes to all four reported
+coordinate ranges. A speed or distance sweep can reach its search bracket while another
+profile finds an accepted slower, closer geometry beyond that sweep's interval. Retaining
+that geometry prevents the exported search bounds from discarding an explanation already
+admitted by the fit. This adds no solver calls and leaves the best fit, cutoff and generous
+floors unchanged. Wider bounds can admit more downstream candidates under the existing
+search limits; they do not establish a globally complete or calibrated confidence region.
+
 **High** confidence needs every gate. **Medium** needs two core matches, clock lock, and a margin of at least
 3 nats (or no rival), also with no recorded comparison cut. Everything else is **low**. The full gate details
 are in `result.json` and `report.html`. An incomplete comparison still reports its observed numerical gap,
@@ -1939,6 +1947,29 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Retain accepted fit geometry in the exported search bounds
+
+`short_two_sided_trace_retains_accepted_profile_geometry` independently generates a
+112 Hz, 100 m/s pass at 7 km, with propagation delay and fixed 0.2 Hz frequency scatter
+over a 24-second emission interval. All 121 observations remain inliers, with more than
+11 seconds of approach and recede and 0.141 Hz fitted RMS. An independently prescribed
+40 m/s alternative optimizes to 1,068.32 m with residual sum 2.895687, below the unchanged
+24.673421 profile cutoff. The original exported distance interval starts at 2,551.21 m
+and excludes that accepted alternative; the native regression fails before the correction
+and passes after it, checking both the profile and generous search ranges.
+
+A read-only diagnostic on the same trace finds 53 of 122 accepted parameter vectors outside
+the original exported geometry and none outside the corrected geometry. A well-supported
+300-second control retains the same point estimate, ranges, floors and warnings. The fix
+unions already accepted solutions into speed and distance bounds, with no new optimizations.
+This preserves an admitted alternative; it does not claim recovery of the generating observer.
+
+All 16 active fit-module tests pass in the actual native core package; one existing timing
+benchmark remains ignored. Existing tone, clock, robust-fit, one-sided and support controls
+pass, and the final core package passes all-targets Clippy with warnings denied and dependency
+linting excluded. Pinned formatting and diff checks pass. Full-workspace, CLI selftest and
+reference/field validation remain incomplete.
 
 ### Keep observed turn velocities when a preferred duplicate omits them
 

@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve accepted speed and distance alternatives in fit/search ranges
+
+- Union every already accepted profile solution into the exported speed and distance
+  intervals, as for tone and heard CPA time. Another coordinate's profile can accept
+  geometry beyond the original speed/distance sweep bracket; omitting it discarded an
+  explanation the fit itself admitted before the catalogue search could consider it.
+- Keep point estimates, profile cutoff, solver calls, generous floors and warning logic
+  unchanged. Wider valid bounds can increase downstream candidate work within existing
+  limits; no confidence-calibration or globally complete region claim is made.
+- Add an independently generated short physical pass with 121 retained observations.
+  An accepted 40 m/s, 1,068.32 m alternative has residual sum 2.895687 below the unchanged
+  24.673421 cutoff, but lies below the original 2,551.21 m distance lower bound. Its native
+  regression fails before the correction and passes after it. Diagnostic inspection goes
+  from 53 excluded accepted vectors out of 122 to zero; a long supported control is unchanged.
+- All 16 active native fit-module tests pass; one existing timing benchmark stays ignored.
+  The final core package passes all-targets Clippy with warnings denied and dependency
+  linting excluded; pinned formatting and diff checks pass. Full-workspace, CLI selftest
+  and reference/field validation remain incomplete.
+
 ### Retain observed motion omitted by a preferred duplicate flight report
 
 - Recover missing groundspeed or heading from one fresh, complete duplicate motion pair

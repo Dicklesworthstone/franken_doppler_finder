@@ -813,7 +813,12 @@ fn finish_fit(prepared: PreparedFit) -> FitResult {
             }
         }
     }
+    // Keep every accepted solution in every exported coordinate. A speed or distance
+    // sweep can stop at its search bracket while another profile accepts geometry
+    // outside that sweep's interval.
     for p in &accepted {
+        rng[0] = [rng[0][0].min(p[1]), rng[0][1].max(p[1])];
+        rng[1] = [rng[1][0].min(p[2]), rng[1][1].max(p[2])];
         f0r = [f0r[0].min(p[0]), f0r[1].max(p[0])];
         let time = p[3] + p[2] / c;
         t0rr = [t0rr[0].min(time), t0rr[1].max(time)];
@@ -1325,6 +1330,58 @@ mod tests {
             [x[0], x[1], x[2], value - x[2] / c],
             resid(&x).iter().map(|r| r * r).sum(),
         )
+    }
+
+    #[test]
+    fn short_two_sided_trace_retains_accepted_profile_geometry() {
+        let (c, f0, v, d) = (343.0, 112.0, 100.0, 7000.0);
+        // Emit a physical pass, then add its propagation delay and a fixed small
+        // frequency scatter. No received-time fitting routine generates the data.
+        let (t, f): (Vec<f64>, Vec<f64>) = (-60..=60)
+            .map(|k| {
+                let tau = 0.2 * k as f64;
+                let range = (d * d + v * v * tau * tau).sqrt();
+                (
+                    1000.0 + tau + range / c,
+                    f0 * c / (c + v * v * tau / range) + 0.2 * (1.731 * k as f64 + 0.37).sin(),
+                )
+            })
+            .unzip();
+        let prepared = prepare_constant_velocity(&t, &f, c, Side::Both).unwrap();
+        assert_eq!(prepared.t_i.len(), t.len());
+        let best = prepared.best();
+        assert!(best.t0r - t[0] > 8.0 && t[t.len() - 1] - best.t0r > 8.0);
+        assert!(best.rmse < 0.2);
+        assert!((28.0..=0.8 * c).contains(&best.v));
+        assert!((200.0..=25_000.0).contains(&best.d));
+
+        // A slower, closer pass can explain this short observed arc as well. Its
+        // acceptance must survive projecting the fitted region onto each coordinate.
+        let (witness, cost, _) = ls(
+            &prepared.t_i,
+            &prepared.f_i,
+            c,
+            prepared.p_best,
+            &[0, 2, 3],
+            &[(1, 40.0)],
+            LossKind::Linear,
+        );
+        let minimum = prepared.cmin;
+        let result = prepared.complete();
+        let threshold = minimum * (1.0 + result.diagnostics.delta);
+        assert!(cost.is_finite() && cost <= threshold);
+        assert!((200.0..=25_000.0).contains(&witness[2]));
+        for (name, interval, value) in [
+            ("speed", result.ranges.v, witness[1]),
+            ("distance", result.ranges.d, witness[2]),
+            ("search speed", result.ranges_generous.v, witness[1]),
+            ("search distance", result.ranges_generous.d, witness[2]),
+        ] {
+            assert!(
+                (interval[0]..=interval[1]).contains(&value),
+                "accepted profile {witness:?}, SSE {cost} <= {threshold}: {name} {value} outside {interval:?}"
+            );
+        }
     }
 
     #[test]
