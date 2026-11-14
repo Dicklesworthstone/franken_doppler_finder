@@ -1214,6 +1214,9 @@ fn stamp_track(
     }
     let reach = p.reach_m;
     let rc = ((reach + g.horizontal_shift_m) / g.step).ceil() as i64;
+    // Validate the model once before using binary-searched interval bounds. Invalid
+    // geometry cannot justify skipping an exact recovery at any observer.
+    let bounded_track = tr.bounds().is_some();
     let last_sample = ((tb - ta) / p.sample_s).ceil() as usize;
     let (ends_a, ends_b) = (ta <= tr.t0() + 1.0, tb >= tr.t1() - 1.0);
     let trim = 0.5 * (p.chunk_s - p.chunk_step_s);
@@ -1253,6 +1256,12 @@ fn stamp_track(
             {
                 continue;
             }
+            let bracket = (times[i.saturating_sub(1)], times[(i + 1).min(times.len() - 1)]);
+            // One small hull per sample, reused across every cell. Clear square-corner
+            // misses must not pay for an exact CPA solve merely because the range failed.
+            let interval_bounds = bounded_track
+                .then(|| tr.bounds_between(bracket.0, bracket.1))
+                .flatten();
             let (ix, iy) = (
                 ((q[0] - g.e0) / g.step).round() as i64,
                 ((q[1] - g.n0) / g.step).round() as i64,
@@ -1331,15 +1340,30 @@ fn stamp_track(
                         bt = times[i];
                         (pos, vel) = tr.pv(bt);
                     }
-                    let d = dist2(g.enu.from_ecef(pos)).sqrt();
-                    let v = norm(vel);
+                    let mut d = dist2(g.enu.from_ecef(pos)).sqrt();
+                    let mut v = norm(vel);
+                    let v_cap = p.v_grid.last().copied().unwrap_or(200.0) * 1.15;
+                    if d.is_finite() && d > reach && v >= 15.0 && v <= v_cap {
+                        let observer = g.enu.to_ecef(x);
+                        if interval_bounds.is_none_or(|bounds| bounds.may_reach(observer, reach))
+                            && let Some(cpa) = tr.cpa_near(
+                                observer,
+                                0.5 * (bracket.0 + bracket.1),
+                                0.5 * (bracket.1 - bracket.0),
+                            )
+                        {
+                            // Squared range is not quadratic on a turning Hermite path.
+                            // Only a rejected proposal takes this single bounded retry;
+                            // every original success keeps its exact time and geometry.
+                            bt = cpa.t_e;
+                            (pos, vel) = tr.pv(bt);
+                            d = dist2(g.enu.from_ecef(pos)).sqrt();
+                            v = norm(vel);
+                        }
+                    }
                     // The closest sample can be outside reach while the interpolated pass
                     // enters it. Apply the range gate to that pass, after finding its CPA.
-                    if !d.is_finite()
-                        || d > reach
-                        || v < 15.0
-                        || v > p.v_grid.last().copied().unwrap_or(200.0) * 1.15
-                    {
+                    if !d.is_finite() || d > reach || v < 15.0 || v > v_cap {
                         continue;
                     }
                     let c = c_at(bt);
@@ -4323,6 +4347,152 @@ mod tests {
         assert_eq!(stamped.len(), 1);
         let expected = 4.0 + ranges[1] / BASE_C;
         assert!((stamped[0].1.arrive as f64 - expected).abs() < 0.001);
+    }
+
+    /// A gentle heading change whose actual closest approach falls between the
+    /// coarse samples. Symmetric sampled ranges leave their quadratic at 100 s.
+    fn bent_grazing_track(north_shift: f64, direction: f64) -> TrackModel {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let reach = MatchParams::default().reach_m;
+        let ranges = [reach + 10.0, reach + 0.1, reach + 10.0];
+        let outer_north = (ranges[0].powi(2) - 400.0_f64.powi(2) - 600.0_f64.powi(2)).sqrt();
+        let mut tr = scene_track(
+            [0.0, outer_north + north_shift, 600.0 + MIC_HEIGHT_M],
+            [100.0 * direction, 0.0, 0.0],
+            100.0,
+            -200.0,
+            600.0,
+        );
+        for (i, (east, north_v)) in [(-400.0_f64, 4.0), (0.0, -5.0), (400.0, -4.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let north = (ranges[i].powi(2) - east.powi(2) - 600.0_f64.powi(2)).sqrt();
+            let k = tr
+                .t
+                .iter()
+                .position(|&t| t == clock + 96.0 + i as f64 * 4.0)
+                .unwrap();
+            tr.pos[k] = enu.to_ecef([direction * east, north + north_shift, 600.0 + MIC_HEIGHT_M]);
+            tr.vel[k] = enu.vec_to_ecef([100.0 * direction, north_v, 0.0]);
+        }
+        tr
+    }
+
+    #[test]
+    fn grazing_turn_recovers_a_true_cpa_after_the_quadratic_proposal_misses() {
+        let (lat, lon, clock) = SCENE_AT;
+        let observer = Enu::new(lat, lon, 0.0).to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let p = MatchParams::default();
+        for direction in [-1.0, 1.0] {
+            for shift in [0.0, 25.0, -25.0] {
+                let tr = bent_grazing_track(shift, direction);
+                let cpa = tr.cpa_near(observer, clock + 100.0, 4.0).unwrap();
+                let mut stamped = Vec::new();
+                stamp_track(
+                    &tr,
+                    &observer_cell(&p),
+                    &p,
+                    &|_| BASE_C,
+                    None,
+                    clock,
+                    (clock, clock + 360.0),
+                    &mut stamped,
+                );
+                if shift > 0.0 {
+                    assert!(cpa.d > p.reach_m);
+                    assert!(stamped.is_empty(), "a true outside-reach pass voted");
+                    continue;
+                }
+                assert_eq!(stamped.len(), 1, "supported pass lost: {direction}/{shift}");
+                let expected = if shift == 0.0 {
+                    assert!(tr.pos.iter().all(|&pos| norm(sub(pos, observer)) > p.reach_m));
+                    assert!(cpa.interior && cpa.d < p.reach_m - 1.0, "{cpa:?}");
+                    assert!(cpa.speed > 90.0 && cpa.speed < 110.0);
+                    assert!(cpa.t_e > clock + 100.0 && cpa.t_e < clock + 102.0);
+                    cpa.t_e - clock + cpa.d / BASE_C
+                } else {
+                    // A successful original sampled proposal must not be replaced with
+                    // the later, closer CPA: its timestamp stays bit-for-bit unchanged.
+                    100.0 + norm(sub(tr.pos_at(clock + 100.0), observer)) / BASE_C
+                };
+                if shift == 0.0 {
+                    assert!((f64::from(stamped[0].1.arrive) - expected).abs() < 0.001);
+                } else {
+                    assert_eq!(stamped[0].1.arrive.to_bits(), (expected as f32).to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grazing_recovery_cannot_cross_clipped_windows_or_a_track_gap() {
+        let (_, _, clock) = SCENE_AT;
+        let p = MatchParams::default();
+        let tr = bent_grazing_track(0.0, 1.0);
+        for span in [(clock, clock + 98.0), (clock + 104.0, clock + 360.0)] {
+            let mut stamped = Vec::new();
+            stamp_track(
+                &tr,
+                &observer_cell(&p),
+                &p,
+                &|_| BASE_C,
+                None,
+                clock,
+                span,
+                &mut stamped,
+            );
+            assert!(stamped.is_empty(), "recovered a pass outside {span:?}");
+        }
+        let slow_bank = MatchParams {
+            v_grid: vec![30.0, 45.0],
+            ..p.clone()
+        };
+        let mut stamped = Vec::new();
+        stamp_track(
+            &tr,
+            &observer_cell(&slow_bank),
+            &slow_bank,
+            &|_| BASE_C,
+            None,
+            clock,
+            (clock, clock + 360.0),
+            &mut stamped,
+        );
+        assert!(stamped.is_empty(), "range recovery bypassed the bank's speed gate");
+        // Models on either side of a real data gap have no interpolated path through it.
+        for before in [false, true] {
+            let keep: Vec<_> = tr
+                .t
+                .iter()
+                .enumerate()
+                .filter(|&(_, &t)| {
+                    if before {
+                        t <= clock + 96.0
+                    } else {
+                        t >= clock + 104.0
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let mut part = tr.clone();
+            part.t = keep.iter().map(|&i| tr.t[i]).collect();
+            part.pos = keep.iter().map(|&i| tr.pos[i]).collect();
+            part.vel = keep.iter().map(|&i| tr.vel[i]).collect();
+            let mut stamped = Vec::new();
+            stamp_track(
+                &part,
+                &observer_cell(&p),
+                &p,
+                &|_| BASE_C,
+                None,
+                clock,
+                (clock, clock + 360.0),
+                &mut stamped,
+            );
+            assert!(stamped.is_empty(), "invented a pass across the model gap");
+        }
     }
 
     #[test]

@@ -705,6 +705,35 @@ impl TrackModel {
     /// positions would miss a turn whose curve reaches beyond both knots. Invalid/overflowing
     /// inputs yield no bound and must retain the track for the normal geometry checks.
     pub fn bounds(&self) -> Option<TrackBounds> {
+        self.segment_bounds(0..self.t.len().saturating_sub(1))
+    }
+
+    /// Bound the knot segments touching a time interval. Complete segments deliberately
+    /// include any out-of-interval control points, so a partial segment cannot lose a turn.
+    /// As with interpolation, callers supply finite, strictly increasing model times.
+    /// Unknown intervals or invalid selected geometry have no bound and must retain the
+    /// exact check; callers can validate the whole model once with `bounds` first.
+    pub(crate) fn bounds_between(&self, lo: f64, hi: f64) -> Option<TrackBounds> {
+        let n = self.t.len();
+        if n < 2
+            || !lo.is_finite()
+            || !hi.is_finite()
+            || hi < lo
+            || hi < self.t0()
+            || lo > self.t1()
+        {
+            return None;
+        }
+        let first = self
+            .t
+            .partition_point(|&t| t <= lo)
+            .saturating_sub(1)
+            .min(n - 2);
+        let end = self.t.partition_point(|&t| t < hi).min(n - 1).max(first + 1);
+        self.segment_bounds(first..end)
+    }
+
+    fn segment_bounds(&self, segments: std::ops::Range<usize>) -> Option<TrackBounds> {
         let n = self.t.len();
         if n < 2 || self.pos.len() != n || self.vel.len() != n {
             return None;
@@ -713,7 +742,7 @@ impl TrackModel {
             lo: [f64::INFINITY; 3],
             hi: [f64::NEG_INFINITY; 3],
         };
-        for i in 0..n - 1 {
+        for i in segments {
             let (ta, tb) = (self.t[i], self.t[i + 1]);
             let h = tb - ta;
             if !ta.is_finite() || !tb.is_finite() || h <= 0.0 || !h.is_finite() {
@@ -2939,6 +2968,67 @@ mod tests {
                 assert!(!bounds.may_reach(far, 8000.0));
             }
         }
+    }
+
+    #[test]
+    fn interval_bounds_preserve_selected_hermite_paths_and_prune_distant_parts() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let mut tr = straight_track(
+            &enu,
+            [0.0, 0.0, 1000.0],
+            [100.0, 0.0, 0.0],
+            1000.0,
+            1000.0,
+            1040.0,
+            10.0,
+        );
+        tr.vel[1] = enu.vec_to_ecef([100.0, 200.0, 0.0]);
+        tr.vel[2] = enu.vec_to_ecef([100.0, -200.0, 0.0]);
+        // The middle segment leaves its endpoint chord. Partial intervals must keep
+        // that excursion, without admitting a later, distant part of the flight.
+        for (lo, hi) in [(1010.0, 1020.0), (1012.25, 1018.75), (1015.0, 1015.0)] {
+            let bounds = tr.bounds_between(lo, hi).unwrap();
+            for k in 0..=100 {
+                let t = lo + (hi - lo) * k as f64 / 100.0;
+                assert!(bounds.may_reach(tr.pos_at(t), 0.0), "lost path at {t}");
+            }
+            assert!(!bounds.may_reach(tr.pos_at(1040.0), 100.0));
+        }
+        let full = tr.bounds().unwrap();
+        for (lo, hi) in [(1000.0, 1040.0), (999.0, 1041.0)] {
+            let interval = tr.bounds_between(lo, hi).unwrap();
+            assert_eq!(interval.lo.map(f64::to_bits), full.lo.map(f64::to_bits));
+            assert_eq!(interval.hi.map(f64::to_bits), full.hi.map(f64::to_bits));
+        }
+    }
+
+    #[test]
+    fn interval_bounds_refuse_unknown_ranges_and_invalid_selected_geometry() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let tr = straight_track(
+            &enu,
+            [0.0, 0.0, 1000.0],
+            [100.0, 0.0, 0.0],
+            1000.0,
+            1000.0,
+            1040.0,
+            10.0,
+        );
+        for (lo, hi) in [
+            (f64::NAN, 1020.0),
+            (1010.0, f64::INFINITY),
+            (1020.0, 1010.0),
+            (900.0, 999.0),
+            (1041.0, 1100.0),
+        ] {
+            assert!(tr.bounds_between(lo, hi).is_none());
+        }
+        let mut invalid = tr.clone();
+        invalid.pos[1][0] = f64::NAN;
+        assert!(invalid.bounds_between(1010.0, 1020.0).is_none());
+        let mut invalid = tr;
+        invalid.vel.truncate(1);
+        assert!(invalid.bounds_between(1010.0, 1020.0).is_none());
     }
 
     #[test]

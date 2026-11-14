@@ -522,6 +522,12 @@ in `crates/fdop-core/src/curvematch.rs`:
   Coarse and exact scoring refine a sampled local minimum before applying the physical reach limit,
   so a pass just inside the limit can survive when its nearby samples are outside. Coarse refinement
   keeps the original sampled point if its proposed time is no closer on the actual trajectory.
+  If both remain outside reach, a conservative bound on the neighboring flight segments can
+  admit one exact closest-approach retry inside those same sample times (at most eight seconds
+  at the default spacing). This recovers turning paths whose sampled-range quadratic misses
+  the real approach. The original range and speed gates still apply; an already accepted
+  coarse vote keeps its time and geometry. Clearly unreachable cells skip the retry, and
+  artificial catalogue boundaries and track gaps remain excluded.
   An actual closest approach outside the reach remains excluded.
   Exact trajectories between bank shapes use interpolated fitted null quantiles on the existing
   log-speed/log-distance grid. This removes evidence jumps caused solely by selecting a neighbouring

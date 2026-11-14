@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover turning flyovers that enter hearing range between sampled reports
+
+- When a coarse curve-match proposal fails its range gate, use a conservative bound
+  on the neighboring Hermite segments to permit one bounded closest-approach retry.
+  Reapply the original local range and speed gates; every originally accepted vote
+  keeps its time and geometry. The retry never extends the sampled clock interval.
+- Reuse the existing Bézier hull arithmetic for interval bounds, prepared once per
+  coarse sample outside the cell loops. Distant cells skip the exact retry. Full-track
+  bounds retain their original traversal and arithmetic; invalid bounds fail open.
+- Add physical mirrored-flight regressions with reports at 8010/8000.1/8010 m, all
+  outside the unchanged 8 km reach. Independent Hermite arithmetic places the actual
+  closest approach at 7998.425930 m between reports. Controls cover genuinely outside
+  passes, unchanged accepted timestamps, speed limits, clipped windows, track gaps,
+  interval containment and full-bound equivalence.
+- Native tests, Clippy, selftest and reference/field replays remain unverified. The
+  full core build was SIGKILLed in unchanged `fsci-linalg`; a smaller exact-source
+  component did not finish before the execution environment became unavailable.
+  Arithmetic and source review do not establish native recovery or field accuracy.
+
 ### Keep cached flight catalogues usable during a release lookup outage
 
 - Defer an online ADS-B release-discovery error until the existing partial day-cache
@@ -30,9 +49,10 @@ at that commit, not per-change commits.
 - Add regressions using real compressed stores across eight feed/MLAT/jet combinations,
   plus absent, MLAT-only, corrupt, spatially/temporally incomplete, uncertified-jet and
   unverified-midnight caches. They require unchanged cached bytes and flight provenance.
-- Source review and whitespace checks completed. Native package tests and full quality
-  checks remain unverified: the execution host disconnected during dependency compilation.
-  No native test pass, end-to-end recovery or recording-accuracy result is claimed.
+- Source review and whitespace checks completed. The native data-package build was
+  SIGKILLed in unchanged `syn` 2.0.119 before its tests ran; the execution environment
+  subsequently became unavailable. Full quality checks, end-to-end recovery and
+  recording-accuracy results remain unverified.
 
 ### Keep distinct recorded flyovers when their extrapolated curves overlap
 
