@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover the real engine-tone change after a clustered ridge jump
+
+- After the existing per-side robust refit rejects observations, reuse its masks for
+  one additional prefix-sum change-point scan. A short burst on a stray ridge can
+  otherwise move the split well past the real RPM change, even after its two tones
+  are corrected. Keep the original candidates, inlier mask, split limits and tone
+  bounds, and accept the proposal only if its full capped residual score improves.
+  Every masked or missing observation still pays its original penalty.
+- Add physical retarded-time trace regressions with a 24-of-360-sample ridge burst,
+  both rising/falling RPM changes and relative/Unix clocks. All three focused tests
+  pass in the actual pinned core package, including after integrating concurrent
+  upstream fitting and curve-identity changes. Direct chi is about 1.67327, with
+  the true change time and source tones; raw RMS still exposes the contamination.
+- Both two-aircraft searches retain the intended core matches, refinement and no
+  comparison cut, at 0.122365571 m synthetic error and zero clock error. Tone bounds,
+  missing-coverage penalties and wrong-curve controls pass. The added scan has a
+  fixed number of passes, not a nonlinear fit at every candidate split.
+- Independent source review and changed-hunk formatting pass. A native pre-change
+  comparison was not completed after host memory pressure stopped an intervening
+  rebuild. Full workspace, release CLI selftest and reference/field replays remain
+  unverified; these trace fixtures do not establish field accuracy or calibration.
+
 ### Keep qualifying aircraft ridges beside weak high-z interference
 
 - Select the highest-z slope that satisfies both existing tracing gates. A weak peak over

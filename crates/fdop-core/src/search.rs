@@ -1755,20 +1755,24 @@ fn trace_chi(
         }
         let seg_clamp = |f: f64| f.clamp(0.85 * source_f0, 1.15 * source_f0);
         let min_side = (n / 6).max(10);
-        let mut best: Option<(f64, usize, f64, f64)> = None;
-        for k in min_side..n.saturating_sub(min_side) {
-            let (a1, b1, c1) = (pa[k], pb[k], pc[k]);
-            let (a2, b2, c2) = (pa[n] - a1, pb[n] - b1, pc[n] - c1);
-            if b1 <= 0.0 || b2 <= 0.0 {
-                continue;
+        let best_split = |prefix: &[Vec<f64>; 3]| {
+            let [pa, pb, pc] = prefix;
+            let mut best: Option<(f64, usize, f64, f64)> = None;
+            for k in min_side..n.saturating_sub(min_side) {
+                let (a1, b1, c1) = (pa[k], pb[k], pc[k]);
+                let (a2, b2, c2) = (pa[n] - a1, pb[n] - b1, pc[n] - c1);
+                if b1 <= 0.0 || b2 <= 0.0 {
+                    continue;
+                }
+                let (fa, fb) = (seg_clamp(a1 / b1), seg_clamp(a2 / b2));
+                let sse = (c1 - 2.0 * fa * a1 + fa * fa * b1) + (c2 - 2.0 * fb * a2 + fb * fb * b2);
+                if best.is_none_or(|b| sse < b.0) {
+                    best = Some((sse, k, fa, fb));
+                }
             }
-            let (fa, fb) = (seg_clamp(a1 / b1), seg_clamp(a2 / b2));
-            let sse = (c1 - 2.0 * fa * a1 + fa * fa * b1) + (c2 - 2.0 * fb * a2 + fb * fb * b2);
-            if best.is_none_or(|b| sse < b.0) {
-                best = Some((sse, k, fa, fb));
-            }
-        }
-        if let Some((_, k, fa, fb)) = best {
+            best
+        };
+        if let Some((_, k, fa, fb)) = best_split(prefix) {
             let (chi2, rms2, m2) = score(fa, fb, k);
             if chi2 < out.chi {
                 out = TraceFit {
@@ -1792,7 +1796,7 @@ fn trace_chi(
                     (rr[i].is_finite() && rr[i] > 0.0 && tone.is_finite()).then_some(tone)
                 }));
                 if ad.is_empty() || ad.len() != finite {
-                    return original;
+                    return (original, None);
                 }
                 let centre = seg_clamp(crate::spectro::median_f64(ad));
                 ad.clear();
@@ -1812,12 +1816,13 @@ fn trace_chi(
                     }
                 }
                 if kept < finite && b > 0.0 {
-                    seg_clamp(a / b)
+                    (seg_clamp(a / b), Some((centre, limit)))
                 } else {
-                    original
+                    (original, None)
                 }
             };
-            let (robust_a, robust_b) = (refit(0, k, fa), refit(k, n, fb));
+            let (robust_a, mask_a) = refit(0, k, fa);
+            let (robust_b, mask_b) = refit(k, n, fb);
             if robust_a != fa || robust_b != fb {
                 let (chi, rms, m) = score(robust_a, robust_b, k);
                 if chi < out.chi {
@@ -1828,6 +1833,50 @@ fn trace_chi(
                         cov: m as f64 / n as f64,
                         brk: Some((tt[k], robust_b)),
                     };
+                }
+            }
+            if mask_a.is_some() || mask_b.is_some() {
+                // The same stray ridge can also pull the split away from the RPM
+                // change. Reuse the side masks for one additional linear-time split
+                // scan. Retain the original inlier mask, split bounds and candidates;
+                // every point, including each masked one, still pays its original
+                // capped penalty when the resulting proposal is scored.
+                for sums in prefix.iter_mut() {
+                    sums[0] = 0.0;
+                }
+                let [pa, pb, pc] = prefix;
+                for i in 0..n {
+                    let mask = if i < k { mask_a } else { mask_b };
+                    let ok = rr[i].is_finite()
+                        && (ff[i] - f0 * rr[i]).abs() <= lim.max(0.15 * ev.f0)
+                        && mask
+                            .is_none_or(|(centre, limit)| (ff[i] - centre * rr[i]).abs() <= limit);
+                    let (fr, r2, f2) = if ok {
+                        (ff[i] * rr[i], rr[i] * rr[i], ff[i] * ff[i])
+                    } else {
+                        (0.0, 0.0, 0.0)
+                    };
+                    pa[i + 1] = pa[i] + fr;
+                    pb[i + 1] = pb[i] + r2;
+                    pc[i + 1] = pc[i] + f2;
+                }
+                if let Some((_, next, a, b)) = best_split(prefix)
+                    && next != k
+                {
+                    let (ra, _) = refit(0, next, a);
+                    let (rb, _) = refit(next, n, b);
+                    for (a, b) in [(a, b), (ra, rb)] {
+                        let (chi, rms, m) = score(a, b, next);
+                        if chi < out.chi {
+                            out = TraceFit {
+                                chi,
+                                f0: a,
+                                rms,
+                                cov: m as f64 / n as f64,
+                                brk: Some((tt[next], b)),
+                            };
+                        }
+                    }
                 }
             }
         }
@@ -5523,9 +5572,116 @@ mod tests {
         }
     }
 
+    fn clustered_rpm_case(falling: bool, start: f64) -> TwoCase {
+        let mut case = contaminated_rpm_case(falling, start);
+        let x = observer(case.obs.0, case.obs.1, &FlatElevation(0.0)).x;
+        let prop = Prop::still(343.0);
+        let tr = &case.tracks[0];
+        let cpa = tr.cpa_nearest_time(x, start + 120.0, 30.0).unwrap();
+        let event = &mut case.events[0];
+        for (k, (&t, f)) in event.tr_t.iter().zip(&mut event.tr_f).enumerate() {
+            let (emitted, _, ratio) = tr.solve_emission_p(start + t, x, &prop, None).unwrap();
+            let later = emitted >= cpa.t_e + 10.0;
+            let tone = if later != falling { 131.0 } else { 121.0 };
+            // A brief ridge jump after the real RPM change can pull an ordinary
+            // squared-error change point to the end of the contaminating burst.
+            let stray = if (252..276).contains(&k) {
+                if falling { 22.0 } else { -22.0 }
+            } else {
+                0.0
+            };
+            *f = (tone + stray) * ratio + 0.03 * (k as f64 * 1.7).sin();
+        }
+        (event.q_t, event.q_f) = subsample(&event.tr_t, &event.tr_f, 40);
+        case
+    }
+
+    #[test]
+    fn clustered_ridge_noise_preserves_the_real_rpm_change() {
+        let prop = Prop::still(343.0);
+        for start in [0.0, 1_788_895_000.0] {
+            for falling in [false, true] {
+                let case = clustered_rpm_case(falling, start);
+                let x = observer(case.obs.0, case.obs.1, &FlatElevation(0.0)).x;
+                let tr = &case.tracks[0];
+                let event = &case.events[0];
+                let ratio = |t| tr.solve_emission_p(t, x, &prop, None).unwrap().2;
+                let fit = trace_chi(
+                    &event.tr_t,
+                    &event.tr_f,
+                    &ratio,
+                    start,
+                    event,
+                    1.0,
+                    event.sigma_hz,
+                    DEFAULT_CAP_SIGMA,
+                    true,
+                    &mut TraceScratch::default(),
+                );
+                eprintln!("clustered RPM change, falling={falling}, start={start}: {fit:?}");
+                assert!(fit.chi < 2.0, "{fit:?}");
+                assert_eq!(fit.cov, 1.0);
+                let (at, after) = fit
+                    .brk
+                    .expect("the physical engine-tone change must survive");
+                let cpa = tr.cpa_nearest_time(x, start + 120.0, 30.0).unwrap();
+                let emitted = cpa.t_e + 10.0;
+                let rv = sub(tr.pos_at(emitted), x);
+                let received = emitted + prop.travel(rv, norm(rv)) - start;
+                assert!(
+                    (at - received).abs() < 0.4,
+                    "{fit:?}, true change {received}"
+                );
+                let tones = if falling {
+                    [131.0, 121.0]
+                } else {
+                    [121.0, 131.0]
+                };
+                assert!((fit.f0 - tones[0]).abs() < 0.05, "{fit:?}");
+                assert!((after - tones[1]).abs() < 0.05, "{fit:?}");
+                assert!(fit.rms > 3.0, "raw RMS must still expose the stray ridge");
+            }
+        }
+    }
+
+    #[test]
+    fn two_flyovers_locate_despite_a_clustered_ridge_jump() {
+        for falling in [false, true] {
+            let case = clustered_rpm_case(falling, 1_788_895_000.0);
+            let result = run_case(&case, fdop_types::atmo::Medium::still(343.0));
+            let top = result
+                .candidates
+                .first()
+                .expect("both actual flights must locate");
+            let error = haversine_m(top.lat, top.lon, case.obs.0, case.obs.1);
+            eprintln!(
+                "clustered RPM location, falling={falling}: {error} m, clock {} s, {:?}",
+                top.t_start_utc - case.t_s,
+                top.events
+            );
+            assert!(result.funnel.truncated.is_empty(), "{:?}", result.funnel);
+            assert!(error < 75.0, "{error} m");
+            assert!((top.t_start_utc - case.t_s).abs() < 0.5);
+            assert_eq!(top.n_explained, 2);
+            assert!(top.events.iter().all(|m| m.event == m.flight && m.core));
+            let changed = top.events.iter().find(|m| m.event == "rpm-change").unwrap();
+            assert!(changed.f0_change.is_some());
+            assert!(changed.chi < 2.0, "{changed:?}");
+            assert!(result.refine.is_some());
+        }
+    }
+
     #[test]
     fn robust_rpm_change_keeps_bounds_coverage_and_wrong_curve_penalties() {
-        let case = contaminated_rpm_case(false, 0.0);
+        check_rpm_change_refusals(contaminated_rpm_case(false, 0.0));
+    }
+
+    #[test]
+    fn clustered_rpm_change_keeps_bounds_coverage_and_wrong_curve_penalties() {
+        check_rpm_change_refusals(clustered_rpm_case(false, 0.0));
+    }
+
+    fn check_rpm_change_refusals(case: TwoCase) {
         let x = observer(case.obs.0, case.obs.1, &FlatElevation(0.0)).x;
         let prop = Prop::still(343.0);
         let event = &case.events[0];

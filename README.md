@@ -317,8 +317,12 @@ For an event already allowed one engine-tone change, the scorer also robustly re
 side of the existing selected split. A real power change can otherwise broaden the initial
 residual mask enough that stray ridge points bias both tones and reject the correct flight.
 The alternative must improve the same capped objective, and a segment whose trim rejects
-no observations keeps its original coefficient exactly. Split selection, source-tone bounds,
-coverage penalties and confidence gates are unchanged; chance calibration uses the same scorer.
+no observations keeps its original coefficient exactly. If those side masks reject observations,
+one additional prefix-sum scan can also recover a split displaced by a burst of stray ridge points.
+It retains every original candidate, the original split limits and the initial inlier mask;
+the recovered proposal must improve the same score across all original points. Masked and
+missing observations still pay their original penalties. Source-tone bounds, coverage penalties
+and confidence gates are unchanged; chance calibration uses the same scorer.
 
 A still-air fit's reference tone can differ from the aircraft's physical source tone in wind.
 For each candidate flight, trace scoring converts the fitted tone and its permitted interval into
@@ -1924,6 +1928,24 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover a real engine-tone change after a burst of stray ridge points
+
+`clustered_ridge_noise_preserves_the_real_rpm_change` uses physical retarded-time
+frequency observations with a 121/131 Hz source-tone change and 24 of 360 samples
+on a stray ridge. Its rising/falling and relative/Unix-time cases all recover the
+true change time and tones with chi about 1.67327. Raw RMS remains above 4.5 Hz,
+so the contamination remains visible in the diagnostics.
+
+`two_flyovers_locate_despite_a_clustered_ridge_jump` keeps both intended core
+aircraft at 0.122365571 m from the synthetic observer with zero clock error,
+refinement and no comparison truncation in both directions of tone change.
+The bounds, missing-coverage and wrong-curve controls also pass. All three tests
+ran in the actual core crate on the pinned nightly with optimization disabled,
+including after integration with the newer fitter and flyover-identity changes.
+These are synthetic trace results; they do not establish real-recording accuracy,
+calibrated confidence or end-to-end performance. Full workspace and release-CLI
+validation remain incomplete.
 
 ### Recover qualifying ridges hidden by weak high-z interference
 
