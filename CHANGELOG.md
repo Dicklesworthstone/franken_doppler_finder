@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve faster flyovers when only part of a flight reports speed
+
+- After the existing track recovery, a still-incomplete leg with mixed velocity
+  availability can retain adjacent missing-speed chords corroborated by three consecutive
+  positions. Reuse the existing 25 m/s velocity-consistency, vertical-motion, gap and
+  subsonic limits, without widening the whole leg's speed envelope.
+- Keep every report in the preceding winning chain and preserve independently supported
+  separated parts. Finite or infinite speed reports cannot supply missing-motion support.
+  Entirely reported and entirely missing legs retain their original recovery paths;
+  search scoring and confidence thresholds are unchanged.
+- Add eight physical builder cases with analytic position/frequency assertions, plus
+  controls for isolated jumps, unsupported motion and separated coverage. Independent
+  scalar-motion arithmetic retains 25/38 reports before recovery and 38/38 after it in
+  both time directions; this is not a native Rust or localization result.
+- Source review and pre-outage whitespace checks completed. Registry TLS failures and
+  execution-environment loss prevented native validation. Formatting verification,
+  Clippy, workspace tests, selftest, UBS and reference/field replays remain incomplete;
+  no measured interpolation error or field-accuracy improvement is claimed.
+
 ### Recover completed flight downloads during a release lookup outage
 
 - When online ADS-B discovery fails and no processed catalogue qualifies, rebuild the

@@ -1386,8 +1386,14 @@ Design notes:
   the observed horizontal motion within the existing 25 m/s limit, be positive and no faster
   than the nominal sound speed, and respect the existing vertical and gap bounds. The global
   envelope is unchanged for other chords. The longer chain must retain every original winning
-  report and cannot absorb a separately supported part. Complete original chains stay intact;
-  missing or contradictory local motion does not qualify for this additional recovery.
+  report and cannot absorb a separately supported part. Complete original chains stay intact.
+  After that recovery, an incomplete leg with mixed velocity availability can also recover
+  adjacent missing-speed chords supported by three consecutive positions with missing speeds.
+  Their horizontal velocities must agree within the same 25 m/s limit and satisfy the existing
+  subsonic, vertical and gap limits. This allowance stays local: it cannot cross a finite-speed
+  report or an uncorroborated gap, and the longer chain must retain the preceding winner and
+  separately supported parts. Entirely reported and entirely missing legs retain their
+  established recovery paths. No search-confidence threshold changes.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
@@ -1883,6 +1889,23 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover faster flyovers from mixed velocity reports
+
+`mixed_speed_reports_recover_the_unreported_faster_flyover` builds a physical
+45-to-145 m/s track whose slow portion reports velocity and whose faster portion does not.
+Its eight cases cover two headings, accelerated/decelerated ordering, and relative/Unix
+timestamps. They require all 38 reports and check reconstructed positions and received
+frequencies against analytic states. Refusal controls cover insufficient local support,
+position/height jumps, finite zero and infinite speed reports; the separated-support
+regression also exercises the mixed-report retry.
+
+An independent scalar-motion arithmetic check keeps only 25 of 38 reports under the old
+chain rules and admits all 38 with the new local allowance, in both time directions.
+This is not native interpolation or localization evidence. **The Rust regressions have
+not run:** registry TLS failures and then loss of the execution environment blocked
+validation. Formatting verification, Clippy, workspace tests, selftest, UBS and the
+reference/field replays remain incomplete; no field-accuracy improvement is claimed.
 
 ### Keep distinct curve matches at recording and frequency boundaries
 

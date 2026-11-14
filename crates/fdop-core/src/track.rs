@@ -121,6 +121,46 @@ fn drop_bracketed_non_gnss(pts: &mut Vec<fdop_types::store::TrackPoint>, max_spa
     });
 }
 
+/// Two agreeing horizontal secants can corroborate missing speed, subject to the same
+/// sample-gap, vertical-motion and subsonic bounds as position-only track recovery.
+fn position_triplet_speed(
+    pts: &[fdop_types::store::TrackPoint],
+    xy: &[[f64; 2]],
+    bp: &BuildParams,
+) -> Option<f64> {
+    let dt = [pts[1].t - pts[0].t, pts[2].t - pts[1].t];
+    if dt
+        .iter()
+        .any(|&t| !t.is_finite() || t <= 0.0 || t > bp.max_gap_s)
+    {
+        return None;
+    }
+    let velocity = [
+        [
+            (xy[1][0] - xy[0][0]) / dt[0],
+            (xy[1][1] - xy[0][1]) / dt[0],
+        ],
+        [
+            (xy[2][0] - xy[1][0]) / dt[1],
+            (xy[2][1] - xy[1][1]) / dt[1],
+        ],
+    ];
+    let speed = velocity.map(|v| v[0].hypot(v[1]));
+    if speed
+        .iter()
+        .any(|&v| !v.is_finite() || v <= 0.0 || v > fdop_types::C_SOUND)
+        || (0..2).any(|k| {
+            (pts[k + 1].alt_m - pts[k].alt_m).abs() as f64
+                > bp.max_vz_mps * dt[k] + bp.pos_slack_m.1
+        })
+        || (velocity[1][0] - velocity[0][0]).hypot(velocity[1][1] - velocity[0][1])
+            > bp.vel_consistency_mps
+    {
+        return None;
+    }
+    Some(0.5 * (speed[0] + speed[1]))
+}
+
 /// Missing groundspeed is not evidence for the old 200 m/s limit. A piece with missing
 /// coverage can infer its scale from three positions with agreeing horizontal secants. Use
 /// the reported-speed envelope, but cap this recovery at the nominal sound speed: repeated
@@ -133,31 +173,9 @@ fn position_speed_limit(
 ) -> Option<f64> {
     let mut speeds = Vec::new();
     for (p, x) in pts.windows(3).zip(xy.windows(3)) {
-        let dt = [p[1].t - p[0].t, p[2].t - p[1].t];
-        if dt
-            .iter()
-            .any(|&t| !t.is_finite() || t <= 0.0 || t > bp.max_gap_s)
-        {
-            continue;
+        if let Some(speed) = position_triplet_speed(p, x, bp) {
+            speeds.push(speed);
         }
-        let velocity = [
-            [(x[1][0] - x[0][0]) / dt[0], (x[1][1] - x[0][1]) / dt[0]],
-            [(x[2][0] - x[1][0]) / dt[1], (x[2][1] - x[1][1]) / dt[1]],
-        ];
-        let speed = velocity.map(|v| v[0].hypot(v[1]));
-        if speed
-            .iter()
-            .any(|&v| !v.is_finite() || v <= 0.0 || v > fdop_types::C_SOUND)
-            || (0..2).any(|k| {
-                (p[k + 1].alt_m - p[k].alt_m).abs() as f64
-                    > bp.max_vz_mps * dt[k] + bp.pos_slack_m.1
-            })
-            || (velocity[1][0] - velocity[0][0]).hypot(velocity[1][1] - velocity[0][1])
-                > bp.vel_consistency_mps
-        {
-            continue;
-        }
-        speeds.push(0.5 * (speed[0] + speed[1]));
     }
     if speeds.is_empty() {
         return None;
@@ -237,7 +255,7 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
             (velocity[0] - chord[0]).hypot(velocity[1] - chord[1]) <= bp.vel_consistency_mps
         })
     };
-    let select = |limit, allow_reported| {
+    let select = |limit, allow_reported, missing_limits: &[f64]| {
         let mut best = vec![1usize; n];
         let mut prev = vec![usize::MAX; n];
         let mut prefix_best = vec![1usize; n];
@@ -251,7 +269,12 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                     break;
                 }
                 if best[i] + 1 > best[j]
-                    && (reachable(i, j, limit) || (allow_reported && reported_reachable(i, j)))
+                    && (reachable(i, j, limit)
+                        || (allow_reported && reported_reachable(i, j))
+                        || (j == i + 1
+                            && missing_limits
+                                .get(j)
+                                .is_some_and(|&local| local > limit && reachable(i, j, local))))
                 {
                     best[j] = best[i] + 1;
                     prev[j] = i;
@@ -262,7 +285,7 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
         let winner = (0..n).max_by_key(|&k| (best[k], k)).unwrap_or(0);
         (best, prev, winner)
     };
-    let (mut best, mut prev, mut winner) = select(v_lim, false);
+    let (mut best, mut prev, mut winner) = select(v_lim, false, &[]);
     // A few closely spaced reports can pass the default envelope even when the rest of a
     // coherent fast flyover does not. Recover missing coverage only by extending the legacy
     // winner, never by replacing a supported rival. A finite zero must not be reinterpreted,
@@ -274,7 +297,38 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
     let allow_reported = pts.iter().any(|p| {
         p.gs_mps as f64 > v_lim && p.gs_mps as f64 <= fdop_types::C_SOUND && p.track_deg.is_finite()
     });
-    if best[winner] < n && (allow_reported || position_limit.is_some()) {
+    // Finish the original reported/position-only extension first. A mixed-report retry
+    // must extend that winner too, not replace it with another interpretation of the leg.
+    for recover_missing in [false, true] {
+        if best[winner] == n {
+            break;
+        }
+        let mut missing_limits = Vec::new();
+        if recover_missing {
+            // A slow reported portion must not disable position-only support elsewhere.
+            // Only adjacent chords in an all-missing triplet get this local allowance:
+            // no finite report or uncorroborated gap is crossed by the inferred speed.
+            if !pts.iter().any(|p| p.gs_mps.is_finite()) {
+                break;
+            }
+            for (i, (points, positions)) in pts.windows(3).zip(xy.windows(3)).enumerate() {
+                if points.iter().all(|p| p.gs_mps.is_nan())
+                    && let Some(speed) = position_triplet_speed(points, positions, bp)
+                {
+                    let limit = (1.5 * speed + 30.0).min(fdop_types::C_SOUND);
+                    if limit > v_lim {
+                        missing_limits.resize(n, 0.0_f64);
+                        missing_limits[i + 1] = missing_limits[i + 1].max(limit);
+                        missing_limits[i + 2] = missing_limits[i + 2].max(limit);
+                    }
+                }
+            }
+            if missing_limits.is_empty() {
+                break;
+            }
+        } else if !allow_reported && position_limit.is_none() {
+            continue;
+        }
         let limit = position_limit.unwrap_or(v_lim);
         let mut first = winner;
         while prev[first] != usize::MAX {
@@ -289,7 +343,8 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                     || pts[k].t - pts[winner].t > bp.max_gap_s)
         });
         if !disjoint_support {
-            let (expanded_best, expanded_prev, expanded_winner) = select(limit, allow_reported);
+            let (expanded_best, expanded_prev, expanded_winner) =
+                select(limit, allow_reported, &missing_limits);
             let mut old = winner;
             let mut expanded = expanded_winner;
             while expanded != usize::MAX && old != usize::MAX {
@@ -3301,6 +3356,149 @@ mod tests {
         }
     }
 
+    fn mixed_speed_state(enu: &Enu, reverse: bool, axis: [f64; 2], t: f64) -> (V3, V3) {
+        let distance = |t: f64| {
+            45.0 * t + 0.5 * (t - 420.0).clamp(0.0, 100.0).powi(2)
+                + 100.0 * (t - 520.0).max(0.0)
+        };
+        let q = if reverse { 740.0 - t } else { t };
+        let s = if reverse {
+            distance(740.0) - distance(q)
+        } else {
+            distance(q)
+        };
+        let speed = 45.0 + (q - 420.0).clamp(0.0, 100.0);
+        (
+            enu.to_ecef([axis[0] * s, axis[1] * s, 1200.0]),
+            enu.vec_to_ecef([axis[0] * speed, axis[1] * speed, 0.0]),
+        )
+    }
+
+    fn mixed_speed_leg(enu: &Enu, reverse: bool, axis: [f64; 2]) -> FlightLeg {
+        let times: Vec<_> = (0..=37).map(|k| k as f64 * 20.0).collect();
+        let mut leg = leg_from_states(&times, |t| mixed_speed_state(enu, reverse, axis, t));
+        for p in &mut leg.points {
+            let q = if reverse { 1740.0 - p.t } else { p.t - 1000.0 };
+            if q > 420.0 {
+                p.gs_mps = f32::NAN;
+                p.track_deg = f32::NAN;
+            }
+        }
+        leg
+    }
+
+    #[test]
+    fn mixed_speed_reports_recover_the_unreported_faster_flyover() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        for epoch in [1000.0, 1_788_895_000.0] {
+            for reverse in [false, true] {
+                for axis in [[1.0, 0.0], [0.6, 0.8]] {
+                    let mut leg = mixed_speed_leg(&enu, reverse, axis);
+                    for point in &mut leg.points {
+                        point.t += epoch - 1000.0;
+                    }
+                    let models = build(&leg, &BuildParams::default());
+                    assert_eq!(models.len(), 1);
+                    let model = &models[0];
+                    assert_eq!(
+                        model.t,
+                        leg.points.iter().map(|p| p.t).collect::<Vec<_>>(),
+                        "missing faster reports lost coverage: epoch={epoch}, reverse={reverse}, axis={axis:?}"
+                    );
+                    assert_eq!(model.reported_vel_frac, 22.0 / 38.0);
+                    let pass = if reverse { 90.0 } else { 650.0 };
+                    let state = |t| mixed_speed_state(&enu, reverse, axis, t);
+                    let observer = add(
+                        state(pass).0,
+                        enu.vec_to_ecef([-800.0 * axis[1], 800.0 * axis[0], -1200.0]),
+                    );
+                    let (mut position_error, mut frequency_error) = (0.0_f64, 0.0_f64);
+                    for offset in [-60.0, -17.5, 0.0, 18.25, 60.0] {
+                        let t = pass + offset;
+                        let (position, velocity) = state(t);
+                        position_error =
+                            position_error.max(norm(sub(model.pos_at(epoch + t), position)));
+                        let rv = sub(position, observer);
+                        let range = norm(rv);
+                        let received = epoch + t + range / C_MPS;
+                        let truth_hz = F0_HZ / (1.0 + dot(rv, velocity) / (range * C_MPS));
+                        let (_, _, ratio) = model
+                            .solve_emission_p(received, observer, &Prop::still(C_MPS), None)
+                            .expect("the recovered physical flyover must solve its emission time");
+                        frequency_error = frequency_error.max((F0_HZ * ratio - truth_hz).abs());
+                    }
+                    eprintln!(
+                        "mixed speed epoch={epoch}, reverse={reverse}, axis={axis:?}: {}/{} reports, position={position_error:.9} m, frequency={frequency_error:.9} Hz",
+                        model.t.len(),
+                        leg.points.len()
+                    );
+                    assert!(position_error < 0.01);
+                    assert!(frequency_error < 0.001);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_speed_recovery_needs_local_missing_motion_support() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let physical = mixed_speed_leg(&enu, false, [1.0, 0.0]);
+        let bp = BuildParams::default();
+        let mut two_missing = physical.clone();
+        two_missing
+            .points
+            .retain(|p| p.t <= 1420.0 || p.t == 1500.0 || p.t == 1520.0);
+        let models = build(&two_missing, &bp);
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].t1(),
+            1500.0,
+            "one fast chord is not independent support"
+        );
+
+        for invalid in [
+            "position jump",
+            "height jump",
+            "finite speed",
+            "infinite speed",
+        ] {
+            let mut leg = physical.clone();
+            for p in &mut leg.points {
+                if p.t < 1540.0 {
+                    continue;
+                }
+                match invalid {
+                    "position jump" if p.t == 1600.0 => {
+                        let (lat, lon, alt) =
+                            ecef_to_geodetic(enu.to_ecef([0.0, 100_000.0, 1200.0]));
+                        (p.lat, p.lon, p.alt_m) = (lat, lon, alt as f32);
+                    }
+                    "height jump" => p.alt_m += 10_000.0,
+                    "finite speed" => p.gs_mps = 0.0,
+                    "infinite speed" => p.gs_mps = f32::INFINITY,
+                    _ => {}
+                }
+            }
+            let models = build(&leg, &bp);
+            assert!(!models.is_empty(), "lost the earlier slow flight: {invalid}");
+            assert!(models[0].t.contains(&1000.0));
+            if invalid == "position jump" {
+                assert!(models.iter().all(|m| !m.t.contains(&1600.0)));
+                assert!(
+                    models.iter().all(|m| {
+                        m.t.windows(2)
+                            .all(|p| !(p[0] < 1600.0 && p[1] > 1600.0))
+                    })
+                );
+            } else {
+                assert!(
+                    models.iter().all(|m| m.t1() < 1540.0),
+                    "{invalid} was reinterpreted as missing motion"
+                );
+            }
+        }
+    }
+
     #[test]
     fn changing_speed_recovery_requires_independent_local_motion_support() {
         let enu = Enu::new(40.876466, -73.524951, 0.0);
@@ -3400,6 +3598,22 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "reported extension lost a supported part, reverse={reverse}"
+            );
+            // The same separate support must survive when only the faster alternative
+            // lacks velocity reports and becomes eligible for local position recovery.
+            for p in &mut points {
+                if p.gs_mps == 145.0 {
+                    p.gs_mps = f32::NAN;
+                    p.track_deg = f32::NAN;
+                }
+            }
+            let mixed: Vec<Vec<_>> = consistent_chains(&points, &BuildParams::default())
+                .iter()
+                .map(|chain| chain.iter().map(|&i| points[i].t).collect())
+                .collect();
+            assert_eq!(
+                mixed, expected,
+                "mixed-speed extension lost a supported part, reverse={reverse}"
             );
         }
     }
