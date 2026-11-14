@@ -490,8 +490,11 @@ in `crates/fdop-core/src/curvematch.rs`:
   finishes before recovery looks for a distinct, unclaimed peak for the rejected trajectory. A recovered
   peak must clear the existing 6.9-nat heard threshold and timing penalty, with the same coverage, type
   prior and null. Peak qualification includes claimed neighbours, so the shoulder of an owned ridge
-  cannot become a new tone simply because the ridge itself is excluded. Harmonic pixel ownership still
-  applies, and an original independent match keeps priority over every recovered alternative. Recovery
+  cannot become a new tone simply because the ridge itself is excluded. Harmonic pixel ownership counts
+  only central samples inside the recording and received-fundamental band. A shared harmonic must also
+  be inside the frequency image for both curves; extrapolated paths and cropped harmonic intersections
+  cannot merge distinct recorded ridges. The existing 40% sharing threshold remains, and an original
+  independent match keeps priority over every recovered alternative. Recovery
   subtracts only positive harmonic contributions on already claimed full paths, retaining independent
   partials, all original coverage weights and the original comb normalization. Its remaining evidence
   must still clear the heard threshold. The normalized frequency rows are retained for this check,
@@ -1866,6 +1869,22 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Keep distinct curve matches at recording and frequency boundaries
+
+`edge_passes_do_not_share_unrecorded_curve_pixels` uses physical 250 m passes at
+40 and 60 m/s with their closest approaches at either 8 s or 112 s of a 120 s recording.
+Both retain the scorer's existing 25% weighted support on each half. Independent
+JavaScript arithmetic finds theoretical sharing of 25/61 and 27/61 central frames,
+above the 40% duplicate threshold, but recorded sharing of only 11/46 and 12/46.
+The new ownership check uses the recorded pixels.
+
+The accompanying boundary test covers first/last pixels, invalid fundamental rows,
+harmonic intersections beyond the image, and empty or unsolved paths. Genuine duplicate
+claims and completely visible sharing retain their original decisions. These arithmetic
+checks are separate from native validation: Rust tests, formatting, Clippy, selftest,
+UBS and reference/field replays remain **unrun** after the executor outage. No end-to-end
+localization or field-accuracy result is claimed.
 
 ### Preserve fresh flight positions beside stale duplicates
 

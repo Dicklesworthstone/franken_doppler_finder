@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep distinct recorded flyovers when their extrapolated curves overlap
+
+- Restrict the curve match's shared-pixel test to recorded frames and valid received
+  fundamental rows. Shared harmonics must lie within the actual frequency image for
+  both paths. Unobserved extrapolation can no longer suppress a distinct visible ridge.
+- Preserve the precomputed overlap lookup for fully visible harmonic ranges, the
+  existing 40% sharing threshold, scoring order, coverage rules, budgets and calibration.
+  The helper borrows existing paths and adds no per-pass pixel allocation.
+- Add physical head/tail regressions and frequency/time boundary controls, including
+  genuine duplicates, complete visibility and missing path samples. Independent JavaScript
+  arithmetic gives 25/61 and 27/61 theoretically overlapping frames but only 11/46 and 12/46
+  recorded overlaps; both physical passes retain the unchanged two-sided coverage floor.
+- Native Rust checks, formatting, Clippy, selftest, UBS and reference/field replays remain
+  unrun because the executor is unavailable. Arithmetic and static review do not establish
+  native integration, end-to-end localization, timing or field accuracy.
+
 ### Preserve fresh ADS-B positions when duplicates are stale
 
 - In raw day construction and overlapping cached-day merges, prefer a fresh position

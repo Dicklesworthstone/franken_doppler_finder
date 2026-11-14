@@ -1439,6 +1439,79 @@ impl ExactTrack {
     }
 }
 
+/// The central pixels of one predicted pass. `row` is its absolute emitted-tone
+/// row in the received-frequency image; `offsets` contains its Doppler shifts.
+#[derive(Clone, Copy)]
+struct CurvePixels<'a> {
+    first_frame: i64,
+    row: i64,
+    offsets: &'a [i32],
+}
+
+/// Acoustic ownership can use only pixels the scorer could observe. Extrapolated
+/// curves beyond a recording or frequency boundary cannot merge two heard passes.
+fn shares_observed_pixels<'a>(
+    (nt, nu): (usize, usize),
+    curve: CurvePixels<'_>,
+    claims: impl Iterator<Item = CurvePixels<'a>> + Clone,
+    shifts: &[i32],
+    same_pixels: &[bool],
+    min_share: f64,
+) -> bool {
+    let dmax = (same_pixels.len() / 2) as i64;
+    let first_shift = i64::from(shifts.iter().copied().min().unwrap_or(0));
+    let last_shift = i64::from(shifts.iter().copied().max().unwrap_or(0));
+    let (mut shared, mut total) = (0usize, 0usize);
+    for (q, &dr) in curve.offsets.iter().enumerate() {
+        if dr == i32::MIN {
+            continue;
+        }
+        let frame = curve.first_frame + q as i64;
+        let here = curve.row + i64::from(dr);
+        if !(0..nt as i64).contains(&frame) || !(0..nu as i64).contains(&here) {
+            continue;
+        }
+        total += 1;
+        let hit = claims.clone().any(|other| {
+            let q2 = frame - other.first_frame;
+            if q2 < 0 || q2 >= other.offsets.len() as i64 {
+                return false;
+            }
+            let dr2 = other.offsets[q2 as usize];
+            if dr2 == i32::MIN {
+                return false;
+            }
+            let there = other.row + i64::from(dr2);
+            let d = here - there;
+            if !(0..nu as i64).contains(&there)
+                || d.abs() > dmax
+                || !same_pixels[(d + dmax) as usize]
+            {
+                return false;
+            }
+            // Interior paths retain the original table lookup; only clipped harmonics
+            // need the exact intersection of their visible pixels.
+            if here + first_shift >= 0
+                && there + first_shift >= 0
+                && here + last_shift < nu as i64
+                && there + last_shift < nu as i64
+            {
+                return true;
+            }
+            shifts.iter().any(|&sa| {
+                let pixel = here + i64::from(sa);
+                (0..nu as i64).contains(&pixel)
+                    && shifts.iter().any(|&sb| {
+                        let owned = there + i64::from(sb);
+                        (0..nu as i64).contains(&owned) && (pixel - owned).abs() <= 1
+                    })
+            })
+        });
+        shared += usize::from(hit);
+    }
+    total > 0 && shared as f64 >= min_share * total as f64
+}
+
 /// Evidence at a point with exact curves (real trajectory, emission-time solve, modelled wind and
 /// sound speed), over a small clock sweep shared by all passes, inside this window's start bounds.
 /// `None` if no pass is in reach.
@@ -1672,27 +1745,22 @@ fn score_exact_with_recovery(
     let mut profiles: Vec<Vec<Option<Vec<f32>>>> = ones.iter().map(|_| Vec::new()).collect();
     let shares_pixels = |o: &One, at: i64, row: u16, claims: &[(i64, i64, usize)]| {
         let nc = (o.core.len() as i64 - 1) / 2;
-        let first = o.f_arr + at - nc;
-        let (mut shared, mut total) = (0usize, 0usize);
-        for (q, &dr) in o.core.iter().enumerate() {
-            if dr == i32::MIN {
-                continue;
-            }
-            total += 1;
-            let frame = first + q as i64;
-            let here = i64::from(row) + i64::from(dr);
-            let hit = claims.iter().any(|&(f2, r2, c)| {
-                let q2 = frame - f2;
-                let other = &ones[c].core;
-                if q2 < 0 || q2 >= other.len() as i64 || other[q2 as usize] == i32::MIN {
-                    return false;
-                }
-                let d = here - (r2 + i64::from(other[q2 as usize]));
-                d.abs() <= dmax as i64 && same_pixels[(d + dmax as i64) as usize]
-            });
-            shared += usize::from(hit);
-        }
-        total > 0 && shared as f64 >= p.same_event_share * total as f64
+        shares_observed_pixels(
+            (im.nt, im.nu),
+            CurvePixels {
+                first_frame: o.f_arr + at - nc,
+                row: bank.r0 as i64 + i64::from(row),
+                offsets: &o.core,
+            },
+            claims.iter().map(|&(first_frame, row, index)| CurvePixels {
+                first_frame,
+                row: bank.r0 as i64 + row,
+                offsets: &ones[index].core,
+            }),
+            &shifts,
+            &same_pixels,
+            p.same_event_share,
+        )
     };
     let claim = |i: usize, choice: Choice| {
         let o = &ones[i];
@@ -3104,6 +3172,206 @@ mod tests {
     use crate::track::straight_track;
     use fdop_types::FlatElevation;
     use fdop_types::atmo::{Medium, UniformAtmosphere};
+
+    fn pixel_mask(shifts: &[i32]) -> Vec<bool> {
+        let reach = shifts.iter().copied().max().unwrap_or(0) + 2;
+        (-reach..=reach)
+            .map(|d| {
+                shifts
+                    .iter()
+                    .any(|&a| shifts.iter().any(|&b| (d - a + b).abs() <= 1))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn edge_passes_do_not_share_unrecorded_curve_pixels() {
+        let p = MatchParams::default();
+        let (dt, bpo, nt, nu) = (0.5, 48.0, 239, 279);
+        let shifts: Vec<_> = p
+            .harmonics
+            .iter()
+            .map(|&(h, _)| (bpo * f64::from(h).log2()).round() as i32)
+            .collect();
+        let mask = pixel_mask(&shifts);
+        let paths = [
+            path(&p, 40.0, 250.0, dt, bpo),
+            path(&p, 60.0, 250.0, dt, bpo),
+        ];
+        let cores: Vec<Vec<i32>> = paths
+            .iter()
+            .map(|path| {
+                path.iter()
+                    .filter(|s| s.dt.abs() <= 30)
+                    .map(|s| s.dr)
+                    .collect()
+            })
+            .collect();
+        // Straight 250 m passes with the same far-side asymptote, but distinct
+        // received ridges through the recorded CPA. No score thresholds change.
+        for (t0r, f0, all_shared, visible_shared) in [
+            (8.0, 140.0 * (BASE_C - 60.0) / (BASE_C - 40.0), 25, 11),
+            (112.0, 140.0 * (BASE_C + 60.0) / (BASE_C + 40.0), 27, 12),
+        ] {
+            // A one-second STFT of 120 s has centres from 0.5 to 119.5 s.
+            let centre = ((t0r - 0.5) / dt).round() as i64;
+            let a = CurvePixels {
+                first_frame: centre - 30,
+                row: (bpo * (140.0_f64 / 25.0).log2()).round() as i64,
+                offsets: &cores[0],
+            };
+            let b = CurvePixels {
+                row: (bpo * (f0 / 25.0).log2()).round() as i64,
+                offsets: &cores[1],
+                ..a
+            };
+            // Both paths retain the exact scorer's minimum weight on each half.
+            for path in &paths {
+                for approach in [false, true] {
+                    let full: f32 = path
+                        .iter()
+                        .filter(|s| s.approach == approach)
+                        .map(|s| s.w * s.w)
+                        .sum();
+                    let visible: f32 = path
+                        .iter()
+                        .filter(|s| {
+                            s.approach == approach
+                                && (0..nt as i64).contains(&(centre + i64::from(s.dt)))
+                        })
+                        .map(|s| s.w * s.w)
+                        .sum();
+                    assert!(visible >= 0.25 * full, "physical two-sided coverage");
+                }
+            }
+            let overlaps: Vec<_> = a
+                .offsets
+                .iter()
+                .zip(b.offsets)
+                .enumerate()
+                .filter(|(_, (da, db))| {
+                    let left = a.row + i64::from(**da);
+                    let right = b.row + i64::from(**db);
+                    shifts.iter().any(|&sa| {
+                        shifts.iter().any(|&sb| {
+                            (left + i64::from(sa) - right - i64::from(sb)).abs() <= 1
+                        })
+                    })
+                })
+                .map(|(q, _)| a.first_frame + q as i64)
+                .collect();
+            assert_eq!(overlaps.len(), all_shared);
+            assert_eq!(
+                overlaps
+                    .iter()
+                    .filter(|&&f| (0..nt as i64).contains(&f))
+                    .count(),
+                visible_shared,
+            );
+            assert!(all_shared as f64 >= p.same_event_share * 61.0);
+            assert!((visible_shared as f64) < p.same_event_share * 46.0);
+            assert!(!shares_observed_pixels(
+                (nt, nu),
+                b,
+                [a].into_iter(),
+                &shifts,
+                &mask,
+                p.same_event_share,
+            ));
+            // A duplicate retains its claim on the visible ridge.
+            assert!(shares_observed_pixels(
+                (nt, nu),
+                b,
+                [b].into_iter(),
+                &shifts,
+                &mask,
+                p.same_event_share,
+            ));
+            // If those extrapolated frames are really recorded, the original
+            // sharing decision still applies without any arithmetic change.
+            let a_full = CurvePixels {
+                first_frame: a.first_frame + 100,
+                ..a
+            };
+            let b_full = CurvePixels {
+                first_frame: b.first_frame + 100,
+                ..b
+            };
+            assert!(shares_observed_pixels(
+                (nt + 200, nu),
+                b_full,
+                [a_full].into_iter(),
+                &shifts,
+                &mask,
+                p.same_event_share,
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_pixels_require_visible_frames_fundamentals_and_harmonics() {
+        let offsets = [0];
+        let curve = |frame, row| CurvePixels {
+            first_frame: frame,
+            row,
+            offsets: &offsets,
+        };
+        let shared = |shape, a, b, shifts: &[i32]| {
+            shares_observed_pixels(
+                shape,
+                a,
+                [b].into_iter(),
+                shifts,
+                &pixel_mask(shifts),
+                0.4,
+            )
+        };
+        // Boundary pixels are visible; adjacent pixels outside either edge are not.
+        for frame in [0, 2] {
+            for row in [0, 2] {
+                assert!(shared((3, 3), curve(frame, row), curve(frame, row), &[0]));
+            }
+        }
+        for frame in [-1, 3] {
+            assert!(!shared((3, 3), curve(frame, 1), curve(frame, 1), &[0]));
+        }
+        for (visible, absent) in [(0, -1), (2, 3)] {
+            assert!(!shared((3, 3), curve(1, visible), curve(1, absent), &[0]));
+            assert!(!shared((3, 3), curve(1, absent), curve(1, visible), &[0]));
+        }
+        // A 3:2 coincidence at row 116 cannot own evidence cropped at row 99.
+        let shifts = [0, 48, 76];
+        assert!(!shared((3, 100), curve(1, 40), curve(1, 68), &shifts));
+        assert!(shared((3, 117), curve(1, 40), curve(1, 68), &shifts));
+        let missing = [i32::MIN];
+        assert!(!shared(
+            (3, 3),
+            CurvePixels {
+                offsets: &missing,
+                ..curve(1, 1)
+            },
+            curve(1, 1),
+            &[0],
+        ));
+        assert!(!shared(
+            (3, 3),
+            curve(1, 1),
+            CurvePixels {
+                offsets: &missing,
+                ..curve(1, 1)
+            },
+            &[0],
+        ));
+        assert!(!shared(
+            (3, 3),
+            CurvePixels {
+                offsets: &[],
+                ..curve(1, 1)
+            },
+            curve(1, 1),
+            &[0],
+        ));
+    }
 
     /// xorshift Gaussian noise, so the test needs no dependency.
     fn noise(n: usize, seed: u64, amp: f64) -> Vec<f64> {
