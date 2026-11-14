@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve supported fast turns in flights dominated by slower reports
+
+- After the existing faster-chord recovery fails, require independent turning-arc support
+  at both endpoints of that exact report pair. Reuse the established velocity residual and
+  strict interval below 30 s, with finite positive subsonic speed/heading reports and the
+  original vertical bounds. No other report can vouch for the edge or excuse its own heading.
+- Preserve direct-chord successes, complete original chains, every original winning report
+  and separately supported parts. The fallback uses two stack positions, with no new
+  per-track allocation, dependencies, thresholds or confidence changes.
+- The native physical regression fails on the original code at 29 of 38 retained reports.
+  All four direction/time-reversal cases now retain all 38, with maximum analytic position
+  error 2.549027 m and received-frequency error 0.350646 Hz at a 200 Hz source.
+- All 68 active native track tests pass; one existing benchmark remains ignored. New
+  bad-report and gap controls pass, as do the concurrently added mixed-speed regressions.
+  Correct their unsupported-chord fixture after reproducing its failure on untouched
+  upstream: the old endpoint could already win a legacy tie. Keep the expected result and
+  add prerequisites proving that the replacement sample needs additional motion support.
+  The complete production modules compile with real pinned
+  dependencies in an external component; full workspace, CLI selftest and reference/field
+  validation remain incomplete. New code is formatted; pre-existing formatting differences
+  remain. These are synthetic reconstruction results, not a field-accuracy claim.
+
 ### Preserve faster flyovers when only part of a flight reports speed
 
 - After the existing track recovery, a still-incomplete leg with mixed velocity

@@ -227,24 +227,27 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
         dh <= limit * dt + bp.pos_slack_m.0 && dz <= bp.max_vz_mps * dt + bp.pos_slack_m.1
     };
     // A long slow portion can set the leg-wide median below a later genuine cruise speed.
-    // Both endpoint reports must independently support the faster position chord. Keep the
+    // Both endpoint reports must independently support the faster observed motion. Keep the
     // same velocity residual and vertical bounds; one fast report cannot widen the leg.
     let reported_reachable = |i: usize, j: usize| {
         let dt = pts[j].t - pts[i].t;
         if (pts[j].alt_m - pts[i].alt_m).abs() as f64 > bp.max_vz_mps * dt + bp.pos_slack_m.1 {
             return false;
         }
-        let chord = [(xy[j][0] - xy[i][0]) / dt, (xy[j][1] - xy[i][1]) / dt];
-        [i, j].into_iter().all(|k| {
+        if [i, j].into_iter().any(|k| {
             let p = &pts[k];
             let speed = p.gs_mps as f64;
-            if !speed.is_finite()
+            !speed.is_finite()
                 || speed <= 0.0
                 || speed > fdop_types::C_SOUND
                 || !p.track_deg.is_finite()
-            {
-                return false;
-            }
+        }) {
+            return false;
+        }
+        let chord = [(xy[j][0] - xy[i][0]) / dt, (xy[j][1] - xy[i][1]) / dt];
+        if [i, j].into_iter().all(|k| {
+            let p = &pts[k];
+            let speed = p.gs_mps as f64;
             let heading = (p.track_deg as f64).to_radians();
             let local = Enu::new(p.lat, p.lon, 0.0);
             let velocity = enu.vec_from_ecef(local.vec_to_ecef([
@@ -253,6 +256,26 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                 0.0,
             ]));
             (velocity[0] - chord[0]).hypot(velocity[1] - chord[1]) <= bp.vel_consistency_mps
+        }) {
+            return true;
+        }
+        // A real turn's tangents can lie far from its chord. Reuse the established
+        // neighbour-heading prediction at BOTH endpoints of this exact edge, without
+        // allowing another report to vouch for it. Preserve its <30 s support window.
+        if dt >= 30.0 {
+            return false;
+        }
+        let pair = [pts[i], pts[j]];
+        let positions = pair.map(|p| geodetic_to_ecef(p.lat, p.lon, p.alt_m as f64));
+        pair.iter().enumerate().all(|(k, p)| {
+            turn_consistent(
+                &pair,
+                &positions,
+                k,
+                &Enu::new(p.lat, p.lon, 0.0),
+                None,
+                bp.vel_consistency_mps,
+            )
         })
     };
     let select = |limit, allow_reported, missing_limits: &[f64]| {
@@ -3356,6 +3379,126 @@ mod tests {
         }
     }
 
+    fn faster_turn_state(enu: &Enu, t: f64, omega: f64) -> (V3, V3) {
+        let ramp = (t - 420.0).clamp(0.0, 100.0);
+        let (east, north, ve, vn) = if t <= 520.0 {
+            (45.0 * t + 0.5 * ramp * ramp, 0.0, 45.0 + ramp, 0.0)
+        } else {
+            let angle = omega * (t - 520.0);
+            let radius = 145.0 / omega;
+            (
+                28_400.0 + radius * angle.sin(),
+                radius * (1.0 - angle.cos()),
+                145.0 * angle.cos(),
+                145.0 * angle.sin(),
+            )
+        };
+        (
+            enu.to_ecef([east, north, 1200.0]),
+            enu.vec_to_ecef([ve, vn, 0.0]),
+        )
+    }
+
+    #[test]
+    fn changing_speed_reports_preserve_a_supported_faster_turn() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let times: Vec<_> = (0..=37).map(|k| k as f64 * 20.0).collect();
+        for reverse in [false, true] {
+            for turn in [-2.0_f64, 2.0] {
+                let state = |t: f64| {
+                    let (pos, vel) = faster_turn_state(
+                        &enu,
+                        if reverse { 740.0 - t } else { t },
+                        turn.to_radians(),
+                    );
+                    (pos, scale(vel, if reverse { -1.0 } else { 1.0 }))
+                };
+                let leg = leg_from_states(&times, state);
+                assert!(reported_speed_limit(&leg.points) < 100.0);
+                let models = build(&leg, &BuildParams::default());
+                assert_eq!(models.len(), 1);
+                let model = &models[0];
+                eprintln!(
+                    "faster turn reverse={reverse} rate={turn}: retained {} of {} reports",
+                    model.t.len(),
+                    times.len()
+                );
+                assert_eq!(model.t, leg.points.iter().map(|p| p.t).collect::<Vec<_>>());
+                assert_eq!(model.reported_vel_frac, 1.0);
+                let pass = if reverse { 90.0 } else { 650.0 };
+                let observer = add(state(pass).0, enu.vec_to_ecef([0.0, 800.0, -1200.0]));
+                let errors = analytic_flight_errors(model, observer, state);
+                eprintln!("faster turn physical errors: {errors:?}");
+                // The 40-degree cubic arc has a <3 m analytic interpolation error;
+                // its received 200 Hz tone stays within 0.2% of the analytic source.
+                assert!(errors.0 < 3.0, "position error: {errors:?}");
+                assert!(errors.1 < 0.4, "Doppler error: {errors:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn faster_turn_recovery_requires_both_independent_endpoint_reports() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let times: Vec<_> = (0..=28).map(|k| k as f64 * 20.0).collect();
+        let physical =
+            leg_from_states(&times, |t| faster_turn_state(&enu, t, 2.0_f64.to_radians()));
+        // End shortly after the turn starts: a later lap must not provide unrelated
+        // position support for the endpoint whose motion report is under test.
+        for k in [27, 28] {
+            for invalid in [
+                "missing speed",
+                "missing heading",
+                "wrong heading",
+                "supersonic",
+                "height jump",
+                "position jump",
+            ] {
+                let mut leg = physical.clone();
+                let p = &mut leg.points[k];
+                match invalid {
+                    "missing speed" => p.gs_mps = f32::NAN,
+                    "missing heading" => p.track_deg = f32::NAN,
+                    // A 20-degree error at 145 m/s exceeds 25 m/s. Using half of
+                    // its own heading error in the arc prediction would excuse it.
+                    "wrong heading" => p.track_deg += 20.0,
+                    "supersonic" => p.gs_mps = 400.0,
+                    "height jump" => p.alt_m += 10_000.0,
+                    "position jump" => {
+                        let (lat, lon, _) =
+                            ecef_to_geodetic(enu.to_ecef([80_000.0, 50_000.0, 1200.0]));
+                        (p.lat, p.lon) = (lat, lon);
+                    }
+                    _ => unreachable!(),
+                }
+                let models = build(&leg, &BuildParams::default());
+                assert_eq!(models.len(), 1);
+                assert_eq!(
+                    models[0].t,
+                    physical.points[..k].iter().map(|p| p.t).collect::<Vec<_>>(),
+                    "{invalid} at point {k} supplied unsupported turn coverage"
+                );
+            }
+        }
+
+        // The established arc check vouches only for neighbours less than 30 s
+        // apart. Larger gaps must not acquire a new turn exemption here.
+        let mut sparse_times: Vec<_> = times[..=26].to_vec();
+        sparse_times.push(550.0);
+        let sparse = leg_from_states(&sparse_times, |t| {
+            faster_turn_state(&enu, t, 2.0_f64.to_radians())
+        });
+        let models = build(&sparse, &BuildParams::default());
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].t,
+            physical.points[..=26]
+                .iter()
+                .map(|p| p.t)
+                .collect::<Vec<_>>()
+        );
+    }
+
     fn mixed_speed_state(enu: &Enu, reverse: bool, axis: [f64; 2], t: f64) -> (V3, V3) {
         let distance = |t: f64| {
             45.0 * t + 0.5 * (t - 420.0).clamp(0.0, 100.0).powi(2)
@@ -3447,7 +3590,25 @@ mod tests {
         let mut two_missing = physical.clone();
         two_missing
             .points
-            .retain(|p| p.t <= 1420.0 || p.t == 1500.0 || p.t == 1520.0);
+            .retain(|p| p.t <= 1420.0 || p.t == 1500.0 || p.t == 1540.0);
+        assert_eq!(
+            two_missing
+                .points
+                .iter()
+                .filter(|p| p.gs_mps.is_nan())
+                .count(),
+            2
+        );
+        // The final sample must not win a legacy tie through the slow prefix.
+        // Both incoming chords need extra support, but two missing reports provide
+        // only one fast chord rather than the two independently agreeing secants.
+        let limit = reported_speed_limit(&two_missing.points);
+        let last = mixed_speed_state(&enu, false, [1.0, 0.0], 540.0).0;
+        for earlier in [420.0, 500.0] {
+            let first = mixed_speed_state(&enu, false, [1.0, 0.0], earlier).0;
+            let chord = enu.vec_from_ecef(sub(last, first));
+            assert!(chord[0].hypot(chord[1]) > limit * (540.0 - earlier) + bp.pos_slack_m.0);
+        }
         let models = build(&two_missing, &bp);
         assert_eq!(models.len(), 1);
         assert_eq!(

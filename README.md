@@ -1384,7 +1384,11 @@ Design notes:
   the original median-speed envelope leaves a chain incomplete, an additional faster chord
   can use its two endpoint speed/heading reports. Each report must independently agree with
   the observed horizontal motion within the existing 25 m/s limit, be positive and no faster
-  than the nominal sound speed, and respect the existing vertical and gap bounds. The global
+  than the nominal sound speed, and respect the existing vertical and gap bounds. The local
+  check also permits a turn when both endpoints independently pass the established arc
+  prediction from the opposite heading and the observed displacement. Only that exact report
+  pair supplies support, at an interval strictly below 30 s; a report cannot excuse its own
+  bad heading. The original direct-chord check remains first, and the global speed
   envelope is unchanged for other chords. The longer chain must retain every original winning
   report and cannot absorb a separately supported part. Complete original chains stay intact.
   After that recovery, an incomplete leg with mixed velocity availability can also recover
@@ -1890,6 +1894,23 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Preserve supported fast turns after a slower flight segment
+
+`changing_speed_reports_preserve_a_supported_faster_turn` follows a 45 m/s segment,
+acceleration to 145 m/s, and a 2-degree-per-second turn with reports every 20 seconds.
+The original cleaner retained only 29 of 38 reports, bridging across missing turn geometry.
+Independent endpoint arc checks retain all 38 in both turn directions and reversed flight
+chronology. Against the analytic trajectory, maximum position error is 2.549027 m and
+maximum received-frequency error is 0.350646 Hz for a 200 Hz emitted tone.
+
+All 68 active native track tests pass; one existing timing benchmark remains ignored.
+The new controls reject missing or wrong motion reports, excessive speeds, position/height
+jumps and intervals outside the existing arc-support window, preserving the earlier supported
+prefix. Validation uses the complete production track, curve, physics and spectrogram modules
+with real pinned dependencies. Full workspace checks, the CLI selftest and reference/field
+replays remain incomplete; these are synthetic track-reconstruction results. The added code
+introduces no new differences under the pinned formatter; older formatting differences remain.
+
 ### Recover faster flyovers from mixed velocity reports
 
 `mixed_speed_reports_recover_the_unreported_faster_flyover` builds a physical
@@ -1902,10 +1923,13 @@ regression also exercises the mixed-report retry.
 
 An independent scalar-motion arithmetic check keeps only 25 of 38 reports under the old
 chain rules and admits all 38 with the new local allowance, in both time directions.
-This is not native interpolation or localization evidence. **The Rust regressions have
-not run:** registry TLS failures and then loss of the execution environment blocked
-validation. Formatting verification, Clippy, workspace tests, selftest, UBS and the
-reference/field replays remain incomplete; no field-accuracy improvement is claimed.
+Subsequent native component validation passes all eight physical cases and the refusal
+controls. The two-report control's final sample was moved from 1520 s to 1540 s because
+the original sample was already reachable through the slow prefix and won a legacy tie;
+the same failure was reproduced on untouched upstream code. Its expected 1500 s endpoint
+is unchanged, and prerequisites now verify that the last sample needs additional support.
+Full workspace checks, selftest, UBS and reference/field replays remain incomplete;
+these are synthetic reconstruction results, not a field-accuracy claim.
 
 ### Keep distinct curve matches at recording and frequency boundaries
 
