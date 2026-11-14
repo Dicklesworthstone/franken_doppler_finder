@@ -1538,6 +1538,12 @@ Design notes:
   reducing ordinary squared error. The existing outlier trim and final linear fit follow
   selection; uncertainty profiles still use their original linear residual sums. No measurement
   gate or confidence threshold changes with this correction.
+- **Linear fits solve emitted tone directly at each trial geometry.** The received curve is
+  proportional to its emitted tone, so ordinary least squares can minimize that coordinate
+  analytically within the existing 1–20,000 Hz bounds. Final linear refits and range/speed
+  profiles therefore search one fewer nonlinear coordinate. Robust soft-L1 multistarts and
+  explicitly fixed-tone profiles retain their original objectives. Uncertainty still accounts
+  for all fitted parameters, and the observation, physical and measurement gates stay intact.
 - **Guided measurement follows the predicted ridge.** It selects the nearest qualified local spectral
   peak within the existing model band, using the existing SNR and robust-z requirements. A brighter
   neighbouring aircraft no longer automatically takes over the trace when both tones enter that band.

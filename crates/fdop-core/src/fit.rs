@@ -193,6 +193,26 @@ fn ls(
     fixed: &[(usize, f64)],
     loss: LossKind,
 ) -> ([f64; 4], f64, Vec<f64>) {
+    // At fixed geometry the received curve is f0 times a known frequency ratio.
+    // Linear profiles can eliminate that correlated direction exactly; robust
+    // losses and explicitly fixed tones retain their numerical objective.
+    let project_tone = matches!(loss, LossKind::Linear)
+        && free.contains(&0)
+        && !fixed.iter().any(|&(k, _)| k == 0);
+    ls_impl(t, f, c, x0, free, fixed, loss, project_tone)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ls_impl(
+    t: &[f64],
+    f: &[f64],
+    c: f64,
+    x0: [f64; 4],
+    free: &[usize],
+    fixed: &[(usize, f64)],
+    loss: LossKind,
+    project_tone: bool,
+) -> ([f64; 4], f64, Vec<f64>) {
     let (tmin, tmax) = t.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, &v| {
         (a.0.min(v), a.1.max(v))
     });
@@ -204,19 +224,31 @@ fn ls(
     for &(k, v) in fixed {
         base[k] = v;
     }
-    let full = |xf: &[f64]| -> [f64; 4] {
+    let projected_free: Vec<usize> = if project_tone {
+        free.iter().copied().filter(|&k| k != 0).collect()
+    } else {
+        Vec::new()
+    };
+    let free = if project_tone { &projected_free } else { free };
+    let model = |xf: &[f64]| -> ([f64; 4], Vec<f64>) {
         let mut p = base;
         for (j, &k) in free.iter().enumerate() {
             p[k] = xf[j];
         }
-        p
-    };
-    let resid = |xf: &[f64]| -> Vec<f64> {
-        let p = full(xf);
-        t.iter()
-            .zip(f)
-            .map(|(&tt, &ff)| cv_curve(tt, p[0], p[1], p[2], p[3], c) - ff)
-            .collect()
+        let residual = if project_tone {
+            let mut ratios: Vec<f64> = t
+                .iter()
+                .map(|&tt| cv_curve(tt, 1.0, p[1], p[2], p[3], c))
+                .collect();
+            p[0] = project_linear_tone(&mut ratios, f, [lo[0], hi[0]]);
+            ratios
+        } else {
+            t.iter()
+                .zip(f)
+                .map(|(&tt, &ff)| cv_curve(tt, p[0], p[1], p[2], p[3], c) - ff)
+                .collect()
+        };
+        (p, residual)
     };
     let xf0: Vec<f64> = free.iter().map(|&k| base[k]).collect();
     let lof: Vec<f64> = free.iter().map(|&k| lo[k]).collect();
@@ -229,18 +261,30 @@ fn ls(
         max_nfev: Some(4000),
         ..Default::default()
     };
-    let x = match least_squares_bounded(resid, &xf0, &lof, &hif, opts) {
-        Ok(r) => r.x,
-        Err(_) => xf0,
+    let x = if free.is_empty() {
+        // A tone-only fit has no nonlinear coordinates left to optimize.
+        xf0
+    } else {
+        least_squares_bounded(|x| model(x).1, &xf0, &lof, &hif, opts)
+            .map(|r| r.x)
+            .unwrap_or(xf0)
     };
-    let p = full(&x);
-    let res: Vec<f64> = t
-        .iter()
-        .zip(f)
-        .map(|(&tt, &ff)| cv_curve(tt, p[0], p[1], p[2], p[3], c) - ff)
-        .collect();
+    let (p, res) = model(&x);
     let cost = res.iter().map(|r| r * r).sum();
     (p, cost, res)
+}
+
+/// Minimize sum((f0 * ratio - frequency)^2) within the original emitted-tone bounds.
+/// Reuse the ratio buffer for residuals, so each geometry needs just one allocation
+/// and one evaluation of the retarded model per observation.
+fn project_linear_tone(ratios: &mut [f64], frequencies: &[f64], bounds: [f64; 2]) -> f64 {
+    let fr: f64 = frequencies.iter().zip(&*ratios).map(|(&f, &r)| f * r).sum();
+    let rr: f64 = ratios.iter().map(|r| r * r).sum();
+    let f0 = (fr / rr).clamp(bounds[0], bounds[1]);
+    for (r, &f) in ratios.iter_mut().zip(frequencies) {
+        *r = f0 * *r - f;
+    }
+    f0
 }
 
 /// Profile a fixed heard CPA while refitting range, speed and emitted tone. The source
@@ -278,14 +322,11 @@ fn ls_at_heard_cpa(t: &[f64], f: &[f64], c: f64, warm: [f64; 4], t0r: f64) -> ([
     let relative: Vec<f64> = t.iter().map(|&tt| tt - t0r).collect();
     let model = |x: &[f64]| {
         let (v, d) = (x[0], if distance_free { x[1] } else { d_lo });
-        let ratios: Vec<f64> = relative
+        let mut residual: Vec<f64> = relative
             .iter()
             .map(|&tt| crate::physics::cv_ratio_rel_t0r(tt, v, d, c))
             .collect();
-        let fr: f64 = f.iter().zip(&ratios).map(|(&ff, &r)| ff * r).sum();
-        let rr: f64 = ratios.iter().map(|r| r * r).sum();
-        let f0 = (fr / rr).clamp(lo[0], hi[0]);
-        let residual: Vec<f64> = ratios.iter().zip(f).map(|(&r, &ff)| f0 * r - ff).collect();
+        let f0 = project_linear_tone(&mut residual, f, [lo[0], hi[0]]);
         ([f0, v, d, t0r - d / c], residual)
     };
     let opts = LeastSquaresOptions {
@@ -968,6 +1009,71 @@ fn corrcoef(a: &[f64], b: &[f64]) -> f64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn projected_tone_minimizes_the_bounded_linear_objective() {
+        // The unconstrained normal equation is 5.25*f0 = 34. Its derivative
+        // must vanish inside the box and point outwards at either clipped end.
+        let ratios = [0.5, 1.0, 2.0];
+        let frequencies = [4.0, 6.0, 13.0];
+        for (bounds, expected) in [
+            ([1.0, 20_000.0], 136.0 / 21.0),
+            ([7.0, 20_000.0], 7.0),
+            ([1.0, 6.0], 6.0),
+        ] {
+            let mut residuals = ratios;
+            let tone = project_linear_tone(&mut residuals, &frequencies, bounds);
+            assert_eq!(tone, expected);
+            let cost: f64 = residuals.iter().map(|r| r * r).sum();
+            let gradient: f64 = residuals.iter().zip(ratios).map(|(r, a)| r * a).sum();
+            if tone == bounds[0] {
+                assert!(gradient > 0.0);
+            } else if tone == bounds[1] {
+                assert!(gradient < 0.0);
+            } else {
+                assert!(gradient.abs() < 1e-13);
+            }
+            for adjacent in [tone - 0.001, tone + 0.001] {
+                if (bounds[0]..=bounds[1]).contains(&adjacent) {
+                    let other: f64 = ratios
+                        .iter()
+                        .zip(frequencies)
+                        .map(|(&r, f)| (adjacent * r - f).powi(2))
+                        .sum();
+                    assert!(other > cost);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tone_only_fits_need_no_nonlinear_solver_and_preserve_fixed_geometry() {
+        let c = 343.0;
+        let (v, d, t0e) = (120.0, 2500.0, 1000.0);
+        for emitted in [0.25, 112.7, 25_000.0] {
+            let (t, f): (Vec<f64>, Vec<f64>) = (-20..=20)
+                .map(|k| {
+                    let tau = k as f64 * 3.0;
+                    let range = (d * d + v * v * tau * tau).sqrt();
+                    (
+                        t0e + tau + range / c,
+                        emitted * c / (c + v * v * tau / range),
+                    )
+                })
+                .unzip();
+            let (actual, cost, residuals) =
+                ls(&t, &f, c, [70.0, v, d, t0e], &[0], &[], LossKind::Linear);
+            let expected = emitted.clamp(1.0, 20_000.0);
+            assert!((actual[0] - expected).abs() < 1e-9, "{actual:?}");
+            assert_eq!(&actual[1..], &[v, d, t0e]);
+            assert_eq!(cost, residuals.iter().map(|r| r * r).sum::<f64>());
+            let expected_cost: f64 = f
+                .iter()
+                .map(|&frequency| (expected / emitted * frequency - frequency).powi(2))
+                .sum();
+            assert!((cost - expected_cost).abs() < 1e-10 * expected_cost.max(1.0));
+        }
+    }
+
     fn emitted_trace(f0: f64, v: f64, d: f64, half: i32, phase: f64) -> (Vec<f64>, Vec<f64>) {
         let c = 343.0;
         (-half..=half)
@@ -980,6 +1086,132 @@ mod tests {
                 )
             })
             .unzip()
+    }
+
+    #[test]
+    fn tone_projection_preserves_robust_and_fixed_tone_solves() {
+        let c = 343.0;
+        let (t, mut f) = emitted_trace(112.7, 140.0, 6100.0, 80, 0.37);
+        for frequency in f.iter_mut().step_by(17) {
+            *frequency += 20.0;
+        }
+        let warm = [113.0, 138.0, 6000.0, 1000.5];
+        for (loss, free, fixed) in [
+            (LossKind::SoftL1, &[0, 1, 2, 3][..], &[][..]),
+            (LossKind::Linear, &[1, 2, 3][..], &[(0, 112.7)][..]),
+        ] {
+            let actual = ls(&t, &f, c, warm, free, fixed, loss);
+            let original = ls_impl(&t, &f, c, warm, free, fixed, loss, false);
+            assert_eq!(actual, original);
+        }
+    }
+
+    #[test]
+    fn projected_profiles_match_full_numerical_solves() {
+        let c = 343.0;
+        for (f0, v, d, half, one_sided) in [
+            (112.7, 140.0, 6100.0, 150, false),
+            (80.0, 60.0, 8000.0, 30, false),
+            (112.7, 140.0, 6100.0, 150, true),
+        ] {
+            let (mut t, mut f) = emitted_trace(f0, v, d, half, 0.37);
+            if one_sided {
+                t.truncate(half as usize);
+                f.truncate(half as usize);
+            }
+            let warm = [f0, v, d, 1000.0];
+            for (free, fixed) in [
+                (&[0, 1, 2, 3][..], &[][..]),
+                (&[0, 1, 3][..], &[(2, d * 1.02)][..]),
+                (&[0, 2, 3][..], &[(1, v * 0.98)][..]),
+            ] {
+                let (projected, cost, residuals) =
+                    ls(&t, &f, c, warm, free, fixed, LossKind::Linear);
+                let (_, original_cost, _) =
+                    ls_impl(&t, &f, c, warm, free, fixed, LossKind::Linear, false);
+                assert!(
+                    cost <= original_cost + 1e-7 * original_cost.max(1.0),
+                    "half={half} one_sided={one_sided} fixed={fixed:?}: {cost} vs {original_cost}"
+                );
+                assert_eq!(cost, residuals.iter().map(|r| r * r).sum::<f64>());
+                for &(k, value) in fixed {
+                    assert_eq!(projected[k], value);
+                }
+                let gradient: f64 = t
+                    .iter()
+                    .zip(&residuals)
+                    .map(|(&tt, &residual)| {
+                        residual * cv_curve(tt, 1.0, projected[1], projected[2], projected[3], c)
+                    })
+                    .sum();
+                assert!(gradient.abs() < 1e-8, "tone normal equation: {gradient}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "component timing; run serially with --ignored --nocapture"]
+    fn projected_linear_profile_timing() {
+        use std::time::{Duration, Instant};
+
+        let c = 343.0;
+        let mut total = [Duration::ZERO; 2];
+        let mut case = 0;
+        for (f0, v, d, half, one_sided) in [
+            (112.7, 140.0, 6100.0, 150, false),
+            (80.0, 60.0, 8000.0, 30, false),
+            (112.7, 140.0, 6100.0, 150, true),
+        ] {
+            let (mut t, mut f) = emitted_trace(f0, v, d, half, 0.37);
+            if one_sided {
+                t.truncate(half as usize);
+                f.truncate(half as usize);
+            }
+            let warm = [f0, v, d, 1000.0];
+            for (free, fixed) in [
+                (&[0, 1, 2, 3][..], &[][..]),
+                (&[0, 1, 3][..], &[(2, d * 1.02)][..]),
+                (&[0, 2, 3][..], &[(1, v * 0.98)][..]),
+            ] {
+                let mut elapsed = [Duration::ZERO; 2];
+                for round in 0..6 {
+                    let mut costs = [0.0; 2];
+                    for projected in if (round + case) % 2 == 0 {
+                        [false, true]
+                    } else {
+                        [true, false]
+                    } {
+                        let start = Instant::now();
+                        let result = if projected {
+                            ls(&t, &f, c, warm, free, fixed, LossKind::Linear)
+                        } else {
+                            ls_impl(&t, &f, c, warm, free, fixed, LossKind::Linear, false)
+                        };
+                        elapsed[usize::from(projected)] += start.elapsed();
+                        costs[usize::from(projected)] = result.1;
+                        std::hint::black_box(result);
+                    }
+                    assert!(
+                        costs[1] <= costs[0] + 1e-7 * costs[0].max(1.0),
+                        "half={half} one_sided={one_sided} fixed={fixed:?}: {costs:?}"
+                    );
+                }
+                eprintln!(
+                    "six paired solves half={half} one_sided={one_sided} fixed={fixed:?}: numerical {:?}, projected {:?}",
+                    elapsed[0], elapsed[1]
+                );
+                for k in 0..2 {
+                    total[k] += elapsed[k];
+                }
+                case += 1;
+            }
+        }
+        eprintln!(
+            "{case} linear-profile cases, six paired repeats: numerical {:?}, projected {:?}, speed ratio {:.3}",
+            total[0],
+            total[1],
+            total[0].as_secs_f64() / total[1].as_secs_f64()
+        );
     }
 
     fn ridge_jump_trace(jump_hz: f64) -> (Vec<f64>, Vec<f64>) {

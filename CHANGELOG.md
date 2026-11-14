@@ -19,6 +19,34 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Eliminate the emitted-tone search dimension from linear Doppler fits
+
+- At each geometry trial, solve the emitted tone's bounded ordinary-least-squares
+  coefficient analytically. The final linear refit searches three nonlinear coordinates
+  instead of four; fixed-range and fixed-speed profiles search two instead of three.
+  Tone-only fits need no nonlinear solve. Reuse the ratio buffer for residuals, including
+  the existing heard-CPA profiler.
+- Preserve the robust soft-L1 and explicitly fixed-tone solver paths, physical bounds,
+  residual objective, parameter counts used for uncertainty and measurement gates.
+  Geometry iterates and profile endpoints can still move because the numerical solver
+  has one fewer coordinate; equal objectives do not imply bit-identical estimates.
+- All 15 active fitter tests pass in the actual `fdop-core` crate with the pinned nightly
+  and core/dependency optimization disabled. The new tests independently verify the
+  bounded normal equation, tone-only fits, unchanged robust/fixed-tone paths, and nine
+  full/short/one-sided profile cases against the preceding numerical formulation.
+  Existing recovery, contamination, profile-endpoint, timestamp and observed-support
+  tests pass too.
+- Five existing synthesized-PCM measurement checks also pass: deferred/eager diagnostics,
+  ordinary detection-to-measurement recovery, independent-emission-phase fast-pass
+  recovery, the faint-pass missing-ridge refusal, and support based only on samples
+  retained by the solver. No assertions or tolerances were weakened.
+- `projected_linear_profile_timing` passes 54 paired comparisons with alternating order
+  and an equal-or-better objective requirement on every pair. On this shared Linux
+  Intel Xeon Platinum 8573C host, the unoptimized validation build takes 161.008 ms for
+  the preceding numerical solves and 89.532 ms with projection (1.798 times faster).
+  This is a small fitting-component measurement; release and end-to-end performance,
+  CLI selftest, complete workspace checks and reference/field replays remain unverified.
+
 ### Preserve the scored flyover through wind-dependent propagation delays
 
 - Retain each exact curve match's emission-time CPA privately. Refinement and the
