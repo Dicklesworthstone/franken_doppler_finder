@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain observed motion omitted by a preferred duplicate flight report
+
+- Recover missing groundspeed or heading from one fresh, complete duplicate motion pair
+  after choosing the preferred position. Require exact coordinates, a shared agreeing
+  altitude and no conflicting available heights; processed stores also require the same
+  altitude source. Available motion must agree and keeps its exact bits. Invalid values
+  remain distinct from missing ones, and separate incomplete donors cannot form a pair.
+- Apply the recovery to both raw catalogue building and overlapping processed-store merges.
+  Keep original duplicate intervals, position/altitude/flag selection, boundaries and feed
+  precedence; raw provenance records the contributing feed. No cache format, dependency,
+  motion threshold or downstream confidence gate changes.
+- Both new native positive regressions fail on the original builder. All 38 builder tests
+  now pass, including 72 compressed-ingest/store-roundtrip cases, 30 refusal cases, and
+  exact-value, competing-feed and interval-preservation controls.
+- Native checks use the complete production build, ingest and raw-cache modules plus
+  verbatim shared definitions in an offline component with real pinned dependencies.
+  Full data compilation was SIGKILLed in unchanged `asupersync 0.6.2`, including a lower-memory
+  retry. New code follows the pinned formatter; network, full-workspace, selftest and
+  reference/field validation remain incomplete. No localization-accuracy claim is made.
+
 ### Recover the real engine-tone change after a clustered ridge jump
 
 - After the existing per-side robust refit rejects observations, reuse its masks for

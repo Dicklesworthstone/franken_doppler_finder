@@ -1018,7 +1018,7 @@ When building a day from raw reports, duplicate reconciliation prefers a fresh p
 one readsb marked stale or estimated, including competing reports within one feed. Among
 equally fresh reports it prefers a non-MLAT position, then the established feed preference.
 Stale reports remain usable when no fresh duplicate is available. Selection stays within
-the original duplicate groups and keeps the chosen report's time, position, motion and
+the original duplicate groups and keeps the chosen report's time, position, available motion and
 position-source flags. Ground and new-leg events remain available, with the existing gap
 thresholds applied to the selected reports' observed times. A lower-priority duplicate can supply a missing
 GNSS or barometric altitude only when its exact coordinates and one shared altitude agree,
@@ -1026,6 +1026,14 @@ and it carries a complete, nonstale altitude pair. This retains observed altitud
 the existing leg and regional barometric corrections, with the contributing feed recorded in
 leg provenance. The rule applies to fresh ingestion and raw-checkpoint reconstruction; an
 existing processed day store must be rebuilt to recover evidence discarded by older ingestion.
+
+Missing groundspeed or heading can likewise use one fresh duplicate's complete observed
+motion pair. Its coordinates must match exactly, at least one finite altitude must agree,
+and any other heights available in both reports must agree. Every already available motion
+component stays unchanged and must match that donor; invalid values are not treated as
+missing. Donor speeds must be positive and at most nominal sound speed, as in track cleaning.
+The same feed preference selects among eligible donors, and raw leg provenance records the contributing
+feed. Separate incomplete reports cannot be combined into a new speed/heading pair.
 
 Reuse requires the exact release metadata and ordered assets, spatial/time filter,
 unknown/jet policy and midnight-context version. A changed finite geoid reference can
@@ -1181,7 +1189,10 @@ another day to the same merge cannot erase that preference. Mixed or unknown ori
 retain the existing representative. Position flags keep their observed values, and the selection preserves flight
 boundaries and join limits. This also works with existing day stores when both reports and
 their unambiguous origins remain available; it cannot restore points already discarded within
-a cached day.
+a cached day. Missing speed or heading can use the same complete-report recovery after the
+preferred position is selected, with exact coordinates, finite altitude and altitude-source
+agreement. Available motion, duplicate intervals, position flags and boundary ownership stay
+unchanged; a previously discarded duplicate must still belong to a surviving original interval.
 
 Malformed scalar entries inside an otherwise valid aircraft trace are skipped individually,
 like the existing null and object entries. Valid surrounding reports and ground/new-leg markers
@@ -1928,6 +1939,28 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Keep observed turn velocities when a preferred duplicate omits them
+
+`raw_duplicates_retain_observed_turn_velocities` and
+`processed_duplicates_retain_observed_turn_velocities` ingest compressed synthetic archives
+for a 145 m/s turning flight. Across 72 cases, the preferred prod reports omit speed, heading
+or both while staging or MLAT duplicates retain complete motion. Both archive orders and
+duplicate timestamps on either side of the preferred report are covered. The original raw
+builder and processed-store merger each fail their native regression by keeping missing
+motion. Recovery preserves every reference position, timestamp, altitude, flag and observed
+motion value, including after processed-store round trips.
+
+All 38 builder tests pass natively. Thirty refusal cases cover incompatible positions/heights,
+stale or incomplete donors, invalid speeds/headings, conflicts with known components and
+separate incomplete donors. Additional controls preserve complete preferred reports, exact
+known-component bits, feed precedence and the original duplicate intervals.
+
+Validation uses the complete production builder, ingest and raw-cache modules with verbatim
+shared definitions and real pinned archive/serialization/store dependencies in an offline
+component. The full data-package build was blocked by compiler memory kills in unchanged
+`asupersync 0.6.2`; network fetching, the complete workspace, CLI selftest and reference/field
+replays remain unverified. This establishes catalogue-content recovery, not localization accuracy.
 
 ### Recover a real engine-tone change after a burst of stray ridge points
 

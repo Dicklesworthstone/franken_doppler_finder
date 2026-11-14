@@ -71,6 +71,52 @@ fn recover_duplicate_altitude(preferred: &mut MPoint, donor: &MPoint) {
     }
 }
 
+/// Fill only missing components from one complete observed horizontal-motion pair.
+/// An available component must agree exactly; invalid reports are not treated as absent.
+fn missing_duplicate_motion(preferred: (f32, f32), donor: (f32, f32)) -> Option<(f32, f32)> {
+    if !(preferred.0.is_nan() || preferred.1.is_nan())
+        || !(donor.0.is_finite() && donor.0 > 0.0 && donor.0 as f64 <= fdop_types::C_SOUND)
+        || !donor.1.is_finite()
+        || (!preferred.0.is_nan() && preferred.0 != donor.0)
+        || (!preferred.1.is_nan() && preferred.1 != donor.1)
+    {
+        return None;
+    }
+    Some((
+        if preferred.0.is_nan() {
+            donor.0
+        } else {
+            preferred.0
+        },
+        if preferred.1.is_nan() {
+            donor.1
+        } else {
+            preferred.1
+        },
+    ))
+}
+
+fn raw_duplicate_motion(preferred: &RawPoint, donor: &RawPoint) -> Option<(f32, f32)> {
+    let heights = [
+        (preferred.alt_geom_msl, donor.alt_geom_msl),
+        (preferred.alt_baro_m, donor.alt_baro_m),
+    ];
+    if preferred.lat != donor.lat
+        || preferred.lon != donor.lon
+        || donor.flags & pt_flags::STALE != 0
+        || !heights.iter().any(|&(a, b)| a.is_finite() && a == b)
+        || heights
+            .iter()
+            .any(|&(a, b)| a.is_finite() && b.is_finite() && a != b)
+    {
+        return None;
+    }
+    missing_duplicate_motion(
+        (preferred.gs_mps, preferred.track_deg),
+        (donor.gs_mps, donor.track_deg),
+    )
+}
+
 fn feed_of(label: &str) -> Feed {
     Feed::from_label(label).unwrap_or(Feed::Prod)
 }
@@ -469,6 +515,18 @@ fn build_store_inner(
                     preferred_times.insert(original.p.t.to_bits(), q.p.t);
                 }
             }
+            // Select motion only after the original duplicate interval and preferred
+            // position are fixed. Retain one complete agreeing observation, prioritised
+            // by the same feed order; two incomplete donors cannot manufacture a pair.
+            if (q.p.gs_mps.is_nan() || q.p.track_deg.is_nan())
+                && let Some((donor, motion)) = duplicates
+                    .iter()
+                    .filter_map(|donor| raw_duplicate_motion(&q.p, &donor.p).map(|m| (donor, m)))
+                    .min_by_key(|(donor, _)| donor.rank)
+            {
+                (q.p.gs_mps, q.p.track_deg) = motion;
+                q.feed_bit |= donor.feed_bit;
+            }
         }
         // Resolve the original remaps first, then the quality replacements. Combining
         // both maps could cycle when the final choice was an earlier discarded report.
@@ -694,18 +752,18 @@ fn dedupe_store_points(
         a.t.total_cmp(&b.t)
             .then((a.flags & pt_flags::MLAT).cmp(&(b.flags & pt_flags::MLAT)))
     });
-    let mut reports = anchors.into_iter().peekable();
+    let mut next = 0;
     for (preferred, mut preferred_rank) in kept.iter_mut().zip(kept_ranks) {
         let group_start = preferred.t;
         // Some reports were already discarded before a later store changed the anchors.
         // They remain discarded unless they belong to a surviving original interval.
-        while reports
-            .peek()
-            .is_some_and(|&i| points[i].t.total_cmp(&group_start).is_lt())
-        {
-            let _ = reports.next();
+        while next < anchors.len() && points[anchors[next]].t.total_cmp(&group_start).is_lt() {
+            next += 1;
         }
-        while let Some(i) = reports.next_if(|&i| (points[i].t - group_start).abs() < DEDUPE_S) {
+        let first = next;
+        while next < anchors.len() && (points[anchors[next]].t - group_start).abs() < DEDUPE_S {
+            let i = anchors[next];
+            next += 1;
             let p = points[i];
             let boundary =
                 (preferred.flags | p.flags) & (pt_flags::NEW_LEG | pt_flags::NEW_LEG_AFTER);
@@ -729,6 +787,33 @@ fn dedupe_store_points(
                 & !(pt_flags::CLIPPED_BEFORE | pt_flags::CLIPPED_AFTER))
                 | boundary
                 | clipped;
+        }
+        if preferred.gs_mps.is_nan() || preferred.track_deg.is_nan() {
+            let mut best: Option<(Option<u8>, (f32, f32))> = None;
+            for &i in &anchors[first..next] {
+                let donor = &points[i];
+                if preferred.lat != donor.lat
+                    || preferred.lon != donor.lon
+                    || !preferred.alt_m.is_finite()
+                    || preferred.alt_m != donor.alt_m
+                    || preferred.alt_src != donor.alt_src
+                    || donor.flags & pt_flags::STALE != 0
+                {
+                    continue;
+                }
+                if let Some(motion) = missing_duplicate_motion(
+                    (preferred.gs_mps, preferred.track_deg),
+                    (donor.gs_mps, donor.track_deg),
+                ) && best.is_none_or(|(rank, _)| match (feed_ranks[i], rank) {
+                    (Some(candidate), Some(current)) => candidate < current,
+                    _ => false,
+                }) {
+                    best = Some((feed_ranks[i], motion));
+                }
+            }
+            if let Some((_, motion)) = best {
+                (preferred.gs_mps, preferred.track_deg) = motion;
+            }
         }
     }
     kept
@@ -1971,6 +2056,271 @@ mod tests {
         let store = build_store(parts, &seam_spec(T0), vec![]);
         assert_eq!(store.legs[0].source, "prod");
         assert_eq!(store.legs[0].points, reference.legs[0].points);
+    }
+
+    fn duplicate_motion_parts(
+        dt: f64,
+        donor_feed: &str,
+        missing: (bool, bool),
+    ) -> Vec<(Vec<RawAircraft>, IngestStats)> {
+        use fdop_types::geo::Enu;
+
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let sp = spec();
+        let speed = 145.0;
+        let rate = 2.0_f64.to_radians();
+        let rows: Vec<_> = (0..9)
+            .map(|k| {
+                let t = k as f64 * 20.0;
+                let angle = rate * t;
+                let (lat, lon, height) = enu.to_geodetic([
+                    speed / rate * angle.sin(),
+                    speed / rate * (1.0 - angle.cos()),
+                    1200.0,
+                ]);
+                let velocity = Enu::new(lat, lon, 0.0).vec_from_ecef(enu.vec_to_ecef([
+                    speed * angle.cos(),
+                    speed * angle.sin(),
+                    0.0,
+                ]));
+                serde_json::json!([
+                    70_000.0 + t,
+                    lat,
+                    lon,
+                    (height + sp.geoid_n_m) / fdop_types::FT_TO_M,
+                    velocity[0].hypot(velocity[1]) / fdop_types::KT_TO_MPS,
+                    velocity[0]
+                        .atan2(velocity[1])
+                        .to_degrees()
+                        .rem_euclid(360.0),
+                    8,
+                    0,
+                    null,
+                    "adsb_icao"
+                ])
+            })
+            .collect();
+        ["prod", donor_feed]
+            .into_iter()
+            .enumerate()
+            .map(|(i, feed)| {
+                let mut rows = rows.clone();
+                for row in &mut rows {
+                    if i == 0 {
+                        if missing.0 {
+                            row[4] = serde_json::Value::Null;
+                        }
+                        if missing.1 {
+                            row[5] = serde_json::Value::Null;
+                        }
+                    } else {
+                        row[0] = serde_json::json!(row[0].as_f64().unwrap() + dt);
+                        if feed == "mlat" {
+                            row[9] = serde_json::json!("mlat");
+                        }
+                    }
+                }
+                ingest_reader(
+                    std::io::Cursor::new(seam_tar(T0, &rows)),
+                    feed,
+                    &sp,
+                    &|_| {},
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn duplicate_motion_store(
+        parts: Vec<(Vec<RawAircraft>, IngestStats)>,
+        processed: bool,
+    ) -> TrackStore {
+        if processed {
+            let stores = parts
+                .into_iter()
+                .map(|part| {
+                    seam_roundtrip(&build_store(vec![part], &spec(), vec![]), "motion-input")
+                })
+                .collect();
+            merge_stores(stores, 300.0)
+        } else {
+            build_store(parts, &spec(), vec![])
+        }
+    }
+
+    fn check_duplicate_motion_recovery(processed: bool) {
+        for donor_feed in ["staging", "mlat"] {
+            let complete = duplicate_motion_parts(0.0, donor_feed, (false, false));
+            let expected = build_store(vec![complete[0].clone()], &spec(), vec![]);
+            assert_eq!(expected.n_points(), 9);
+            for missing in [(true, false), (false, true), (true, true)] {
+                for dt in [-0.02, 0.0, 0.02] {
+                    for reverse in [false, true] {
+                        let mut parts = duplicate_motion_parts(dt, donor_feed, missing);
+                        if reverse {
+                            parts.reverse();
+                        }
+                        let store = duplicate_motion_store(parts, processed);
+                        let restored = seam_roundtrip(&store, "motion-recovered");
+                        assert_eq!(restored.legs.len(), 1);
+                        assert_eq!(
+                            restored.legs[0].points, expected.legs[0].points,
+                            "processed={processed}, feed={donor_feed}, missing={missing:?}, dt={dt}, reverse={reverse}"
+                        );
+                        assert!(restored.legs[0].source.split('+').any(|s| s == "prod"));
+                        assert!(restored.legs[0].source.split('+').any(|s| s == donor_feed));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_duplicates_retain_observed_turn_velocities() {
+        check_duplicate_motion_recovery(false);
+    }
+
+    #[test]
+    fn processed_duplicates_retain_observed_turn_velocities() {
+        check_duplicate_motion_recovery(true);
+    }
+
+    #[test]
+    fn duplicate_motion_requires_one_complete_fresh_agreeing_report() {
+        for processed in [false, true] {
+            for rejected in [
+                "latitude",
+                "longitude",
+                "height",
+                "stale",
+                "missing speed",
+                "missing heading",
+                "infinite speed",
+                "infinite heading",
+                "zero speed",
+                "supersonic",
+                "known speed",
+                "known heading",
+                "invalid preferred speed",
+                "invalid preferred heading",
+                "partial donors",
+            ] {
+                let missing = match rejected {
+                    "known speed" | "invalid preferred speed" => (false, true),
+                    "known heading" | "invalid preferred heading" => (true, false),
+                    _ => (true, true),
+                };
+                let mut parts = duplicate_motion_parts(0.02, "mlat", missing);
+                for p in &mut parts[0].0[0].points {
+                    match rejected {
+                        "invalid preferred speed" => p.gs_mps = f32::INFINITY,
+                        "invalid preferred heading" => p.track_deg = f32::INFINITY,
+                        _ => {}
+                    }
+                }
+                let reference = build_store(vec![parts[0].clone()], &spec(), vec![]);
+                for donor in &mut parts[1].0[0].points {
+                    match rejected {
+                        "latitude" => donor.lat += 1e-9,
+                        "longitude" => donor.lon += 1e-9,
+                        "height" => donor.alt_geom_msl += 1.0,
+                        "stale" => donor.flags |= pt_flags::STALE,
+                        "missing speed" | "partial donors" => donor.gs_mps = f32::NAN,
+                        "missing heading" => donor.track_deg = f32::NAN,
+                        "infinite speed" => donor.gs_mps = f32::INFINITY,
+                        "infinite heading" => donor.track_deg = f32::INFINITY,
+                        "zero speed" => donor.gs_mps = 0.0,
+                        "supersonic" => donor.gs_mps = 400.0,
+                        "known speed" => donor.gs_mps += 1.0,
+                        "known heading" => donor.track_deg += 1.0,
+                        "invalid preferred speed" | "invalid preferred heading" => {}
+                        _ => unreachable!(),
+                    }
+                }
+                if rejected == "partial donors" {
+                    let mut other = duplicate_motion_parts(-0.02, "staging", missing).remove(1);
+                    for donor in &mut other.0[0].points {
+                        donor.track_deg = f32::NAN;
+                    }
+                    parts.push(other);
+                }
+                let result = duplicate_motion_store(parts, processed);
+                assert_eq!(result.legs.len(), 1, "{rejected}, processed={processed}");
+                assert_eq!(result.n_points(), reference.n_points());
+                for (actual, expected) in
+                    result.legs[0].points.iter().zip(&reference.legs[0].points)
+                {
+                    assert_eq!(
+                        (actual.gs_mps.to_bits(), actual.track_deg.to_bits()),
+                        (expected.gs_mps.to_bits(), expected.track_deg.to_bits()),
+                        "{rejected}, processed={processed} donated unsupported motion"
+                    );
+                    let (mut actual, mut expected) = (*actual, *expected);
+                    // Compare the remaining geometry and flags without NaN's unequal semantics.
+                    (actual.gs_mps, actual.track_deg) = (0.0, 0.0);
+                    (expected.gs_mps, expected.track_deg) = (0.0, 0.0);
+                    assert_eq!(actual, expected, "{rejected}, processed={processed}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_motion_preserves_complete_reports_feed_priority_and_intervals() {
+        for processed in [false, true] {
+            let mut complete = duplicate_motion_parts(0.02, "mlat", (false, false));
+            let expected = build_store(vec![complete[0].clone()], &spec(), vec![]);
+            for p in &mut complete[1].0[0].points {
+                p.gs_mps += 10.0;
+                p.track_deg += 10.0;
+            }
+            assert_eq!(
+                duplicate_motion_store(complete, processed).legs[0].points,
+                expected.legs[0].points
+            );
+            let mut signed_heading = duplicate_motion_parts(0.02, "mlat", (true, false));
+            for p in &mut signed_heading[0].0[0].points {
+                p.track_deg = 0.0;
+            }
+            for p in &mut signed_heading[1].0[0].points {
+                p.track_deg = -0.0;
+            }
+            let signed_heading = duplicate_motion_store(signed_heading, processed);
+            assert!(
+                signed_heading.legs[0].points.iter().all(|p| {
+                    p.gs_mps.is_finite() && p.track_deg.to_bits() == 0.0_f32.to_bits()
+                })
+            );
+            for reverse in [false, true] {
+                let mut parts = duplicate_motion_parts(0.02, "staging", (true, true));
+                let mut other = duplicate_motion_parts(-0.02, "mlat", (true, true)).remove(1);
+                for donor in &mut other.0[0].points {
+                    donor.gs_mps += 10.0;
+                    donor.track_deg += 10.0;
+                }
+                parts.push(other);
+                if reverse {
+                    parts.reverse();
+                }
+                assert_eq!(
+                    duplicate_motion_store(parts, processed).legs[0].points,
+                    expected.legs[0].points
+                );
+            }
+            let separated = duplicate_motion_store(
+                duplicate_motion_parts(0.06, "mlat", (true, true)),
+                processed,
+            );
+            assert_eq!(separated.n_points(), 18);
+            assert_eq!(
+                separated.legs[0]
+                    .points
+                    .iter()
+                    .filter(|p| p.gs_mps.is_nan())
+                    .count(),
+                9
+            );
+        }
     }
 
     #[test]
