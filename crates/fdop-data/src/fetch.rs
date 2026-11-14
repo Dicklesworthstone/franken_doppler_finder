@@ -468,8 +468,24 @@ pub fn published_until(
         } else if end + PUBLISH_LAG_S > now {
             let dir = day_dir(cache_dir, day);
             let cached = std::fs::read_dir(&dir).is_ok_and(|rd| {
-                rd.flatten()
-                    .any(|e| parse_cache_name(&e.file_name().to_string_lossy()).is_some())
+                rd.flatten().any(|entry| {
+                    // Only an actual main-feed catalogue can make this day usable.
+                    // MLAT-only files never substitute for a prod/staging release, and
+                    // a directory named like a store is not a completed catalogue.
+                    entry.path().is_file()
+                        && parse_cache_name(&entry.file_name().to_string_lossy()).is_some_and(
+                            |(feedset, _)| {
+                                matches!(
+                                    feedset
+                                        .strip_suffix("+jets")
+                                        .unwrap_or(&feedset)
+                                        .split('+')
+                                        .next(),
+                                    Some("prod" | "staging")
+                                )
+                            },
+                        )
+                })
             });
             // Like the processed-cache check, this is only an availability preflight.
             // Full raw identity and integrity are verified by fetch_window, which has
@@ -4153,6 +4169,39 @@ mod tests {
         let (until, pend) = published_until(t8, t8 + day, &dir, true, t8 + 5.0 * 3600.0).unwrap();
         assert_eq!(until, t8);
         assert_eq!(pend.len(), 2);
+        // MLAT-only remnants and directories masquerading as caches cannot
+        // establish availability of the required main ADS-B catalogue.
+        let mlat_dir = dir.join("optional-only");
+        let mlat_day = mlat_dir.join("adsb").join("2026-09-08");
+        std::fs::create_dir_all(&mlat_day).unwrap();
+        std::fs::write(
+            mlat_day.join("mlatonly_40.0_-74.0_41.0_-73.0.fdtrk"),
+            b"optional archive marker",
+        )
+        .unwrap();
+        let window_end = t8 + day + 7200.0;
+        let now = t8 + 2.0 * day + 3600.0;
+        assert_eq!(
+            published_until(t8 + 3600.0, window_end, &mlat_dir, true, now).unwrap(),
+            (
+                t8,
+                vec!["2026-09-08".to_string(), "2026-09-09".to_string()]
+            )
+        );
+        std::fs::create_dir_all(mlat_day.join("prod_40.0_-74.0_41.0_-73.0.fdtrk")).unwrap();
+        assert_eq!(
+            published_until(t8 + 3600.0, window_end, &mlat_dir, true, now).unwrap().0,
+            t8
+        );
+        std::fs::write(
+            mlat_day.join("staging_40.0_-74.0_41.0_-73.0.fdtrk"),
+            b"main archive marker",
+        )
+        .unwrap();
+        assert_eq!(
+            published_until(t8 + 3600.0, window_end, &mlat_dir, true, now).unwrap(),
+            (t8 + day, vec!["2026-09-09".to_string()])
+        );
         // an old missing day is not pending: fetch_window reports it as missing
         let t1 = t8 + day + 7200.0;
         assert_eq!(
