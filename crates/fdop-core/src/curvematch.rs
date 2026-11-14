@@ -1256,7 +1256,10 @@ fn stamp_track(
             {
                 continue;
             }
-            let bracket = (times[i.saturating_sub(1)], times[(i + 1).min(times.len() - 1)]);
+            let bracket = (
+                times[i.saturating_sub(1)],
+                times[(i + 1).min(times.len() - 1)],
+            );
             // One small hull per sample, reused across every cell. Clear square-corner
             // misses must not pay for an exact CPA solve merely because the range failed.
             let interval_bounds = bounded_track
@@ -4369,11 +4372,10 @@ mod tests {
             .enumerate()
         {
             let north = (ranges[i].powi(2) - east.powi(2) - 600.0_f64.powi(2)).sqrt();
-            let k = tr
-                .t
-                .iter()
-                .position(|&t| t == clock + 96.0 + i as f64 * 4.0)
-                .unwrap();
+            let k =
+                tr.t.iter()
+                    .position(|&t| t == clock + 96.0 + i as f64 * 4.0)
+                    .unwrap();
             tr.pos[k] = enu.to_ecef([direction * east, north + north_shift, 600.0 + MIC_HEIGHT_M]);
             tr.vel[k] = enu.vec_to_ecef([100.0 * direction, north_v, 0.0]);
         }
@@ -4407,7 +4409,11 @@ mod tests {
                 }
                 assert_eq!(stamped.len(), 1, "supported pass lost: {direction}/{shift}");
                 let expected = if shift == 0.0 {
-                    assert!(tr.pos.iter().all(|&pos| norm(sub(pos, observer)) > p.reach_m));
+                    assert!(
+                        tr.pos
+                            .iter()
+                            .all(|&pos| norm(sub(pos, observer)) > p.reach_m)
+                    );
                     assert!(cpa.interior && cpa.d < p.reach_m - 1.0, "{cpa:?}");
                     assert!(cpa.speed > 90.0 && cpa.speed < 110.0);
                     assert!(cpa.t_e > clock + 100.0 && cpa.t_e < clock + 102.0);
@@ -4460,22 +4466,24 @@ mod tests {
             (clock, clock + 360.0),
             &mut stamped,
         );
-        assert!(stamped.is_empty(), "range recovery bypassed the bank's speed gate");
+        assert!(
+            stamped.is_empty(),
+            "range recovery bypassed the bank's speed gate"
+        );
         // Models on either side of a real data gap have no interpolated path through it.
         for before in [false, true] {
-            let keep: Vec<_> = tr
-                .t
-                .iter()
-                .enumerate()
-                .filter(|&(_, &t)| {
-                    if before {
-                        t <= clock + 96.0
-                    } else {
-                        t >= clock + 104.0
-                    }
-                })
-                .map(|(i, _)| i)
-                .collect();
+            let keep: Vec<_> =
+                tr.t.iter()
+                    .enumerate()
+                    .filter(|&(_, &t)| {
+                        if before {
+                            t <= clock + 96.0
+                        } else {
+                            t >= clock + 104.0
+                        }
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
             let mut part = tr.clone();
             part.t = keep.iter().map(|&i| tr.t[i]).collect();
             part.pos = keep.iter().map(|&i| tr.pos[i]).collect();

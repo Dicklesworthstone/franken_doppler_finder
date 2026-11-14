@@ -729,7 +729,11 @@ impl TrackModel {
             .partition_point(|&t| t <= lo)
             .saturating_sub(1)
             .min(n - 2);
-        let end = self.t.partition_point(|&t| t < hi).min(n - 1).max(first + 1);
+        let end = self
+            .t
+            .partition_point(|&t| t < hi)
+            .min(n - 1)
+            .max(first + 1);
         self.segment_bounds(first..end)
     }
 

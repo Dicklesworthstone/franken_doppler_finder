@@ -33,10 +33,14 @@ at that commit, not per-change commits.
   closest approach at 7998.425930 m between reports. Controls cover genuinely outside
   passes, unchanged accepted timestamps, speed limits, clipped windows, track gaps,
   interval containment and full-bound equivalence.
-- Native tests, Clippy, selftest and reference/field replays remain unverified. The
-  full core build was SIGKILLed in unchanged `fsci-linalg`; a smaller exact-source
-  component did not finish before the execution environment became unavailable.
-  Arithmetic and source review do not establish native recovery or field accuracy.
+- The native regression fails against the original production code and passes with
+  the fix on the pinned nightly. All 13 focused geometry, interval-bound, ownership
+  and timestamp-preservation tests pass in an exact-source component using the real
+  pinned dependencies. It compiles the complete curve, track, physics and spectrogram
+  modules; it does not cover the optimizer, full pipeline or CLI.
+- The initial full core build was SIGKILLed in unchanged `fsci-linalg`. Whole-workspace
+  checks, selftest and reference/field replays remain unverified; focused synthetic
+  recovery does not establish field accuracy.
 
 ### Keep cached flight catalogues usable during a release lookup outage
 
@@ -49,10 +53,10 @@ at that commit, not per-change commits.
 - Add regressions using real compressed stores across eight feed/MLAT/jet combinations,
   plus absent, MLAT-only, corrupt, spatially/temporally incomplete, uncertified-jet and
   unverified-midnight caches. They require unchanged cached bytes and flight provenance.
-- Source review and whitespace checks completed. The native data-package build was
-  SIGKILLed in unchanged `syn` 2.0.119 before its tests ran; the execution environment
-  subsequently became unavailable. Full quality checks, end-to-end recovery and
-  recording-accuracy results remain unverified.
+- Source review and whitespace checks completed. Native data-package builds were
+  SIGKILLed in unchanged dependencies: first `syn` 2.0.119, then `asupersync` 0.6.2
+  after the environment recovered. Neither reached the tests. Full quality checks,
+  end-to-end recovery and recording-accuracy results remain unverified.
 
 ### Keep distinct recorded flyovers when their extrapolated curves overlap
 
