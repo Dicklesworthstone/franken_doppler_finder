@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep genuine flyovers across intermittent speed reports
+
+- Preserve the existing reported-speed and all-missing-triplet recovery passes, then permit
+  one further extension when a valid speed report interrupts otherwise supported missing
+  motion, or when reported and unreported portions meet. Reuse the existing gap, vertical,
+  subsonic and 25 m/s consistency limits.
+- Newly permitted mixed reported/missing-speed chords require fresh positional corroboration,
+  agreement with available speed/heading reports, and independently supported fresh reported
+  motion in the preceding winner. Keep earlier recovery permissions, every retained winning
+  report and independently supported separate parts. Complete preceding results remain
+  unchanged; missing velocities are not fabricated or credited as reports.
+- Add 32 physical coverage, interpolation, Doppler and report-provenance cases across two
+  headings, time directions, four report-availability patterns and relative/Unix clocks,
+  plus eight preservation cases and refusal controls for unsupported bridges.
+- Independent motion/chain calculations retain 38 of 38 reports where the preceding rules
+  retain 25 or 32, depending on the missing-report boundary. These are translated arithmetic
+  checks, not native Rust measurements. Source review completed; the execution environment
+  disconnected during dependency compilation. Native tests, post-change formatting, Clippy,
+  workspace/selftest checks, UBS and reference/field replays remain unverified for this change.
+
 ### Recover closest approaches whose sampled speed fails the coarse gate
 
 - Extend the existing bounded closest-approach retry to finite proposals rejected by either

@@ -1399,6 +1399,14 @@ Design notes:
   report or an uncorroborated gap, and the longer chain must retain the preceding winner and
   separately supported parts. Entirely reported and entirely missing legs retain their
   established recovery paths. No search-confidence threshold changes.
+  If that still leaves the track incomplete, a final recovery can cross a valid speed report
+  inside an otherwise position-only portion, or the boundary where reports stop. Newly
+  permitted chords involving a speed report need mutually consistent fresh positions and
+  agreement with every available local speed and heading. The preceding winning chain must
+  already contain independently corroborated fresh reported motion. Earlier recovery
+  permissions remain available; the new pass can only extend the preceding winner, preserving
+  all of its reports and separately supported parts. Complete preceding results stay unchanged,
+  and missing velocities remain derived from positions rather than counted as reported measurements.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
@@ -1894,6 +1902,28 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Preserve flyovers across intermittent speed reports
+
+A valid speed report can interrupt an otherwise position-supported cruise, and the transition
+from reported to missing speeds can lose the rest of a real flyover.
+`mixed_triplets_preserve_a_supported_faster_pass` covers 32 physical combinations of
+accelerating/decelerating flight, two headings, relative/Unix clocks, and four report
+patterns: a late missing-speed boundary, an isolated accurate report, an interrupted
+missing stretch, and alternating reported/missing speeds. They check retained samples,
+off-knot position and velocity, received Doppler frequency, and the fraction of velocities
+that were actually reported. Eight further cases in
+`mixed_triplet_extension_preserves_existing_lone_report_recovery` retain the already
+accepted all-missing-triplet recovery. Refusal controls cover unsupported new bridges.
+
+Independent motion and chain calculations show why this matters: a 38-report trajectory
+can lose everything after 480 s, or after 620 s when an accurate isolated speed report
+interrupts recovery, although its real flyover continues through 740 s. The added local
+permission retains all 38 in that calculation. This is arithmetic evidence, not a native
+Rust or localization result. The execution host disconnected during dependency compilation;
+the new Rust regressions, post-change formatting, Clippy, workspace tests, selftest, UBS,
+and reference/field replays remain unverified for this change. No field-accuracy or runtime
+gain is claimed.
 
 ### Recover valid closest approaches hidden by an ineligible sampled speed
 

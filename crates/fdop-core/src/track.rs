@@ -161,6 +161,58 @@ fn position_triplet_speed(
     Some(0.5 * (speed[0] + speed[1]))
 }
 
+/// New mixed triplets must corroborate every available horizontal report in the same ENU
+/// frame. A missing speed can use positions; a finite invalid speed or contradictory heading
+/// cannot. The caller has already checked both position chords with position_triplet_speed.
+fn mixed_triplet_reports_agree(
+    pts: &[fdop_types::store::TrackPoint],
+    xy: &[[f64; 2]],
+    enu: &Enu,
+    bp: &BuildParams,
+) -> bool {
+    if !pts.iter().any(|p| p.gs_mps.is_nan())
+        || pts.iter().any(|p| p.flags & pt_flags::STALE != 0)
+    {
+        return false;
+    }
+    let agrees = |k: usize, chord: [f64; 2]| {
+        let p = &pts[k];
+        let mut speed = p.gs_mps as f64;
+        if speed.is_nan() {
+            if p.track_deg.is_nan() {
+                return true;
+            }
+            // A heading without a speed can still contradict the observed direction.
+            // This comparison never creates a velocity report for interpolation.
+            speed = chord[0].hypot(chord[1]);
+        } else if !speed.is_finite() || speed <= 0.0 || speed > fdop_types::C_SOUND {
+            return false;
+        }
+        if !p.track_deg.is_finite() {
+            return false;
+        }
+        let heading = (p.track_deg as f64).to_radians();
+        let local = Enu::new(p.lat, p.lon, 0.0);
+        let report = enu.vec_from_ecef(local.vec_to_ecef([
+            speed * heading.sin(),
+            speed * heading.cos(),
+            0.0,
+        ]));
+        (report[0] - chord[0]).hypot(report[1] - chord[1]) <= bp.vel_consistency_mps
+    };
+    (0..2).all(|k| {
+        let dt = pts[k + 1].t - pts[k].t;
+        if !dt.is_finite() || dt <= 0.0 {
+            return false;
+        }
+        let chord = [
+            (xy[k + 1][0] - xy[k][0]) / dt,
+            (xy[k + 1][1] - xy[k][1]) / dt,
+        ];
+        agrees(k, chord) && agrees(k + 1, chord)
+    })
+}
+
 /// Missing groundspeed is not evidence for the old 200 m/s limit. A piece with missing
 /// coverage can infer its scale from three positions with agreeing horizontal secants. Use
 /// the reported-speed envelope, but cap this recovery at the nominal sound speed: repeated
@@ -320,34 +372,64 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
     let allow_reported = pts.iter().any(|p| {
         p.gs_mps as f64 > v_lim && p.gs_mps as f64 <= fdop_types::C_SOUND && p.track_deg.is_finite()
     });
-    // Finish the original reported/position-only extension first. A mixed-report retry
-    // must extend that winner too, not replace it with another interpretation of the leg.
-    for recover_missing in [false, true] {
+    // Preserve the reported/position-only and all-missing-triplet winners first.
+    // A third pass may bridge mixed triplets only by extending that retained path.
+    for recovery in 0..3 {
         if best[winner] == n {
             break;
         }
         let mut missing_limits = Vec::new();
-        if recover_missing {
-            // A slow reported portion must not disable position-only support elsewhere.
-            // Only adjacent chords in an all-missing triplet get this local allowance:
-            // no finite report or uncorroborated gap is crossed by the inferred speed.
+        if recovery > 0 {
+            // Keep the existing all-missing allowances in both retries. New mixed
+            // bridges additionally need independent fresh reports on the retained path.
             if !pts.iter().any(|p| p.gs_mps.is_finite()) {
                 break;
             }
+            if recovery == 2 {
+                let mut k = winner;
+                let mut reported_anchor = false;
+                while prev[k] != usize::MAX {
+                    let i = prev[k];
+                    if pts[i].flags & pt_flags::STALE == 0
+                        && pts[k].flags & pt_flags::STALE == 0
+                        && reported_reachable(i, k)
+                    {
+                        reported_anchor = true;
+                        break;
+                    }
+                    k = i;
+                }
+                if !reported_anchor {
+                    break;
+                }
+            }
             for (i, (points, positions)) in pts.windows(3).zip(xy.windows(3)).enumerate() {
-                if points.iter().all(|p| p.gs_mps.is_nan())
-                    && let Some(speed) = position_triplet_speed(points, positions, bp)
+                let all_missing = points.iter().all(|p| p.gs_mps.is_nan());
+                if !all_missing
+                    && (recovery != 2 || !points.iter().any(|p| p.gs_mps.is_nan()))
                 {
-                    let limit = (1.5 * speed + 30.0).min(fdop_types::C_SOUND);
-                    if limit > v_lim {
-                        missing_limits.resize(n, 0.0_f64);
-                        missing_limits[i + 1] = missing_limits[i + 1].max(limit);
-                        missing_limits[i + 2] = missing_limits[i + 2].max(limit);
+                    continue;
+                }
+                let Some(speed) = position_triplet_speed(points, positions, bp) else {
+                    continue;
+                };
+                if !all_missing && !mixed_triplet_reports_agree(points, positions, &enu, bp) {
+                    continue;
+                }
+                let limit = (1.5 * speed + 30.0).min(fdop_types::C_SOUND);
+                if limit > v_lim {
+                    missing_limits.resize(n, 0.0_f64);
+                    for k in 1..3 {
+                        if points[k - 1].gs_mps.is_nan() || points[k].gs_mps.is_nan() {
+                            missing_limits[i + k] = missing_limits[i + k].max(limit);
+                        }
                     }
                 }
             }
+            // Alternating reported/missing speeds can have no all-missing triplet.
+            // An empty second pass must leave the third pass available.
             if missing_limits.is_empty() {
-                break;
+                continue;
             }
         } else if !allow_reported && position_limit.is_none() {
             continue;
@@ -3661,6 +3743,125 @@ mod tests {
     }
 
     #[test]
+    fn mixed_triplets_preserve_a_supported_faster_pass() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let times: Vec<_> = (0..=37).map(|k| k as f64 * 20.0).collect();
+        for epoch in [1000.0, 1_788_895_000.0] {
+            for reverse in [false, true] {
+                for axis in [[1.0, 0.0], [0.6, 0.8]] {
+                    let state = |t| mixed_speed_state(&enu, reverse, axis, t);
+                    for availability in [
+                        "late missing",
+                        "single report",
+                        "interrupted missing",
+                        "alternating",
+                    ] {
+                        let mut leg = leg_from_states(&times, state);
+                        for point in &mut leg.points {
+                            let t = point.t - 1000.0;
+                            let q = if reverse { 740.0 - t } else { t };
+                            // "single report" is the former refusal fixture. Its real
+                            // positions corroborate the cruise, independently of the lone
+                            // fast report; conflicting finite reports still fail below.
+                            let missing = match availability {
+                                "late missing" => q >= 500.0,
+                                "single report" => q >= 500.0 && q != 640.0,
+                                "interrupted missing" => q > 420.0 && q != 640.0,
+                                "alternating" => q > 420.0 && (q as i64 / 20) % 2 == 1,
+                                _ => unreachable!(),
+                            };
+                            if missing {
+                                point.gs_mps = f32::NAN;
+                            }
+                            point.t = epoch + t;
+                        }
+                        let models = build(&leg, &BuildParams::default());
+                        assert_eq!(models.len(), 1);
+                        let model = &models[0];
+                        eprintln!(
+                            "mixed-triplet epoch={epoch} reverse={reverse} axis={axis:?} availability={availability}: retained {} of {} reports, {:.1}..{:.1} s",
+                            model.t.len(), times.len(), model.t0() - epoch, model.t1() - epoch
+                        );
+                        assert_eq!(
+                            model.t,
+                            times.iter().map(|t| epoch + t).collect::<Vec<_>>(),
+                            "the position-supported faster pass was lost"
+                        );
+                        let reported = leg
+                            .points
+                            .iter()
+                            .filter(|p| p.gs_mps.is_finite() && p.track_deg.is_finite())
+                            .count();
+                        assert_eq!(
+                            model.reported_vel_frac,
+                            reported as f64 / times.len() as f64,
+                            "position support must not manufacture reported velocity credit"
+                        );
+                        let pass = if reverse { 90.0 } else { 650.0 };
+                        let observer = add(
+                            state(pass).0,
+                            enu.vec_to_ecef([-800.0 * axis[1], 800.0 * axis[0], -1200.0]),
+                        );
+                        let (mut position, mut velocity, mut frequency) = (0.0_f64, 0.0_f64, 0.0_f64);
+                        for q in [580.25, 600.5, 650.0, 680.75, 720.5] {
+                            let t = if reverse { 740.0 - q } else { q };
+                            let (pos, vel) = state(t);
+                            position = position.max(norm(sub(model.pos_at(epoch + t), pos)));
+                            velocity = velocity.max(norm(sub(model.pv(epoch + t).1, vel)));
+                            let rv = sub(pos, observer);
+                            let range = norm(rv);
+                            let received = epoch + t + range / C_MPS;
+                            let truth_hz = F0_HZ / (1.0 + dot(rv, vel) / (range * C_MPS));
+                            let (_, _, ratio) = model
+                                .solve_emission_p(received, observer, &Prop::still(C_MPS), None)
+                                .expect("the recovered pass covers its emitted sound");
+                            frequency = frequency.max((F0_HZ * ratio - truth_hz).abs());
+                        }
+                        eprintln!(
+                            "mixed-triplet physical errors: {position} m, {velocity} m/s, {frequency} Hz"
+                        );
+                        assert!(position < 0.001, "position error {position} m");
+                        assert!(velocity < 0.001, "velocity error {velocity} m/s");
+                        assert!(frequency < 0.001, "Doppler error {frequency} Hz");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_triplet_extension_preserves_existing_lone_report_recovery() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let times: Vec<_> = (0..=37).map(|k| k as f64 * 20.0).collect();
+        for epoch in [1000.0, 1_788_895_000.0] {
+            for reverse in [false, true] {
+                for axis in [[1.0, 0.0], [0.6, 0.8]] {
+                    let mut leg =
+                        leg_from_states(&times, |t| mixed_speed_state(&enu, reverse, axis, t));
+                    for p in &mut leg.points {
+                        let t = p.t - 1000.0;
+                        let q = if reverse { 740.0 - t } else { t };
+                        if q != 0.0 {
+                            p.gs_mps = f32::NAN;
+                            p.track_deg = f32::NAN;
+                        }
+                        p.t = epoch + t;
+                    }
+                    // The existing all-missing-triplet pass already keeps this whole leg.
+                    // New mixed-bridge requirements must not erase that accepted result.
+                    let models = build(&leg, &BuildParams::default());
+                    assert_eq!(models.len(), 1);
+                    assert_eq!(
+                        models[0].t,
+                        times.iter().map(|t| epoch + t).collect::<Vec<_>>()
+                    );
+                    assert_eq!(models[0].reported_vel_frac, 1.0 / times.len() as f64);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn changing_speed_recovery_requires_independent_local_motion_support() {
         let enu = Enu::new(40.876466, -73.524951, 0.0);
         let times: Vec<_> = (0..=37).map(|k| k as f64 * 20.0).collect();
@@ -3677,11 +3878,19 @@ mod tests {
         };
         let physical = leg_from_states(&times, state);
         for invalid in [
-            "single speed",
+            "conflicting speeds",
             "heading absent",
             "wrong heading",
             "supersonic",
             "height jump",
+            "missing stale positions",
+            "missing wrong heading",
+            "missing infinite heading",
+            "missing height jumps",
+            "missing changing direction",
+            "stale isolated report",
+            "wrong isolated heading",
+            "conflicting isolated speed",
         ] {
             let mut leg = physical.clone();
             for p in &mut leg.points {
@@ -3689,15 +3898,54 @@ mod tests {
                     continue;
                 }
                 match invalid {
-                    "single speed" => {
+                    "conflicting speeds" => {
+                        // The old missing-speed fixture is now independently supported by
+                        // its positions (the positive regression above). Actual conflicting
+                        // finite reports still cannot be overridden by one fast report.
                         if p.t != 1640.0 {
-                            p.gs_mps = f32::NAN;
+                            p.gs_mps = 45.0;
                         }
                     }
                     "heading absent" => p.track_deg = f32::NAN,
                     "wrong heading" => p.track_deg += 90.0,
                     "supersonic" => p.gs_mps = 400.0,
                     "height jump" => p.alt_m += 10_000.0,
+                    "missing stale positions" => {
+                        p.gs_mps = f32::NAN;
+                        p.flags |= pt_flags::STALE;
+                    }
+                    "stale isolated report" | "wrong isolated heading" | "conflicting isolated speed" => {
+                        if p.t != 1640.0 {
+                            p.gs_mps = f32::NAN;
+                        } else {
+                            match invalid {
+                                "stale isolated report" => p.flags |= pt_flags::STALE,
+                                "wrong isolated heading" => p.track_deg += 90.0,
+                                "conflicting isolated speed" => p.gs_mps = 45.0,
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                    "missing wrong heading" => {
+                        p.gs_mps = f32::NAN;
+                        p.track_deg += 90.0;
+                    }
+                    "missing infinite heading" => {
+                        p.gs_mps = f32::NAN;
+                        p.track_deg = f32::INFINITY;
+                    }
+                    "missing height jumps" => {
+                        p.gs_mps = f32::NAN;
+                        p.alt_m += ((p.t - 1500.0) * 100.0) as f32;
+                    }
+                    "missing changing direction" => {
+                        p.gs_mps = f32::NAN;
+                        p.track_deg = f32::NAN;
+                        let north = if (p.t as i64 / 20) % 2 == 0 { 0.0 } else { 2000.0 };
+                        let pos = add(state(p.t - 1000.0).0, enu.vec_to_ecef([0.0, north, 0.0]));
+                        let (lat, lon, alt) = ecef_to_geodetic(pos);
+                        (p.lat, p.lon, p.alt_m) = (lat, lon, alt as f32);
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -3708,6 +3956,27 @@ mod tests {
                 "{invalid} justified unsupported cruise coverage"
             );
         }
+        for invalid in [0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut leg = physical.clone();
+            for p in leg.points.iter_mut().filter(|p| p.t >= 1500.0) {
+                p.gs_mps = invalid;
+            }
+            let models = build(&leg, &BuildParams::default());
+            assert!(models.iter().all(|m| !(m.t0() < 1650.0 && m.t1() > 1650.0)));
+        }
+        let mut stale_anchors = physical.clone();
+        for p in &mut stale_anchors.points {
+            if p.t >= 1500.0 {
+                p.gs_mps = f32::NAN;
+            } else {
+                p.flags |= pt_flags::STALE;
+            }
+        }
+        let models = build(&stale_anchors, &BuildParams::default());
+        assert!(
+            models.iter().all(|m| !(m.t0() < 1650.0 && m.t1() > 1650.0)),
+            "stale reports established the new mixed-bridge anchor"
+        );
     }
 
     #[test]
