@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve fresh ADS-B positions when duplicates are stale
+
+- In raw day construction and overlapping cached-day merges, prefer a fresh position
+  to one readsb marks stale or estimated. Among equally fresh reports retain the
+  established non-MLAT and feed priorities; stale-only data stays usable.
+- Keep the original duplicate groups, observed timestamps, flight-boundary remapping,
+  altitude-donation rules, clipping flags and cache format. This prevents a preferred
+  feed's stale coordinates from discarding an available fresh trajectory.
+- Add compressed-ingestion and raw/processed-cache regressions, including reordered
+  feeds, same-feed duplicates, both sides of the 50 ms interval, 30 s leg boundaries
+  and all-stale ties.
+- Source review completed. Native validation was interrupted during dependency
+  compilation when the execution host became unavailable; no test pass or measured
+  recovery is claimed. Full workspace checks and real-recording replays remain unrun.
+
 ### Seed fine-grid recovery when exact geometry falls between samples
 
 - Preserve original fine-grid successes and the earlier rejected-trace fallback. When no

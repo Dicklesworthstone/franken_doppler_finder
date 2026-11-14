@@ -983,9 +983,10 @@ leg-boundary provenance. A later online `locate` or `fetch` can reuse a complete
 when another feed failed, including an MLAT feed whose main feed failed. The archive stream
 is opened only when no usable checkpoint exists.
 
-When building a day from raw reports, duplicate reconciliation prefers an observed non-MLAT
-position over an explicitly MLAT position, including competing reports within one feed.
-The established feed preference decides when position quality ties. Selection stays within
+When building a day from raw reports, duplicate reconciliation prefers a fresh position over
+one readsb marked stale or estimated, including competing reports within one feed. Among
+equally fresh reports it prefers a non-MLAT position, then the established feed preference.
+Stale reports remain usable when no fresh duplicate is available. Selection stays within
 the original duplicate groups and keeps the chosen report's time, position, motion and
 position-source flags. Ground and new-leg events remain available, with the existing gap
 thresholds applied to the selected reports' observed times. A lower-priority duplicate can supply a missing
@@ -1137,8 +1138,9 @@ precedence over an unrecognized designator from another feed. If no feed recogni
 the first nonempty designator is retained and the usual unknown-type policy applies. This does
 not change which feed supplies duplicate positions; boundary-only records cannot supply identity.
 
-Across overlapping cached days, duplicate positions first follow the per-position MLAT flags.
-When those flags tie and both original legs identify one known feed, the existing preference
+Across overlapping cached days, duplicate positions first prefer a fresh report over a stale
+or estimated one, then follow the per-position MLAT flags. When both quality flags tie and
+both original legs identify one known feed, the existing preference
 for prod, then staging, then mlat applies within the original 50 ms duplicate intervals.
 The merger keeps those original feed ranks while combining leg-level source labels, so adding
 another day to the same merge cannot erase that preference. Mixed or unknown original sources
@@ -1160,7 +1162,8 @@ trimmed and lowercased, retaining readsb's `~` prefix. Existing day stores need 
 to recover tracks previously merged under a blank ID.
 
 When neighboring track stores overlap, reports within the existing 0.05 s duplicate interval
-prefer non-MLAT positions even if an MLAT report arrived slightly earlier. The merge preserves
+prefer fresh positions, then non-MLAT positions, even if a lower-quality report arrived slightly
+earlier. The merge preserves
 the previous flight-leg joins and same-quality choices, including interleaved overlaps from
 three or more files. Unjoined legs retain their original point allocation.
 
@@ -1863,6 +1866,22 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Preserve fresh flight positions beside stale duplicates
+
+The new `raw_fresh_duplicates_recover_observed_geometry` and
+`cross_store_fresh_duplicates_recover_observed_geometry` regressions exercise real
+compressed-archive ingestion, raw checkpoints and processed-store round trips. They
+place stale reports away from a known synthetic trajectory and require the selected
+fresh reports to retain their exact coordinates, motion and flags, across feed order,
+position-source type and duplicate-time offsets. Additional controls preserve the
+50 ms duplicate groups, ground/new-leg boundaries around the existing 30 s gap rule,
+and the previous tie behavior when every report is stale.
+
+**Validation pending:** the execution host became unavailable during dependency
+compilation, before these tests ran. Source review is complete; native tests, Clippy,
+UBS, the full workspace checks and real-recording replays are not completed for this
+change. These fixtures are not measured recovery or field-accuracy results.
 
 ### Recover a pair when exact distance intervals meet between fine nodes
 
