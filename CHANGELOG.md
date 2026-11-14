@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover completed flight downloads during a release lookup outage
+
+- When online ADS-B discovery fails and no processed catalogue qualifies, rebuild the
+  day from verified completed raw feeds and cached release metadata. This shares the
+  offline reconstruction path, including cross-feed altitude and aircraft-type recovery.
+- Retain processed-cache priority, main-feed requirements, feed and jet policies,
+  geoid conversion, midnight coverage and atomic publication. Report the discovery
+  outage and unchecked newer feeds. Without a verified main feed, return the original
+  discovery error; a final cache-write failure remains fatal.
+- Add compressed-source recovery regressions across 16 main-feed, jet and MLAT
+  combinations, requiring exact flight contents, unchanged checkpoints and manifests,
+  visible warnings and subsequent cache reuse. Extend invalid-identity, MLAT-only,
+  local-manifest failure and publication-failure controls to online outages.
+- Source review, changed-hunk formatting and whitespace checks pass. Native data
+  tests are pending dependency compilation, with intermittent execution-host
+  disconnections; no native recovery, live outage or field-accuracy claim is made.
+
 ### Recover turning flyovers that enter hearing range between sampled reports
 
 - When a coarse curve-match proposal fails its range gate, use a conservative bound

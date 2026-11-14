@@ -978,10 +978,11 @@ Availability checks look up only the main feed (prod, or staging when prod is ab
 Fetches with MLAT disabled also skip its release lookup. With MLAT enabled, an optional
 MLAT lookup failure keeps the successfully discovered main feed and records the error in
 progress and final notes, so a usable main cache or archive can still supply the day.
-A failed main-feed lookup can also reuse a readable, covering processed main-feed catalogue.
+A failed main-feed lookup can also reuse a readable, covering processed main-feed catalogue,
+or rebuild one from completed raw feeds and cached release metadata when no processed cache qualifies.
 The report retains its existing missing-feed warnings and adds that newer or additional feeds
 could not be checked. Feed preference, aircraft policy, certified jet coverage and midnight
-coverage checks still apply. Without an acceptable main-feed cache, the original lookup error
+coverage checks still apply. Without verified local main-feed data, the original lookup error
 remains fatal, including when missing days would otherwise be allowed.
 
 Main-only discoveries use `releases-main.json`. They never replace `releases.json` or
@@ -1026,6 +1027,9 @@ change final day-store publication errors.
 
 If no processed full or partial day cache is usable, `--offline` can rebuild it from
 completed raw checkpoints and cached `releases.json` or `releases-main.json` metadata.
+An online request whose main release lookup fails tries the same local reconstruction,
+without retrying a network request or opening an archive stream. A successful recovery
+reports the lookup failure and that newer or additional feeds could not be checked.
 It validates that each release belongs to the requested day and feed, then applies the same
 raw identity checks and geoid conversion as an online retry. A usable prod checkpoint takes priority over staging. Available requested
 MLAT is reconciled with the main feed; if requested MLAT is unavailable, a main-only result
@@ -1034,7 +1038,7 @@ hits keep their priority.
 
 The rebuilt day is atomically saved for later searches, so this recovery needs a writable
 cache. A final day-store write failure remains an error. No network client or archive
-stream is opened in offline reconstruction. For recent ended days, the CLI's availability
+stream is opened in local reconstruction. For recent ended days, the CLI's availability
 check recognizes a completed raw main-feed filename paired with valid same-day release
 metadata; full checkpoint integrity and query policy are checked during reconstruction.
 Metadata alone, temporary files and MLAT-only data do not establish that availability,
