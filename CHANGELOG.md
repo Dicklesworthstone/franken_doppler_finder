@@ -19,6 +19,31 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve the scored flyover through wind-dependent propagation delays
+
+- Retain each exact curve match's emission-time CPA privately. Refinement and the
+  along-track ambiguity check previously reconstructed it by subtracting range/343,
+  which can miss the visit in wind or substitute a closer return by the same aircraft.
+- Keep original lookups bit-for-bit when their time and boundary status still match.
+  Otherwise reconstruct the scored
+  position and velocity at its retained emission time and the same observer, including
+  the original track-end status. A visit outside the supplied track span stays invalid.
+  No evidence threshold, calibration, search budget or serialized field changes.
+- Add physical climbing-flight regressions at relative and Unix epochs, a closer-return
+  case, exact preservation controls, and track-end/missing-span checks, including
+  sub-millisecond solutions that straddle the existing interior boundary. Extend the
+  existing two-flight wind PCM test to verify metadata from the production scorer.
+- All four new visit-recovery regressions pass in the actual `fdop-core` crate on the
+  pinned nightly after integrating concurrent upstream track and coarse-search fixes.
+  The crate and dependencies were compiled without optimization to fit this host's
+  memory. The extended two-flight wind PCM test and existing fractional-clock
+  localization test also pass in the earlier exact-source curve/track/physics/spectrogram
+  component with real pinned dependencies; its broader run was stopped before completion.
+  Default compilation was SIGKILLed in `fsci-linalg`, then in the complete core test crate;
+  workspace Clippy was SIGKILLed in unchanged `syn`. Static UBS review finds no actionable
+  new issue in production changes; its optional AST-grep rule pack was unavailable.
+  No field-accuracy improvement or complete quality-gate pass is claimed.
+
 ### Keep genuine flyovers across intermittent speed reports
 
 - Preserve the existing reported-speed and all-missing-triplet recovery passes, then permit

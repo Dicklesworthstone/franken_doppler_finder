@@ -904,6 +904,9 @@ pub struct MatchedPass {
     pub clock_offset_s: f64,
     /// Its curve lies on pixels a stronger pass already claimed, so it earned nothing.
     pub shared: bool,
+    /// Emission-time identity of this visit, retained through weather-dependent travel time.
+    #[serde(skip)]
+    emission_utc: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1589,6 +1592,7 @@ fn score_exact_with_recovery(
         d: f64,
         v: f64,
         arrive: f64,
+        emission_utc: f64,
         null: Null,
         at_end: bool,
         f_arr: i64,
@@ -1709,6 +1713,7 @@ fn score_exact_with_recovery(
                 d: cpa.d,
                 v: cpa.speed,
                 arrive,
+                emission_utc: cpa.t_e,
                 null,
                 at_end: !cpa.interior,
                 f_arr,
@@ -2069,6 +2074,7 @@ fn score_exact_with_recovery(
             at_track_end: o.at_end,
             clock_offset_s: (k - at) as f64 * im.dt,
             shared,
+            emission_utc: o.emission_utc,
         });
     }
     passes.sort_by(|x, y| y.value.total_cmp(&x.value));
@@ -2079,6 +2085,40 @@ fn score_exact_with_recovery(
         passes,
         n_heard,
         n_close,
+    })
+}
+
+/// Retrieve the physical visit whose curve was scored. Subtracting a nominal still-air
+/// delay can miss it in wind, and a distance minimum can select a closer return instead.
+/// Both callers are still at the scored observer. Keep an original successful lookup
+/// exactly (the solver resolves time to 1 ms); otherwise recover that same source point.
+fn matched_pass_cpa(
+    tr: &TrackModel,
+    x: V3,
+    clock: f64,
+    pass: &MatchedPass,
+    half: f64,
+) -> Option<crate::track::Cpa> {
+    if !pass.emission_utc.is_finite() || pass.emission_utc < tr.t0() || pass.emission_utc > tr.t1()
+    {
+        return None;
+    }
+    let guess = clock + pass.t_audio - pass.slant_m / BASE_C;
+    let original = tr.cpa_near(x, guess, half);
+    if original.is_some_and(|cpa| {
+        (cpa.t_e - pass.emission_utc).abs() <= 1e-3 && cpa.interior != pass.at_track_end
+    }) {
+        return original;
+    }
+    let (pos, vel) = tr.pv(pass.emission_utc);
+    let rv = sub(pos, x);
+    Some(crate::track::Cpa {
+        t_e: pass.emission_utc,
+        d: norm(rv),
+        speed: norm(vel),
+        interior: !pass.at_track_end,
+        rv,
+        vel,
     })
 }
 
@@ -2113,15 +2153,12 @@ fn along_track_aliases(
         .iter()
         .filter(|q| q.nats >= HEARD_NATS && !q.shared)
     {
-        // emission time near the heard closest approach; `cpa_near` finds the exact one. Keys are
-        // unique per track (`icao_date_n` per leg, plus `#k` per piece), and a track heard twice, a
-        // lap flown again, gives each pass its own time and so its own closest approach.
-        let t_guess = top.clock_unix + ps.t_audio - ps.slant_m / BASE_C;
+        // Keys identify tracks; the retained emission time distinguishes their visits.
         let Some(cpa) = idx
             .iter()
             .map(|t| &inp.tracks[t.index])
             .filter(|t| t.key == ps.key)
-            .find_map(|t| t.cpa_near(x, t_guess, 30.0))
+            .find_map(|t| matched_pass_cpa(t, x, top.clock_unix, ps, 30.0))
         else {
             continue;
         };
@@ -2276,8 +2313,7 @@ fn polish_point(
         else {
             continue;
         };
-        let t_guess = original.2.clock + ps.t_audio - ps.slant_m / BASE_C;
-        let Some(cpa) = tr.cpa_near(x, t_guess, 2.0 * p.sample_s) else {
+        let Some(cpa) = matched_pass_cpa(tr, x, original.2.clock, ps, 2.0 * p.sample_s) else {
             continue;
         };
         let (_, _, height_m) = ecef_to_geodetic(tr.pos_at(cpa.t_e));
@@ -6995,6 +7031,220 @@ mod tests {
         assert!(wind_bank_pass(rv, [f64::NAN, 0.0, 0.0], &prop).is_none());
     }
 
+    fn matched_visit(
+        tr: &TrackModel,
+        cpa: crate::track::Cpa,
+        prop: &Prop,
+        clock: f64,
+    ) -> MatchedPass {
+        MatchedPass {
+            icao: tr.icao.clone(),
+            reg: tr.reg.clone(),
+            typ: tr.typ.clone(),
+            key: tr.key.clone(),
+            t_audio: cpa.t_r_p(prop) - clock,
+            slant_m: cpa.d,
+            speed_mps: cpa.speed,
+            f0_hz: 100.0,
+            score: 0.0,
+            nats: 0.0,
+            value: 0.0,
+            at_track_end: !cpa.interior,
+            clock_offset_s: 0.0,
+            shared: false,
+            emission_utc: cpa.t_e,
+        }
+    }
+
+    #[test]
+    fn matched_pass_recovers_its_climbing_visit_after_a_wind_delayed_arrival() {
+        let (lat, lon, _) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let distance = 7_800.0_f64;
+        let height = 1_000.0_f64;
+        let velocity = [120.0, 0.0, 10.0];
+        // r.v = 0 fixes the independent emission-time CPA of this climbing flight.
+        let east = -height * velocity[2] / velocity[0];
+        let north = (distance.powi(2) - height.powi(2) - east.powi(2)).sqrt();
+        for clock in [0.0, SCENE_AT.2] {
+            let tr = straight_track(
+                &enu,
+                [east, north, height + MIC_HEIGHT_M],
+                velocity,
+                clock + 200.0,
+                clock,
+                clock + 400.0,
+                20.0,
+            );
+            let cpa = tr.cpa_near(x, clock + 200.0, 8.0).unwrap();
+            assert!(cpa.interior && (cpa.t_e - clock - 200.0).abs() < 0.001);
+            for (c, wind) in [(300.0, 100.0), (280.0, 80.0)] {
+                let prop = Prop {
+                    c,
+                    w: enu.vec_to_ecef([0.0, wind, 0.0]),
+                };
+                assert!(norm(sub(cpa.vel, prop.w)) < c);
+                let pass = matched_visit(&tr, cpa, &prop, clock);
+                let old_guess = clock + pass.t_audio - pass.slant_m / BASE_C;
+                assert!(old_guess - cpa.t_e > 15.0);
+                let old = tr.cpa_near(x, old_guess, 8.0).unwrap();
+                assert!(!old.interior && old.t_e - cpa.t_e > 7.0);
+                let recovered = matched_pass_cpa(&tr, x, clock, &pass, 8.0).unwrap();
+                assert!(recovered.interior);
+                assert!((recovered.t_e - clock - 200.0).abs() < 0.001);
+                assert!((recovered.d - distance).abs() < 0.001);
+                let true_height = ecef_to_geodetic(tr.pos_at(clock + 200.0)).2;
+                let recovered_height = ecef_to_geodetic(tr.pos_at(recovered.t_e)).2;
+                let old_height = ecef_to_geodetic(tr.pos_at(old.t_e)).2;
+                assert!((recovered_height - true_height).abs() < 0.02);
+                assert!(old_height - true_height > 70.0);
+                assert!(
+                    serde_json::to_value(pass)
+                        .unwrap()
+                        .get("emission_utc")
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matched_pass_keeps_its_visit_when_a_return_is_closer() {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let mut tr = short_circuit(60.0);
+        // A 24 s circuit at the original horizontal speed, alternating high and low
+        // visits. Both fit the alias lookup's 30 s half-window around the higher pass.
+        for i in 0..tr.t.len() {
+            let mut pos = enu.from_ecef(tr.pos[i]);
+            let mut vel = enu.vec_from_ecef(tr.vel[i]);
+            pos[0] = 300.0 + 0.2 * (pos[0] - 300.0);
+            pos[1] *= 0.2;
+            vel[2] /= 0.2;
+            tr.t[i] = clock + 0.2 * (tr.t[i] - clock);
+            tr.pos[i] = enu.to_ecef(pos);
+            tr.vel[i] = enu.vec_to_ecef(vel);
+        }
+        let intended = tr.cpa_nearest_time(x, clock + 12.0, 8.0).unwrap();
+        assert!(intended.interior && (intended.t_e - clock - 12.0).abs() < 0.001);
+        let prop = Prop::still(BASE_C);
+        let pass = matched_visit(&tr, intended, &prop, clock);
+        let guess = clock + pass.t_audio - pass.slant_m / BASE_C;
+        let old = tr.cpa_near(x, guess, 30.0).unwrap();
+        assert!(old.interior && (old.t_e - intended.t_e).abs() > 20.0);
+        assert!(old.d < intended.d - 200.0);
+        let recovered = matched_pass_cpa(&tr, x, clock, &pass, 30.0).unwrap();
+        assert!(recovered.interior && (recovered.t_e - intended.t_e).abs() < 0.001);
+        assert!((recovered.d - intended.d).abs() < 0.001);
+    }
+
+    #[test]
+    fn matched_pass_keeps_original_cpas_when_the_nominal_seed_reaches_the_visit() {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let tr = scene_track(
+            [0.0, 7_000.0, 1_000.0 + MIC_HEIGHT_M],
+            [120.0, 0.0, 0.0],
+            200.0,
+            0.0,
+            400.0,
+        );
+        let intended = tr.cpa_near(x, clock + 200.0, 8.0).unwrap();
+        let signature = |cpa: crate::track::Cpa| {
+            let mut values = vec![cpa.t_e, cpa.d, cpa.speed];
+            values.extend(cpa.rv);
+            values.extend(cpa.vel);
+            (
+                cpa.interior,
+                values.into_iter().map(f64::to_bits).collect::<Vec<_>>(),
+            )
+        };
+        for c in [BASE_C, 280.0, 365.0] {
+            let pass = matched_visit(&tr, intended, &Prop::still(c), clock);
+            for half in [8.0, 30.0] {
+                let guess = clock + pass.t_audio - pass.slant_m / BASE_C;
+                let old = tr.cpa_near(x, guess, half).unwrap();
+                assert!(old.interior && (old.t_e - intended.t_e).abs() < 0.001);
+                let current = matched_pass_cpa(&tr, x, clock, &pass, half).unwrap();
+                assert_eq!(signature(current), signature(old));
+            }
+        }
+    }
+
+    #[test]
+    fn matched_pass_recovery_preserves_track_ends_and_cannot_cross_a_missing_span() {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let x = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let tr = scene_track(
+            [0.0, 7_000.0, 1_000.0 + MIC_HEIGHT_M],
+            [120.0, 0.0, 0.0],
+            200.0,
+            0.0,
+            196.0,
+        );
+        let end = tr.cpa_near(x, clock + 196.0, 8.0).unwrap();
+        assert!(!end.interior && tr.t1() - end.t_e < 0.001);
+        let prop = Prop {
+            c: 280.0,
+            w: enu.vec_to_ecef([0.0, 100.0, 0.0]),
+        };
+        let pass = matched_visit(&tr, end, &prop, clock);
+        let guess = clock + pass.t_audio - pass.slant_m / BASE_C;
+        assert!(tr.cpa_near(x, guess, 8.0).is_none());
+        let recovered = matched_pass_cpa(&tr, x, clock, &pass, 8.0).unwrap();
+        assert!(!recovered.interior);
+        assert_eq!(recovered.t_e.to_bits(), end.t_e.to_bits());
+        assert_eq!(recovered.d.to_bits(), end.d.to_bits());
+        assert_eq!(recovered.rv, end.rv);
+        assert_eq!(recovered.vel, end.vel);
+
+        // Neither independently retained side of a missing report span owns this visit.
+        for (from, to) in [(0.0, 180.0), (220.0, 400.0)] {
+            let part = scene_track(
+                [0.0, 7_000.0, 1_000.0 + MIC_HEIGHT_M],
+                [120.0, 0.0, 0.0],
+                200.0,
+                from,
+                to,
+            );
+            assert!(matched_pass_cpa(&part, x, clock, &pass, 30.0).is_none());
+        }
+
+        // Two sub-millisecond solutions can straddle the unchanged half-second
+        // interior boundary. Matching time alone must not change the scored status.
+        for epoch in [0.0, clock] {
+            for (boundary, cpa_time) in [(0.0, 0.5), (100.0, 99.5)] {
+                let tr = straight_track(
+                    &enu,
+                    [0.0, 800.0, 600.0 + MIC_HEIGHT_M],
+                    [120.0, 0.0, 0.0],
+                    epoch + cpa_time,
+                    epoch,
+                    epoch + 100.0,
+                    4.0,
+                );
+                let scored = tr.cpa_near(x, epoch + boundary, 8.0).unwrap();
+                assert!(!scored.interior);
+                let pass = matched_visit(&tr, scored, &Prop::still(BASE_C), epoch);
+                let guess = epoch + pass.t_audio - pass.slant_m / BASE_C;
+                let old = tr.cpa_near(x, guess, 8.0).unwrap();
+                assert!(old.interior);
+                assert!((old.t_e - scored.t_e).abs() < 1e-3);
+                let recovered = matched_pass_cpa(&tr, x, epoch, &pass, 8.0).unwrap();
+                assert_eq!(recovered.interior, scored.interior);
+                assert_eq!(recovered.t_e.to_bits(), scored.t_e.to_bits());
+                assert_eq!(recovered.d.to_bits(), scored.d.to_bits());
+                assert_eq!(recovered.speed.to_bits(), scored.speed.to_bits());
+                assert_eq!(recovered.rv, scored.rv);
+                assert_eq!(recovered.vel, scored.vel);
+            }
+        }
+    }
+
     #[test]
     fn uniform_calm_coarse_stamps_preserve_the_original_bits() {
         struct Calm;
@@ -7444,6 +7694,26 @@ mod tests {
             direct.n_heard, 2,
             "the original exact scorer supports both passes"
         );
+        for pass in &direct.passes {
+            let tr = tracks.iter().find(|tr| tr.key == pass.key).unwrap();
+            let retained = tr
+                .cpa_nearest_time(observer, pass.emission_utc, 8.0)
+                .unwrap();
+            assert!(retained.interior);
+            assert!((retained.t_e - pass.emission_utc).abs() < 0.001);
+            assert!((retained.d - pass.slant_m).abs() < 0.001);
+            assert!((retained.t_r_p(&prop) - direct.clock - pass.t_audio).abs() < 0.001);
+            for half in [8.0, 30.0] {
+                let recovered = matched_pass_cpa(tr, observer, direct.clock, pass, half).unwrap();
+                assert!((recovered.t_e - pass.emission_utc).abs() < 0.001);
+            }
+            assert!(
+                serde_json::to_value(pass)
+                    .unwrap()
+                    .get("emission_utc")
+                    .is_none()
+            );
+        }
         let result = run(&inp, &p, &|_| {});
         let top = result
             .modes

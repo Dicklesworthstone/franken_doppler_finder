@@ -512,6 +512,11 @@ in `crates/fdop-core/src/curvematch.rs`:
   the fitted point at that shared clock with its original per-flight timing slack. The point is
   adopted only if each fitted source visit remains independently heard, matched one-to-one by
   track, observed arrival support and tone neighbourhood. Otherwise the original mode remains.
+  Refinement and the along-track ambiguity check retain each scored visit's actual emission time.
+  If subtracting a nominal still-air delay selects a clipped point or a closer return by the same
+  aircraft, they reconstruct the scored source position and velocity at that observer instead.
+  Successful original lookups keep their exact results, and scored track ends keep their boundary
+  status. This internal timing metadata adds no fields to the JSON reports.
   Flights are screened for exact scoring using their interpolated paths over the catalogue span, at the
   closest-approach sampling interval. This retains sparse passes that enter the search area between logged
   ADS-B positions.
