@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Continue a search when an optional MLAT download fails
+
+- A completely ingested and successfully published prod/staging main catalogue now
+  survives an optional MLAT stream or ingest failure under the default fetch policy.
+  Keep the detailed failed-release error and the missing-aircraft warning in progress
+  and final notes. Missing main days, MLAT-only remnants and all final cache-publication
+  failures retain the existing error policy.
+- Preserve actual feed provenance and raw integrity. A later online request still tries
+  the advertised MLAT feed and reuses the completed main checkpoint; a partial archive
+  cannot become a raw checkpoint or claim full-feed coverage.
+- Add production-path fetch regressions with real/truncated archives for prod/staging
+  and both jet policies, recovery and upgrade, both completion orders, a missing main
+  on another day, and publication failures. Source review, changed-hunk formatting and
+  whitespace checks pass. Native validation stopped when unchanged `asupersync 0.6.2`
+  was SIGKILLed before compiling this crate; the new tests have not run.
+
 ### Eliminate the emitted-tone search dimension from linear Doppler fits
 
 - At each geometry trial, solve the emitted tone's bounded ordinary-least-squares

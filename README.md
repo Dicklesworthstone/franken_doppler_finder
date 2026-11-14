@@ -991,6 +991,13 @@ could not be checked. Feed preference, aircraft policy, certified jet coverage a
 coverage checks still apply. Without verified local main-feed data, the original lookup error
 remains fatal, including when missing days would otherwise be allowed.
 
+If a requested MLAT archive fails during download or ingestion, a completely ingested
+and successfully published prod/staging main catalogue can still supply that day. The
+result retains the detailed MLAT error and missing-aircraft warning. Incomplete main data
+remains an error under the default policy, and final catalogue publication failures remain
+errors under every policy. Online retries still try to add the advertised MLAT feed,
+reusing the completed main raw checkpoint; partial MLAT bytes are never published.
+
 Main-only discoveries use `releases-main.json`. They never replace `releases.json` or
 certify that MLAT is absent. A later online request for both feeds retries MLAT unless an
 existing full listing is reusable under the established publication rules. Offline reconstruction
@@ -2864,11 +2871,17 @@ No live-download timing, full-workspace pass, selftest or field-accuracy improve
 ### Completed main feeds survive a failed MLAT download
 
 The archive regressions now cover both prod and staging, either completion order, actual atomic
-cache publication, offline reuse with a warning, rejection of MLAT-only remnants, and partial
-caches failing full-feedset lookups. They retain the bounded-channel publication handshake and
-verify that strict feed failures and finalized-day cache-write failures remain errors. The new and updated
-tests are authored but unrun because the execution host is unavailable; source review is not
-native validation.
+cache publication, default online and offline reuse with warnings, rejection of MLAT-only
+remnants, and partial caches failing full-feedset lookups. A source-injected fetch regression
+uses real tar archives and a truncated MLAT archive through the production ingest, checkpoint,
+build, merge and filter path. It requires the original main tracks and detailed failure notes,
+then a complete online MLAT upgrade that reuses the main checkpoint. Both jet policies are
+covered. Another missing main day and final catalogue publication errors retain their
+existing failure policy; optional-feed recovery cannot excuse them.
+
+Source review and changed-hunk formatting checks pass. The pinned native data test attempt
+was killed while compiling unchanged `asupersync 0.6.2`, before this crate or its tests ran.
+These new regressions remain unexecuted; no live-outage or field-accuracy result is claimed.
 
 ### Archive coverage for wide distance gates
 

@@ -606,29 +606,37 @@ fn ingest_cached_release(
 struct StreamedDayFailures {
     feeds: Vec<(usize, String)>,
     caches: Vec<(usize, String)>,
+    /// Optional failures whose day already has a completely ingested, published main feed.
+    recovered_mlat: Vec<(usize, String)>,
 }
 
 impl StreamedDayFailures {
     fn report(&self, opts: &FetchOptions, notes: &mut Vec<String>) -> Result<(), DataError> {
-        if self.feeds.is_empty() && self.caches.is_empty() {
-            return Ok(());
+        if !self.feeds.is_empty() || !self.caches.is_empty() {
+            let msg = format!(
+                "ADS-B fetch failed (rerun to retry incomplete feeds or caches): {}",
+                self.feeds
+                    .iter()
+                    .chain(&self.caches)
+                    .map(|(_, e)| e.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            // Missing main data keeps the existing strict policy. A cache write failure
+            // remains fatal even when incomplete archive coverage is explicitly allowed.
+            if !opts.allow_missing || !self.caches.is_empty() {
+                return Err(DataError(msg));
+            }
+            opts.say(&format!("[adsb] WARNING {msg}"));
+            notes.push(msg);
         }
-        let msg = format!(
-            "ADS-B fetch failed (rerun to retry incomplete feeds or caches): {}",
-            self.feeds
-                .iter()
-                .chain(&self.caches)
-                .map(|(_, e)| e.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-        // Strict searches still fail on a missing feed. A cache write failure remains
-        // fatal even when the caller explicitly allows incomplete archive coverage.
-        if !opts.allow_missing || !self.caches.is_empty() {
-            return Err(DataError(msg));
+        for (_, error) in &self.recovered_mlat {
+            let note = format!(
+                "MLAT-only fetch failed; using the completed main-feed catalogue; rerun online to retry the missing feed: {error}"
+            );
+            opts.say(&format!("[adsb] WARNING {note}"));
+            notes.push(note);
         }
-        opts.say(&format!("[adsb] WARNING {msg}"));
-        notes.push(msg);
         Ok(())
     }
 }
@@ -643,6 +651,8 @@ fn collect_streamed_days(
 ) -> StreamedDayFailures {
     let mut pending: BTreeMap<usize, (Vec<Part>, Vec<String>)> = BTreeMap::new();
     let mut failures = StreamedDayFailures::default();
+    let mut failed_mlat = Vec::new();
+    let mut published_main = HashSet::new();
     for (di, tag, result) in results {
         remaining[di] -= 1;
         match result {
@@ -651,6 +661,7 @@ fn collect_streamed_days(
                 parts.push(part);
                 tags.push(tag);
             }
+            Err(e) if tag.contains("-mlatonly-") => failed_mlat.push((di, e.0)),
             Err(e) => failures.feeds.push((di, e.0)),
         }
         if remaining[di] == 0
@@ -660,7 +671,16 @@ fn collect_streamed_days(
             tags.sort();
             if let Err(e) = finish(di, parts, tags, feedset) {
                 failures.caches.push((di, e.0));
+            } else {
+                published_main.insert(di);
             }
+        }
+    }
+    for (di, error) in failed_mlat {
+        if published_main.contains(&di) {
+            failures.recovered_mlat.push((di, error));
+        } else {
+            failures.feeds.push((di, error));
         }
     }
     failures
@@ -700,6 +720,33 @@ fn fetch_window_with_discovery(
     spec: &IngestSpec,
     cache_dir: &Path,
     opts: &FetchOptions,
+    discover: impl FnMut(
+        Option<&fdop_http::Net>,
+        i64,
+        u32,
+        u32,
+        &Path,
+        bool,
+        bool,
+    ) -> Result<crate::adsblol::ReleaseDiscovery, DataError>,
+) -> Result<TrackStore, DataError> {
+    fetch_window_with_sources(
+        spec,
+        cache_dir,
+        opts,
+        discover,
+        |rel, sp, context, progress| {
+            let reader = crate::stream::BigStreamReader::open(rel.urls());
+            ingest_day_reader(reader, rel.feed.label(), sp, progress, context)
+        },
+    )
+}
+
+/// Share discovery, durable feed checkpoints and day assembly across archive sources.
+fn fetch_window_with_sources(
+    spec: &IngestSpec,
+    cache_dir: &Path,
+    opts: &FetchOptions,
     mut discover: impl FnMut(
         Option<&fdop_http::Net>,
         i64,
@@ -709,6 +756,13 @@ fn fetch_window_with_discovery(
         bool,
         bool,
     ) -> Result<crate::adsblol::ReleaseDiscovery, DataError>,
+    ingest: impl Fn(
+        &DayRelease,
+        &IngestSpec,
+        DayContext,
+        &(dyn Fn(&IngestProgress) + Sync),
+    ) -> Result<Part, DataError>
+    + Sync,
 ) -> Result<TrackStore, DataError> {
     let feedset = if opts.include_mlat {
         "prod+mlatonly"
@@ -959,6 +1013,7 @@ fn fetch_window_with_discovery(
                 let tx = tx.clone();
                 let queue = &queue;
                 let day_spec = &day_spec;
+                let ingest = &ingest;
                 s.spawn(move || {
                     loop {
                         let job = match queue.lock() {
@@ -985,8 +1040,7 @@ fn fetch_window_with_discovery(
                         let context = day_context(job.day);
                         let res = ingest_cached_release(
                             &day_dir(cache_dir, job.day), &job.rel, &sp, context, opts, || {
-                                let reader = crate::stream::BigStreamReader::open(job.rel.urls());
-                                ingest_day_reader(reader, job.rel.feed.label(), &sp, &cb, context)
+                                ingest(&job.rel, &sp, context, &cb)
                             },
                         ).map_err(|e| DataError(format!("{label} ({}): {e}", job.rel.tag)));
                         if tx.send((job.day_idx, job.rel.tag.clone(), res)).is_err() {
@@ -999,7 +1053,7 @@ fn fetch_window_with_discovery(
             collect_streamed_days(rx, remaining, |di, parts, tags, fs| {
                 let day = days[di];
                 // Only completely ingested feeds reach this cache. Its actual feedset
-                // lets offline runs use a surviving main feed with the existing warning;
+                // lets searches use a surviving main feed with the existing warning;
                 // an online retry reuses completed raw feeds and rebuilds them together
                 // with new ingests for the same altitude/type reconciliation.
                 if opts.include_mlat && !fs.contains("mlatonly") {
@@ -1538,10 +1592,10 @@ mod tests {
             });
         assert_eq!(completed, [1, 2, 3, 4]);
         assert_eq!(usable, [1, 2, 4]);
+        assert_eq!(failures.feeds, [(0, "early failed main".to_string())]);
         assert_eq!(
-            failures.feeds,
+            failures.recovered_mlat,
             [
-                (0, "early failed main".to_string()),
                 (1, "late failed MLAT".to_string()),
                 (2, "early failed MLAT".to_string()),
             ]
@@ -1558,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_mlat_preserves_main_cache_for_permissive_and_offline_reuse() {
+    fn failed_mlat_preserves_main_cache_for_default_and_offline_reuse() {
         use crate::ingest::tests::{T0, spec};
         let want = spec();
         let day = (2026, 9, 8);
@@ -1607,7 +1661,11 @@ mod tests {
                     retained = Some(CachedDay::publish(store, &path)?);
                     Ok(())
                 });
-                assert_eq!(failures.feeds, [(0, "synthetic MLAT outage".to_string())]);
+                assert!(failures.feeds.is_empty());
+                assert_eq!(
+                    failures.recovered_mlat,
+                    [(0, "synthetic MLAT outage".to_string())]
+                );
                 assert!(failures.caches.is_empty());
                 let saved = retained
                     .as_ref()
@@ -1625,20 +1683,14 @@ mod tests {
                 assert_eq!(published.n_points(), expected.n_points());
                 assert_eq!(published.legs[0].points, expected.legs[0].points);
 
-                // Saving progress does not turn a failed strict online fetch into success.
+                // A complete published main feed survives an optional MLAT outage under
+                // the ordinary policy; the failure remains visible in the result notes.
                 let strict = FetchOptions::default();
                 let mut notes = Vec::new();
-                let error = failures.report(&strict, &mut notes).unwrap_err();
-                assert!(error.to_string().contains("synthetic MLAT outage"));
-                assert!(notes.is_empty());
-                // Explicitly permissive callers keep the successful day and the warning.
-                let permissive = FetchOptions {
-                    allow_missing: true,
-                    ..strict.clone()
-                };
-                failures.report(&permissive, &mut notes).unwrap();
+                failures.report(&strict, &mut notes).unwrap();
                 assert_eq!(notes.len(), 1);
                 assert!(notes[0].contains("synthetic MLAT outage"));
+                assert!(notes[0].contains("using the completed main-feed catalogue"));
                 let selected = load_selected_stores(vec![retained.take().unwrap()], &want).unwrap();
                 assert_eq!(selected.len(), 1);
                 assert!(!selected[0].legs.is_empty());
@@ -1789,6 +1841,221 @@ mod tests {
             releases,
             parts,
             archives,
+        }
+    }
+
+    #[test]
+    fn online_mlat_stream_failure_returns_main_tracks_and_retries_the_upgrade() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                let f = offline_raw_fixture(main, include_jets);
+                let want = IngestSpec {
+                    keep_unknown: true,
+                    ..f.want
+                };
+                let calls = [AtomicUsize::new(0), AtomicUsize::new(0)];
+                let messages = Arc::new(Mutex::new(Vec::new()));
+                let log = messages.clone();
+                let opts = FetchOptions {
+                    progress: Some(Arc::new(move |line| {
+                        log.lock().unwrap().push(line.to_owned())
+                    })),
+                    ..Default::default()
+                };
+                let run = |truncate_mlat| {
+                    fetch_window_with_sources(
+                        &want,
+                        &f.cache,
+                        &opts,
+                        |_, _, _, _, _, offline, include_mlat| {
+                            assert!(!offline && include_mlat);
+                            Ok(crate::adsblol::ReleaseDiscovery {
+                                releases: f.releases.to_vec(),
+                                mlat_error: None,
+                            })
+                        },
+                        |rel, spec, context, progress| {
+                            let i = usize::from(rel.feed == Feed::Mlatonly);
+                            calls[i].fetch_add(1, Ordering::Relaxed);
+                            let bytes = &f.archives[i];
+                            let end = bytes.len() - if truncate_mlat && i == 1 { 512 } else { 0 };
+                            ingest_day_reader(
+                                &bytes[..end],
+                                rel.feed.label(),
+                                spec,
+                                progress,
+                                context,
+                            )
+                        },
+                    )
+                };
+                let main_store = build_day_store(
+                    vec![f.parts[0].clone()],
+                    &f.spec,
+                    vec![f.releases[0].tag.clone()],
+                    day_context((2026, 9, 8)),
+                );
+                let expected = merge_stores(vec![main_store], DAY_JOIN_GAP_S).filtered(
+                    &want.bbox,
+                    want.t_start,
+                    want.t_end,
+                );
+                let got = run(true)
+                    .expect("complete main data must survive a truncated optional archive");
+                assert!(!got.legs.is_empty());
+                assert_same_legs(&got.legs, &expected.legs);
+                assert_eq!(got.meta.sources, [f.releases[0].tag.clone()]);
+                let notes = got.meta.stats["notes"].as_array().unwrap();
+                assert!(
+                    notes
+                        .iter()
+                        .any(|n| n.as_str().unwrap().contains(NO_MLATONLY))
+                );
+                assert!(notes.iter().any(|n| {
+                    let note = n.as_str().unwrap();
+                    note.contains("MLAT-only fetch failed")
+                        && note.contains(&f.releases[1].tag)
+                        && note.contains("using the completed main-feed catalogue")
+                }));
+                assert!(
+                    messages
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|line| line.contains("MLAT-only fetch failed"))
+                );
+                let raw_main = crate::raw_cache::path(&f.dir, &f.releases[0], &f.spec);
+                let raw_before = std::fs::read(&raw_main).unwrap();
+                assert!(!crate::raw_cache::path(&f.dir, &f.releases[1], &f.spec).exists());
+                let full_path = f.dir.join(format!(
+                    "{}_{}.fdtrk",
+                    cache_feedset(&feedset_name(main, true), include_jets),
+                    bbox_key(&f.spec.bbox).1
+                ));
+                assert!(
+                    !full_path.exists(),
+                    "a partial catalogue cannot claim complete MLAT coverage"
+                );
+
+                // The advertised MLAT release keeps an online retry from settling for the
+                // partial processed cache; only the unfinished feed is opened again.
+                let upgraded = run(false).unwrap();
+                assert_eq!(calls.map(|n| n.load(Ordering::Relaxed)), [1, 2]);
+                assert_eq!(std::fs::read(raw_main).unwrap(), raw_before);
+                let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
+                tags.sort();
+                let full = build_day_store(
+                    f.parts.to_vec(),
+                    &f.spec,
+                    tags.clone(),
+                    day_context((2026, 9, 8)),
+                );
+                let expected = merge_stores(vec![full], DAY_JOIN_GAP_S).filtered(
+                    &want.bbox,
+                    want.t_start,
+                    want.t_end,
+                );
+                assert_same_legs(&upgraded.legs, &expected.legs);
+                assert_eq!(upgraded.meta.sources, tags);
+                assert_eq!(upgraded.legs[0].engine == EngineClass::Jet, include_jets);
+                assert!(
+                    upgraded.meta.stats["notes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|n| {
+                            let note = n.as_str().unwrap();
+                            !note.contains(NO_MLATONLY) && !note.contains("MLAT-only fetch failed")
+                        })
+                );
+                assert!(full_path.is_file());
+            }
+        }
+    }
+
+    #[test]
+    fn mlat_recovery_does_not_hide_a_missing_main_day_or_failed_publication() {
+        use crate::ingest::tests::T0;
+
+        for problem in ["main day", "publication"] {
+            let f = offline_raw_fixture(Feed::Prod, false);
+            let want = IngestSpec {
+                keep_unknown: true,
+                t_end: if problem == "main day" {
+                    T0 + 86_400.0 + 60.0
+                } else {
+                    f.want.t_end
+                },
+                ..f.want
+            };
+            if problem == "publication" {
+                // A directory at the final store path makes atomic publication fail.
+                std::fs::create_dir_all(
+                    f.dir
+                        .join(format!("prod_{}.fdtrk", bbox_key(&f.spec.bbox).1)),
+                )
+                .unwrap();
+            }
+            for allow_missing in [false, true] {
+                let result = fetch_window_with_sources(
+                    &want,
+                    &f.cache,
+                    &FetchOptions {
+                        allow_missing,
+                        ..Default::default()
+                    },
+                    |_, y, m, d, _, offline, _| {
+                        assert!(!offline);
+                        let mut releases = f.releases.to_vec();
+                        for release in &mut releases {
+                            release.tag = crate::adsblol::tag_for(y, m, d, release.feed, 0);
+                        }
+                        Ok(crate::adsblol::ReleaseDiscovery {
+                            releases,
+                            mlat_error: None,
+                        })
+                    },
+                    |rel, spec, context, progress| {
+                        let i = usize::from(rel.feed == Feed::Mlatonly);
+                        let second_day = context.day_start > T0;
+                        let fail = (second_day && i == 0) || (!second_day && i == 1);
+                        let bytes = &f.archives[i];
+                        let end = bytes.len() - if fail { 512 } else { 0 };
+                        ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
+                    },
+                );
+                if problem == "publication" {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("could not cache completed day"), "{error}");
+                } else if allow_missing {
+                    // Preserve the existing explicit partial-day policy, with the main
+                    // failure still reported. Default callers must never take this path.
+                    let got = result.unwrap();
+                    assert!(
+                        got.meta.stats["notes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|n| { n.as_str().unwrap().contains("2026-09-09 prod") })
+                    );
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("2026-09-09 prod"), "{error}");
+                }
+                let day_two = day_dir(&f.cache, (2026, 9, 9));
+                assert!(
+                    !day_two
+                        .join(format!("prod_{}.fdtrk", bbox_key(&f.spec.bbox).1))
+                        .exists()
+                );
+                assert!(
+                    !day_two
+                        .join(format!("prod+mlatonly_{}.fdtrk", bbox_key(&f.spec.bbox).1))
+                        .exists()
+                );
+            }
         }
     }
 
@@ -2886,9 +3153,12 @@ mod tests {
                         )?);
                         Ok(())
                     });
-                    assert_eq!(failures.feeds.len(), 1);
+                    assert_eq!(failures.feeds.len(), usize::from(main_failed));
+                    assert_eq!(failures.recovered_mlat.len(), usize::from(!main_failed));
                     assert!(failures.caches.is_empty());
-                    assert!(failures.report(&opts, &mut Vec::new()).is_err());
+                    let mut notes = Vec::new();
+                    assert_eq!(failures.report(&opts, &mut notes).is_err(), main_failed);
+                    assert_eq!(notes.is_empty(), main_failed);
                     assert_eq!(partial.is_none(), main_failed);
                     if let Some(published) = &partial {
                         let store = TrackStore::load(&published.path).unwrap();
