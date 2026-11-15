@@ -1615,11 +1615,12 @@ Design notes:
   neighbouring aircraft no longer automatically takes over the trace when both tones enter that band.
   The peak must also stand the SNR requirement above the valley separating it from any stronger bin, so
   ripple on a stronger ridge's top does not qualify, while a separate aircraft's ridge still does.
-  Standalone unguided ridge tracing retains the strongest peak within each slope's profile.
-  Across slopes it ranks candidates that pass both existing SNR and robust-z requirements
-  before ineligible peaks: a weak peak with a tiny noise spread cannot hide a qualifying
-  ridge. An already eligible winning slope stays identical. If none qualifies, the original
-  seed direction remains available, and the unchanged point gate still refuses its peak.
+  Standalone unguided ridge tracing selects the strongest qualified local peak within each
+  slope's profile, applying the same in-band vertex, SNR, robust-z and valley-clearance
+  requirements. A bright shoulder from a tone outside the band cannot hide an eligible
+  aircraft ridge. The original strongest winner stays identical when it qualifies. Across
+  slopes, qualifying peaks retain their existing robust-z ranking. If none qualifies, the
+  original direction remains available only to initialize a seed, never as a measured point.
 - **Frequency estimates preserve the spectral peak's shape.** Ordinary and short windows integrate
   along the full Doppler curve. Noise exclusion accounts for the Hann main lobe and chirp smear, so
   narrowing the frequency tolerance does not count the signal as its own noise. Normalized spectra
@@ -1991,6 +1992,30 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Follow an aircraft ridge beside an out-of-band interfering tone
+
+`free_trace_keeps_a_physical_ridge_beside_an_out_of_band_shoulder` combines an independently
+calculated received-Doppler spectrum with a transient broad tone whose peak is outside the
+search band. The preceding tracer follows the interference, retaining 40 points over 4.4 s
+with 25.854807 Hz RMS frequency error. Qualified local-peak selection recovers 401 points over
+the full 40 s with 0.032980 Hz RMS error, below the fixture's 0.25 Hz spectral bin.
+
+`an_out_of_band_shoulder_can_seed_a_direction_but_never_a_point` verifies that a shoulder
+with high SNR and robust z can preserve the original seed direction but cannot produce an
+accepted point or trace. All 12 native trace tests pass, including eligible-winner, weak and
+blank evidence, guided-peak and raw-frequency controls, in a component compiling the complete
+production modules with real pinned dependencies.
+
+All six new regressions across tracking, curve matching and tracing also pass in the complete
+native `fdop-core` test executable, built with the pinned nightly's official Cranelift backend
+and real dependencies. This includes the concurrent source-tone search changes. The ordinary
+LLVM build was SIGKILLed during unchanged dependency code generation; full core production
+and test source passes LLVM metadata checking. Component all-target Clippy passes with warnings
+denied except dead code from omitted callers. Workspace Clippy was SIGKILLed in unchanged
+`asupersync` before reaching repository crates. Full workspace tests, release CLI selftest and
+reference/field replays remain incomplete. The tracing fixture is analytic spectral evidence,
+not a PCM or field-accuracy result.
 
 ### Carry fitted tone uncertainty through exact search
 

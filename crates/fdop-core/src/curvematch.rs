@@ -5662,7 +5662,10 @@ mod tests {
         let error = haversine_m(top.lat, top.lon, c.lat, c.lon);
         eprintln!("rejected center: error {error} m, mode {top:?}");
         assert_eq!(top.n_heard, 2);
-        assert!(error < 200.0, "recovered {error} m from the physical observer");
+        assert!(
+            error < 200.0,
+            "recovered {error} m from the physical observer"
+        );
         assert!((top.clock_unix - c.clock).abs() < 2.0);
 
         // The recovery consumes an existing refinement slot. Disabling refinement

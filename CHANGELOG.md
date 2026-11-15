@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep free ridge tracing on an aircraft beside an out-of-band tone
+
+- Select the strongest qualified local peak within each slope's existing profile, reusing
+  the guided tracer's in-band vertex, SNR, robust-z and valley-clearance requirements. A
+  brighter out-of-band tone's shoulder can no longer hide an eligible aircraft ridge.
+- Preserve an eligible original winner exactly and integrate each slope only once. When no
+  slope qualifies, retain the original direction only for seed initialization; its SNR/z
+  cannot turn an unqualified shoulder into a measured point. Guided selection, thresholds
+  and search ranges are unchanged.
+- A native analytic-Doppler spectrum regression improves from 40 points over 4.4 s with
+  25.854807 Hz RMS error to 401 points over 40 s with 0.032980 Hz RMS error. A shoulder-only
+  control verifies that no point or trace is accepted. All 12 trace tests pass.
+- All six new tracking, curve-match and tracing regressions also pass in the complete native
+  `fdop-core` test executable, built with the pinned nightly's official Cranelift backend and
+  real dependencies, including the concurrent source-tone search changes. The LLVM native
+  build was SIGKILLed during unchanged dependency code generation; full core production and
+  tests pass LLVM metadata checking. Exact-source component Clippy passes with warnings denied
+  except dead code from omitted callers. Workspace Clippy was SIGKILLed in unchanged `asupersync`
+  before reaching repository crates. Full workspace tests, release CLI selftest and reference/
+  field replays remain incomplete. The tracing result does not claim PCM or field accuracy.
+
 ### Preserve fitted tone alternatives through the search handoff
 
 - Carry the fitter's generous tone range into `SearchEvent`, using the smallest symmetric

@@ -67,8 +67,10 @@ impl Trace {
     }
 }
 
-/// (fhat, snr_db, robust z) of the ridge near `f_pred` at frame `j`, or None.
-pub(crate) fn ridge_peak(
+/// Integrate one slope once, retaining whether its selected peak qualifies as an observed
+/// in-band ridge. An unqualified strongest bin can preserve a seed direction, but not a point.
+#[allow(clippy::too_many_arguments)]
+fn ridge_profile(
     spec: &Spec,
     j: usize,
     f_pred: f64,
@@ -76,7 +78,8 @@ pub(crate) fn ridge_peak(
     band: f64,
     noise_band: f64,
     half: usize,
-) -> Option<(f64, f64, f64)> {
+    choice: PeakChoice,
+) -> Option<ProfilePeak> {
     let tj = spec.t[j];
     profile_peak(
         spec,
@@ -87,8 +90,32 @@ pub(crate) fn ridge_peak(
         band,
         noise_band,
         half,
-        PeakChoice::Strongest,
+        choice,
         None,
+    )
+}
+
+/// Original strongest-bin reading, retained as a test oracle for eligible winners and the
+/// no-qualified-slope seed fallback.
+#[cfg(test)]
+fn ridge_peak(
+    spec: &Spec,
+    j: usize,
+    f_pred: f64,
+    slope: f64,
+    band: f64,
+    noise_band: f64,
+    half: usize,
+) -> Option<(f64, f64, f64)> {
+    ridge_profile(
+        spec,
+        j,
+        f_pred,
+        slope,
+        band,
+        noise_band,
+        half,
+        PeakChoice::Strongest,
     )
     .map(|peak| peak.values)
 }
@@ -188,11 +215,20 @@ pub(crate) fn guided_raw_ridge_peak(
 struct ProfilePeak {
     values: (f64, f64, f64),
     local_raw_vertex: bool,
+    qualified: bool,
 }
 
 enum PeakChoice {
+    #[cfg(test)]
     Strongest,
-    NearestQualified { min_snr: f64, min_z: f64 },
+    StrongestQualified {
+        min_snr: f64,
+        min_z: f64,
+    },
+    NearestQualified {
+        min_snr: f64,
+        min_z: f64,
+    },
 }
 
 /// How far `prof[k]` stands above the shallower valley between it and a stronger bin. The
@@ -291,31 +327,50 @@ fn profile_peak(
         }
         fhat
     };
-    let k = match choice {
-        PeakChoice::Strongest => kin?,
-        PeakChoice::NearestQualified { min_snr, min_z } => (1..n_off - 1)
-            .filter(|&k| {
-                // Check the full profile, including the bins just outside the search band:
-                // an increasing shoulder at the band edge is not an observed ridge peak.
-                prof[k].is_finite()
-                    && prof[k - 1].is_finite()
-                    && prof[k + 1].is_finite()
-                    && prof[k] >= prof[k - 1]
-                    && prof[k] >= prof[k + 1]
-                    && (prof[k] > prof[k - 1] || prof[k] > prof[k + 1])
-                    && offs[k].abs() <= band
-                    && prof[k] - med >= min_snr
-                    && (prof[k] - med) / mad >= min_z
-                    && (peak_frequency(k) - f_pred).abs() <= band
-                    && clearance(&prof, k) >= min_snr
-            })
-            .min_by(|&a, &b| {
-                (peak_frequency(a) - f_pred)
-                    .abs()
-                    .total_cmp(&(peak_frequency(b) - f_pred).abs())
-                    .then_with(|| prof[b].total_cmp(&prof[a]))
-                    .then(a.cmp(&b))
-            })?,
+    let qualifies = |k: usize, min_snr: f64, min_z: f64| {
+        // Check the full profile, including the bins just outside the search band:
+        // an increasing shoulder at the band edge is not an observed ridge peak.
+        prof[k].is_finite()
+            && prof[k - 1].is_finite()
+            && prof[k + 1].is_finite()
+            && prof[k] >= prof[k - 1]
+            && prof[k] >= prof[k + 1]
+            && (prof[k] > prof[k - 1] || prof[k] > prof[k + 1])
+            && offs[k].abs() <= band
+            && prof[k] - med >= min_snr
+            && (prof[k] - med) / mad >= min_z
+            && (peak_frequency(k) - f_pred).abs() <= band
+            && clearance(&prof, k) >= min_snr
+    };
+    let (k, qualified) = match choice {
+        #[cfg(test)]
+        PeakChoice::Strongest => (kin?, false),
+        PeakChoice::StrongestQualified { min_snr, min_z } => {
+            // The original winner is already strongest with the earliest-bin tie rule.
+            // Keep an eligible one exactly, and scan alternatives only for an invalid peak.
+            let peak = kin
+                .filter(|&k| k > 0 && k + 1 < n_off && qualifies(k, min_snr, min_z))
+                .or_else(|| {
+                    (1..n_off - 1)
+                        .filter(|&k| qualifies(k, min_snr, min_z))
+                        .max_by(|&a, &b| prof[a].total_cmp(&prof[b]).then(b.cmp(&a)))
+                });
+            // Keep the original fallback only for choosing a seed direction. Its
+            // SNR/z may be high even when it is an out-of-band tone's shoulder.
+            (peak.or(kin)?, peak.is_some())
+        }
+        PeakChoice::NearestQualified { min_snr, min_z } => (
+            (1..n_off - 1)
+                .filter(|&k| qualifies(k, min_snr, min_z))
+                .min_by(|&a, &b| {
+                    (peak_frequency(a) - f_pred)
+                        .abs()
+                        .total_cmp(&(peak_frequency(b) - f_pred).abs())
+                        .then_with(|| prof[b].total_cmp(&prof[a]))
+                        .then(a.cmp(&b))
+                })?,
+            true,
+        ),
     };
     let snr = prof[k] - med;
     let mut fhat = peak_frequency(k);
@@ -365,6 +420,7 @@ fn profile_peak(
     Some(ProfilePeak {
         values: (fhat, snr, snr / mad),
         local_raw_vertex,
+        qualified,
     })
 }
 
@@ -379,25 +435,43 @@ fn best_slope(
     p: &TraceParams,
     nb: f64,
     half: usize,
+    seed_fallback: bool,
 ) -> Option<(f64, (f64, f64, f64))> {
     let mut best: Option<(f64, (f64, f64, f64))> = None;
     let mut qualified: Option<(f64, (f64, f64, f64))> = None;
     let n = ((2.0 * span + 1e-9) / step).floor() as usize + 1;
     for i in 0..n {
         let sl = center - span + i as f64 * step;
-        if let Some(r) = ridge_peak(spec, j, fc, sl, p.band, nb, half) {
+        if let Some(peak) = ridge_profile(
+            spec,
+            j,
+            fc,
+            sl,
+            p.band,
+            nb,
+            half,
+            PeakChoice::StrongestQualified {
+                min_snr: p.min_snr,
+                min_z: p.min_z,
+            },
+        ) {
+            let r = peak.values;
             if best.is_none_or(|b| r.2 > b.1.2) {
                 best = Some((sl, r));
             }
-            if r.1 >= p.min_snr && r.2 >= p.min_z && qualified.is_none_or(|b| r.2 > b.1.2) {
+            if peak.qualified && qualified.is_none_or(|b| r.2 > b.1.2) {
                 qualified = Some((sl, r));
             }
         }
     }
     // A weak peak with a tiny noise MAD can outrank a usable ridge by z alone.
-    // Prefer an eligible slope; if none qualifies, retain the original seed
-    // direction and let the caller's unchanged acceptance gate refuse its peak.
-    qualified.or(best)
+    // Prefer an eligible slope; if none qualifies, retain the original direction
+    // only for initializing a seed, never for accepting a measured point.
+    if seed_fallback {
+        qualified.or(best)
+    } else {
+        qualified
+    }
 }
 
 fn polyfit_slope(x: &[f64], y: &[f64]) -> f64 {
@@ -427,7 +501,8 @@ pub fn ridge_trace(spec: &Spec, seeds: &[(f64, f64)], p: &TraceParams) -> Trace 
             continue;
         }
         let j0 = spec.frame_index(ts);
-        let slope0 = best_slope(spec, j0, fs, 0.0, 25.0, 0.25, p, nb, half).map_or(0.0, |b| b.0);
+        let slope0 =
+            best_slope(spec, j0, fs, 0.0, 25.0, 0.25, p, nb, half, true).map_or(0.0, |b| b.0);
         for dir in [1i64, -1] {
             let (mut ht, mut hf) = (vec![spec.t[j0]], vec![fs]);
             let (mut j, mut misses) = (j0 as i64, 0usize);
@@ -443,7 +518,8 @@ pub fn ridge_trace(spec: &Spec, seeds: &[(f64, f64)], p: &TraceParams) -> Trace 
                     slope0
                 };
                 let f_pred = f_last + slope * (spec.t[ju] - t_last);
-                let res = best_slope(spec, ju, f_pred, slope, 1.0, 0.5, p, nb, half).map(|b| b.1);
+                let res =
+                    best_slope(spec, ju, f_pred, slope, 1.0, 0.5, p, nb, half, false).map(|b| b.1);
                 match res {
                     Some((fhat, snr, z)) if snr >= p.min_snr && z >= p.min_z => {
                         let e = got.entry(ju).or_insert((fhat, snr));
@@ -638,6 +714,49 @@ mod tests {
     }
 
     #[test]
+    fn free_trace_keeps_a_physical_ridge_beside_an_out_of_band_shoulder() {
+        // The aircraft's received frequencies are independently generated from
+        // emission range and radial velocity. A brief broad interfering tone has
+        // its peak outside the seed's search band, but its bright shoulder enters it.
+        let (mut spec, received) = qualified_slope_scene(4.0);
+        let nt = spec.nt();
+        for (row, &frequency) in spec.db.chunks_mut(nt).zip(&spec.f) {
+            for (value, &time) in row.iter_mut().zip(&spec.t) {
+                *value += (80.0
+                    * (-0.5 * ((frequency - 110.0) / 3.0).powi(2)).exp()
+                    * (-0.5 * ((time - 20.0) / 0.6).powi(2)).exp())
+                    as f32;
+            }
+        }
+        let p = TraceParams {
+            integ_s: 1.5,
+            ..Default::default()
+        };
+        let trace = ridge_trace(&spec, &[(20.0, received[200])], &p);
+        let rms = (trace
+            .t
+            .iter()
+            .zip(&trace.f)
+            .map(|(&time, &frequency)| (frequency - received[spec.frame_index(time)]).powi(2))
+            .sum::<f64>()
+            / trace.len().max(1) as f64)
+            .sqrt();
+        eprintln!(
+            "out-of-band shoulder: {} points, {:.3} s, {rms:.6} Hz RMS, endpoints {:?} {:?}",
+            trace.len(),
+            trace.span(),
+            trace.t.first(),
+            trace.t.last()
+        );
+        assert!(trace.t.first().is_some_and(|&t| t <= 12.0));
+        assert!(trace.t.last().is_some_and(|&t| t >= 28.0));
+        assert!(
+            rms < spec.df(),
+            "the trace abandoned the physical ridge: {rms} Hz"
+        );
+    }
+
+    #[test]
     fn slope_selection_preserves_eligible_winners_and_unqualified_seed_directions() {
         // The same physical fixture has a nonzero old winner. A deliberately
         // higher requested SNR leaves every candidate ineligible and must retain
@@ -669,7 +788,18 @@ mod tests {
                 assert!(original.1.1 >= p.min_snr && original.1.2 >= p.min_z);
             }
             assert_eq!(
-                best_slope(&spec, 200, received[200], 0.0, 25.0, 0.25, &p, 24.0, 15),
+                best_slope(
+                    &spec,
+                    200,
+                    received[200],
+                    0.0,
+                    25.0,
+                    0.25,
+                    &p,
+                    24.0,
+                    15,
+                    true
+                ),
                 Some(original)
             );
         }
@@ -681,6 +811,29 @@ mod tests {
         assert!(ridge_trace(&blank, &[(20.0, 100.0)], &p).is_empty());
         blank.db.fill(0.0);
         assert!(ridge_trace(&blank, &[(20.0, 100.0)], &p).is_empty());
+    }
+
+    #[test]
+    fn an_out_of_band_shoulder_can_seed_a_direction_but_never_a_point() {
+        // Use the tracing cadence and full integration context, so the seed's
+        // wide slope scan cannot alias the line between sparsely sampled frames.
+        let (mut spec, _) = qualified_slope_scene(0.0);
+        let nt = spec.nt();
+        for (row, &frequency) in spec.db.chunks_mut(nt).zip(&spec.f) {
+            row.fill((30.0 * (-0.5 * ((frequency - 107.0) / 2.0).powi(2)).exp()) as f32);
+        }
+        let p = TraceParams {
+            integ_s: 1.5,
+            ..Default::default()
+        };
+        let old = ridge_peak(&spec, 200, 100.0, 0.0, p.band, 24.0, 15).unwrap();
+        assert!(old.1 >= p.min_snr && old.2 >= p.min_z, "{old:?}");
+        assert_eq!(
+            best_slope(&spec, 200, 100.0, 0.0, 0.0, 1.0, &p, 24.0, 15, true),
+            Some((0.0, old)),
+        );
+        assert!(best_slope(&spec, 200, 100.0, 0.0, 0.0, 1.0, &p, 24.0, 15, false).is_none());
+        assert!(ridge_trace(&spec, &[(20.0, 100.0)], &p).is_empty());
     }
 
     #[test]
@@ -836,7 +989,10 @@ mod tests {
             // the selected bin and the valley at -1. Mirror both directions.
             let expected = 100.0 - 0.7 * spec.df() * direction;
             let normalized_vertex = 100.0 + spec.df() * direction / 6.0;
-            assert!((normalized.0 - normalized_vertex).abs() < 2e-5, "{normalized:?}");
+            assert!(
+                (normalized.0 - normalized_vertex).abs() < 2e-5,
+                "{normalized:?}"
+            );
             assert!((restored.0 - expected).abs() < 2e-5, "{restored:?}");
             assert_eq!((restored.1, restored.2), (normalized.1, normalized.2));
         }
