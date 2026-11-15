@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve faster aircraft passes with missing ADS-B headings
+
+- Recover a locally supported faster section even when speed is reported without heading.
+  Three consecutive fresh positions must provide agreeing secants, all three positive
+  subsonic speed reports must agree with their adjacent chords, and every available
+  heading must still agree. Keep the existing gap, vertical and velocity limits.
+- Apply the new allowance only to adjacent edges touching a missing heading, after
+  preserving all preceding recovery decisions. Retain the earlier winner, its recovered
+  missing-speed edges and independently supported parts. Missing headings do not become
+  reported velocities; interpolation and report attribution are unchanged.
+- The native regression first fails on the preceding implementation at 25 of 38 retained
+  reports, then keeps all 38 in 24 physical cases across time directions, flight headings,
+  relative/Unix timestamps and missing-heading patterns. Cruise position/velocity and
+  Doppler errors stay below 0.001 in their respective SI units. Mixed-missing recovery
+  preservation and unsupported-motion controls pass too.
+- All 73 active track tests pass in the exact-source native component using the pinned
+  nightly and real dependencies; one timing benchmark is ignored. Full core compilation
+  was SIGKILLed in unchanged `fsci-linalg`; workspace checks, CLI selftest and reference/field
+  replays remain incomplete. No field-accuracy improvement is claimed.
+
 ### Prune distant confirmation flights under certified calm weather
 
 - Restore conservative spatial pruning for calm atmospheres whose sound speed varies

@@ -1441,7 +1441,7 @@ Design notes:
   report or an uncorroborated gap, and the longer chain must retain the preceding winner and
   separately supported parts. Entirely reported and entirely missing legs retain their
   established recovery paths. No search-confidence threshold changes.
-  If that still leaves the track incomplete, a final recovery can cross a valid speed report
+  If that still leaves the track incomplete, another recovery can cross a valid speed report
   inside an otherwise position-only portion, or the boundary where reports stop. Newly
   permitted chords involving a speed report need mutually consistent fresh positions and
   agreement with every available local speed and heading. The preceding winning chain must
@@ -1449,6 +1449,13 @@ Design notes:
   permissions remain available; the new pass can only extend the preceding winner, preserving
   all of its reports and separately supported parts. Complete preceding results stay unchanged,
   and missing velocities remain derived from positions rather than counted as reported measurements.
+  A final recovery also permits missing headings when three consecutive fresh positions give
+  two agreeing secants and all three valid speed reports agree with their adjacent chords.
+  Available headings must still agree as vectors. Only adjacent edges touching a missing
+  heading gain this allowance; infinite headings, conflicting speeds and stale positions
+  cannot justify it. Earlier recovered edges and every preceding winning report remain
+  available. This works even when every heading is missing, without manufacturing reported
+  velocity credit or changing the interpolation model.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
@@ -1963,6 +1970,26 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Preserve a faster pass when speed reports lack headings
+
+`headingless_speeds_preserve_a_supported_faster_pass` supplies a physical flight that accelerates
+from 45 to 145 m/s after a long slow segment. Before the change, the first missing-heading
+case retains only 25 of 38 reports and loses the later flyover. All 24 combinations of two
+timestamp origins, two directions in time, two flight headings, and three heading-availability
+patterns now retain all 38. Reconstructed cruise positions and velocities remain within
+0.001 m and 0.001 m/s of the independent trajectory, and received tones within 0.001 Hz.
+The reported-velocity fraction counts only the reports that actually carry headings.
+
+`headingless_extension_preserves_recovered_missing_speed_edges` checks that recovering
+one incomplete motion component cannot undo an earlier recovery of the other.
+`headingless_speeds_require_fresh_independent_position_support` refuses stale reports,
+conflicting or invalid motion, height jumps, incompatible secants, and a lone fast chord.
+All 73 active native track tests pass, with one timing benchmark ignored, in a component
+that compiles the complete production modules with their real pinned dependencies. The
+full core build was stopped by a SIGKILL in unchanged `fsci-linalg`; full workspace checks,
+CLI selftest and reference/field replays remain incomplete. This is synthetic trajectory
+and propagation evidence, not a measured change in field accuracy.
+
 ### Bound confirmation work under certified calm weather
 
 Two new regressions cover malformed or windy certificates, outward-rounded distance gates,
@@ -2229,8 +2256,9 @@ envelope keeps only 25 of 38 reports in the accelerating baseline, ending covera
 
 Maximum reconstructed position error is 0.0000599 m and maximum received-frequency error
 is 0.00000792 Hz against the analytic trajectories. The new controls retain the earlier
-supported portion while refusing extensions based on one usable speed report, absent or
-wrong headings, supersonic reports or an excessive height jump. Independently supported
+supported portion while refusing extensions based on one usable speed report,
+wrong headings, supersonic reports or an excessive height jump. Missing headings now have
+the separately corroborated recovery described above. Independently supported
 parts retain their original selection in both time directions.
 
 All 62 active native track tests pass; one timing benchmark is intentionally ignored.
