@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover radiosonde lookup from damaged station metadata
+
+- Validate the station index before trusting its cache or publishing a replacement.
+  Missing features, empty listings and entries without usable US station coordinates
+  can refresh online instead of remaining trusted for 30 days. An unusable refresh
+  preserves a valid stale listing for the existing fallback.
+- Keep usable rows beside malformed entries and validate the shared catalogue before
+  applying recording-date eligibility. A valid listing with no historical match remains
+  cached and can serve other dates; existing country and legacy identifier rules stay.
+- Add three regressions using the existing local HTTP fixture and real cache files for
+  refresh, stale preservation, online/offline reuse and mixed valid/invalid entries.
+  Source and exact-change review passed. The execution environment disconnected before
+  native validation; formatting, compilation, tests, selftest and field replays remain
+  unverified. No accuracy or complete quality-gate pass is claimed.
+
 ### Preserve accepted speed and distance alternatives in fit/search ranges
 
 - Union every already accepted profile solution into the exported speed and distance

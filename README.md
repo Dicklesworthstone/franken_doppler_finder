@@ -1261,6 +1261,13 @@ complete cells. This counts coverage, not geographic accuracy. New partial respo
 A window ending after 23:00 UTC requests the following midnight; an offline run needs that covering
 response cached. Complete-grid descriptions count retained hours rather than every downloaded hour.
 
+Radiosonde station listings are validated before a cache hit or replacement is accepted.
+Missing or empty feature lists and listings without usable US station coordinates trigger
+an online refresh instead of disabling radiosonde lookup for the 30-day cache lifetime.
+An unusable refresh leaves a valid stale listing available. Invalid individual entries are
+skipped; a valid catalogue with no stations covering the requested dates remains reusable
+for other dates.
+
 Radiosonde selection first keeps the existing nearby-station blend. If none of those stations
 has a usable sounding, it tries the next-nearest stations within 700 km until one supplies usable
 profiles. Preferred and recovery attempts share the existing limit of four stations; a working
@@ -1947,6 +1954,14 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover radiosonde lookup from an unusable station-index cache
+
+The station-index regressions exercise the production cache path with temporary files and
+the existing local HTTP fixture: damaged-cache refresh, preservation of a valid stale index
+after a malformed refresh, online/offline reuse, historical empty selections, and valid
+stations alongside malformed entries. They have not run: the execution environment became
+unavailable before native validation. No field-accuracy or full-workspace pass is claimed.
 
 ### Retain accepted fit geometry in the exported search bounds
 

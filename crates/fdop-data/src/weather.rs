@@ -64,18 +64,6 @@ fn date_str(t: f64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// GET a JSON document through the cache. `max_age_s`: re-fetch cached copies older than this.
-fn get_cached(
-    url: &str,
-    cache: &Path,
-    offline: bool,
-    timeout_s: u64,
-    max_age_s: Option<f64>,
-    retries: u32,
-) -> Result<serde_json::Value, DataError> {
-    get_cached_validated(url, cache, offline, (timeout_s, max_age_s, retries), Ok)
-}
-
 /// Validate the requested weather before trusting or replacing its cache. A response may
 /// contain useful hours outside this request, so a failed refresh preserves the old bytes.
 fn get_cached_validated<T>(
@@ -556,23 +544,40 @@ fn raob_stations(
     offline: bool,
     window: (f64, f64),
 ) -> Result<Vec<(String, f64, f64, f64)>, DataError> {
-    let v = get_cached(
-        IEM_RAOB_NETWORK,
+    raob_stations_from(IEM_RAOB_NETWORK, cache, offline, window)
+}
+
+fn raob_stations_from(
+    url: &str,
+    cache: &Path,
+    offline: bool,
+    window: (f64, f64),
+) -> Result<Vec<(String, f64, f64, f64)>, DataError> {
+    let parse = |v| parse_raob_stations(v, window);
+    get_cached_validated(
+        url,
         cache,
         offline,
-        30,
-        Some(30.0 * 86400.0),
-        1,
+        (30, Some(30.0 * 86400.0), 1),
+        parse,
     )
     .or_else(|e| {
-        // a stale copy beats none
-        get_cached(IEM_RAOB_NETWORK, cache, true, 30, None, 0).map_err(|_| e)
-    })?;
+        // A valid stale index beats none, but an unusable refresh must not replace
+        // it before this fallback gets to read the previously published bytes.
+        get_cached_validated(url, cache, true, (30, None, 0), parse).map_err(|_| e)
+    })
+}
+
+fn parse_raob_stations(
+    v: serde_json::Value,
+    window: (f64, f64),
+) -> Result<Vec<(String, f64, f64, f64)>, DataError> {
     let feats = v
         .get("features")
         .and_then(|f| f.as_array())
         .ok_or_else(|| DataError::new("RAOB network: no features"))?;
     let mut out = Vec::new();
+    let mut usable = false;
     for f in feats {
         let id = f.get("id").and_then(|x| x.as_str()).unwrap_or("");
         let pr = &f["properties"];
@@ -587,7 +592,6 @@ fn raob_stations(
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
             && us_station)
-            || !raob_station_overlaps(pr, window)
         {
             continue;
         }
@@ -596,7 +600,13 @@ fn raob_stations(
             c[0].as_f64().unwrap_or(f64::NAN),
             c[1].as_f64().unwrap_or(f64::NAN),
         );
-        if la.is_finite() && lo.is_finite() {
+        if !((-90.0..=90.0).contains(&la) && (-180.0..=180.0).contains(&lo)) {
+            continue;
+        }
+        // Cache validity is independent of the recording date. A real station
+        // outside this window still makes the shared index usable for other dates.
+        usable = true;
+        if raob_station_overlaps(pr, window) {
             out.push((
                 id.to_string(),
                 la,
@@ -604,6 +614,9 @@ fn raob_stations(
                 pr.get("elevation").and_then(|x| x.as_f64()).unwrap_or(0.0),
             ));
         }
+    }
+    if !usable {
+        return Err(DataError::new("RAOB network: no usable US stations"));
     }
     Ok(out)
 }
@@ -1810,6 +1823,129 @@ mod tests {
         assert_eq!(
             old.medium(lat, lon, day + 7200.0, 30.0, 5000.0),
             parse(partial, 2.0).unwrap().medium(lat, lon, day + 7200.0, 30.0, 5000.0)
+        );
+    }
+
+    fn raob_station_index_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "features": [{
+                "id": "KOLD",
+                "properties": {
+                    "country": "US", "elevation": 100.0,
+                    "archive_begin": "2020-01-01", "archive_end": "2026-09-08",
+                },
+                "geometry": {"coordinates": [-73.524951, 40.876466]},
+            }],
+        })
+    }
+
+    #[test]
+    fn cached_station_indexes_refresh_unusable_metadata() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let window = (day, day + 43_200.0);
+        let complete = raob_station_index_fixture();
+        let expected = vec![("KOLD".to_string(), 40.876466, -73.524951, 100.0)];
+        for incomplete in [
+            serde_json::json!({"features": null}),
+            serde_json::json!({"features": []}),
+            serde_json::json!({"features": [null, false, 17]}),
+            serde_json::json!({"features": [{
+                "id": "KAAA", "properties": {"country": "US"},
+                "geometry": {"coordinates": [-73.524951, 91.0]},
+            }]}),
+        ] {
+            let (url, server) = serve_weather_once(&complete);
+            let (dir, path) = weather_test_cache(&url, "station-index");
+            let prior = serde_json::to_vec(&incomplete).unwrap();
+            std::fs::write(&path, &prior).unwrap();
+            assert!(raob_stations_from(&url, &dir, true, window).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), prior);
+            assert_eq!(
+                raob_stations_from(&url, &dir, false, window).unwrap(),
+                expected
+            );
+            server.join().unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                serde_json::to_vec(&complete).unwrap()
+            );
+            assert!(!path.with_extension("fail").exists());
+            // The one-shot server is gone. A valid index is reused without a request,
+            // even for dates outside every station's lifetime, and still serves history.
+            for offline in [false, true] {
+                assert!(
+                    raob_stations_from(
+                        &url,
+                        &dir,
+                        offline,
+                        (day + 86_400.0, day + 129_600.0),
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+                assert_eq!(
+                    raob_stations_from(&url, &dir, offline, window).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_station_index_refresh_preserves_valid_stale_metadata() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let window = (day, day + 43_200.0);
+        let complete = raob_station_index_fixture();
+        let expected = vec![("KOLD".to_string(), 40.876466, -73.524951, 100.0)];
+        for incomplete in [
+            serde_json::json!({"features": {}}),
+            serde_json::json!({"features": []}),
+        ] {
+            let (url, server) = serve_weather_once(&incomplete);
+            let (dir, path) = weather_test_cache(&url, "station-index-stale");
+            let prior = serde_json::to_vec(&complete).unwrap();
+            std::fs::write(&path, &prior).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+                .unwrap();
+            assert_eq!(
+                raob_stations_from(&url, &dir, false, window).unwrap(),
+                expected
+            );
+            server.join().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), prior);
+            assert!(!path.with_extension("fail").exists());
+            assert_eq!(
+                raob_stations_from(&url, &dir, true, window).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn station_indexes_keep_valid_rows_beside_invalid_entries() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let mut listing = raob_station_index_fixture();
+        let features = listing["features"].as_array_mut().unwrap();
+        let valid = features[0].clone();
+        for (id, country, lat, lon) in [
+            ("KLOC", "US", 40.876466, 181.0),
+            ("KLOC", "US", -91.0, -73.524951),
+            ("bad", "US", 40.876466, -73.524951),
+            ("KCAN", "CA", 40.876466, -73.524951),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["id"] = serde_json::json!(id);
+            invalid["properties"]["country"] = serde_json::json!(country);
+            invalid["geometry"]["coordinates"] = serde_json::json!([lon, lat]);
+            features.push(invalid);
+        }
+        assert_eq!(
+            parse_raob_stations(listing, (day, day + 43_200.0)).unwrap(),
+            vec![("KOLD".to_string(), 40.876466, -73.524951, 100.0)]
         );
     }
 
