@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover supported curve-match locations around rejected coarse centres
+
+- A coarse centre rejected by exact scoring no longer discards its whole retained
+  neighbourhood. Search that existing bounded disc before requiring a point from which
+  to climb. Preserve successful centres' clocks, scores and refinement priority.
+- Retry failed selected centres only in otherwise unspent refinement slots, in coarse
+  order; failed attempts consume slots. Apply the same recovery, unchanged scorer,
+  physical polish and final ranking to real and decoy clock windows.
+- A native two-flight PCM regression changes no candidate into a location 55.813 m from
+  the synthetic observer with -0.5 s clock error and two heard passes. Disabled-refinement,
+  region, unsupported-terrain, blank-audio and decoy-symmetry controls pass. The existing
+  alternative-clock three-flight regression also passes.
+- The existing single-move-refinement negative control fails with exactly the same values
+  on pristine preceding source and this change; its actual recovery assertions pass.
+  Keep that failure visible without weakening assertions. Native component evidence uses
+  complete source modules and pinned dependencies; workspace checks, CLI selftest and
+  reference/field replays remain incomplete. No field-accuracy change is claimed.
+
 ### Reuse completed flight downloads after narrowing the search region
 
 - After the exact raw checkpoint is unavailable, try completed same-feed checkpoints

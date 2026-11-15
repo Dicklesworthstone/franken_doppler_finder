@@ -498,6 +498,12 @@ in `crates/fdop-core/src/curvematch.rs`:
   on a 100 m grid before it is climbed to 25 m. A close pass with no energy costs evidence, as in the trace
   search, and one audio event can credit only one flight. This recovers clock alternatives at selected
   places; the existing spatial shortlist still limits which places reach exact scoring.
+  A selected centre that fails exact scoring can still hide a supported point in that disc,
+  for example where fine terrain differs from the coarse model. After preserving every
+  successful centre's rank and refinement allowance, otherwise unused refinement slots
+  try rejected centres in coarse-vote order at their original coarse clocks. Failed attempts
+  consume slots too. The same bounded disc search runs for real and decoy windows; region,
+  physical reach, hearing thresholds and the four-place refinement budget remain in force.
   If two trajectories initially prefer the same bright tone, the original strongest-tone assignment
   finishes before recovery looks for a distinct, unclaimed peak for the rejected trajectory. A recovered
   peak must clear the existing 6.9-nat heard threshold and timing penalty, with the same coverage, type
@@ -1976,6 +1982,25 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover a supported location around a rejected coarse centre
+
+`rejected_center_disc_recovers_two_physical_passes` synthesizes harmonic PCM from two
+perpendicular 70 m/s aircraft passes. Fine and coarse terrain differ, so the selected
+coarse centre has no eligible exact pass even though its retained disc contains the
+observer. The preceding implementation returns no modes while the observer's two passes
+already exceed the unchanged hearing threshold. The new search recovers both passes
+55.813 m from the synthesized observer, with a -0.5 s clock error.
+
+The same native test keeps disabled refinement, clipped regions, wholly unsupported
+terrain and blank PCM empty, and checks identical recovery at a shifted decoy clock.
+`alternative_clock_peaks_recover_the_three_flight_recording` also passes its existing
+three-flight, 200 m location and clock requirements. The historical negative control in
+`refinement_climbs_from_a_start_beyond_one_move_per_scale` fails identically on the changed
+and pristine preceding source: the older single-move method already reaches 106.196 m
+there. Its actual recovery assertions pass; no assertion was weakened. These tests use
+complete production modules and real pinned dependencies in the native component.
+Full workspace checks, CLI selftest and reference/field replays remain incomplete.
 
 ### Reuse a completed raw feed after narrowing the search region
 

@@ -2215,14 +2215,16 @@ fn refine_point(
     lon: f64,
     clock: f64,
 ) -> Option<(f64, f64, Exact)> {
-    let mut cur = (lat, lon, score_exact(inp, p, bank, idx, lat, lon, clock)?);
+    let mut cur = score_exact(inp, p, bank, idx, lat, lon, clock).map(|e| (lat, lon, e));
     // The whole disc the start stands for, on the first (coarsest) step, before any climbing: the
     // coarse vote picks one cell per disc, and a sharper peak elsewhere in it can sit across a
     // valley. As in the climb, each point sweeps the clock around the start's (`clock_sweep_frames`) and
-    // the best point brings its own clock.
+    // the best point brings its own clock. A centre rejected by the fine terrain or physical
+    // pass checks still represents its disc; nearby points must get the same search.
     if let Some(&step) = p.refine_steps_m.first() {
         let (mlat, mlon) = m_per_deg(lat);
         let (dla, dlo) = (step / mlat, step / mlon);
+        let scan_clock = cur.as_ref().map_or(clock, |c| c.2.clock);
         let best = disc_offsets(p.nms_m, step)
             .into_par_iter()
             .filter_map(|(i, j)| {
@@ -2230,15 +2232,16 @@ fn refine_point(
                 if !inp.region.contains(la, lo) {
                     return None;
                 }
-                score_exact(inp, p, bank, idx, la, lo, cur.2.clock).map(|e| (la, lo, e))
+                score_exact(inp, p, bank, idx, la, lo, scan_clock).map(|e| (la, lo, e))
             })
             .max_by(|a, b| a.2.evidence.total_cmp(&b.2.evidence));
         if let Some(b) = best
-            && b.2.evidence > cur.2.evidence
+            && cur.as_ref().is_none_or(|c| b.2.evidence > c.2.evidence)
         {
-            cur = b;
+            cur = Some(b);
         }
     }
+    let mut cur = cur?;
     for &step in &p.refine_steps_m {
         for _ in 0..refine_moves(p.nms_m, step) {
             let (mlat, mlon) = m_per_deg(cur.0);
@@ -3059,6 +3062,17 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
             .flatten()
             .collect();
         scored.sort_by(|a, b| b.2.evidence.total_cmp(&a.2.evidence).then(a.0.cmp(&b.0)));
+        // Keep every successful centre's rank and refinement allowance. A rejected centre
+        // can hide a valid point in its retained disc, so use only otherwise vacant slots
+        // to try those discs in coarse order. Taking slots before scoring counts failed
+        // attempts too, and the same bounded recovery runs in every decoy window.
+        let recover: Vec<_> = chosen
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| scored.iter().all(|(j, _, _)| i != j))
+            .take(p.refine_modes.saturating_sub(scored.len()))
+            .map(|(_, m)| m)
+            .collect();
         let mut modes: Vec<MatchMode> = scored
             .into_par_iter()
             .enumerate()
@@ -3094,6 +3108,34 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
                 })
             })
             .collect();
+        modes.extend(
+            recover
+                .into_par_iter()
+                .filter_map(|m| {
+                    let (la, lo, e) = refine_point(
+                        &window,
+                        p,
+                        &bank,
+                        &keep,
+                        m.1,
+                        m.2,
+                        bin_clock(m.0.bin as usize).clamp(window.start_lo, window.start_hi),
+                    )?;
+                    let (la, lo, e) = polish_point(&window, p, &bank, &keep, la, lo, e);
+                    Some(MatchMode {
+                        lat: la,
+                        lon: lo,
+                        clock_unix: e.clock,
+                        coarse: m.0.coarse as f64,
+                        evidence: e.evidence,
+                        r50_m: e.r50_m,
+                        n_heard: e.n_heard,
+                        n_unheard_close: e.n_close,
+                        passes: e.passes,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
         modes.sort_by(|a, b| b.evidence.total_cmp(&a.evidence));
         // climbing can bring two starts to one place; the runner-up must be somewhere else
         let mut distinct: Vec<MatchMode> = Vec::with_capacity(modes.len());
@@ -5550,6 +5592,140 @@ mod tests {
             r.decoy_margin,
             r0.decoy_margin
         );
+    }
+
+    #[test]
+    fn rejected_center_disc_recovers_two_physical_passes() {
+        let heard = [
+            ([700.0, 0.0, 700.0], [0.0, 70.0, 0.0], 90.0),
+            ([0.0, 700.0, 700.0], [70.0, 0.0, 0.0], 240.0),
+        ];
+        let tracks = heard
+            .iter()
+            .enumerate()
+            .map(|(i, &(pos, vel, cpa))| {
+                let mut tr = scene_track(pos, vel, cpa, -150.0, 500.0);
+                tr.key = format!("disc-{i}");
+                tr.icao = tr.key.clone();
+                tr
+            })
+            .collect();
+        let c = scene_for(tracks, 600.0, 900.0);
+        let p = MatchParams {
+            v_grid: vec![70.0],
+            d_grid: vec![700.0, 900.0, 1100.0],
+            reach_m: 1100.0,
+            cell_m: 200.0,
+            nms_m: 1000.0,
+            top_modes: 1,
+            refine_modes: 1,
+            decoy_span_s: 0.0,
+            tone_prior: false,
+            r50_m: vec![1000.0],
+            ..Default::default()
+        };
+        // Coarse terrain can differ from the fine DEM on a hillside. Here its
+        // strongest vote lies southwest of the microphone, where both actual
+        // passes are outside reach. The same retained disc includes the real
+        // observer and its two ordinary, independently synthesized Doppler curves.
+        let coarse_dem = FlatElevation(500.0);
+        let fine_dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &c.tracks,
+            region: c.region,
+            start_lo: c.clock - 15.0,
+            start_hi: c.clock + 15.0,
+            duration_s: c.x.len() as f64 / 2800.0,
+            catalog: (f64::NEG_INFINITY, f64::INFINITY),
+            dem: &coarse_dem,
+            fine_dem: &fine_dem,
+            atmo: &atmo,
+        };
+        let bank = build_bank(&im, &p);
+        let idx: Vec<_> = c
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
+        let truth = score_exact(&inp, &p, &bank, &idx, c.lat, c.lon, c.clock)
+            .expect("the observed physical pair must be in reach");
+        assert_eq!(truth.n_heard, 2);
+        let result = run(&inp, &p, &|line| eprintln!("{line}"));
+        let top = result
+            .modes
+            .first()
+            .expect("a rejected center must not erase its supported disc");
+        let error = haversine_m(top.lat, top.lon, c.lat, c.lon);
+        eprintln!("rejected center: error {error} m, mode {top:?}");
+        assert_eq!(top.n_heard, 2);
+        assert!(error < 200.0, "recovered {error} m from the physical observer");
+        assert!((top.clock_unix - c.clock).abs() < 2.0);
+
+        // The recovery consumes an existing refinement slot. Disabling refinement
+        // must preserve the original empty result, even with these same strong curves.
+        let disabled = MatchParams {
+            refine_modes: 0,
+            ..p.clone()
+        };
+        assert!(run(&inp, &disabled, &|_| {}).modes.is_empty());
+
+        // An ineligible centre is not permission to leave the requested region or
+        // invent a pass where the entire disc is outside the physical reach.
+        let (mlat, mlon) = m_per_deg(c.lat);
+        let clipped = MatchInputs {
+            region: BBox::new(
+                c.lat - 600.0 / mlat,
+                c.lon - 600.0 / mlon,
+                c.lat - 300.0 / mlat,
+                c.lon - 300.0 / mlon,
+            ),
+            ..inp
+        };
+        assert!(run(&clipped, &p, &|_| {}).modes.is_empty());
+        let out_of_reach = FlatElevation(2500.0);
+        let unsupported = MatchInputs {
+            fine_dem: &out_of_reach,
+            ..inp
+        };
+        assert!(run(&unsupported, &p, &|_| {}).modes.is_empty());
+
+        // Identical recovery at a decoy clock: changing the flights' dates cannot
+        // grant the real window a search advantage over its empirical controls.
+        let shift = inp.start_hi - inp.start_lo + p.decoy_guard_s;
+        let mut shifted = c.tracks.clone();
+        for tr in &mut shifted {
+            for t in &mut tr.t {
+                *t += shift;
+            }
+        }
+        let decoy_inp = MatchInputs {
+            tracks: &shifted,
+            ..inp
+        };
+        let decoy_p = MatchParams {
+            decoy_span_s: shift,
+            ..p.clone()
+        };
+        let decoy_result = run(&decoy_inp, &decoy_p, &|_| {});
+        let decoy = decoy_result
+            .decoys
+            .iter()
+            .find(|d| (d.shift_s - shift).abs() < 1e-6)
+            .expect("the shifted true clock is a decoy window");
+        assert_eq!(decoy.n_heard, 2);
+        assert!((decoy.best_evidence - top.evidence).abs() < 1e-6);
+        assert!(haversine_m(decoy.lat, decoy.lon, top.lat, top.lon) < 1.0);
+
+        let blank = build_image(&vec![0.0; c.x.len()], 2800, &p).unwrap();
+        let blank_inp = MatchInputs {
+            image: &blank,
+            ..inp
+        };
+        assert!(run(&blank_inp, &p, &|_| {}).modes.is_empty());
     }
 
     /// A climb that starts 600 m from the observer (420 m north, 430 m west: past the 350 m on
