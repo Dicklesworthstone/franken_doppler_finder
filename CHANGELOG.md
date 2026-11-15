@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve fitted tone alternatives through the search handoff
+
+- Carry the fitter's generous tone range into `SearchEvent`, using the smallest symmetric
+  allowance centred on the best tone that contains the profile and the existing 4 Hz / 4%
+  minimum. Short-arc alternatives admitted by the fit can reach exact trace scoring and
+  confirmation; constrained profiles retain the original tolerance bit-for-bit.
+- Keep the fitted tone, model flags, residual scale, coverage penalties, confidence
+  thresholds and atmospheric source-tone conversion unchanged. The same interval reaches
+  quick, fine, confirmation, refinement and chance-calibration scoring.
+- Add a physical short-arc regression with both lower and higher admitted source tones,
+  relative and Unix clocks, the actual measured-event adapter and an explicit comparison
+  against the previous clipped allowance. Add a long-arc control for unchanged behavior.
+- Nine focused tests pass in the full native core executable using the pinned nightly's
+  official Cranelift backend and real dependencies: both new regressions, source-tone,
+  robust-tone, measured-wind and two-flyover controls. All four new short-arc cases
+  retain full coverage and exact chi below 0.55; the old-tolerance counterfactual refuses
+  every case. The long-arc control preserves the original tolerance bits. The ordinary
+  LLVM test build was SIGKILLed during code generation. The tested search, fitting, tracking
+  and propagation sources remain unchanged after integrating the independent curve-match
+  commit `6c7891e`. Full workspace checks, CLI selftest
+  and reference/field replays are incomplete; no field-accuracy improvement is claimed.
+
 ### Recover supported curve-match locations around rejected coarse centres
 
 - A coarse centre rejected by exact scoring no longer discards its whole retained
@@ -55,7 +77,9 @@ at that commit, not per-change commits.
 - Source review, formatting of changed Rust hunks and whitespace checks pass. The
   pinned native component compiled the complete production raw-cache, build and ingest
   modules with real dependencies: all 59 tests passed, including the three new covering-cache
-  regressions. The complete fetch integration test, workspace checks, CLI selftest and
+  regressions. The same new tests on the preceding loader reproduce both positive recovery
+  failures while the incompatible-identity control still passes. The complete fetch
+  integration test, workspace checks, CLI selftest and
   reference/field replays remain unexecuted; no field-accuracy improvement is claimed.
 
 ### Preserve faster aircraft passes with missing ADS-B headings

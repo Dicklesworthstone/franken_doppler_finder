@@ -42,6 +42,7 @@ pub struct SearchEvent {
     pub d_gate: [f64; 2],
     /// Tone (Hz) fitted in still air; wind converts this to a candidate's emitted tone.
     pub f0: f64,
+    /// Symmetric half-width containing the generous tone profile and the search's minimum.
     pub f0_tol: f64,
     /// Trace noise scale used to normalise residuals (Hz).
     pub sigma_hz: f64,
@@ -101,6 +102,13 @@ impl SearchEvent {
         let b = fr.best;
         let g = &fr.ranges_generous;
         let t_tol = (b.t0r - g.t0r[0]).max(g.t0r[1] - b.t0r).max(1.0);
+        // Short arcs can admit tones beyond the best fit's usual allowance. Keep
+        // the smallest symmetric interval containing that floor and the profile,
+        // so exact trace scoring cannot discard an already admitted alternative.
+        let f0_tol = (0.04 * b.f0)
+            .max(4.0)
+            .max(b.f0 - g.f0[0])
+            .max(g.f0[1] - b.f0);
         let misfit = fr.warnings.iter().any(|w| {
             w.starts_with("model misfit") || w.starts_with("approach/recede sides disagree")
         });
@@ -124,7 +132,7 @@ impl SearchEvent {
             v_gate: [(g.v[0] - wind_mps).max(5.0), g.v[1] + wind_mps],
             d_gate: [g.d[0].max(30.0), g.d[1]],
             f0: b.f0,
-            f0_tol: (0.04 * b.f0).max(4.0),
+            f0_tol,
             // trace noise plus a model-error floor (ADS-B position/velocity error, residual
             // atmosphere error): 0.2 % of f0
             sigma_hz: (b.rmse * b.rmse + (0.002 * b.f0).powi(2)).sqrt().max(0.12),
@@ -8475,6 +8483,210 @@ mod tests {
                 check_wind_delayed_case(&case, medium, run_case(&case, medium));
             }
         }
+    }
+
+    fn profiled_tone_measurement(half: i32) -> MeasuredEvent {
+        use crate::detect::Detection;
+        use crate::fit::{Side, fit_constant_velocity};
+        use crate::measure::EventQuality;
+        use crate::trace::Trace;
+
+        let (c, emitted, speed, distance) = (343.0, 112.0, 100.0, 7000.0);
+        let mut trace = Trace::default();
+        for k in -half..=half {
+            // Independent emission times, ranges and radial velocities generate
+            // the observations; fitting does not generate its own expected curve.
+            let tau = 0.2 * k as f64;
+            let range = (distance * distance + speed * speed * tau * tau).sqrt();
+            trace.t.push(1000.0 + tau + range / c);
+            trace.f.push(
+                emitted * c / (c + speed * speed * tau / range)
+                    + 0.2 * (1.731 * k as f64 + 0.37).sin(),
+            );
+            trace.snr.push(20.0);
+        }
+        let fit = fit_constant_velocity(&trace.t, &trace.f, c, Side::Both).unwrap();
+        let b = fit.best;
+        let approach = b.t0r - trace.t[0];
+        let recede = trace.t.last().unwrap() - b.t0r;
+        // This ridge has one continuous stretch through the central 80% of
+        // the model's drop. Verify the production continuity limits, then use
+        // its endpoint medians rather than letting noisy extrema claim support.
+        let central: Vec<_> = trace
+            .t
+            .iter()
+            .zip(&trace.f)
+            .filter_map(|(&t, &f)| {
+                let model = cv_curve(t, b.f0, b.v, b.d, b.t0e, c);
+                (0.1..=0.9)
+                    .contains(&((fit.f_pre - model) / (fit.f_pre - fit.f_post)))
+                    .then_some((t, f, f - model))
+            })
+            .collect();
+        assert!(central.len() >= 5);
+        assert!(
+            central
+                .windows(2)
+                .all(|p| p[1].0 - p[0].0 <= 3.0 && (p[1].2 - p[0].2).abs() <= 2.0)
+        );
+        let wing = (central.len() / 4).clamp(2, 10);
+        let mut first: Vec<_> = central[..wing].iter().map(|p| p.1).collect();
+        let mut last: Vec<_> = central[central.len() - wing..]
+            .iter()
+            .map(|p| p.1)
+            .collect();
+        let drop = (crate::spectro::median_f64(&mut first) - crate::spectro::median_f64(&mut last))
+            .max(0.0)
+            / (0.8 * (fit.f_pre - fit.f_post));
+        // Search-level trace evidence, not a detection/PCM claim. Keep the
+        // measurement prerequisites and the actual fitter's warnings intact.
+        assert_eq!(fit.diagnostics.n_inliers, trace.len());
+        assert!(trace.len() >= 80 && approach > 8.0 && recede > 8.0 && drop > 0.15);
+        assert!(b.rmse < 0.2 && (28.0..=0.8 * c).contains(&b.v));
+        assert!((200.0..=25_000.0).contains(&b.d));
+        let measured = MeasuredEvent {
+            id: "profiled-tone".into(),
+            detection: Detection {
+                id: 0,
+                t0r: b.t0r,
+                f0: b.f0,
+                v: b.v,
+                d: b.d,
+                score: 10.0,
+                score_approach: 10.0,
+                score_recede: 10.0,
+                half_s: 0.2 * half as f64,
+                harmonic_of: None,
+                harmonics: vec![],
+                from_contrast: false,
+            },
+            quality: EventQuality {
+                n_points: trace.len(),
+                span_approach_s: approach,
+                span_recede_s: recede,
+                drop_traversed: drop,
+                median_snr_db: 20.0,
+                rmse_hz: b.rmse,
+                score: 20.0 * fit.diagnostics.n_eff.sqrt(),
+                ok: true,
+                reseeded: false,
+                reasons: vec![],
+            },
+            fit: Some(fit),
+            trace,
+            win_s: 1.0,
+            spec: None,
+        };
+        assert!(measured.is_aircraft_like());
+        measured
+    }
+
+    #[test]
+    fn accepted_tone_profiles_reach_exact_search_and_confirmation() {
+        let measured = profiled_tone_measurement(60);
+        let fit = measured.fit.as_ref().unwrap();
+        let event = SearchEvent::from_measured(&measured, 0.0).unwrap();
+        assert!(!event.misfit, "keep the actual measured model flags");
+        let mut original = event.clone();
+        original.f0_tol = (0.04 * event.f0).max(4.0);
+        let cutoff = fit.best.rmse.powi(2)
+            * fit.diagnostics.n_inliers as f64
+            * (1.0 + fit.diagnostics.delta);
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let dem = FlatElevation(0.0);
+        let prop = Prop::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let o = observer(lat, lon, &dem);
+        // These independent, physically plausible nuisance solutions fit the
+        // observed short arc inside its existing F-test cutoff. Their received
+        // centres need not coincide with the best straight-line estimate.
+        for epoch in [0.0, 1_783_000_000.0] {
+            for (emitted, distance, emission_cpa, direction) in [
+                (106.0, 4585.79779005_f64, 1020.490183, 1.0),
+                (118.0, 3722.62333651_f64, 997.95705647, -1.0),
+            ] {
+                let tr = straight_track(
+                    &enu,
+                    [
+                        0.0,
+                        (distance * distance - 1000.0_f64.powi(2)).sqrt(),
+                        1000.0 + MIC_HEIGHT_M,
+                    ],
+                    [direction * 80.0, 0.0, 0.0],
+                    epoch + emission_cpa,
+                    epoch + 700.0,
+                    epoch + 1400.0,
+                    2.0,
+                );
+                let cpa = tr
+                    .cpa_nearest_time(o.x, epoch + emission_cpa, 30.0)
+                    .unwrap();
+                let sse: f64 = event
+                    .tr_t
+                    .iter()
+                    .zip(&event.tr_f)
+                    .map(|(&t, &f)| {
+                        let ratio = tr.solve_emission_p(epoch + t, o.x, &prop, None).unwrap().2;
+                        (emitted * ratio - f).powi(2)
+                    })
+                    .sum();
+                assert!(sse < cutoff, "{emitted} Hz: accepted SSE {sse} < {cutoff}");
+                assert!((fit.ranges_generous.f0[0]..=fit.ranges_generous.f0[1]).contains(&emitted));
+                assert!((emitted - event.f0).abs() > original.f0_tol);
+                assert!(gates_ok(&event, &cpa, &prop, 0.0));
+                let tracks = [tr];
+                let index = TimeIndex::new(&tracks);
+                let p = SearchParams::new(
+                    epoch,
+                    epoch,
+                    1200.0,
+                    BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01),
+                );
+                assert!(
+                    best_confirmer(&o, epoch, &original, &tracks, &index, &p, &atmo, &[]).is_none(),
+                    "the old point-estimate tone clip must lose this admitted trajectory"
+                );
+                let (chi, matched, ti) =
+                    best_confirmer(&o, epoch, &event, &tracks, &index, &p, &atmo, &[])
+                        .expect("an accepted tone alternative must reach exact confirmation");
+                assert_eq!(ti, 0);
+                assert!(chi < 1.0 && matched.coverage == 1.0);
+                assert!((matched.f0 - emitted).abs() < 0.01);
+                let assign = [(0, 0, cpa.t_e)];
+                let point = eval_point(
+                    &o,
+                    &assign,
+                    std::slice::from_ref(&event),
+                    &tracks,
+                    &p,
+                    &atmo,
+                    true,
+                    true,
+                    false,
+                )
+                .expect("the same profiled tone must reach the fine search");
+                assert!(point.chis[0].chi < 1.0 && point.chis[0].cov == 1.0);
+                eprintln!(
+                    "profile tone {emitted} Hz epoch {epoch}: admitted SSE {sse:.6}/{cutoff:.6}, exact chi {chi:.6}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_tone_profile_keeps_the_existing_search_tolerance() {
+        let measured = profiled_tone_measurement(400);
+        let fit = measured.fit.as_ref().unwrap();
+        let event = SearchEvent::from_measured(&measured, 0.0).unwrap();
+        let original = (0.04 * event.f0).max(4.0);
+        assert!(
+            fit.ranges_generous
+                .f0
+                .iter()
+                .all(|f| (f - event.f0).abs() < original)
+        );
+        assert_eq!(event.f0_tol.to_bits(), original.to_bits());
     }
 
     // Supply a synthetic traced ridge to the actual fitter and measured-event adapter.

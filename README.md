@@ -334,6 +334,15 @@ and refined matches, including the allowed tone change for model-misfit events.
 Calm-air intervals stay unchanged. This preserves the existing tolerance instead of discarding
 a physically supported windy pass because its source tone lies outside the unconverted interval.
 
+The measurement-to-search handoff also retains the fitter's generous tone profile.
+The permitted interval is centred on the best fitted tone and is the smallest symmetric
+one containing both that profile and the existing minimum allowance of 4 Hz or 4% of
+the best fitted tone, whichever is larger.
+A short observed arc can support physically different tones beyond that minimum; those
+alternatives now reach exact scoring and confirmation. A tightly constrained profile
+keeps the original allowance exactly. This changes no residual, coverage or confidence
+threshold, and the candidate's wind conversion still applies to the whole interval.
+
 The speed and distance intervals from a still-air fit also require separate wind conversions.
 Exact candidate checks now predict both fitted quantities from the aircraft's physical CPA and
 compare them with the measured intervals. A common first-order factor could exclude the true
@@ -1983,6 +1992,31 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Carry fitted tone uncertainty through exact search
+
+`accepted_tone_profiles_reach_exact_search_and_confirmation` generates an independent
+112 Hz physical pass with fixed frequency scatter, runs the real constant-velocity fitter,
+and preserves its actual model flags. A 24-second observed arc admits both 106 Hz and
+118 Hz alternatives under the existing profile cutoff. The regression compares the old
+point-estimate allowance with the corrected measured-event conversion at relative and
+Unix timestamps, through exact confirmation and fine-point scoring. The long-arc control
+`constrained_tone_profile_keeps_the_existing_search_tolerance` requires bit-identical
+allowance when the profile fits inside the existing minimum.
+
+All nine focused core tests pass in the full native `fdop-core` test executable built with
+the pinned nightly's official Cranelift backend and real dependencies: both new regressions,
+two source-tone controls, two robust-tone controls, the measured windy pair search, and
+two existing two-flyover tests. All four new short-arc cases have full coverage and exact
+chi below 0.55; the old allowance refuses each one. The long-arc control preserves the
+tolerance bits. The executable predates the independent `6c7891e` curve-match change;
+the tested search, fitting, tracking and propagation sources and dependency pins were
+verified unchanged when that commit was integrated.
+
+The ordinary LLVM test build was SIGKILLed during native code generation. The new
+regressions are search-level trace fixtures, not detection from audio, end-to-end
+geolocation or field-accuracy evidence. Full workspace checks, CLI selftest and
+reference/field replays remain incomplete.
+
 ### Recover a supported location around a rejected coarse centre
 
 `rejected_center_disc_recovers_two_physical_passes` synthesizes harmonic PCM from two
@@ -2018,6 +2052,8 @@ and reviewed. All 59 tests passed in a native component compiling the complete p
 raw-cache, build and ingest modules with the real pinned dependencies, including all nine
 raw-cache tests and the three new covering-cache regressions. The complete fetch integration
 test has not run; neither field-accuracy nor full-workspace success is claimed here.
+Compiling the same new tests against the preceding raw loader reproduces both positive
+recovery failures; the incompatible-identity refusal control continues to pass.
 
 ### Preserve a faster pass when speed reports lack headings
 
