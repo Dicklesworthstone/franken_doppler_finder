@@ -1788,6 +1788,14 @@ Search clock scans also reuse trace-fit and result buffers, preserving the origi
 candidate comparisons. Before/after synthetic comparisons check complete point scores and chosen clocks
 bit-for-bit; the size of the end-to-end speedup has not yet been measured on a real recording.
 
+Confirmation queries also use spatial bounds when an atmosphere certifies zero wind but
+its sound speed varies with place, time or height, or differs from the measurement fit.
+The search computes that atmosphere's maximum sound speed once and rounds each event's
+physical distance bound outward before checking complete interpolated flight paths.
+The original matching still-air path keeps its arithmetic. Windy, unknown or invalid
+atmosphere bounds retain the full scan. Exact candidate gates, time windows, scores and
+search budgets are unchanged; no end-to-end timing improvement has been measured.
+
 Nearest-pass searches now visit the original two-second lattice outward from the proposed emission
 time. After finding an interior closest approach, a direction stops only when every remaining
 refinement bracket is strictly farther away in time. The lattice, refinement, tie order and boundary
@@ -1954,6 +1962,15 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Bound confirmation work under certified calm weather
+
+Two new regressions cover malformed or windy certificates, outward-rounded distance gates,
+and physical Doppler traces through the height-dependent standard atmosphere. They compare
+complete serialized matches and refusals with the unpruned path at relative and Unix clocks,
+check that 64 distant tracks can be excluded before CPA scans, and require one certificate
+lookup across repeated queries. Independent source and mathematical review supports the calm-only
+bound. Native tests and timings remain unverified because the execution environment is unavailable.
 
 ### Recover radiosonde lookup from an unusable station-index cache
 

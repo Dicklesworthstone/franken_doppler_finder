@@ -2647,6 +2647,9 @@ struct TimeIndex {
     by_t0: Vec<(f64, f64, u32)>,
     max_len: f64,
     bounds: Vec<Option<TrackBounds>>,
+    /// Certified maximum sound speed for a provider with no wind anywhere.
+    /// Cache once: gridded providers may inspect every weather column to certify it.
+    calm_c_max: Option<f64>,
 }
 
 impl TimeIndex {
@@ -2662,8 +2665,50 @@ impl TimeIndex {
             by_t0,
             max_len,
             bounds: tracks.iter().map(TrackModel::bounds).collect(),
+            calm_c_max: None,
         }
     }
+
+    /// The certificate belongs to the same provider used by every confirmation call.
+    fn with_atmosphere(tracks: &[TrackModel], atmo: &dyn Atmosphere) -> Self {
+        let mut index = Self::new(tracks);
+        index.calm_c_max = atmo.medium_bounds().and_then(|b| {
+            (b.c[0] > 0.0
+                && b.c[0].is_finite()
+                && b.c[1] >= b.c[0]
+                && b.c[1].is_finite()
+                && b.wind_max == 0.0)
+                .then_some(b.c[1])
+        });
+        index
+    }
+
+    fn confirmer_reach(&self, ev: &SearchEvent, ordinary_still_air: bool) -> f64 {
+        if ordinary_still_air {
+            return 1.15 * ev.d_gate[1];
+        }
+        let Some(c_max) = self.calm_c_max else {
+            return f64::INFINITY;
+        };
+        if !(ev.c_fit > 0.0
+            && ev.c_fit.is_finite()
+            && ev.d_gate[1] >= 0.0
+            && ev.d_gate[1].is_finite())
+        {
+            return f64::INFINITY;
+        }
+        // In calm air the exact gate compares the physical CPA range to
+        // d_gate[1] * (c / c_fit), even when temperature varies. Round both
+        // operations outward. Wind gates use a perpendicular tangent range;
+        // without a stationarity certificate that is not a bound on cpa.d.
+        let reach = (ev.d_gate[1] * (c_max / ev.c_fit).next_up()).next_up();
+        if reach.is_finite() {
+            reach
+        } else {
+            f64::INFINITY
+        }
+    }
+
     /// Tracks overlapping [a, b].
     fn overlapping(&self, a: f64, b: f64) -> impl Iterator<Item = u32> + '_ {
         let lo = self.by_t0.partition_point(|t| t.0 < a - self.max_len);
@@ -2703,15 +2748,10 @@ fn best_confirmer(
 ) -> Option<(f64, EventMatch, u32)> {
     let c = p.c;
     let t_heard = t_start + ev.t_rec;
-    // A still-air fitted distance is not a physical radius in a moving or varying medium.
-    // Keep that shortcut only when its scale is exactly one; otherwise the existing exact
-    // CPA gates below decide the range.
+    // A certified calm provider may scale the fitted range by its maximum sound
+    // speed. Moving and unknown media keep the complete spatial scan.
     let ordinary_still_air = matching_still_air(ev, p, atmo);
-    let reach = if ordinary_still_air {
-        1.15 * ev.d_gate[1]
-    } else {
-        f64::INFINITY
-    };
+    let reach = tix.confirmer_reach(ev, ordinary_still_air);
     // Fitting can leave a wide CPA-time profile even when its best curve passed measurement.
     // The exact timing gate permits that interval, so neither preliminary time query may
     // discard it. Preserve the established calm windows. In moving or undeclared media,
@@ -3485,7 +3525,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     });
     let mut cands = dedupe(fine);
     // confirmers + unheard close passes for the leading candidates
-    let tix = TimeIndex::new(tracks);
+    let tix = TimeIndex::with_atmosphere(tracks, atmo);
     let n_conf = cands.len().min(p.max_confirm);
     if n_conf < cands.len() {
         funnel
@@ -11017,6 +11057,244 @@ mod tests {
     }
 
     #[test]
+    fn calm_confirmation_bounds_require_a_valid_zero_wind_certificate() {
+        use fdop_types::atmo::{Medium, MediumBounds};
+
+        struct Envelope(Option<MediumBounds>);
+        impl Atmosphere for Envelope {
+            fn medium(&self, _: f64, _: f64, _: f64, _: f64, _: f64) -> Medium {
+                Medium::still(343.0)
+            }
+            fn describe(&self) -> String {
+                "bound-validation fixture".into()
+            }
+            fn medium_bounds(&self) -> Option<MediumBounds> {
+                self.0
+            }
+        }
+
+        let mut event = plain_event(100.0, false);
+        for envelope in [
+            None,
+            Some(([330.0, 350.0], 1.0)),
+            Some(([330.0, 350.0], f64::from_bits(1))),
+            Some(([330.0, 350.0], -1.0)),
+            Some(([330.0, 350.0], f64::NAN)),
+            Some(([330.0, 350.0], f64::INFINITY)),
+            Some(([0.0, 350.0], 0.0)),
+            Some(([-1.0, 350.0], 0.0)),
+            Some(([350.0, 330.0], 0.0)),
+            Some(([f64::NAN, 350.0], 0.0)),
+            Some(([330.0, f64::NAN], 0.0)),
+            Some(([330.0, f64::INFINITY], 0.0)),
+        ] {
+            let envelope = envelope.map(|(c, wind_max)| MediumBounds { c, wind_max });
+            let index = TimeIndex::with_atmosphere(&[], &Envelope(envelope));
+            assert!(index.confirmer_reach(&event, false).is_infinite());
+            assert_eq!(
+                index.confirmer_reach(&event, true).to_bits(),
+                (1.15 * event.d_gate[1]).to_bits(),
+                "the established ordinary-still-air path is independent of the certificate"
+            );
+        }
+
+        let index = TimeIndex::with_atmosphere(
+            &[],
+            &Envelope(Some(MediumBounds {
+                c: [330.0, 350.0],
+                wind_max: 0.0,
+            })),
+        );
+        event.v_gate = [1.0, 1000.0];
+        for c_fit in [280.0, 343.0, 410.0] {
+            event.c_fit = c_fit;
+            for d_hi in [0.0, 30.0, 1234.56789, 200_000.0] {
+                event.d_gate = [0.0, d_hi];
+                let reach = index.confirmer_reach(&event, false);
+                assert!(reach.is_finite());
+                for c in [330.0, 337.12345, 350.0] {
+                    // Construct the exact upper boundary of the unchanged calm gate.
+                    let d = d_hi * (c / c_fit);
+                    let cpa = crate::track::Cpa {
+                        t_e: 0.0,
+                        d,
+                        speed: 100.0,
+                        interior: true,
+                        rv: [d, 0.0, 0.0],
+                        vel: [0.0, 100.0, 0.0],
+                    };
+                    assert!(gates_ok(&event, &cpa, &Prop::still(c), 0.0));
+                    assert!(
+                        cpa.d <= reach,
+                        "an exact boundary match must remain reachable"
+                    );
+                }
+            }
+        }
+        for (c_fit, distance) in [
+            (0.0, 1000.0),
+            (-1.0, 1000.0),
+            (f64::NAN, 1000.0),
+            (f64::INFINITY, 1000.0),
+            (343.0, -1.0),
+            (343.0, f64::NAN),
+            (343.0, f64::INFINITY),
+            (f64::MIN_POSITIVE, f64::MAX),
+        ] {
+            event.c_fit = c_fit;
+            event.d_gate[1] = distance;
+            assert!(index.confirmer_reach(&event, false).is_infinite());
+        }
+    }
+
+    #[test]
+    fn certified_calm_confirmation_matches_the_complete_search() {
+        use fdop_types::atmo::{Medium, MediumBounds, StandardAtmosphere};
+
+        struct CountedCalm {
+            inner: StandardAtmosphere,
+            certificates: AtomicUsize,
+        }
+        impl Atmosphere for CountedCalm {
+            fn medium(&self, lat: f64, lon: f64, t: f64, a: f64, b: f64) -> Medium {
+                self.inner.medium(lat, lon, t, a, b)
+            }
+            fn describe(&self) -> String {
+                self.inner.describe()
+            }
+            fn medium_bounds(&self) -> Option<MediumBounds> {
+                self.certificates.fetch_add(1, Ordering::Relaxed);
+                self.inner.medium_bounds()
+            }
+        }
+
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let dem = FlatElevation(0.0);
+        let o = observer(lat, lon, &dem);
+        for start in [0.0, 1_788_895_000.0] {
+            for c_fit in [280.0, 343.0, 410.0] {
+                let atmo = CountedCalm {
+                    inner: StandardAtmosphere::new(32.0, 0.0, 0.5),
+                    certificates: AtomicUsize::new(0),
+                };
+                assert_ne!(
+                    atmo.medium(lat, lon, start, 2.0, 800.0).c,
+                    atmo.medium(lat, lon, start, 2.0, 4000.0).c,
+                    "use a real provider with height-dependent path averages"
+                );
+                let mut tr = straight_track(
+                    &enu,
+                    [0.0, 1400.0, 800.0],
+                    [90.0, 0.0, 0.0],
+                    start + 200.0,
+                    start,
+                    start + 500.0,
+                    5.0,
+                );
+                tr.key = "calm-source".into();
+                let cpa = tr.cpa_nearest_time(o.x, start + 200.0, 30.0).unwrap();
+                let prop = prop_for(&atmo, &o, &tr, cpa.t_e);
+                let mut event = synth_event(
+                    "calm-source",
+                    &tr,
+                    o.x,
+                    start,
+                    129.5,
+                    c_fit,
+                    start + 200.0,
+                    &prop,
+                );
+                let scale = prop.c / c_fit;
+                event.v_gate = [0.99 * cpa.speed / scale, 1.01 * cpa.speed / scale];
+                event.d_gate = [0.99 * cpa.d / scale, 1.01 * cpa.d / scale];
+                assert!(gates_ok(&event, &cpa, &prop, 0.0));
+                if c_fit == 280.0 {
+                    assert!(cpa.d > 1.15 * event.d_gate[1]);
+                }
+                let mut tracks = vec![tr];
+                for k in 0..64 {
+                    let mut far = straight_track(
+                        &enu,
+                        [40_000.0 + k as f64 * 10.0, -40_000.0, 1200.0],
+                        [70.0, 0.0, 0.0],
+                        start + 250.0,
+                        start,
+                        start + 500.0,
+                        5.0,
+                    );
+                    far.key = format!("distant-{k}");
+                    tracks.push(far);
+                }
+                let bounded = TimeIndex::with_atmosphere(&tracks, &atmo);
+                let complete = TimeIndex::new(&tracks);
+                let p = SearchParams::new(
+                    start - 10.0,
+                    start + 10.0,
+                    500.0,
+                    BBox::new(lat - 0.02, lon - 0.02, lat + 0.02, lon + 0.02),
+                );
+                assert!(!matching_still_air(&event, &p, &atmo));
+                let reach = bounded.confirmer_reach(&event, false);
+                assert_eq!(
+                    complete.overlapping(f64::NEG_INFINITY, f64::INFINITY).count(),
+                    65
+                );
+                assert_eq!(
+                    bounded
+                        .overlapping_near(f64::NEG_INFINITY, f64::INFINITY, o.x, reach)
+                        .collect::<Vec<_>>(),
+                    vec![0],
+                    "exclude the 64 distant tracks before closest-approach scans"
+                );
+                for (east, north, dt) in [(0.0, 0.0, 0.0), (3.0, -2.0, 0.5), (0.0, 0.0, 30.0)] {
+                    let (la, lo, _) = enu.to_geodetic([east, north, 0.0]);
+                    let obs = observer(la, lo, &dem);
+                    for exclude in [vec![], vec![(0, cpa.t_e)]] {
+                        let explain = |index: &TimeIndex| {
+                            best_confirmer(
+                                &obs,
+                                start + dt,
+                                &event,
+                                &tracks,
+                                index,
+                                &p,
+                                &atmo,
+                                &exclude,
+                            )
+                        };
+                        let expected = explain(&complete);
+                        let actual = explain(&bounded);
+                        assert_eq!(
+                            serde_json::to_vec(&actual).unwrap(),
+                            serde_json::to_vec(&expected).unwrap(),
+                            "bounds must preserve every value and refused match"
+                        );
+                        if east == 0.0 && north == 0.0 && dt == 0.0 && exclude.is_empty() {
+                            let (chi, matched, ti) =
+                                actual.expect("the physical source must confirm");
+                            assert_eq!(ti, 0);
+                            assert_eq!(matched.flight, "calm-source");
+                            assert!(chi < 1.0 && matched.coverage >= 0.99);
+                        }
+                        if !exclude.is_empty() || dt == 30.0 {
+                            assert!(
+                                expected.is_none(),
+                                "existing clock and pass exclusions remain"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(
+                    atmo.certificates.load(Ordering::Relaxed),
+                    1,
+                    "many observers, events and clocks must share the cached certificate"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn spatial_bounds_keep_grazing_and_unknown_tracks() {
         let case = narrow_circuit_case(fdop_types::atmo::Medium::still(343.0));
         let o = observer(case.obs.0, case.obs.1, &FlatElevation(0.0));
@@ -11155,6 +11433,7 @@ mod tests {
                 by_t0: bounded.by_t0.clone(),
                 max_len: bounded.max_len,
                 bounds: vec![None; case.tracks.len()],
+                calm_c_max: None,
             };
             assert_eq!(
                 bounded.overlapping(case.t_s, case.t_s + 900.0).count(),

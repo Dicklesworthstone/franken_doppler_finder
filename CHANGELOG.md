@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Prune distant confirmation flights under certified calm weather
+
+- Restore conservative spatial pruning for calm atmospheres whose sound speed varies
+  across the weather model or differs from the sound speed used by measurement. Cache
+  the certified upper sound speed once per search and round event bounds outward before
+  querying the existing complete-path track boxes.
+- Preserve the original matching still-air arithmetic and all exact gates, time windows,
+  candidate order, scores and budgets. Windy, unknown, malformed and overflowing bounds
+  keep the complete scan: wind's projected fitted distance alone cannot certify a physical
+  closest-approach radius for every numerical track solution.
+- Add focused regressions for conservative bounds, one certificate lookup per index and
+  unchanged confirmer results against the unpruned path. Source and mathematical review
+  completed; the execution environment remains unavailable. Native formatting, Clippy,
+  tests, selftest and reference/field replays have not run. No measured speedup or accuracy
+  improvement is claimed.
+
 ### Recover radiosonde lookup from damaged station metadata
 
 - Validate the station index before trusting its cache or publishing a replacement.
