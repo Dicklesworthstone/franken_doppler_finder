@@ -1014,7 +1014,8 @@ Fetches with MLAT disabled also skip its release lookup. With MLAT enabled, an o
 MLAT lookup failure keeps the successfully discovered main feed and records the error in
 progress and final notes, so a usable main cache or archive can still supply the day.
 A failed main-feed lookup can also reuse a readable, covering processed main-feed catalogue,
-or rebuild one from completed raw feeds and cached release metadata when no processed cache qualifies.
+or rebuild one from completed raw feeds and cached release metadata. A main-only processed
+fallback can be upgraded when verified local checkpoints contain that same main feed plus MLAT.
 The report retains its existing missing-feed warnings and adds that newer or additional feeds
 could not be checked. Feed preference, aircraft policy, certified jet coverage and midnight
 coverage checks still apply. Without verified local main-feed data, the original lookup error
@@ -1091,16 +1092,24 @@ A missing, incompatible or damaged checkpoint causes a fresh download of that fe
 A checkpoint-write failure warns and keeps the current successful ingest; it does not
 change final day-store publication errors.
 
-If no processed full or partial day cache is usable, `--offline` can rebuild it from
-completed raw checkpoints and cached `releases.json` or `releases-main.json` metadata.
+Complete processed day caches keep their priority. When MLAT is requested, a main-only
+processed fallback no longer hides completed raw feeds: `--offline` upgrades it when
+compatible checkpoints can rebuild the same main feed together with MLAT. Joint raw
+reconciliation restores MLAT-only aircraft and retains the shared altitude and aircraft-type
+evidence. Missing, damaged or incompatible raw feeds leave the processed fallback usable;
+MLAT-disabled requests retain their main-only cache path.
+
+If no processed day cache is usable, `--offline` can also rebuild one from completed raw
+checkpoints and cached `releases.json` or `releases-main.json` metadata.
 An online request whose main release lookup fails tries the same local reconstruction,
 without retrying a network request or opening an archive stream. A successful recovery
 reports the lookup failure and that newer or additional feeds could not be checked.
 It validates that each release belongs to the requested day and feed, then applies the same
 raw identity checks and geoid conversion as an online retry. A usable prod checkpoint takes priority over staging. Available requested
 MLAT is reconciled with the main feed; if requested MLAT is unavailable, a main-only result
-keeps its missing-feed warning. MLAT alone cannot supply a day. Existing processed-cache
-hits keep their priority.
+keeps its missing-feed warning. MLAT alone cannot supply a day. Upgrading an existing
+processed fallback requires its selected main feed and MLAT, so recovery cannot silently
+substitute a different main feed or replace a usable cache with an incomplete reconstruction.
 
 The rebuilt day is atomically saved for later searches, so this recovery needs a writable
 cache. A final day-store write failure remains an error. No network client or archive
@@ -2007,6 +2016,29 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover completed MLAT data hidden by a main-only processed cache
+
+`complete_raw_pair_recovers_aircraft_hidden_by_a_processed_main_cache` uses real compressed
+synthetic archives and persisted raw checkpoints for prod and staging, with ordinary and
+jet-inclusive policy. The main-only processed file selected by the former early return
+contains one unknown aircraft with raw barometric heights. The verified joint reconstruction
+contains two aircraft, including a second flight available only in MLAT, and recovers the
+first aircraft's type and altitude calibration. Serialized output matches a fresh joint
+raw build after normalizing only its creation timestamp; the original partial cache remains intact.
+
+A separate native check compiles the complete current production track module with real
+pinned types. In all four feed/policy cases, it builds one model from the old serialized
+main-only store and two from the upgraded store. The newly available MLAT aircraft survives
+ordinary track cleaning, with at least 75 seconds of support and subsonic motion.
+
+All 66 native builder, ingest and raw-cache component tests pass with real pinned dependencies.
+The three new tests cover the four positive feed/policy combinations, nine incompatible or
+incomplete input cases, and preservation of ordinary main-only reconstruction and MLAT-disabled
+behavior. Fetch integration regressions cover offline and release-lookup-outage routing,
+publication, subsequent processed-cache reuse and fallback preservation. Those integration
+regressions are authored and source-reviewed but have not run in the complete data package.
+Full workspace, release CLI selftest and reference/field validation remain incomplete.
 
 ### Retain observed climb rates through duplicate reconciliation
 

@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover completed MLAT feeds before accepting a partial offline catalogue
+
+- Upgrade a main-only processed fallback when completed, compatible raw checkpoints contain
+  that same main feed and MLAT. The local recovery also applies after an online main-release
+  lookup failure, without another network request. Complete processed caches retain priority.
+- Reuse the ordinary joint raw-day builder so recovered MLAT-only aircraft, aircraft types and
+  altitude calibration reach the catalogue together. Missing, corrupt or incompatible raw
+  evidence leaves the existing partial fallback available; main-feed preference, MLAT-disabled
+  behavior and fatal final-publication errors retain their existing policies.
+- All 66 native production builder, ingest and raw-cache component tests pass. Four positive
+  prod/staging and ordinary/jet cases recover a second aircraft absent from the selected
+  main-only store and reproduce the fresh joint build's serialized output, with only creation
+  time normalized. Nine incompatible/incomplete controls and main-only policy controls pass.
+- All four serialized before/after pairs also pass the complete current native track module:
+  one old model becomes two, and the recovered MLAT flight retains at least 75 seconds of
+  usable support through ordinary track cleaning.
+- Full fetch integration regressions are authored and source-reviewed but unexecuted.
+  No full data-package/workspace, release CLI selftest or reference/field validation claim.
+
 ### Keep observed climb rates when a preferred duplicate omits them
 
 - Recover a missing vertical rate from a fresh, finite, geometrically agreeing duplicate

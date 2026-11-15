@@ -7,9 +7,10 @@
 //! other filter, policy, release and midnight-context fields must still match exactly.
 
 use crate::DataError;
-use crate::adsblol::DayRelease;
+use crate::adsblol::{DayRelease, Feed};
 use crate::ingest::{DayContext, IngestSpec, IngestStats, RawAircraft};
 use fdop_types::BBox;
+use fdop_types::store::TrackStore;
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
@@ -128,6 +129,66 @@ pub(crate) fn load(
         }
     }
     first_error.map_or(Ok(None), Err)
+}
+
+/// Reconcile complete local feeds with the ordinary day builder. When a processed
+/// main-only cache already exists, `upgrade_main` requires that same main feed and
+/// MLAT before replacing it; an incomplete raw set must leave the usable cache alone.
+pub(crate) fn rebuild_day(
+    dir: &Path,
+    releases: &[DayRelease],
+    spec: &IngestSpec,
+    context: DayContext,
+    include_mlat: bool,
+    upgrade_main: Option<Feed>,
+    mut unreadable: impl FnMut(&DayRelease, &DataError),
+) -> Option<(Feed, bool, TrackStore)> {
+    if upgrade_main.is_some_and(|feed| !include_mlat || !matches!(feed, Feed::Prod | Feed::Staging))
+    {
+        return None;
+    }
+    let day = fdop_types::time::civil_from_days((context.day_start / 86_400.0).floor() as i64);
+    let mut parts = Vec::new();
+    let mut tags = Vec::new();
+    let mut main = None;
+    let mut mlat = false;
+    for feed in [Feed::Prod, Feed::Staging, Feed::Mlatonly] {
+        if (feed == Feed::Mlatonly && (!include_mlat || main.is_none()))
+            || (feed != Feed::Mlatonly
+                && (main.is_some() || upgrade_main.is_some_and(|required| feed != required)))
+        {
+            continue;
+        }
+        for rel in releases
+            .iter()
+            .filter(|rel| rel.feed == feed && crate::fetch::release_for_day(rel, day))
+        {
+            match load(dir, rel, spec, context) {
+                Ok(Some(part)) => {
+                    parts.push(part);
+                    tags.push(rel.tag.clone());
+                    if feed == Feed::Mlatonly {
+                        mlat = true;
+                    } else {
+                        main = Some(feed);
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => unreadable(rel, &error),
+            }
+        }
+    }
+    let main = main?;
+    if upgrade_main.is_some() && !mlat {
+        return None;
+    }
+    tags.sort();
+    Some((
+        main,
+        mlat,
+        crate::build::build_day_store(parts, spec, tags, context),
+    ))
 }
 
 fn covers_bbox(outer: BBox, inner: BBox) -> bool {
@@ -318,7 +379,7 @@ pub(crate) mod boundary_bits {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::adsblol::{AssetPart, Feed};
     use crate::build::BoundaryEvents;
@@ -399,6 +460,338 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    pub(crate) struct RebuildFixture {
+        pub cache: PathBuf,
+        pub dir: PathBuf,
+        pub partial_path: PathBuf,
+        pub want: IngestSpec,
+        pub spec: IngestSpec,
+        pub context: DayContext,
+        pub releases: [DayRelease; 2],
+        pub parts: [(Vec<RawAircraft>, IngestStats); 2],
+    }
+
+    impl RebuildFixture {
+        pub fn checkpoint(&self, index: usize) {
+            save(
+                &self.dir,
+                &self.releases[index],
+                &self.spec,
+                self.context,
+                &self.parts[index],
+            )
+            .unwrap();
+        }
+
+        pub fn complete(&self) -> TrackStore {
+            let mut tags: Vec<_> = self.releases.iter().map(|r| r.tag.clone()).collect();
+            tags.sort();
+            crate::build::build_day_store(self.parts.to_vec(), &self.spec, tags, self.context)
+        }
+    }
+
+    /// One straight main-feed aircraft plus a second flight available only in MLAT.
+    /// The shared raw GNSS/barometric pairs also recover the main flight's type and height.
+    pub(crate) fn rebuild_fixture(main: Feed, include_jets: bool) -> RebuildFixture {
+        use crate::ingest::ingest_day_reader;
+        use crate::ingest::tests::{T0, gz, spec, tar_of};
+        use fdop_types::geo::Enu;
+
+        let (cache, _, _, _) = fixture();
+        let dir = cache.join("adsb/2026-09-08");
+        let want = IngestSpec {
+            include_jets,
+            ..spec()
+        };
+        let spec = IngestSpec {
+            bbox: crate::fetch::bbox_key(&want.bbox).0,
+            t_start: T0 - 3600.0,
+            t_end: T0 + 86_400.0 + 3600.0,
+            ..want
+        };
+        let context = DayContext::new(T0, 300.0, 3600.0);
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let trace = |second: bool, gnss: bool| {
+            let rows: Vec<_> = (0..=8)
+                .map(|i| {
+                    let dt = 10.0 * i as f64 + if gnss && !second { 5.0 } else { 0.0 };
+                    let (east, north, height, speed, heading) = if second {
+                        (900.0, 85.0 * (dt - 40.0), 1200.0, 85.0, 0.0)
+                    } else {
+                        (130.0 * (dt - 40.0), 800.0, 1500.0, 130.0, 90.0)
+                    };
+                    let (lat, lon, altitude) = enu.to_geodetic([east, north, height]);
+                    serde_json::json!([
+                        70_000.0 + if second { 200.0 } else { 0.0 } + dt,
+                        lat,
+                        lon,
+                        (altitude - 100.0) / 0.3048,
+                        speed / 0.514444,
+                        heading,
+                        0,
+                        0,
+                        null,
+                        if gnss { "mlat" } else { "adsb_icao" },
+                        gnss.then_some((altitude + spec.geoid_n_m) / 0.3048),
+                        0,
+                        null,
+                        null
+                    ])
+                })
+                .collect();
+            serde_json::json!({
+                "icao": if second { "d4e5f6" } else { "a1b2c3" },
+                "t": if second { "C172" } else if !gnss { "" }
+                    else if include_jets { "B738" } else { "PC12" },
+                "timestamp": T0, "trace": rows
+            })
+            .to_string()
+        };
+        let archives = [
+            tar_of(&[("trace_full_a1b2c3.json", gz(&trace(false, false)))]),
+            tar_of(&[
+                ("trace_full_a1b2c3.json", gz(&trace(false, true))),
+                ("trace_full_d4e5f6.json", gz(&trace(true, true))),
+            ]),
+        ];
+        let releases = std::array::from_fn(|i| {
+            let feed = if i == 0 { main } else { Feed::Mlatonly };
+            let tag = crate::adsblol::tag_for(2026, 9, 8, feed, 0);
+            DayRelease {
+                feed,
+                repo: crate::adsblol::repo_for_year(2026),
+                parts: vec![AssetPart {
+                    name: format!("{tag}.tar"),
+                    url: format!("https://example.invalid/{tag}.tar"),
+                    size: archives[i].len() as u64,
+                }],
+                tag,
+            }
+        });
+        let parts = std::array::from_fn(|i| {
+            ingest_day_reader(
+                archives[i].as_slice(),
+                releases[i].feed.label(),
+                &spec,
+                &|_| {},
+                context,
+            )
+            .unwrap()
+        });
+        let partial_path = dir.join(format!(
+            "{}{}_{}.fdtrk",
+            main.tag_word(),
+            if include_jets { "+jets" } else { "" },
+            crate::fetch::bbox_key(&spec.bbox).1
+        ));
+        crate::build::build_day_store(
+            vec![parts[0].clone()],
+            &spec,
+            vec![releases[0].tag.clone()],
+            context,
+        )
+        .save(&partial_path)
+        .unwrap();
+        std::fs::write(
+            dir.join("releases.json"),
+            serde_json::to_vec(&releases).unwrap(),
+        )
+        .unwrap();
+        RebuildFixture {
+            cache,
+            dir,
+            partial_path,
+            want,
+            spec,
+            context,
+            releases,
+            parts,
+        }
+    }
+
+    #[test]
+    fn complete_raw_pair_recovers_aircraft_hidden_by_a_processed_main_cache() {
+        use fdop_types::store::alt_src;
+
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                let f = rebuild_fixture(main, include_jets);
+                f.checkpoint(0);
+                f.checkpoint(1);
+                let before = std::fs::read(&f.partial_path).unwrap();
+                let old = TrackStore::load(&f.partial_path).unwrap();
+                assert_eq!(old.legs.len(), 1);
+                assert_eq!(old.legs[0].icao, "a1b2c3");
+                assert_eq!(old.legs[0].engine, EngineClass::Unknown);
+                assert!(
+                    old.legs[0]
+                        .points
+                        .iter()
+                        .all(|p| p.alt_src == alt_src::BARO_RAW)
+                );
+                let (selected, mlat, mut rebuilt) = rebuild_day(
+                    &f.dir,
+                    &f.releases,
+                    &f.spec,
+                    f.context,
+                    true,
+                    Some(main),
+                    |_, error| panic!("valid completed raw feed: {error}"),
+                )
+                .unwrap();
+                assert_eq!(selected, main);
+                assert!(mlat);
+                assert_eq!(rebuilt.legs.len(), 2);
+                assert!(
+                    rebuilt
+                        .legs
+                        .iter()
+                        .any(|l| l.icao == "d4e5f6" && l.engine == EngineClass::Piston)
+                );
+                let identified = rebuilt.legs.iter().find(|l| l.icao == "a1b2c3").unwrap();
+                assert_eq!(identified.engine == EngineClass::Jet, include_jets);
+                assert_ne!(identified.engine, EngineClass::Unknown);
+                assert!(
+                    identified
+                        .points
+                        .iter()
+                        .any(|p| p.alt_src == alt_src::BARO_CORRECTED)
+                );
+                // The recovered output is exactly the ordinary joint raw build, not a
+                // processed-store append that cannot reconstruct altitude calibration.
+                let mut reference = f.complete();
+                rebuilt.meta.created_unix = 0.0;
+                reference.meta.created_unix = 0.0;
+                let output = f.dir.join("reconstructed.fdtrk");
+                let expected = f.dir.join("joint-reference.fdtrk");
+                rebuilt.save(&output).unwrap();
+                reference.save(&expected).unwrap();
+                assert_eq!(
+                    std::fs::read(&output).unwrap(),
+                    std::fs::read(&expected).unwrap()
+                );
+                let roundtrip = f.dir.join("roundtrip.fdtrk");
+                TrackStore::load(&output).unwrap().save(&roundtrip).unwrap();
+                assert_eq!(
+                    std::fs::read(&roundtrip).unwrap(),
+                    std::fs::read(&output).unwrap()
+                );
+                assert_eq!(std::fs::read(&f.partial_path).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_upgrade_requires_both_compatible_feeds_and_the_selected_main() {
+        for problem in [
+            "missing main",
+            "missing MLAT",
+            "corrupt MLAT",
+            "release identity",
+            "wrong day",
+            "context",
+            "time filter",
+            "jet policy",
+            "other main",
+        ] {
+            let mut f = rebuild_fixture(Feed::Prod, false);
+            let before = std::fs::read(&f.partial_path).unwrap();
+            if problem == "wrong day" {
+                f.releases[0].tag = crate::adsblol::tag_for(2026, 9, 9, Feed::Prod, 0);
+            }
+            if problem != "missing main" {
+                f.checkpoint(0);
+            }
+            if problem != "missing MLAT" {
+                f.checkpoint(1);
+            }
+            match problem {
+                "corrupt MLAT" => {
+                    // Retain the original fixture before replacing it with an interrupted file.
+                    let checkpoint = path(&f.dir, &f.releases[1], &f.spec);
+                    std::fs::copy(&checkpoint, f.dir.join("complete-mlat.backup")).unwrap();
+                    std::fs::write(checkpoint, b"incomplete raw checkpoint").unwrap();
+                }
+                "release identity" => f.releases[1].parts[0].size += 1,
+                "context" => f.context = DayContext::new(f.context.day_start, 301.0, 3600.0),
+                "time filter" => f.spec.t_start += 1.0,
+                "jet policy" => f.spec.include_jets = true,
+                _ => {}
+            }
+            let required = if problem == "other main" {
+                Feed::Staging
+            } else {
+                Feed::Prod
+            };
+            let mut errors = Vec::new();
+            assert!(
+                rebuild_day(
+                    &f.dir,
+                    &f.releases,
+                    &f.spec,
+                    f.context,
+                    true,
+                    Some(required),
+                    |rel, error| errors.push((rel.feed, error.to_string())),
+                )
+                .is_none(),
+                "{problem} must leave the processed fallback selected"
+            );
+            assert_eq!(errors.len(), usize::from(problem == "corrupt MLAT"));
+            assert_eq!(std::fs::read(&f.partial_path).unwrap(), before);
+            assert_eq!(TrackStore::load(&f.partial_path).unwrap().legs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn raw_reconstruction_keeps_main_only_policy_without_an_upgrade() {
+        for main in [Feed::Prod, Feed::Staging] {
+            let f = rebuild_fixture(main, false);
+            f.checkpoint(0);
+            // A first reconstruction still preserves the completed main feed if MLAT
+            // is missing. The stronger requirement applies only to replacing a cache.
+            let (selected, mlat, rebuilt) = rebuild_day(
+                &f.dir,
+                &f.releases,
+                &f.spec,
+                f.context,
+                true,
+                None,
+                |_, error| panic!("valid main feed: {error}"),
+            )
+            .unwrap();
+            assert_eq!(selected, main);
+            assert!(!mlat);
+            assert_eq!(rebuilt.legs.len(), 1);
+            f.checkpoint(1);
+            let (selected, mlat, rebuilt) = rebuild_day(
+                &f.dir,
+                &f.releases,
+                &f.spec,
+                f.context,
+                false,
+                None,
+                |_, error| panic!("valid main feed: {error}"),
+            )
+            .unwrap();
+            assert_eq!(selected, main);
+            assert!(!mlat);
+            assert_eq!(rebuilt.legs.len(), 1);
+            assert!(
+                rebuild_day(
+                    &f.dir,
+                    &f.releases,
+                    &f.spec,
+                    f.context,
+                    false,
+                    Some(main),
+                    |_, _| {},
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]

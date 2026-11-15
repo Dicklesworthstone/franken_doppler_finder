@@ -438,7 +438,7 @@ fn partial_feedsets(want: &str) -> &'static [&'static str] {
 pub const PUBLISH_LAG_S: f64 = 2.0 * 86_400.0;
 
 /// A cached listing must describe the requested day and the feed it claims to contain.
-fn release_for_day(release: &DayRelease, day: (i64, u32, u32)) -> bool {
+pub(crate) fn release_for_day(release: &DayRelease, day: (i64, u32, u32)) -> bool {
     release.repo == crate::adsblol::repo_for_year(day.0)
         && (0..4)
             .any(|n| release.tag == crate::adsblol::tag_for(day.0, day.1, day.2, release.feed, n))
@@ -857,89 +857,69 @@ fn fetch_window_with_sources(
             }
         };
         let available = feedset_available(&rels, opts.include_mlat);
+        let mut partial = None;
         for fs in partial_feedsets(feedset) {
             if (opts.offline || available.as_ref().is_none_or(|a| a.as_str() == *fs))
                 && let Some((p, s)) = find_cached(&dir, fs, &want, &label, opts, required_context)
             {
-                opts.say(&format!(
-                    "[adsb] {label}: cached {} ({} legs; {fs} only)",
-                    p.display(),
-                    s.leg_count
-                ));
-                notes.extend(feedset_gaps(&label, fs, opts.include_mlat));
-                notes.extend(cache_context_note(&label, &s, required_context));
-                day_stores[i] = Some(s);
-                cache_hits += 1;
+                partial = Some((*fs, p, s));
                 break;
             }
         }
-        if day_stores[i].is_some() {
-            if let Some(error) = discovery_error {
-                notes.push(format!(
-                    "{label}: release lookup failed; using the cached main-feed catalogue; newer or additional feeds could not be checked: {error}"
-                ));
-            }
-            continue;
-        }
-        if opts.offline || discovery_error.is_some() {
-            // Processed full and partial stores above retain their existing priority.
-            // A completed raw ingest can still recover a day whose publication was
-            // interrupted, including during an online release-lookup outage. Reading
-            // cached release identities cannot trigger another network request. Use
+        let local_recovery = opts.offline || discovery_error.is_some();
+        let upgrade_main = if opts.include_mlat {
+            partial.as_ref().and_then(|(fs, _, _)| match *fs {
+                "prod" => Some(Feed::Prod),
+                "staging" => Some(Feed::Staging),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        if local_recovery && (partial.is_none() || upgrade_main.is_some()) {
+            // A completed raw pair can upgrade a main-only processed fallback after
+            // interrupted publication. Keep its selected main feed and require MLAT
+            // too; complete processed stores and partial-cache ordering stay unchanged.
+            // Cached release identities cannot trigger another network request. Use
             // the same padded spec as online, never the clipped want.
             let rels = match discover(None, day.0, day.1, day.2, &dir, true, opts.include_mlat) {
                 Ok(found) => found.releases,
+                Err(error) if partial.is_some() => {
+                    let note = format!(
+                        "{label}: cached release metadata unreadable ({error}); using the processed main-feed catalogue"
+                    );
+                    opts.say(&format!("[adsb] WARNING {note}"));
+                    notes.push(note);
+                    Vec::new()
+                }
                 Err(error) => return Err(discovery_error.unwrap_or(error)),
             };
             let sp = day_spec(day);
             let context = day_context(day);
-            let mut parts = Vec::new();
-            let mut tags = Vec::new();
-            let mut main = None;
-            let mut mlat = false;
-            for feed in [Feed::Prod, Feed::Staging, Feed::Mlatonly] {
-                if (feed == Feed::Mlatonly && (!opts.include_mlat || main.is_none()))
-                    || (feed != Feed::Mlatonly && main.is_some())
-                {
-                    continue;
-                }
-                for rel in rels
-                    .iter()
-                    .filter(|rel| rel.feed == feed && release_for_day(rel, day))
-                {
-                    match crate::raw_cache::load(&dir, rel, &sp, context) {
-                        Ok(Some(part)) => {
-                            parts.push(part);
-                            tags.push(rel.tag.clone());
-                            if feed == Feed::Mlatonly {
-                                mlat = true;
-                            } else {
-                                main = Some(feed);
-                            }
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            let unavailable = if opts.offline {
-                                "unavailable offline"
-                            } else {
-                                "unavailable during the release lookup outage"
-                            };
-                            let note = format!(
-                                "{label}: raw checkpoint {} unreadable ({e}); {unavailable}",
-                                rel.tag
-                            );
-                            opts.say(&format!("[adsb] WARNING {note}"));
-                            notes.push(note);
-                        }
-                    }
-                }
-            }
-            if let Some(main) = main {
+            let rebuilt = crate::raw_cache::rebuild_day(
+                &dir,
+                &rels,
+                &sp,
+                context,
+                opts.include_mlat,
+                upgrade_main,
+                |rel, error| {
+                    let unavailable = if opts.offline {
+                        "unavailable offline"
+                    } else {
+                        "unavailable during the release lookup outage"
+                    };
+                    let note = format!(
+                        "{label}: raw checkpoint {} unreadable ({error}); {unavailable}",
+                        rel.tag
+                    );
+                    opts.say(&format!("[adsb] WARNING {note}"));
+                    notes.push(note);
+                },
+            );
+            if let Some((main, mlat, store)) = rebuilt {
                 let fs = feedset_name(main, mlat);
                 notes.extend(feedset_gaps(&label, &fs, opts.include_mlat));
-                tags.sort();
-                let store = build_day_store(parts, &sp, tags, context);
                 let path = dir.join(format!(
                     "{}_{key}.fdtrk",
                     cache_feedset(&fs, spec.include_jets)
@@ -950,7 +930,28 @@ fn fetch_window_with_sources(
                         "{label}: release lookup failed; rebuilt the main-feed catalogue from completed raw feeds; newer or additional feeds could not be checked: {error}"
                     ));
                 }
-            } else if let Some(error) = discovery_error {
+                continue;
+            }
+        }
+        if let Some((fs, path, store)) = partial {
+            opts.say(&format!(
+                "[adsb] {label}: cached {} ({} legs; {fs} only)",
+                path.display(),
+                store.leg_count
+            ));
+            notes.extend(feedset_gaps(&label, fs, opts.include_mlat));
+            notes.extend(cache_context_note(&label, &store, required_context));
+            day_stores[i] = Some(store);
+            cache_hits += 1;
+            if let Some(error) = discovery_error {
+                notes.push(format!(
+                    "{label}: release lookup failed; using the cached main-feed catalogue; newer or additional feeds could not be checked: {error}"
+                ));
+            }
+            continue;
+        }
+        if local_recovery {
+            if let Some(error) = discovery_error {
                 // No verified main feed means the online request still failed. Do
                 // not replace its cause with an offline-cache or missing-day error.
                 return Err(error);
@@ -2135,6 +2136,206 @@ mod tests {
     }
 
     #[test]
+    fn completed_raw_pair_upgrades_a_processed_main_only_fallback() {
+        use crate::raw_cache::tests::rebuild_fixture;
+
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                for offline in [false, true] {
+                    let f = rebuild_fixture(main, include_jets);
+                    f.checkpoint(0);
+                    f.checkpoint(1);
+                    let before = std::fs::read(&f.partial_path).unwrap();
+                    let original = TrackStore::load(&f.partial_path).unwrap();
+                    assert_eq!(original.legs.len(), 1);
+                    assert!(original.legs.iter().all(|l| l.icao != "d4e5f6"));
+                    let raw_paths: Vec<_> = f
+                        .releases
+                        .iter()
+                        .map(|r| crate::raw_cache::path(&f.dir, r, &f.spec))
+                        .collect();
+                    let raw_before: Vec<_> = raw_paths
+                        .iter()
+                        .map(|p| std::fs::read(p).unwrap())
+                        .collect();
+                    let opts = FetchOptions {
+                        offline,
+                        ..Default::default()
+                    };
+                    let mut remote_lookups = 0;
+                    let mut local_lookups = 0;
+                    let got = fetch_window_with_sources(
+                        &f.want,
+                        &f.cache,
+                        &opts,
+                        |net, y, m, d, dir, local, include_mlat| {
+                            if local {
+                                assert!(net.is_none());
+                                local_lookups += 1;
+                                find_day_releases_for_fetch_cached(
+                                    None,
+                                    y,
+                                    m,
+                                    d,
+                                    dir,
+                                    true,
+                                    include_mlat,
+                                )
+                            } else {
+                                remote_lookups += 1;
+                                Err(DataError("synthetic release lookup outage".into()))
+                            }
+                        },
+                        |_, _, _, _| panic!("completed raw feeds must not reopen an archive"),
+                    )
+                    .unwrap();
+                    assert_eq!(remote_lookups, usize::from(!offline));
+                    assert_eq!(local_lookups, 1);
+                    assert_eq!(got.meta.stats["cache_hits"], 0);
+                    let expected = merge_stores(vec![f.complete()], DAY_JOIN_GAP_S).filtered(
+                        &f.want.bbox,
+                        f.want.t_start,
+                        f.want.t_end,
+                    );
+                    assert_same_legs(&got.legs, &expected.legs);
+                    assert_eq!(
+                        got.legs.len(),
+                        2,
+                        "the MLAT-only flight must become available"
+                    );
+                    assert!(got.legs.iter().any(|l| l.icao == "d4e5f6"));
+                    assert!(
+                        got.meta.stats["notes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|n| !n.as_str().unwrap().contains(NO_MLATONLY))
+                    );
+                    assert_eq!(std::fs::read(&f.partial_path).unwrap(), before);
+                    for (path, bytes) in raw_paths.iter().zip(raw_before) {
+                        assert_eq!(std::fs::read(path).unwrap(), bytes);
+                    }
+                    // The complete publication is now the first eligible processed
+                    // choice. Neither local discovery nor archive I/O is needed again.
+                    let reused = fetch_window_with_sources(
+                        &f.want,
+                        &f.cache,
+                        &FetchOptions {
+                            offline: true,
+                            ..opts
+                        },
+                        |_, _, _, _, _, _, _| panic!("complete processed cache must keep priority"),
+                        |_, _, _, _| panic!("processed cache must not reopen an archive"),
+                    )
+                    .unwrap();
+                    assert_eq!(reused.meta.stats["cache_hits"], 1);
+                    assert_same_legs(&reused.legs, &got.legs);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unusable_raw_upgrades_keep_the_selected_processed_cache() {
+        use crate::raw_cache::tests::rebuild_fixture;
+
+        for problem in [
+            "missing MLAT",
+            "corrupt MLAT",
+            "metadata",
+            "other main",
+            "main only",
+        ] {
+            let f = rebuild_fixture(Feed::Prod, false);
+            f.checkpoint(0);
+            if problem != "missing MLAT" {
+                f.checkpoint(1);
+            }
+            match problem {
+                "corrupt MLAT" => {
+                    let raw = crate::raw_cache::path(&f.dir, &f.releases[1], &f.spec);
+                    std::fs::copy(&raw, f.dir.join("mlat-complete.backup")).unwrap();
+                    std::fs::write(raw, b"interrupted checkpoint").unwrap();
+                }
+                "metadata" => {
+                    let listing = f.dir.join("releases.json");
+                    std::fs::copy(&listing, f.dir.join("releases-complete.backup")).unwrap();
+                    std::fs::write(listing, b"invalid JSON").unwrap();
+                }
+                "other main" => {
+                    let mut staging = f.releases[0].clone();
+                    staging.feed = Feed::Staging;
+                    staging.tag = crate::adsblol::tag_for(2026, 9, 8, Feed::Staging, 0);
+                    let mut part = f.parts[0].clone();
+                    for aircraft in &mut part.0 {
+                        aircraft.feed = "staging".into();
+                    }
+                    crate::raw_cache::save(&f.dir, &staging, &f.spec, f.context, &part).unwrap();
+                    std::fs::write(
+                        f.dir.join("releases.json"),
+                        serde_json::to_vec(&[staging, f.releases[1].clone()]).unwrap(),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            let before = std::fs::read(&f.partial_path).unwrap();
+            let got = fetch_window_with_sources(
+                &f.want,
+                &f.cache,
+                &FetchOptions {
+                    offline: true,
+                    include_mlat: problem != "main only",
+                    ..Default::default()
+                },
+                |net, y, m, d, dir, local, include_mlat| {
+                    assert!(local && net.is_none());
+                    find_day_releases_for_fetch_cached(None, y, m, d, dir, true, include_mlat)
+                },
+                |_, _, _, _| panic!("a usable offline cache cannot require an archive"),
+            )
+            .unwrap();
+            let old = TrackStore::load(&f.partial_path).unwrap();
+            let expected = merge_stores(vec![old], DAY_JOIN_GAP_S).filtered(
+                &f.want.bbox,
+                f.want.t_start,
+                f.want.t_end,
+            );
+            assert_eq!(got.meta.stats["cache_hits"], 1, "{problem}");
+            assert_same_legs(&got.legs, &expected.legs);
+            assert_eq!(got.legs.len(), 1);
+            assert_eq!(std::fs::read(&f.partial_path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn raw_upgrade_publication_failure_does_not_silently_return_partial_coverage() {
+        let f = crate::raw_cache::tests::rebuild_fixture(Feed::Prod, false);
+        f.checkpoint(0);
+        f.checkpoint(1);
+        let before = std::fs::read(&f.partial_path).unwrap();
+        std::fs::create_dir_all(
+            f.dir
+                .join(format!("prod+mlatonly_{}.fdtrk", bbox_key(&f.spec.bbox).1)),
+        )
+        .unwrap();
+        for allow_missing in [false, true] {
+            let error = fetch_window(
+                &f.want,
+                &f.cache,
+                &FetchOptions {
+                    offline: true,
+                    allow_missing,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("could not cache completed day"));
+            assert_eq!(std::fs::read(&f.partial_path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn narrower_retry_rebuilds_covering_raw_feeds_without_opening_archives() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2277,32 +2478,17 @@ mod tests {
                             context,
                         )
                         .unwrap();
-                        crate::raw_cache::save(
-                            &f.dir,
-                            &f.releases[i],
-                            &previous,
-                            context,
-                            &part,
-                        )
-                        .unwrap();
+                        crate::raw_cache::save(&f.dir, &f.releases[i], &previous, context, &part)
+                            .unwrap();
                     }
                     let raw_bytes: [Vec<u8>; 2] = std::array::from_fn(|i| {
-                        std::fs::read(crate::raw_cache::path(
-                            &f.dir,
-                            &f.releases[i],
-                            &previous,
-                        ))
-                        .unwrap()
+                        std::fs::read(crate::raw_cache::path(&f.dir, &f.releases[i], &previous))
+                            .unwrap()
                     });
                     let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
                     tags.sort();
                     // The fixture's original parts were freshly ingested at target N.
-                    let fresh = build_day_store(
-                        f.parts.to_vec(),
-                        &f.spec,
-                        tags.clone(),
-                        context,
-                    );
+                    let fresh = build_day_store(f.parts.to_vec(), &f.spec, tags.clone(), context);
                     let expected = merge_stores(vec![fresh.clone()], DAY_JOIN_GAP_S).filtered(
                         &f.want.bbox,
                         f.want.t_start,
@@ -2335,7 +2521,8 @@ mod tests {
                     );
                     let fs = cache_feedset(&feedset_name(main, true), include_jets);
                     let saved = TrackStore::load(
-                        &f.dir.join(format!("{fs}_{}.fdtrk", bbox_key(&f.spec.bbox).1)),
+                        &f.dir
+                            .join(format!("{fs}_{}.fdtrk", bbox_key(&f.spec.bbox).1)),
                     )
                     .unwrap();
                     assert_eq!(saved.meta.geoid_n_m, f.spec.geoid_n_m);
@@ -2587,11 +2774,23 @@ mod tests {
                     &want,
                     &f.cache,
                     &opts,
-                    |_, _, _, _, _, offline, requested_mlat| {
-                        calls += 1;
-                        assert!(!offline);
+                    |net, y, m, d, dir, offline, requested_mlat| {
                         assert_eq!(requested_mlat, include_mlat);
-                        Err(DataError("synthetic main release lookup outage".into()))
+                        if offline {
+                            assert!(net.is_none());
+                            find_day_releases_for_fetch_cached(
+                                None,
+                                y,
+                                m,
+                                d,
+                                dir,
+                                true,
+                                requested_mlat,
+                            )
+                        } else {
+                            calls += 1;
+                            Err(DataError("synthetic main release lookup outage".into()))
+                        }
                     },
                 )
                 .unwrap();
@@ -4302,14 +4501,13 @@ mod tests {
         let now = t8 + 2.0 * day + 3600.0;
         assert_eq!(
             published_until(t8 + 3600.0, window_end, &mlat_dir, true, now).unwrap(),
-            (
-                t8,
-                vec!["2026-09-08".to_string(), "2026-09-09".to_string()]
-            )
+            (t8, vec!["2026-09-08".to_string(), "2026-09-09".to_string()])
         );
         std::fs::create_dir_all(mlat_day.join("prod_40.0_-74.0_41.0_-73.0.fdtrk")).unwrap();
         assert_eq!(
-            published_until(t8 + 3600.0, window_end, &mlat_dir, true, now).unwrap().0,
+            published_until(t8 + 3600.0, window_end, &mlat_dir, true, now)
+                .unwrap()
+                .0,
             t8
         );
         std::fs::write(
