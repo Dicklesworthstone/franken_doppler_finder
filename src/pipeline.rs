@@ -193,11 +193,19 @@ fn media_metadata_start_window(
     metadata_start_window(full, creation, duration, tolerance)
 }
 
-/// The distance profile can extend beyond 30 km even when the fitted CPA passes measurement's
-/// 25 km gate. Preserve that full range and the existing 15 km of surrounding track support.
+const MAX_WIND_GATE_ALLOWANCE_MPS: f64 = 10.0;
+
+/// Retain the full CPA distance profile plus its existing 15 km of track context. A long
+/// received trace can require farther emission positions; include its admitted fitted-curve
+/// support too, so cropping the archive cannot discard an otherwise scoreable approach.
 fn search_data_bounds(region: BBox, events: &[search::SearchEvent]) -> (f64, BBox) {
     let d_max = events.iter().map(|e| e.d_gate[1]).fold(5000.0, f64::max);
-    (d_max, region.padded_km(d_max / 1000.0 + 15.0))
+    let support_km = events
+        .iter()
+        .filter_map(search::SearchEvent::catalogue_radius_m)
+        .map(|radius| radius / 1000.0)
+        .fold(d_max / 1000.0 + 15.0, f64::max);
+    (d_max, region.padded_km(support_km))
 }
 
 struct PublishedWindow {
@@ -1758,8 +1766,9 @@ fn locate_with_clock(
         }
     }
     // Wind changes speed gates, not event eligibility, order, distance gates or grouping.
+    // The catalogue must cover the largest speed allowance of either weather outcome.
     // Select the capped event IDs once; rebuild their speed gates for each attempted atmosphere.
-    let mut base_events = search::independent_measured_events(events, 0.0);
+    let mut base_events = search::independent_measured_events(events, MAX_WIND_GATE_ALLOWANCE_MPS);
     let excluded_by_event_limit: std::collections::HashSet<String> = base_events
         .iter()
         .skip(max_measured)
@@ -1893,7 +1902,11 @@ fn locate_with_clock(
             log.say(&format!("weather: {w}"));
         }
         warnings.extend(wwarn);
-        let wind = if has_wind { 3.0 } else { 10.0 };
+        let wind = if has_wind {
+            3.0
+        } else {
+            MAX_WIND_GATE_ALLOWANCE_MPS
+        };
         let mut sevs = search::independent_measured_events(events, wind);
         sevs.truncate(max_measured);
         // ---- search ---------------------------------------------------------------------
@@ -3964,6 +3977,47 @@ mod tests {
                 )),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn archive_catalogue_expands_for_retarded_trace_support() {
+        let region = BBox::new(40.875466, -73.525951, 40.877466, -73.523951);
+        let mut event = search::SearchEvent {
+            id: "archive-support".into(),
+            t_rec: 400.0,
+            t_tol: 3.0,
+            v_gate: [190.0, 210.0 + MAX_WIND_GATE_ALLOWANCE_MPS],
+            d_gate: [12_000.0, 18_750.0],
+            f0: 112.0,
+            f0_tol: 4.5,
+            sigma_hz: 0.25,
+            n_eff: 50.0,
+            quality: 100.0,
+            misfit: false,
+            c_fit: 343.0,
+            tr_t: vec![390.0, 410.0],
+            tr_f: vec![115.0, 109.0],
+            q_t: Vec::new(),
+            q_f: Vec::new(),
+        };
+        let old = region.padded_km(33.75);
+        assert_eq!(
+            search_data_bounds(region, std::slice::from_ref(&event)),
+            (18_750.0, old)
+        );
+        event.tr_t = vec![100.0, 700.0];
+        let radius = event.catalogue_radius_m().unwrap();
+        let (distance, bbox) = search_data_bounds(region, std::slice::from_ref(&event));
+        assert_eq!(distance, 18_750.0, "terrain keeps its CPA footprint");
+        assert_eq!(bbox, region.padded_km(radius / 1000.0));
+        assert!(radius > 100_000.0 && bbox.south < old.south && bbox.east > old.east);
+        event.v_gate[1] -= MAX_WIND_GATE_ALLOWANCE_MPS;
+        assert!(radius > event.catalogue_radius_m().unwrap());
+        event.tr_t.push(f64::NAN);
+        assert_eq!(
+            search_data_bounds(region, std::slice::from_ref(&event)),
+            (18_750.0, old)
+        );
     }
 
     #[test]

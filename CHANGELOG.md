@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain flight context needed by long Doppler traces
+
+- Expand `locate`'s archive footprint when the retained received trace needs emission
+  positions beyond the upper CPA distance plus 15 km. Use the generous time/distance
+  intervals and maximum existing speed allowance, with a stable constant-velocity range
+  calculation that includes both distance endpoints and outward rounding.
+- Preserve the former footprint whenever it already covers the fitted trace, preserve
+  terrain's CPA footprint, and share the existing 10 m/s maximum speed allowance between
+  catalogue preparation and the no-wind-data search. Matching and confidence gates stay unchanged.
+- Three new native core regressions pass. Real fitted 200 and 250 m/s passes at 15 km CPA
+  lose coverage to 57.22% under the old 33.75 km crop and fail the existing 60% gate. The
+  new 165.64 km and 277.05 km footprints restore full coverage and the full-catalogue
+  score. Independent emission geometry, near-sonic, epoch, short-trace and invalid-input
+  controls pass in the full core executable with the pinned official Cranelift backend,
+  alongside nine existing tone, robust-scoring, measured-wind and two-flyover controls.
+- Large fit uncertainties can request substantially larger catalogues. This recovers
+  fitted spatial support; arbitrary weather/curvature and the separate 1200 s archive-time
+  margin are not made globally complete. The root pipeline wiring test, full workspace
+  checks, release CLI selftest and reference/field replays remain unexecuted or incomplete.
+
 ### Keep free ridge tracing on an aircraft beside an out-of-band tone
 
 - Select the strongest qualified local peak within each slope's existing profile, reusing

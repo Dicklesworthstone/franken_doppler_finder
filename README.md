@@ -883,9 +883,11 @@ This caches the ADS-B day stores that `locate` will need, which is useful before
 several runs. It prints `<legs> legs, <points> points cached under <cache>`. Like `locate`, it fetches only the
 published part of the archive. When the dates run into a UTC day adsb.lol has not published yet, it warns
 which days are pending and stops before them. If no published day is left, it exits with an error: rerun after
-the release. The `locate` footprint follows the largest retained event's upper distance gate plus
-15 km of track context; for wider ranges, prefetch with a sufficiently large `--pad-km`.
-The default 30 km prefetch footprint may not cover every `locate` request.
+the release. The `locate` footprint keeps the larger of the retained events' upper CPA distance
+plus 15 km and the source positions needed to explain their complete observed traces. A long,
+fast approach can require flight data more than 100 km from the observer because sound travel
+compresses its received-time span. Broad fitted ranges can require much larger footprints.
+Prefetch with a sufficiently large `--pad-km`; the default 30 km may not cover every `locate` request.
 Use matching aircraft flags for offline work: `fetch --include-jets` primes
 `locate --include-jets --offline`, while ordinary `fetch` primes ordinary `locate --offline`.
 The two cache populations are separate; neither silently substitutes for the other.
@@ -1346,12 +1348,16 @@ Design notes:
   moment of the flight is a candidate CPA: the recorder then sits on the perpendicular to the path through that
   point, at a distance that fits the measured CPA distance, and the moment fixes the recording start. A hash join
   on (east, north, recording start) finds the places two events share in O(N) time.
-- **Archive coverage follows the fitted distance gates.** The `locate` pipeline fetches
-  aircraft out to the largest retained event's upper distance gate, with a 5 km minimum
-  and the existing additional 15 km of track context. The former 30 km cap could discard
-  flights that the search itself permits. Larger ranges now request larger cached
-  footprints and can retain more tracks. This removes that cap; the fixed context
-  padding is not a proof of complete coverage for arbitrary wind or curved paths.
+- **Archive coverage includes the fitted trace's approach and departure.** The `locate`
+  pipeline retains its largest upper CPA distance, with a 5 km minimum and 15 km of context,
+  and expands the footprint when the received trace requires farther emission positions.
+  The bound uses the retained trace times, generous distance and CPA-time ranges, and the
+  largest speed allowance of either weather outcome. It evaluates both distance endpoints:
+  a smaller CPA distance can require a farther approach at the same received-time offset.
+  Short traces keep the previous footprint, and terrain prefetch still follows the CPA range.
+  Longer or weakly constrained traces can require substantially more cache and processing work;
+  no new spatial cap is imposed. This bounds constant-velocity support in fitted coordinates,
+  not arbitrary wind or curved paths. The separate 1200 s archive time padding is unchanged.
 - **Candidate geometry and clocks use the observer's propagation medium.** Each candidate
   ground point uses the path-averaged atmosphere at that observer for its speed, distance and
   recording-clock checks, with wind in the observer's frame. A constant local east/north wind
@@ -1992,6 +1998,26 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Retain the flight positions needed by a long received trace
+
+`catalogue_radius_restores_long_trace_scoring_after_store_crop` constructs independent
+15 km CPA traces at 200 and 250 m/s, runs the real fitter and measured-event adapter, then
+filters a real `TrackStore` before track construction and exact scoring. The former
+33.75 km footprint leaves 57.22% coverage in both cases and fails the unchanged 60% gate.
+The derived footprints, 165.64 km and 277.05 km, restore complete coverage and the same
+normalized chi as the full catalogue, approximately 0.02433.
+
+Two further native regressions compare the radius with independently generated emission
+positions throughout the admitted parameter box, including near-sonic speeds and the
+lower-distance approach extremum. They preserve short-trace footprints and relative/Unix
+timestamp behavior, and reject 17 malformed or unbounded input cases without producing an
+invalid radius. All three new tests and nine existing tone, robust-scoring, measured-wind and
+two-flyover controls pass in the full core executable using the pinned nightly's official
+Cranelift backend and real dependencies. The pipeline wiring regression is authored
+and source-reviewed but has not run in the root executable. These are fitted-trace and
+catalogue-support results, not PCM detection or field geolocation evidence; full workspace
+checks, CLI selftest and reference/field replays remain incomplete.
 
 ### Follow an aircraft ridge beside an out-of-band interfering tone
 

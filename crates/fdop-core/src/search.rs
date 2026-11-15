@@ -86,6 +86,90 @@ fn subsample(t: &[f64], f: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
 }
 
 impl SearchEvent {
+    /// Farthest source position needed by this trace within its admitted constant-velocity
+    /// fit ranges, in the still-air coordinates at `c_fit`. Archive selection must retain
+    /// these approach/recede positions as well as the CPA; sound travel can put an early
+    /// received sample much farther along the flight than its recording-time offset suggests.
+    ///
+    /// This is fitted-curve support, not a complete physical envelope for arbitrary wind or
+    /// curved tracks. An empty trace or invalid/unbounded fit supplies no additional radius;
+    /// callers must retain their existing catalogue footprint in that case.
+    pub fn catalogue_radius_m(&self) -> Option<f64> {
+        let (c, v) = (self.c_fit, self.v_gate[1]);
+        if !(c > 0.0
+            && c.is_finite()
+            && self.v_gate[0] >= 0.0
+            && self.v_gate[0].is_finite()
+            && v >= self.v_gate[0]
+            && v < c
+            && self.d_gate[0] >= 0.0
+            && self.d_gate[1] >= self.d_gate[0]
+            && self.d_gate.iter().all(|d| d.is_finite())
+            && self.t_rec.is_finite()
+            && self.t_tol >= 0.0
+            && self.t_tol.is_finite())
+        {
+            return None;
+        }
+        let mut times = self.tr_t.iter().copied();
+        let first = times.next()?;
+        if !first.is_finite() {
+            return None;
+        }
+        let (mut lo, mut hi) = (first, first);
+        for t in times {
+            if !t.is_finite() {
+                return None;
+            }
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+        // Subtract the local centre first, so an absolute clock cannot erase its tolerance.
+        let offsets = [
+            ((lo - self.t_rec).next_down() - self.t_tol).next_down(),
+            ((hi - self.t_rec).next_up() + self.t_tol).next_up(),
+        ];
+        let beta = v / c;
+        // Avoid subtracting two nearly equal squares for a near-sonic admitted speed.
+        let a = ((c - v) / c) * (1.0 + beta);
+        if !(a > 0.0 && a.is_finite()) {
+            return None;
+        }
+        let mut radius = 0.0_f64;
+        for u in offsets {
+            for d in self.d_gate {
+                // u = tau + (hypot(d, v*tau) - d)/c. Its positive range root is
+                // [hypot(beta*s, sqrt(a)*d) - beta²*s]/a, with s = c*u + d.
+                // Range increases with v and is convex in (u,d), so these four corners
+                // enclose the full fit box. The smaller d can give the longer approach.
+                let s = c * u + d;
+                let b = beta * s;
+                if !s.is_finite() || !b.is_finite() {
+                    return None;
+                }
+                let root = b.hypot(a.sqrt() * d);
+                let r = if s >= 0.0 {
+                    // Rationalize the receding root and normalize before division: neither
+                    // a near-sonic subtraction nor squaring a large distance is necessary.
+                    let numerator = b.hypot(d);
+                    if numerator == 0.0 {
+                        0.0
+                    } else {
+                        numerator / (root / numerator + beta * (b / numerator))
+                    }
+                } else {
+                    (root - beta * b) / a
+                };
+                if !r.is_finite() || r < 0.0 {
+                    return None;
+                }
+                radius = radius.max(r);
+            }
+        }
+        let outward = (radius * (1.0 + 64.0 * f64::EPSILON)).next_up();
+        outward.is_finite().then_some(outward)
+    }
+
     /// Build from a quality-passing measured event. `wind_mps` retains the extra speed
     /// allowance in fitted coordinates; each candidate's propagation medium maps its motion.
     pub fn from_measured(m: &MeasuredEvent, wind_mps: f64) -> Option<Self> {
@@ -14290,5 +14374,332 @@ mod tests {
             res.funnel
         );
         let _ = cv_curve(0.0, 1.0, 1.0, 1.0, 0.0, c);
+    }
+}
+
+#[cfg(test)]
+mod catalogue_support_tests {
+    use super::*;
+    use crate::detect::Detection;
+    use crate::fit::{Side, fit_constant_velocity};
+    use crate::measure::EventQuality;
+    use crate::physics::cv_curve;
+    use crate::trace::Trace;
+    use crate::track::BuildParams;
+    use fdop_types::FlatElevation;
+    use fdop_types::atmo::{Medium, UniformAtmosphere};
+    use fdop_types::engine::EngineClass;
+    use fdop_types::store::{FlightLeg, StoreMeta, TrackPoint, TrackStore, alt_src};
+
+    fn event() -> SearchEvent {
+        SearchEvent {
+            id: "catalogue".into(),
+            t_rec: 1000.0,
+            t_tol: 3.0,
+            v_gate: [90.0, 110.0],
+            d_gate: [4000.0, 10_000.0],
+            f0: 112.0,
+            f0_tol: 4.5,
+            sigma_hz: 0.25,
+            n_eff: 20.0,
+            quality: 10.0,
+            misfit: false,
+            c_fit: 343.0,
+            tr_t: vec![990.0, 1010.0],
+            tr_f: vec![115.0, 109.0],
+            q_t: vec![],
+            q_f: vec![],
+        }
+    }
+
+    #[test]
+    fn catalogue_radius_encloses_physical_emission_samples_across_the_fit_box() {
+        let mut ev = event();
+        ev.d_gate = [30.0, 20_000.0];
+        ev.tr_t = vec![700.0, 1000.0, 1300.0];
+        for upper in [150.0, 300.0, 343.0 * (1.0 - 1e-8)] {
+            ev.v_gate = [0.0, upper];
+            let radius = ev.catalogue_radius_m().unwrap();
+            let mut tested = 0;
+            for v in [0.0, 0.25 * upper, 0.75 * upper, upper] {
+                for d in [30.0_f64, 500.0, 7000.0, 20_000.0] {
+                    // Independent physical source positions generate reception times.
+                    // Include long approaches and the delicate c*u+d ~= 0 transition.
+                    for tau in [
+                        -1e6, -100_000.0, -10_000.0, -1000.0, -300.0, -100.0, -60.0, -10.0, 0.0,
+                        10.0, 60.0, 100.0, 300.0, 1000.0,
+                    ] {
+                        let range = d.hypot(v * tau);
+                        let offset = tau + (range - d) / ev.c_fit;
+                        if (-303.0..=303.0).contains(&offset) {
+                            assert!(
+                                range <= radius,
+                                "v={v} d={d} tau={tau} offset={offset} range={range} radius={radius}"
+                            );
+                            tested += 1;
+                        }
+                    }
+                }
+            }
+            assert!(tested > 80);
+        }
+        // At a fixed heard-time offset a smaller CPA can require a farther approach.
+        ev.v_gate = [200.0, 200.0];
+        ev.tr_t = vec![700.0];
+        ev.t_tol = 0.0;
+        let both = ev.catalogue_radius_m().unwrap();
+        ev.d_gate[0] = ev.d_gate[1];
+        let upper_only = ev.catalogue_radius_m().unwrap();
+        assert!(both > upper_only + 10_000.0);
+    }
+
+    #[test]
+    fn catalogue_radius_preserves_short_footprints_and_rejects_invalid_geometry() {
+        let original = event();
+        let old_radius = original.d_gate[1].max(5000.0) + 15_000.0;
+        assert_eq!(
+            old_radius.max(original.catalogue_radius_m().unwrap()),
+            old_radius
+        );
+        let mut shifted = original.clone();
+        shifted.t_rec += 1_783_000_000.0;
+        for t in &mut shifted.tr_t {
+            *t += 1_783_000_000.0;
+        }
+        assert_eq!(original.catalogue_radius_m(), shifted.catalogue_radius_m());
+        shifted.tr_t.reverse();
+        assert_eq!(original.catalogue_radius_m(), shifted.catalogue_radius_m());
+        for bad in 0..17 {
+            let mut ev = original.clone();
+            match bad {
+                0 => ev.tr_t.clear(),
+                1 => ev.tr_t.push(f64::NAN),
+                2 => ev.tr_t.push(f64::INFINITY),
+                3 => ev.c_fit = 0.0,
+                4 => ev.c_fit = f64::NAN,
+                5 => ev.c_fit = f64::INFINITY,
+                6 => ev.v_gate[0] = -1.0,
+                7 => ev.v_gate.reverse(),
+                8 => ev.v_gate[1] = ev.c_fit,
+                9 => ev.v_gate[1] = f64::INFINITY,
+                10 => ev.d_gate[0] = -1.0,
+                11 => ev.d_gate.reverse(),
+                12 => ev.d_gate[1] = f64::INFINITY,
+                13 => ev.t_rec = f64::NAN,
+                14 => ev.t_tol = -1.0,
+                15 => ev.t_tol = f64::INFINITY,
+                _ => ev.tr_t = vec![-f64::MAX, f64::MAX],
+            }
+            assert!(ev.catalogue_radius_m().is_none(), "invalid case {bad}");
+        }
+    }
+
+    fn long_measurement(speed: f64) -> MeasuredEvent {
+        let (c, emitted, distance, centre) = (343.0_f64, 112.0, 15_000.0_f64, 1000.0);
+        let half = (4.0 * distance / speed).clamp(45.0, 300.0);
+        let mut trace = Trace::default();
+        for k in 0..=1200 {
+            let heard = centre + distance / c - half + 2.0 * half * k as f64 / 1200.0;
+            let q = heard - centre;
+            let a = c * c - speed * speed;
+            let tau =
+                (c * c * q - (c * c * speed * speed * q * q + a * distance * distance).sqrt()) / a;
+            let range = distance.hypot(speed * tau);
+            trace.t.push(heard);
+            trace.f.push(
+                emitted * c / (c + speed * speed * tau / range)
+                    + 0.05 * (1.731 * k as f64 + 0.37).sin(),
+            );
+            trace.snr.push(20.0);
+        }
+        let fit = fit_constant_velocity(&trace.t, &trace.f, c, Side::Both).unwrap();
+        let b = fit.best;
+        let central: Vec<_> = trace
+            .t
+            .iter()
+            .zip(&trace.f)
+            .filter_map(|(&t, &f)| {
+                let model = cv_curve(t, b.f0, b.v, b.d, b.t0e, c);
+                (0.1..=0.9)
+                    .contains(&((fit.f_pre - model) / (fit.f_pre - fit.f_post)))
+                    .then_some((t, f, f - model))
+            })
+            .collect();
+        assert!(central.len() >= 5);
+        assert!(
+            central
+                .windows(2)
+                .all(|p| p[1].0 - p[0].0 <= 3.0 && (p[1].2 - p[0].2).abs() <= 2.0)
+        );
+        let wing = (central.len() / 4).clamp(2, 10);
+        let mut first: Vec<_> = central[..wing].iter().map(|p| p.1).collect();
+        let mut last: Vec<_> = central[central.len() - wing..]
+            .iter()
+            .map(|p| p.1)
+            .collect();
+        let drop = (crate::spectro::median_f64(&mut first) - crate::spectro::median_f64(&mut last))
+            .max(0.0)
+            / (0.8 * (fit.f_pre - fit.f_post));
+        let (approach, recede) = (b.t0r - trace.t[0], trace.t.last().unwrap() - b.t0r);
+        assert_eq!(fit.diagnostics.n_inliers, trace.len());
+        assert!(trace.len() >= 80 && approach > 8.0 && recede > 8.0 && drop > 0.15);
+        assert!(
+            b.rmse < 0.1 && (15.0..=0.8 * c).contains(&b.v) && (60.0..=25_000.0).contains(&b.d)
+        );
+        let measured = MeasuredEvent {
+            id: "long-approach".into(),
+            detection: Detection {
+                id: 0,
+                t0r: b.t0r,
+                f0: b.f0,
+                v: b.v,
+                d: b.d,
+                score: 10.0,
+                score_approach: 10.0,
+                score_recede: 10.0,
+                half_s: half,
+                harmonic_of: None,
+                harmonics: vec![],
+                from_contrast: false,
+            },
+            quality: EventQuality {
+                n_points: trace.len(),
+                span_approach_s: approach,
+                span_recede_s: recede,
+                drop_traversed: drop,
+                median_snr_db: 20.0,
+                rmse_hz: b.rmse,
+                score: 20.0 * fit.diagnostics.n_eff.sqrt(),
+                ok: true,
+                reseeded: false,
+                reasons: vec![],
+            },
+            fit: Some(fit),
+            trace,
+            win_s: 1.0,
+            spec: None,
+        };
+        assert!(measured.is_aircraft_like());
+        measured
+    }
+
+    #[test]
+    fn catalogue_radius_restores_long_trace_scoring_after_store_crop() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let region = BBox::new(lat - 0.001, lon - 0.001, lat + 0.001, lon + 0.001);
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(343.0));
+        let o = observer(lat, lon, &dem);
+        for speed in [200.0, 250.0] {
+            let measured = long_measurement(speed);
+            // The initial catalogue uses the larger allowance of both weather outcomes.
+            let ev = SearchEvent::from_measured(&measured, 10.0).unwrap();
+            assert!(!ev.misfit);
+            let fit_upper = measured.fit.as_ref().unwrap().ranges_generous.v[1];
+            assert_eq!(ev.v_gate[1], fit_upper + 10.0);
+            let distance = 15_000.0_f64;
+            let points = (0..=1000)
+                .map(|i| {
+                    let t = 2.0 * i as f64;
+                    let (lat, lon, h) = enu.to_geodetic([
+                        speed * (t - 1000.0),
+                        (distance * distance - 1000.0_f64.powi(2)).sqrt(),
+                        1000.0 + MIC_HEIGHT_M,
+                    ]);
+                    TrackPoint {
+                        t,
+                        lat,
+                        lon,
+                        alt_m: h as f32,
+                        gs_mps: f32::NAN,
+                        track_deg: f32::NAN,
+                        vrate_mps: f32::NAN,
+                        alt_src: alt_src::GEOM,
+                        flags: 0,
+                    }
+                })
+                .collect();
+            let full = TrackStore {
+                meta: StoreMeta {
+                    version: 1,
+                    bbox: region.padded_km(500.0),
+                    t_start: 0.0,
+                    t_end: 2000.0,
+                    geoid_n_m: 0.0,
+                    sources: vec!["synthetic".into()],
+                    stats: Default::default(),
+                    created_unix: 0.0,
+                },
+                legs: vec![FlightLeg {
+                    key: "catalogue-support".into(),
+                    icao: "support".into(),
+                    reg: String::new(),
+                    typ: String::new(),
+                    source: "synthetic".into(),
+                    engine: EngineClass::Unknown,
+                    points,
+                }],
+            };
+            let old_radius = ev.d_gate[1].max(5000.0) + 15_000.0;
+            let radius = old_radius.max(ev.catalogue_radius_m().unwrap());
+            assert!(radius > old_radius + 20_000.0);
+            let old = full.filtered(&region.padded_km(old_radius / 1000.0), 0.0, 2000.0);
+            let retained = full.filtered(&region.padded_km(radius / 1000.0), 0.0, 2000.0);
+            let p = SearchParams::new(0.0, 0.0, 2000.0, region);
+            let mut complete_chi: Option<f64> = None;
+            for (label, store) in [("full", &full), ("old", &old), ("retained", &retained)] {
+                let tracks: Vec<_> = store
+                    .legs
+                    .iter()
+                    .flat_map(|l| crate::track::build(l, &BuildParams::default()))
+                    .collect();
+                assert_eq!(tracks.len(), 1);
+                let assign = [(0, 0, 1000.0)];
+                let diagnostic = eval_point(
+                    &o,
+                    &assign,
+                    std::slice::from_ref(&ev),
+                    &tracks,
+                    &p,
+                    &atmo,
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+                let fit = diagnostic.chis[0];
+                let accepted = eval_point(
+                    &o,
+                    &assign,
+                    std::slice::from_ref(&ev),
+                    &tracks,
+                    &p,
+                    &atmo,
+                    true,
+                    true,
+                    false,
+                );
+                eprintln!(
+                    "catalogue support v={speed} {label}: radius={radius:.3}, old_radius={old_radius:.3}, reports={}, chi={:.9}, coverage={:.9}",
+                    store.n_points(),
+                    fit.chi,
+                    fit.cov
+                );
+                if label == "old" {
+                    assert!(
+                        fit.cov < 0.6 && accepted.is_none(),
+                        "the unchanged exact coverage gate must refuse the cropped flight"
+                    );
+                } else {
+                    assert!(fit.chi < 0.1 && fit.cov == 1.0);
+                    assert!(accepted.is_some());
+                    if let Some(chi) = complete_chi {
+                        assert!((fit.chi - chi).abs() < 1e-8);
+                    }
+                    complete_chi = Some(fit.chi);
+                }
+            }
+        }
     }
 }
