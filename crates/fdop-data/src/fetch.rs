@@ -2135,6 +2135,125 @@ mod tests {
     }
 
     #[test]
+    fn narrower_retry_rebuilds_covering_raw_feeds_without_opening_archives() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                let f = offline_raw_fixture(main, include_jets);
+                f.checkpoint(0);
+                f.checkpoint(1);
+                let want = IngestSpec {
+                    bbox: BBox::new(40.4, -73.8, 40.6, -73.4),
+                    geoid_n_m: -30.0,
+                    ..f.want
+                };
+                let original: Vec<_> = f
+                    .releases
+                    .iter()
+                    .map(|release| {
+                        let path = crate::raw_cache::path(&f.dir, release, &f.spec);
+                        let bytes = std::fs::read(&path).unwrap();
+                        (path, bytes)
+                    })
+                    .collect();
+                let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
+                tags.sort();
+                // A completed larger day store already supports this query. Raw
+                // recovery must preserve the same joint type/altitude evidence and
+                // filtering boundaries when only its final publication was lost.
+                let mut full = build_day_store(
+                    f.parts.to_vec(),
+                    &f.spec,
+                    tags.clone(),
+                    day_context((2026, 9, 8)),
+                );
+                adjust_geoid(&mut full, want.geoid_n_m);
+                let expected = merge_stores(vec![full], DAY_JOIN_GAP_S).filtered(
+                    &want.bbox,
+                    want.t_start,
+                    want.t_end,
+                );
+                assert!(!expected.legs.is_empty());
+                let archive_opens = AtomicUsize::new(0);
+                let narrow_day = IngestSpec {
+                    bbox: bbox_key(&want.bbox).0,
+                    geoid_n_m: want.geoid_n_m,
+                    ..f.spec
+                };
+                // The online ingest path must also reuse the completed larger feed.
+                for (i, release) in f.releases.iter().enumerate() {
+                    let part = ingest_cached_release(
+                        &f.dir,
+                        release,
+                        &narrow_day,
+                        day_context((2026, 9, 8)),
+                        &FetchOptions::default(),
+                        || {
+                            archive_opens.fetch_add(1, Ordering::Relaxed);
+                            Err(DataError("covering raw retry opened an archive".into()))
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(part.0.len(), f.parts[i].0.len());
+                }
+                let got = fetch_window_with_sources(
+                    &want,
+                    &f.cache,
+                    &FetchOptions {
+                        offline: true,
+                        ..Default::default()
+                    },
+                    |net, y, m, d, dir, offline, include_mlat| {
+                        assert!(offline && net.is_none());
+                        find_day_releases_for_fetch_cached(None, y, m, d, dir, true, include_mlat)
+                    },
+                    |_, _, _, _| {
+                        archive_opens.fetch_add(1, Ordering::Relaxed);
+                        Err(DataError("covering raw retry opened an archive".into()))
+                    },
+                )
+                .unwrap();
+                assert_eq!(archive_opens.load(Ordering::Relaxed), 0);
+                assert_eq!(got.meta.stats["cache_hits"], 0);
+                assert_eq!(got.meta.sources, tags);
+                assert_same_legs(&got.legs, &expected.legs);
+                assert!(
+                    got.legs
+                        .iter()
+                        .all(|leg| leg.engine != EngineClass::Unknown)
+                );
+                assert_eq!(
+                    got.legs.iter().any(|leg| leg.engine == EngineClass::Jet),
+                    include_jets
+                );
+                let path = f.dir.join(format!(
+                    "{}_{}.fdtrk",
+                    cache_feedset(&feedset_name(main, true), include_jets),
+                    bbox_key(&want.bbox).1,
+                ));
+                let saved = TrackStore::load(&path).unwrap();
+                assert_eq!(saved.meta.bbox, bbox_key(&want.bbox).0);
+                assert_eq!(saved.meta.geoid_n_m, want.geoid_n_m);
+                for (path, bytes) in original {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
+                let cached = fetch_window(
+                    &want,
+                    &f.cache,
+                    &FetchOptions {
+                        offline: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(cached.meta.stats["cache_hits"], 1);
+                assert_same_legs(&cached.legs, &got.legs);
+            }
+        }
+    }
+
+    #[test]
     fn offline_raw_recovery_references_geoid_before_joint_altitude_correction() {
         for main in [Feed::Prod, Feed::Staging] {
             for include_jets in [false, true] {

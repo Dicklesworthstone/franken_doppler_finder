@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Reuse completed flight downloads after narrowing the search region
+
+- After the exact raw checkpoint is unavailable, try completed same-feed checkpoints
+  whose stored region covers the request, smallest first. Validate the embedded
+  coverage and complete gzip stream, retaining exact release/ordered-asset, time,
+  aircraft-policy and midnight-context identity checks. Damaged or incompatible
+  alternatives cannot hide a later usable checkpoint.
+- Keep all raw observations for the ordinary joint altitude and boundary reconciliation,
+  then apply the existing final region filter. Existing geoid re-referencing remains
+  available; checkpoint contents, the cache format and complete processed-cache
+  priority are unchanged. A narrower offline retry can now rebuild a catalogue after
+  the larger feed finished but day-store publication was interrupted.
+- Add exact/smallest-cache priority, bit-preservation, changed-geoid, incompatible
+  identity/coverage and corrupt-cache controls, plus online-ingest reuse and offline
+  prod/staging+MLAT reconstruction with both jet policies and no archive opens.
+- Source review, formatting of changed Rust hunks and whitespace checks pass. The
+  pinned native component compiled the complete production raw-cache, build and ingest
+  modules with real dependencies: all 59 tests passed, including the three new covering-cache
+  regressions. The complete fetch integration test, workspace checks, CLI selftest and
+  reference/field replays remain unexecuted; no field-accuracy improvement is claimed.
+
 ### Preserve faster aircraft passes with missing ADS-B headings
 
 - Recover a locally supported faster section even when speed is reported without heading.

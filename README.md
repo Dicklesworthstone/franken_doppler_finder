@@ -1043,8 +1043,15 @@ missing. Donor speeds must be positive and at most nominal sound speed, as in tr
 The same feed preference selects among eligible donors, and raw leg provenance records the contributing
 feed. Separate incomplete reports cannot be combined into a new speed/heading pair.
 
-Reuse requires the exact release metadata and ordered assets, spatial/time filter,
-unknown/jet policy and midnight-context version. A changed finite geoid reference can
+Reuse requires the exact release metadata and ordered assets, time filter,
+unknown/jet policy and midnight-context version. The exact spatial checkpoint takes
+priority. If it is absent, incompatible or unreadable, a retry for a narrower region
+can reuse the smallest usable completed raw checkpoint covering that region. Both its
+filename and embedded coverage must contain the request; a filename alone is not proof.
+All retained raw reports still enter the ordinary altitude and boundary reconciliation
+before the final requested-region filter. This also lets an offline retry recover a
+narrower region after a larger download completed but its day-store publication was
+interrupted. A changed finite geoid reference can
 reuse the same checkpoint: finite GNSS heights shift by the old reference minus the new
 one before ordinary cross-feed reconciliation and barometric correction. This lets a
 retry use a newly available geoid correction without downloading the completed feed again.
@@ -1969,6 +1976,23 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Reuse a completed raw feed after narrowing the search region
+
+The raw-checkpoint regressions require exact-hit priority, deterministic selection of the
+smallest usable covering cache, unchanged raw observations and boundary bits, and the
+existing geoid conversion. Fourteen incompatible identity or embedded-coverage cases
+remain misses. Damaged exact and covering files cannot hide a later usable checkpoint;
+an incomplete gzip footer never supplies data.
+
+A production-fetch regression reconstructs narrower prod/staging+MLAT catalogues with
+both jet policies and a changed geoid, requires zero archive opens, compares the reports
+against reuse of a complete larger catalogue, and checks subsequent processed-cache reuse.
+The online ingest helper has the same no-archive-open control. These tests were authored
+and reviewed. All 59 tests passed in a native component compiling the complete production
+raw-cache, build and ingest modules with the real pinned dependencies, including all nine
+raw-cache tests and the three new covering-cache regressions. The complete fetch integration
+test has not run; neither field-accuracy nor full-workspace success is claimed here.
 
 ### Preserve a faster pass when speed reports lack headings
 

@@ -3,10 +3,13 @@
 //! This is disposable cache data, not a public interchange format: a version, release,
 //! coverage or policy mismatch is a miss and an unreadable file is refetched. A change
 //! only to the geoid re-references GNSS heights without discarding the completed ingest.
+//! After an exact miss, a covering spatial checkpoint can supply a narrower retry; all
+//! other filter, policy, release and midnight-context fields must still match exactly.
 
 use crate::DataError;
 use crate::adsblol::DayRelease;
 use crate::ingest::{DayContext, IngestSpec, IngestStats, RawAircraft};
+use fdop_types::BBox;
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
@@ -80,7 +83,79 @@ pub(crate) fn load(
     spec: &IngestSpec,
     context: DayContext,
 ) -> Result<Option<(Vec<RawAircraft>, IngestStats)>, DataError> {
-    let file = match File::open(path(dir, rel, spec)) {
+    let exact = path(dir, rel, spec);
+    let mut first_error = match load_path(&exact, rel, spec, context, false) {
+        Ok(Some(part)) => return Ok(Some(part)),
+        Ok(None) => None,
+        Err(e) => Some(e),
+    };
+    let entries = match std::fs::read_dir(dir.join("raw")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return first_error.map_or(Ok(None), Err);
+        }
+        Err(e) => return Err(first_error.unwrap_or_else(|| e.into())),
+    };
+    let feed = format!(
+        "{}{}",
+        rel.feed.tag_word(),
+        if spec.include_jets { "+jets" } else { "" },
+    );
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if candidate == exact || !candidate.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = name.strip_suffix(".fdopraw.gz")
+            && let Some((label, bbox)) = crate::fetch::parse_cache_name(&format!("{stem}.fdtrk"))
+            && label == feed
+            && covers_bbox(bbox, spec.bbox)
+        {
+            candidates.push((bbox.area_km2(), candidate));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, candidate) in candidates {
+        match load_path(&candidate, rel, spec, context, true) {
+            Ok(Some(part)) => return Ok(Some(part)),
+            Ok(None) => {}
+            Err(e) => {
+                first_error
+                    .get_or_insert_with(|| DataError(format!("{}: {e}", candidate.display())));
+            }
+        }
+    }
+    first_error.map_or(Ok(None), Err)
+}
+
+fn covers_bbox(outer: BBox, inner: BBox) -> bool {
+    outer
+        .as_array()
+        .into_iter()
+        .chain(inner.as_array())
+        .all(f64::is_finite)
+        && inner.south <= inner.north
+        && inner.west <= inner.east
+        && outer.south >= -90.0
+        && outer.north <= 90.0
+        && outer.west >= -180.0
+        && outer.east <= 180.0
+        && outer.south <= inner.south
+        && outer.west <= inner.west
+        && outer.north >= inner.north
+        && outer.east >= inner.east
+}
+
+fn load_path(
+    path: &Path,
+    rel: &DayRelease,
+    spec: &IngestSpec,
+    context: DayContext,
+    covering: bool,
+) -> Result<Option<(Vec<RawAircraft>, IngestStats)>, DataError> {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -94,6 +169,22 @@ pub(crate) fn load(
         return Ok(None);
     }
     let mut required = Identity::new(rel, spec, context);
+    if covering {
+        let bits = &cached.identity.filter_bits;
+        let bbox = BBox::new(
+            f64::from_bits(bits[0]),
+            f64::from_bits(bits[1]),
+            f64::from_bits(bits[2]),
+            f64::from_bits(bits[3]),
+        );
+        if !covers_bbox(bbox, spec.bbox) {
+            return Ok(None);
+        }
+        // Retain the whole raw part: cropping before feed reconciliation could
+        // discard altitude offsets or leg boundaries. Final store filtering still
+        // applies the requested region; the filename alone certifies no coverage.
+        required.filter_bits[..4].copy_from_slice(&cached.identity.filter_bits[..4]);
+    }
     if cached.identity != required {
         // The initial run may have used the default geoid before an NGS lookup
         // succeeded. All coverage, release and policy fields must still match;
@@ -455,6 +546,152 @@ mod tests {
             assert!(load(&dir, &rel, &spec, changed).unwrap().is_none());
         }
         assert!(load(&dir, &rel, &spec, context).unwrap().is_some());
+    }
+
+    #[test]
+    fn covering_checkpoint_keeps_raw_evidence_and_prefers_exact_then_smallest() {
+        let (dir, rel, spec, context) = fixture();
+        let want = IngestSpec {
+            bbox: BBox::new(0.2, 0.2, 0.4, 0.4),
+            geoid_n_m: -30.0,
+            ..spec
+        };
+        let smaller = IngestSpec {
+            bbox: BBox::new(0.1, 0.1, 0.6, 0.6),
+            ..spec
+        };
+        let mut broad = part();
+        let sample = broad.0[0].points[0];
+        broad.0[0].points.push(RawPoint {
+            alt_geom_msl: 880.0,
+            ..sample
+        });
+        let mut narrow = broad.clone();
+        narrow.1.bytes += 1;
+        // The wider checkpoint was created first, but the tighter coverage wins.
+        save(&dir, &rel, &spec, context, &broad).unwrap();
+        save(&dir, &rel, &smaller, context, &narrow).unwrap();
+        let original = std::fs::read(path(&dir, &rel, &smaller)).unwrap();
+        let restored = load(&dir, &rel, &want, context).unwrap().unwrap();
+        let mut expected = narrow.clone();
+        expected.0[0].points[1].alt_geom_msl = 878.0;
+        assert_eq!(restored.1, expected.1);
+        // Preserve every original report and boundary, including outside the query;
+        // the day builder still needs their altitude and continuity evidence.
+        assert_eq!(
+            serde_json::to_vec(&restored.0).unwrap(),
+            serde_json::to_vec(&expected.0).unwrap()
+        );
+        assert_eq!(std::fs::read(path(&dir, &rel, &smaller)).unwrap(), original);
+
+        let mut exact = part();
+        exact.1.bytes += 2;
+        save(&dir, &rel, &want, context, &exact).unwrap();
+        let restored = load(&dir, &rel, &want, context).unwrap().unwrap();
+        assert_eq!(restored.1, exact.1);
+        assert_eq!(
+            serde_json::to_vec(&restored.0).unwrap(),
+            serde_json::to_vec(&exact.0).unwrap()
+        );
+    }
+
+    #[test]
+    fn covering_checkpoint_requires_certified_bbox_and_exact_nonspatial_identity() {
+        for case in [
+            "south",
+            "west",
+            "north",
+            "east",
+            "nonfinite",
+            "time_start",
+            "time_end",
+            "unknown",
+            "jets",
+            "feed",
+            "release",
+            "parts",
+            "context",
+            "version",
+        ] {
+            let (dir, rel, spec, context) = fixture();
+            let want = IngestSpec {
+                bbox: BBox::new(0.2, 0.2, 0.4, 0.4),
+                geoid_n_m: -30.0,
+                ..spec
+            };
+            let mut identity = Identity::new(&rel, &spec, context);
+            match case {
+                "south" => identity.filter_bits[0] = 0.3_f64.to_bits(),
+                "west" => identity.filter_bits[1] = 0.3_f64.to_bits(),
+                "north" => identity.filter_bits[2] = 0.3_f64.to_bits(),
+                "east" => identity.filter_bits[3] = 0.3_f64.to_bits(),
+                "nonfinite" => identity.filter_bits[0] = f64::NEG_INFINITY.to_bits(),
+                "time_start" => identity.filter_bits[4] += 1,
+                "time_end" => identity.filter_bits[5] += 1,
+                "unknown" => identity.keep_unknown = false,
+                "jets" => identity.include_jets = true,
+                "feed" => identity.release.feed = Feed::Mlatonly,
+                "release" => identity.release.parts[0].size += 1,
+                "parts" => identity.release.parts.reverse(),
+                "context" => identity.context_bits[2] += 1,
+                "version" => identity.version = 0,
+                _ => unreachable!(),
+            }
+            let part = part();
+            let path = path(&dir, &rel, &spec);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut encoder = GzEncoder::new(File::create(&path).unwrap(), Compression::fast());
+            serde_json::to_writer(
+                &mut encoder,
+                &CheckpointRef {
+                    identity: &identity,
+                    aircraft: &part.0,
+                    stats: &part.1,
+                },
+            )
+            .unwrap();
+            encoder.finish().unwrap();
+            // The filename claims coverage, but the embedded identity is decisive.
+            assert!(
+                load(&dir, &rel, &want, context).unwrap().is_none(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn covering_checkpoint_skips_damaged_and_incompatible_candidates() {
+        let (dir, rel, spec, context) = fixture();
+        let want = IngestSpec {
+            bbox: BBox::new(0.3, 0.3, 0.4, 0.4),
+            ..spec
+        };
+        let original = part();
+        save(&dir, &rel, &spec, context, &original).unwrap();
+        let incompatible = IngestSpec {
+            bbox: BBox::new(0.1, 0.1, 0.7, 0.7),
+            t_end: spec.t_end + 1.0,
+            ..spec
+        };
+        save(&dir, &rel, &incompatible, context, &original).unwrap();
+        let corrupt = IngestSpec {
+            bbox: BBox::new(0.2, 0.2, 0.6, 0.6),
+            ..spec
+        };
+        save(&dir, &rel, &corrupt, context, &original).unwrap();
+        let corrupt_path = path(&dir, &rel, &corrupt);
+        let bytes = std::fs::read(&corrupt_path).unwrap();
+        // Even a fully readable JSON payload is unusable without its gzip footer.
+        std::fs::write(&corrupt_path, &bytes[..bytes.len() - 1]).unwrap();
+        std::fs::write(path(&dir, &rel, &want), b"damaged exact checkpoint").unwrap();
+        let restored = load(&dir, &rel, &want, context).unwrap().unwrap();
+        assert_eq!(restored.1, original.1);
+        assert_eq!(
+            serde_json::to_vec(&restored.0).unwrap(),
+            serde_json::to_vec(&original.0).unwrap()
+        );
+        std::fs::write(path(&dir, &rel, &spec), b"damaged covering checkpoint").unwrap();
+        assert!(load(&dir, &rel, &want, context).is_err());
     }
 
     #[test]
