@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep observed climb rates when a preferred duplicate omits them
+
+- Recover a missing vertical rate from a fresh, finite, geometrically agreeing duplicate
+  during raw-day construction and overlapping processed-store merges. Vertical motion is
+  independent of horizontal speed/heading availability. Existing rates, preferred positions,
+  feed priority, duplicate intervals, altitude provenance and leg boundaries stay unchanged.
+- Four new regressions include 192 compressed-ingest/store-roundtrip cases for climbs,
+  descents, uneven spacing, both donor feeds and input orders, with and without horizontal
+  telemetry. All 63 native production builder, ingest and raw-cache component tests pass.
+- Eight synthetic serialized-data-to-core cases reduce maximum trajectory error from
+  38.25-47.87 m to less than 0.036 m and received-tone error from 1.036-2.233 Hz to
+  less than 0.0054 Hz. Both recovery paths exactly match the complete-observation model;
+  inconsistent finite donated rates still fall back under the existing nearby-motion checks.
+- The original raw builder and processed merger fail their positive recovery regressions.
+  The complete current track module, with real pinned types, confirms their serialized
+  output retains the missing-rate errors under the same current interpolation model.
+- Validation uses real production modules and pinned dependencies, not the network fetcher
+  or full data package. No complete workspace, CLI selftest or reference/field accuracy claim.
+
 ### Retain flight context needed by long Doppler traces
 
 - Expand `locate`'s archive footprint when the retained received trace needs emission

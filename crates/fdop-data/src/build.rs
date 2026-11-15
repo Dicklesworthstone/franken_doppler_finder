@@ -96,25 +96,38 @@ fn missing_duplicate_motion(preferred: (f32, f32), donor: (f32, f32)) -> Option<
     ))
 }
 
-fn raw_duplicate_motion(preferred: &RawPoint, donor: &RawPoint) -> Option<(f32, f32)> {
+/// Shared evidence for independent motion components from one fresh duplicate.
+fn raw_duplicate_geometry(preferred: &RawPoint, donor: &RawPoint) -> bool {
     let heights = [
         (preferred.alt_geom_msl, donor.alt_geom_msl),
         (preferred.alt_baro_m, donor.alt_baro_m),
     ];
-    if preferred.lat != donor.lat
-        || preferred.lon != donor.lon
-        || donor.flags & pt_flags::STALE != 0
-        || !heights.iter().any(|&(a, b)| a.is_finite() && a == b)
-        || heights
+    preferred.lat == donor.lat
+        && preferred.lon == donor.lon
+        && donor.flags & pt_flags::STALE == 0
+        && heights.iter().any(|&(a, b)| a.is_finite() && a == b)
+        && !heights
             .iter()
             .any(|&(a, b)| a.is_finite() && b.is_finite() && a != b)
-    {
+}
+
+fn raw_duplicate_motion(preferred: &RawPoint, donor: &RawPoint) -> Option<(f32, f32)> {
+    if !raw_duplicate_geometry(preferred, donor) {
         return None;
     }
     missing_duplicate_motion(
         (preferred.gs_mps, preferred.track_deg),
         (donor.gs_mps, donor.track_deg),
     )
+}
+
+fn processed_duplicate_geometry(preferred: &TrackPoint, donor: &TrackPoint) -> bool {
+    preferred.lat == donor.lat
+        && preferred.lon == donor.lon
+        && preferred.alt_m.is_finite()
+        && preferred.alt_m == donor.alt_m
+        && preferred.alt_src == donor.alt_src
+        && donor.flags & pt_flags::STALE == 0
 }
 
 fn feed_of(label: &str) -> Feed {
@@ -527,6 +540,20 @@ fn build_store_inner(
                 (q.p.gs_mps, q.p.track_deg) = motion;
                 q.feed_bit |= donor.feed_bit;
             }
+            // Climb rate is an independent observed component. Keep it even when
+            // the preferred horizontal pair was already complete; downstream track
+            // construction retains its existing motion checks.
+            if q.p.vrate_mps.is_nan()
+                && let Some(donor) = duplicates
+                    .iter()
+                    .filter(|donor| {
+                        raw_duplicate_geometry(&q.p, &donor.p) && donor.p.vrate_mps.is_finite()
+                    })
+                    .min_by_key(|donor| donor.rank)
+            {
+                q.p.vrate_mps = donor.p.vrate_mps;
+                q.feed_bit |= donor.feed_bit;
+            }
         }
         // Resolve the original remaps first, then the quality replacements. Combining
         // both maps could cycle when the final choice was an earlier discarded report.
@@ -792,13 +819,7 @@ fn dedupe_store_points(
             let mut best: Option<(Option<u8>, (f32, f32))> = None;
             for &i in &anchors[first..next] {
                 let donor = &points[i];
-                if preferred.lat != donor.lat
-                    || preferred.lon != donor.lon
-                    || !preferred.alt_m.is_finite()
-                    || preferred.alt_m != donor.alt_m
-                    || preferred.alt_src != donor.alt_src
-                    || donor.flags & pt_flags::STALE != 0
-                {
+                if !processed_duplicate_geometry(preferred, donor) {
                     continue;
                 }
                 if let Some(motion) = missing_duplicate_motion(
@@ -813,6 +834,24 @@ fn dedupe_store_points(
             }
             if let Some((_, motion)) = best {
                 (preferred.gs_mps, preferred.track_deg) = motion;
+            }
+        }
+        if preferred.vrate_mps.is_nan() {
+            let mut best: Option<usize> = None;
+            for &i in &anchors[first..next] {
+                let donor = &points[i];
+                if processed_duplicate_geometry(preferred, donor)
+                    && donor.vrate_mps.is_finite()
+                    && best.is_none_or(|j| match (feed_ranks[i], feed_ranks[j]) {
+                        (Some(candidate), Some(current)) => candidate < current,
+                        _ => false,
+                    })
+                {
+                    best = Some(i);
+                }
+            }
+            if let Some(i) = best {
+                preferred.vrate_mps = points[i].vrate_mps;
             }
         }
     }
@@ -2017,7 +2056,14 @@ mod tests {
     #[test]
     fn duplicate_altitude_recovery_requires_an_agreeing_complete_observation() {
         for missing_geom in [true, false] {
-            for rejection in ["latitude", "longitude", "altitude", "no_geom", "no_baro", "stale"] {
+            for rejection in [
+                "latitude",
+                "longitude",
+                "altitude",
+                "no_geom",
+                "no_baro",
+                "stale",
+            ] {
                 let mut parts = duplicate_altitude_parts(0.02, missing_geom);
                 let reference = build_store(vec![parts[0].clone()], &seam_spec(T0), vec![]);
                 let donor = &mut parts[1].0[0].points[0];
@@ -2034,7 +2080,10 @@ mod tests {
                 let store = build_store(parts, &seam_spec(T0), vec![]);
                 assert_eq!(store.legs.len(), 1, "{rejection}");
                 assert_eq!(store.legs[0].source, "prod", "{rejection}");
-                assert_eq!(store.legs[0].points, reference.legs[0].points, "{rejection}");
+                assert_eq!(
+                    store.legs[0].points, reference.legs[0].points,
+                    "{rejection}"
+                );
             }
         }
         // Reports outside the duplicate interval remain separate observations;
@@ -2183,6 +2232,333 @@ mod tests {
     #[test]
     fn processed_duplicates_retain_observed_turn_velocities() {
         check_duplicate_motion_recovery(true);
+    }
+
+    fn duplicate_vertical_parts(
+        dt: f64,
+        donor_feed: &str,
+        sign: f64,
+        times: &[f64],
+        missing_horizontal: bool,
+        missing_vertical: bool,
+    ) -> Vec<(Vec<RawAircraft>, IngestStats)> {
+        use fdop_types::geo::Enu;
+
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let sp = spec();
+        // An independent cubic height curve whose actual endpoint climb rates
+        // determine the intervening Hermite trajectory. Horizontal observations
+        // may be wholly absent; the vertical measurement remains useful on its own.
+        let rows: Vec<_> = times
+            .iter()
+            .map(|&t| {
+                let q = t - 50.0;
+                let (lat, lon, height) =
+                    enu.to_geodetic([100.0 * q, 800.0, 1200.0 + sign * 0.003 * q.powi(3)]);
+                let velocity = Enu::new(lat, lon, 0.0).vec_from_ecef(enu.vec_to_ecef([
+                    100.0,
+                    0.0,
+                    sign * 0.009 * q.powi(2),
+                ]));
+                serde_json::json!([
+                    70_000.0 + t,
+                    lat,
+                    lon,
+                    (height + sp.geoid_n_m) / fdop_types::FT_TO_M,
+                    (!missing_horizontal)
+                        .then_some(velocity[0].hypot(velocity[1]) / fdop_types::KT_TO_MPS),
+                    (!missing_horizontal).then_some(
+                        velocity[0]
+                            .atan2(velocity[1])
+                            .to_degrees()
+                            .rem_euclid(360.0)
+                    ),
+                    8,
+                    null,
+                    null,
+                    "adsb_icao",
+                    null,
+                    velocity[2] / fdop_types::FPM_TO_MPS
+                ])
+            })
+            .collect();
+        ["prod", donor_feed]
+            .into_iter()
+            .enumerate()
+            .map(|(i, feed)| {
+                let mut rows = rows.clone();
+                for row in &mut rows {
+                    if i == 0 && missing_vertical {
+                        row[11] = serde_json::Value::Null;
+                    }
+                    if i == 1 {
+                        row[0] = serde_json::json!(row[0].as_f64().unwrap() + dt);
+                        if feed == "mlat" {
+                            row[9] = serde_json::json!("mlat");
+                        }
+                    }
+                }
+                crate::ingest::ingest_day_reader(
+                    std::io::Cursor::new(seam_tar(T0, &rows)),
+                    feed,
+                    &sp,
+                    &|_| {},
+                    DayContext::new(T0, 300.0, 3600.0),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn duplicate_vertical_store(
+        parts: Vec<(Vec<RawAircraft>, IngestStats)>,
+        processed: bool,
+    ) -> TrackStore {
+        let build =
+            |parts| build_day_store(parts, &spec(), vec![], DayContext::new(T0, 300.0, 3600.0));
+        if processed {
+            merge_stores(
+                parts
+                    .into_iter()
+                    .map(|part| seam_roundtrip(&build(vec![part]), "vertical-input"))
+                    .collect(),
+                300.0,
+            )
+        } else {
+            build(parts)
+        }
+    }
+
+    fn stored_point_bits(p: &TrackPoint) -> ([u64; 3], [u32; 4], u8, u8) {
+        (
+            [p.t.to_bits(), p.lat.to_bits(), p.lon.to_bits()],
+            [
+                p.alt_m.to_bits(),
+                p.gs_mps.to_bits(),
+                p.track_deg.to_bits(),
+                p.vrate_mps.to_bits(),
+            ],
+            p.alt_src,
+            p.flags,
+        )
+    }
+
+    fn check_duplicate_vertical_recovery(processed: bool) {
+        for donor_feed in ["staging", "mlat"] {
+            for sign in [-1.0, 1.0] {
+                for times in [
+                    [0.0, 25.0, 50.0, 75.0, 100.0],
+                    [0.0, 19.0, 43.0, 72.0, 100.0],
+                ] {
+                    for missing_horizontal in [false, true] {
+                        let complete = duplicate_vertical_parts(
+                            0.0,
+                            donor_feed,
+                            sign,
+                            &times,
+                            missing_horizontal,
+                            false,
+                        );
+                        let expected = duplicate_vertical_store(vec![complete[0].clone()], false);
+                        assert_eq!(expected.n_points(), times.len());
+                        for dt in [-0.02, 0.0, 0.02] {
+                            for reverse in [false, true] {
+                                let mut parts = duplicate_vertical_parts(
+                                    dt,
+                                    donor_feed,
+                                    sign,
+                                    &times,
+                                    missing_horizontal,
+                                    true,
+                                );
+                                if reverse {
+                                    parts.reverse();
+                                }
+                                let got = seam_roundtrip(
+                                    &duplicate_vertical_store(parts, processed),
+                                    "vertical-recovered",
+                                );
+                                assert_eq!(got.legs.len(), 1);
+                                assert_eq!(got.legs[0].key, expected.legs[0].key);
+                                assert_eq!(
+                                    got.legs[0]
+                                        .points
+                                        .iter()
+                                        .map(stored_point_bits)
+                                        .collect::<Vec<_>>(),
+                                    expected.legs[0]
+                                        .points
+                                        .iter()
+                                        .map(stored_point_bits)
+                                        .collect::<Vec<_>>(),
+                                    "processed={processed}, feed={donor_feed}, sign={sign}, missing_horizontal={missing_horizontal}, dt={dt}, reverse={reverse}"
+                                );
+                                for feed in ["prod", donor_feed] {
+                                    assert!(got.legs[0].source.split('+').any(|s| s == feed));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_daily_duplicates_retain_observed_climb_rates() {
+        check_duplicate_vertical_recovery(false);
+    }
+
+    #[test]
+    fn processed_duplicates_retain_observed_climb_rates() {
+        check_duplicate_vertical_recovery(true);
+    }
+
+    #[test]
+    fn vertical_rate_donation_requires_fresh_matching_geometry() {
+        let times = [0.0, 25.0, 50.0, 75.0, 100.0];
+        for processed in [false, true] {
+            for rejected in [
+                "latitude",
+                "longitude",
+                "height",
+                "stale",
+                "missing",
+                "infinite",
+            ] {
+                let mut parts = duplicate_vertical_parts(0.02, "mlat", 1.0, &times, false, true);
+                for donor in &mut parts[1].0[0].points {
+                    match rejected {
+                        "latitude" => donor.lat += 1e-9,
+                        "longitude" => donor.lon += 1e-9,
+                        "height" => donor.alt_geom_msl += 1.0,
+                        "stale" => donor.flags |= pt_flags::STALE,
+                        "missing" => donor.vrate_mps = f32::NAN,
+                        "infinite" => donor.vrate_mps = f32::INFINITY,
+                        _ => unreachable!(),
+                    }
+                }
+                let reference = duplicate_vertical_store(vec![parts[0].clone()], false);
+                let got = duplicate_vertical_store(parts, processed);
+                assert_eq!(got.legs.len(), 1, "{rejected}, processed={processed}");
+                assert_eq!(
+                    got.legs[0]
+                        .points
+                        .iter()
+                        .map(stored_point_bits)
+                        .collect::<Vec<_>>(),
+                    reference.legs[0]
+                        .points
+                        .iter()
+                        .map(stored_point_bits)
+                        .collect::<Vec<_>>(),
+                    "{rejected}, processed={processed} donated unsupported vertical motion"
+                );
+                if !processed {
+                    assert_eq!(got.legs[0].source, "prod");
+                }
+            }
+            let parts = duplicate_vertical_parts(0.06, "mlat", 1.0, &times, false, true);
+            let original_times: Vec<_> = parts[0].0[0].points.iter().map(|p| p.t).collect();
+            let got = duplicate_vertical_store(parts, processed);
+            assert_eq!(got.n_points(), 2 * times.len());
+            assert!(
+                got.legs
+                    .iter()
+                    .flat_map(|l| &l.points)
+                    .all(|p| { !original_times.contains(&p.t) || p.vrate_mps.is_nan() })
+            );
+        }
+        let mut parts = duplicate_vertical_parts(0.02, "mlat", 1.0, &times, false, true);
+        for preferred in &mut parts[0].0[0].points {
+            preferred.alt_baro_m = 900.0;
+        }
+        for donor in &mut parts[1].0[0].points {
+            donor.alt_baro_m = 901.0;
+        }
+        let got = duplicate_vertical_store(parts, false);
+        assert!(got.legs[0].points.iter().all(|p| p.vrate_mps.is_nan()));
+        assert_eq!(got.legs[0].source, "prod");
+
+        let parts = duplicate_vertical_parts(0.02, "mlat", 1.0, &times, false, true);
+        let main = duplicate_vertical_store(vec![parts[0].clone()], false);
+        let mut donor = duplicate_vertical_store(vec![parts[1].clone()], false);
+        for p in &mut donor.legs[0].points {
+            p.alt_src = alt_src::BARO_CORRECTED;
+        }
+        let got = merge_stores(vec![main, donor], 300.0);
+        assert!(got.legs[0].points.iter().all(|p| p.vrate_mps.is_nan()));
+    }
+
+    #[test]
+    fn vertical_rate_donation_preserves_existing_rates_preference_and_boundaries() {
+        let times = [0.0, 25.0, 60.0, 85.0, 100.0];
+        for processed in [false, true] {
+            for value in [-0.0, 0.0, 12.0, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut parts = duplicate_vertical_parts(0.02, "mlat", 1.0, &times, false, true);
+                for p in &mut parts[0].0[0].points {
+                    p.vrate_mps = value;
+                }
+                let reference = duplicate_vertical_store(vec![parts[0].clone()], false);
+                let got =
+                    seam_roundtrip(&duplicate_vertical_store(parts, processed), "vertical-kept");
+                assert_eq!(
+                    got.legs[0]
+                        .points
+                        .iter()
+                        .map(stored_point_bits)
+                        .collect::<Vec<_>>(),
+                    reference.legs[0]
+                        .points
+                        .iter()
+                        .map(stored_point_bits)
+                        .collect::<Vec<_>>()
+                );
+            }
+            let mut parts = duplicate_vertical_parts(0.02, "mlat", 1.0, &times, true, true);
+            let mut staging =
+                duplicate_vertical_parts(-0.02, "staging", 1.0, &times, true, true).remove(1);
+            let expected_rates: Vec<_> = staging.0[0]
+                .points
+                .iter()
+                .map(|p| p.vrate_mps.to_bits())
+                .collect();
+            // A real boundary remains at the same preferred report even when the
+            // selected rate came from a differently timed, lower-priority feed.
+            let boundary = parts[0].0[0].points[2].t;
+            for part in &mut parts {
+                let source_boundary = part.0[0].points[2].t;
+                part.0[0].leg_boundaries.push(source_boundary, false);
+            }
+            let source_boundary = staging.0[0].points[2].t;
+            staging.0[0].leg_boundaries.push(source_boundary, false);
+            for p in &mut parts[1].0[0].points {
+                p.vrate_mps += 2.0;
+            }
+            parts.push(staging);
+            parts.reverse();
+            let got = seam_roundtrip(
+                &duplicate_vertical_store(parts, processed),
+                "vertical-priority",
+            );
+            assert_eq!(got.legs.len(), 2);
+            assert_eq!(got.legs[0].points.len(), 2);
+            assert_eq!(got.legs[1].points[0].t, boundary);
+            assert_ne!(got.legs[1].points[0].flags & pt_flags::NEW_LEG, 0);
+            assert_eq!(
+                got.legs
+                    .iter()
+                    .flat_map(|l| &l.points)
+                    .map(|p| p.vrate_mps.to_bits())
+                    .collect::<Vec<_>>(),
+                expected_rates
+            );
+            assert!(
+                got.legs
+                    .iter()
+                    .all(|l| l.source.split('+').any(|s| s == "staging"))
+            );
+        }
     }
 
     #[test]

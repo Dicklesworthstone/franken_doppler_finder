@@ -1054,11 +1054,20 @@ existing processed day store must be rebuilt to recover evidence discarded by ol
 
 Missing groundspeed or heading can likewise use one fresh duplicate's complete observed
 motion pair. Its coordinates must match exactly, at least one finite altitude must agree,
-and any other heights available in both reports must agree. Every already available motion
+and any other heights available in both reports must agree. Every already available horizontal
 component stays unchanged and must match that donor; invalid values are not treated as
 missing. Donor speeds must be positive and at most nominal sound speed, as in track cleaning.
 The same feed preference selects among eligible donors, and raw leg provenance records the contributing
 feed. Separate incomplete reports cannot be combined into a new speed/heading pair.
+
+A missing observed climb rate can independently come from a fresh duplicate with the same
+matching geometry, even when neither report has a complete horizontal speed/heading pair.
+The donor rate must be finite; an existing preferred rate, including zero or an invalid
+nonmissing value, is preserved. Raw reconciliation records the contributing feed. Merging
+overlapping processed stores also recovers a missing rate when exact coordinates, finite
+height and altitude provenance agree. Feed preference, duplicate intervals and leg boundaries
+stay unchanged, and track construction keeps its existing motion checks. This retains measured
+vertical motion for interpolation instead of forcing it to be reconstructed from sparse heights.
 
 Reuse requires the exact release metadata and ordered assets, time filter,
 unknown/jet policy and midnight-context version. The exact spatial checkpoint takes
@@ -1998,6 +2007,33 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Retain observed climb rates through duplicate reconciliation
+
+`raw_daily_duplicates_retain_observed_climb_rates` and
+`processed_duplicates_retain_observed_climb_rates` exercise 192 compressed-ingest and
+store-roundtrip cases. Independent cubic climbs and descents cover regular and uneven
+report spacing, staging and MLAT donors, complete and missing horizontal telemetry,
+duplicate times on either side of the preferred report, and both input orders. Recovered
+stores preserve the complete-observation reference's point bits and contributing feed.
+The original raw builder and processed merger both fail their positive recovery regressions.
+Two further regressions keep stale or incompatible donors out, preserve existing rates,
+and retain feed preference, duplicate intervals and real leg boundaries. All 63 native
+builder, ingest and raw-cache component tests pass with the real pinned dependencies.
+
+An eight-case native data-to-core check compiles the complete current production track
+module with real pinned types and reads serialized stores with all horizontal telemetry
+absent. Losing the observed climb rates produces maximum trajectory errors of 38.25-47.87 m and received-tone errors
+of 1.036-2.233 Hz. Recovered raw and processed stores match the complete-observation model
+bit for bit, reducing those errors to less than 0.036 m and 0.0054 Hz. The same current
+track model confirms that stores produced by the original builder retain the missing-rate
+errors. Finite but inconsistent donated rates are rejected by the existing nearby-motion checks and give
+exactly the missing-rate model in these cases.
+
+These are synthetic ingestion, interpolation and Doppler results. The native component
+uses the complete production builder, ingest and raw-cache modules with real dependencies;
+it does not execute the network fetcher or the complete data package. Full workspace,
+release CLI selftest and reference/field validation remain incomplete.
 
 ### Retain the flight positions needed by a long received trace
 
