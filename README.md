@@ -1462,7 +1462,10 @@ Design notes:
   can establish a faster motion scale. Their adjacent horizontal velocity vectors must agree
   within the existing 25 m/s tolerance and obey the existing gap and vertical-motion limits.
   The inferred consistency envelope is capped at the nominal sound speed. The same cleaner
-  then retries once. A usable original winner can only gain reports: the longer replacement
+  retries with that envelope. If a long slow portion still hides a coherent faster section,
+  fresh three-position groups can admit only their supported adjacent chords. Any available
+  headings must agree, and invalid nonmissing speed reports cannot request this recovery.
+  A usable original winner can only gain reports: the longer replacement
   must retain every report of that winner in order. A few closely spaced valid reports therefore
   cannot suppress recovery of the rest of a fast flyover. Existing supported parts separated
   from the winner keep the original selection; an extension cannot swallow their coverage.
@@ -2016,6 +2019,23 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover a faster cruise when every speed report is missing
+
+`position_only_variable_speed_retains_the_supported_cruise` checks a long 45 m/s
+section, a gradual acceleration and a 245 m/s cruise with no speed telemetry. All 12
+combinations of two timestamp origins, both directions in time, two orientations and
+optional valid headings retain all 51 positions. The maximum sampled errors are
+0.000061 m in position, 0.0000026 m/s in velocity and 0.0000021 Hz in received tone.
+No missing velocity is counted as a reported measurement.
+
+`position_only_variable_speed_requires_fresh_independent_motion` checks stale positions,
+contradictory headings, height jumps, supersonic motion, invalid speed values and an
+isolated fast chord. All 80 active tests in the complete production track and physics
+modules pass natively with the pinned toolchain and real dependencies; one pre-existing
+timing benchmark is ignored. The full core build was killed during unchanged
+`fsci-stats` code generation. These are synthetic component results; full workspace,
+release CLI selftest and reference/field validation are not established by this run.
 
 ### Carry admissible short-arc geometry through the terminal profile probe
 

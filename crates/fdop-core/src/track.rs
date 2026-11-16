@@ -376,6 +376,7 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
     let allow_reported = pts.iter().any(|p| {
         p.gs_mps as f64 > v_lim && p.gs_mps as f64 <= fdop_types::C_SOUND && p.track_deg.is_finite()
     });
+    let position_only = pts.iter().all(|p| p.gs_mps.is_nan());
     // Preserve every earlier winner before extending it: reported motion, missing-speed
     // triplets, mixed triplets, then valid speeds whose headings are missing. The last
     // retry retains permissions that already supported the winner's missing-speed edges.
@@ -391,9 +392,11 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
             Vec::new()
         };
         if recovery > 0 {
-            // Keep the existing all-missing allowances in both retries. New mixed
-            // bridges additionally need independent fresh reports on the retained path.
-            if !pts.iter().any(|p| p.gs_mps.is_finite()) {
+            // A long slow part can also dominate the position-only median. Allow
+            // its locally corroborated fast edges through the same first triplet
+            // retry; invalid non-NaN reports cannot request this recovery.
+            // Mixed bridges still need independent fresh reports on the retained path.
+            if !pts.iter().any(|p| p.gs_mps.is_finite()) && (recovery != 1 || !position_only) {
                 break;
             }
             if recovery == 2 {
@@ -437,7 +440,9 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                 let Some(speed) = position_triplet_speed(points, positions, bp) else {
                     continue;
                 };
-                if !all_missing && !triplet_reports_agree(points, positions, &enu, bp, headingless) {
+                if (position_only || !all_missing)
+                    && !triplet_reports_agree(points, positions, &enu, bp, headingless)
+                {
                     continue;
                 }
                 let limit = (1.5 * speed + 30.0).min(fdop_types::C_SOUND);
@@ -4274,6 +4279,177 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    fn position_only_variable_state(enu: &Enu, reverse: bool, axis: [f64; 2], t: f64) -> (V3, V3) {
+        let distance = |t: f64| {
+            45.0 * t + 0.5 * (t - 600.0).clamp(0.0, 200.0).powi(2) + 200.0 * (t - 800.0).max(0.0)
+        };
+        let q = if reverse { 1000.0 - t } else { t };
+        let along = if reverse {
+            distance(1000.0) - distance(q)
+        } else {
+            distance(q)
+        };
+        let speed = 45.0 + (q - 600.0).clamp(0.0, 200.0);
+        (
+            enu.to_ecef([axis[0] * along, axis[1] * along, 1200.0]),
+            enu.vec_to_ecef([axis[0] * speed, axis[1] * speed, 0.0]),
+        )
+    }
+
+    fn position_only_variable_leg(enu: &Enu, reverse: bool, axis: [f64; 2]) -> FlightLeg {
+        let times: Vec<_> = (0..=50).map(|i| f64::from(i) * 20.0).collect();
+        let mut leg = leg_from_states(&times, |t| {
+            position_only_variable_state(enu, reverse, axis, t)
+        });
+        for point in &mut leg.points {
+            point.gs_mps = f32::NAN;
+            point.track_deg = f32::NAN;
+            point.vrate_mps = f32::NAN;
+        }
+        leg
+    }
+
+    #[test]
+    fn position_only_variable_speed_retains_the_supported_cruise() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        for epoch in [1000.0, 1_788_895_000.0] {
+            for reverse in [false, true] {
+                for (axis, headings) in
+                    [([1.0, 0.0], false), ([0.6, 0.8], false), ([0.6, 0.8], true)]
+                {
+                    let mut leg = position_only_variable_leg(&enu, reverse, axis);
+                    for point in &mut leg.points {
+                        if headings {
+                            let (_, velocity) =
+                                position_only_variable_state(&enu, reverse, axis, point.t - 1000.0);
+                            let [ve, vn, _] =
+                                Enu::new(point.lat, point.lon, 0.0).vec_from_ecef(velocity);
+                            point.track_deg = ve.atan2(vn).to_degrees().rem_euclid(360.0) as f32;
+                        }
+                        point.t += epoch - 1000.0;
+                    }
+                    // The slow part dominates the global median, despite two independently
+                    // agreeing position chords throughout the faster cruise.
+                    let local = Enu::new(leg.points[0].lat, leg.points[0].lon, 0.0);
+                    let xy: Vec<_> = leg
+                        .points
+                        .iter()
+                        .map(|p| {
+                            let e = local.from_ecef(geodetic_to_ecef(p.lat, p.lon, 0.0));
+                            [e[0], e[1]]
+                        })
+                        .collect();
+                    let bp = BuildParams::default();
+                    assert!(position_speed_limit(&leg.points, &xy, &bp).unwrap() < 200.0);
+                    let models = build(&leg, &bp);
+                    assert_eq!(models.len(), 1);
+                    let model = &models[0];
+                    eprintln!(
+                        "position-only variable speed epoch={epoch}, reverse={reverse}, axis={axis:?}, headings={headings}: {}/{} reports, {:.1}..{:.1} s",
+                        model.t.len(),
+                        leg.points.len(),
+                        model.t0() - epoch,
+                        model.t1() - epoch
+                    );
+                    assert_eq!(
+                        model.t,
+                        leg.points.iter().map(|p| p.t).collect::<Vec<_>>(),
+                        "the independently supported cruise was lost"
+                    );
+                    assert_eq!(model.reported_vel_frac, 0.0);
+                    let state = |t| position_only_variable_state(&enu, reverse, axis, t);
+                    let pass = if reverse { 100.0 } else { 900.0 };
+                    let observer = add(
+                        state(pass).0,
+                        enu.vec_to_ecef([-800.0 * axis[1], 800.0 * axis[0], -1200.0]),
+                    );
+                    let (mut position, mut velocity, mut frequency) = (0.0_f64, 0.0_f64, 0.0_f64);
+                    for q in [840.25, 860.5, 900.0, 940.75, 979.5] {
+                        let t = if reverse { 1000.0 - q } else { q };
+                        let (pos, vel) = state(t);
+                        position = position.max(norm(sub(model.pos_at(epoch + t), pos)));
+                        velocity = velocity.max(norm(sub(model.pv(epoch + t).1, vel)));
+                        let rv = sub(pos, observer);
+                        let range = norm(rv);
+                        let received = epoch + t + range / C_MPS;
+                        let truth_hz = F0_HZ / (1.0 + dot(rv, vel) / (range * C_MPS));
+                        let (_, _, ratio) = model
+                            .solve_emission_p(received, observer, &Prop::still(C_MPS), None)
+                            .expect("the recovered cruise must cover its emitted sound");
+                        frequency = frequency.max((F0_HZ * ratio - truth_hz).abs());
+                    }
+                    eprintln!(
+                        "position-only cruise physical errors: {position} m, {velocity} m/s, {frequency} Hz"
+                    );
+                    assert!(position < 0.001, "position error {position} m");
+                    assert!(velocity < 0.001, "velocity error {velocity} m/s");
+                    assert!(frequency < 0.001, "Doppler error {frequency} Hz");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn position_only_variable_speed_requires_fresh_independent_motion() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let bp = BuildParams::default();
+        for reverse in [false, true] {
+            for invalid in [
+                "stale",
+                "heading",
+                "height jump",
+                "supersonic",
+                "infinite speed",
+            ] {
+                let mut leg = position_only_variable_leg(&enu, reverse, [1.0, 0.0]);
+                for p in &mut leg.points {
+                    let q = if reverse { 2000.0 - p.t } else { p.t - 1000.0 };
+                    if q < 800.0 {
+                        continue;
+                    }
+                    match invalid {
+                        "stale" => p.flags |= pt_flags::STALE,
+                        "heading" => p.track_deg = 0.0, // the positions move east, not north
+                        "height jump" => p.alt_m += 10_000.0,
+                        "supersonic" => {
+                            let pos = geodetic_to_ecef(p.lat, p.lon, p.alt_m as f64);
+                            let direction = if reverse { -1.0 } else { 1.0 };
+                            let (lat, lon, alt) = ecef_to_geodetic(add(
+                                pos,
+                                enu.vec_to_ecef([direction * 200.0 * (q - 800.0), 0.0, 0.0]),
+                            ));
+                            (p.lat, p.lon, p.alt_m) = (lat, lon, alt as f32);
+                        }
+                        "infinite speed" => p.gs_mps = f32::INFINITY,
+                        _ => unreachable!(),
+                    }
+                }
+                let models = build(&leg, &bp);
+                assert_eq!(models.len(), 1, "reverse={reverse}, invalid={invalid}");
+                let slow_endpoint = if reverse { 2000.0 } else { 1000.0 };
+                let fast_endpoint = if reverse { 1000.0 } else { 2000.0 };
+                assert!(models[0].t.contains(&slow_endpoint));
+                assert!(
+                    !models[0].t.contains(&fast_endpoint),
+                    "unsupported cruise was restored: reverse={reverse}, invalid={invalid}"
+                );
+            }
+
+            let mut one_fast_chord = position_only_variable_leg(&enu, reverse, [1.0, 0.0]);
+            one_fast_chord.points.retain(|p| {
+                let q = if reverse { 2000.0 - p.t } else { p.t - 1000.0 };
+                q <= 600.0 || q == 780.0 || q == 820.0
+            });
+            let models = build(&one_fast_chord, &bp);
+            assert_eq!(models.len(), 1);
+            let unsupported = if reverse { 1180.0 } else { 1820.0 };
+            assert!(
+                !models[0].t.contains(&unsupported),
+                "one fast chord cannot corroborate a velocity: reverse={reverse}"
+            );
         }
     }
 

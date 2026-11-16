@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover a coherent faster cruise without ground-speed telemetry
+
+- Let an entirely missing-speed track use the existing local three-position recovery
+  when a long slow section makes its global motion envelope too small. Only independently
+  supported adjacent edges gain an allowance; fresh positions, available headings,
+  subsonic motion, vertical/gap bounds and the preceding winning chain remain required.
+- Add 12 physical trajectory configurations and controls for stale or inconsistent
+  motion, invalid reports and a lone fast chord. All positive cases retain 51 of 51
+  reports without fabricating reported-velocity credit; maximum sampled errors stay
+  below 0.000061 m, 0.0000026 m/s and 0.0000021 Hz.
+- All 80 active tests in the complete native track and physics modules pass using
+  the pinned toolchain and real dependencies; one timing benchmark is ignored.
+  Full-core LLVM compilation was killed in unchanged `fsci-stats`. Workspace checks,
+  release CLI selftest and reference/field replays remain incomplete; no field-accuracy
+  improvement is claimed.
+
 ### Retain admissible aircraft beyond the last geometric uncertainty probe
 
 - Evaluate speed and distance profiles at their existing relative or physical limit
