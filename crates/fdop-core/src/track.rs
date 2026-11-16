@@ -162,8 +162,9 @@ fn position_triplet_speed(
 }
 
 /// Corroborate available horizontal reports against both adjacent position chords in one
-/// ENU frame. The headingless retry may compare a valid speed's magnitude alone, but never
-/// forgive a contradictory finite heading. Callers first check position_triplet_speed.
+/// ENU frame. Headingless and anchored mixed retries may compare a valid speed's magnitude
+/// alone, but never forgive a contradictory finite heading. Callers first check
+/// position_triplet_speed.
 fn triplet_reports_agree(
     pts: &[fdop_types::store::TrackPoint],
     xy: &[[f64; 2]],
@@ -378,16 +379,16 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
     });
     let position_only = pts.iter().all(|p| p.gs_mps.is_nan());
     // Preserve every earlier winner before extending it: reported motion, missing-speed
-    // triplets, mixed triplets, then valid speeds whose headings are missing. The last
-    // retry retains permissions that already supported the winner's missing-speed edges.
-    let mut retained_missing_limits = Vec::new();
+    // triplets, mixed triplets, then valid speeds whose headings are missing. Keep locally
+    // checked edge permissions even when their path still needs a headingless bridge.
+    let mut supported_missing_limits = Vec::new();
     for recovery in 0..4 {
         if best[winner] == n {
             break;
         }
         let headingless = recovery == 3;
-        let mut missing_limits = if headingless {
-            retained_missing_limits.clone()
+        let mut missing_limits = if headingless || recovery == 2 {
+            supported_missing_limits.clone()
         } else {
             Vec::new()
         };
@@ -441,7 +442,13 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                     continue;
                 };
                 if (position_only || !all_missing)
-                    && !triplet_reports_agree(points, positions, &enu, bp, headingless)
+                    && !triplet_reports_agree(
+                        points,
+                        positions,
+                        &enu,
+                        bp,
+                        headingless || recovery == 2,
+                    )
                 {
                     continue;
                 }
@@ -449,10 +456,17 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                 if limit > v_lim {
                     missing_limits.resize(n, 0.0_f64);
                     for k in 1..3 {
+                        // An anchored mixed triplet can also support a pair whose speeds
+                        // are present but headings are absent. Without this edge, a repeating
+                        // missing/present/present pattern still loses the faster flight.
+                        let missing_heading =
+                            points[k - 1].track_deg.is_nan() || points[k].track_deg.is_nan();
                         let eligible = if headingless {
-                            points[k - 1].track_deg.is_nan() || points[k].track_deg.is_nan()
+                            missing_heading
                         } else {
-                            points[k - 1].gs_mps.is_nan() || points[k].gs_mps.is_nan()
+                            points[k - 1].gs_mps.is_nan()
+                                || points[k].gs_mps.is_nan()
+                                || (recovery == 2 && missing_heading)
                         };
                         if eligible {
                             added_headingless |= headingless && limit > missing_limits[i + k];
@@ -465,6 +479,12 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
             // An empty second pass must leave the third pass available.
             if missing_limits.is_empty() || (headingless && !added_headingless) {
                 continue;
+            }
+            if recovery == 2 {
+                // These anchored triplets are valid edge permissions even if an all-finite,
+                // headingless bridge prevents this retry from extending the winning path.
+                // The final retry may use both, under the same winner-preservation checks.
+                supported_missing_limits.clone_from(&missing_limits);
             }
         } else if !allow_reported && position_limit.is_none() {
             continue;
@@ -498,7 +518,7 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
             {
                 v_lim = limit;
                 (best, prev, winner) = (expanded_best, expanded_prev, expanded_winner);
-                retained_missing_limits = missing_limits;
+                supported_missing_limits = missing_limits;
             }
         }
     }
@@ -3980,7 +4000,16 @@ mod tests {
             for reverse in [false, true] {
                 for axis in [[1.0, 0.0], [0.6, 0.8]] {
                     let state = |t| mixed_speed_state(&enu, reverse, axis, t);
-                    for availability in ["cruise", "alternating", "all"] {
+                    for (availability, missing_phase) in [
+                        ("cruise", 0),
+                        ("alternating", 0),
+                        ("all", 0),
+                        ("mixed alternating", 0),
+                        ("mixed alternating", 1),
+                        ("mixed pairs", 0),
+                        ("mixed pairs", 1),
+                        ("mixed pairs", 2),
+                    ] {
                         let mut leg = leg_from_states(&times, state);
                         for p in &mut leg.points {
                             let t = p.t - 1000.0;
@@ -3989,9 +4018,19 @@ mod tests {
                                 "cruise" => q >= 500.0,
                                 "alternating" => q > 420.0 && (q as i64 / 20) % 2 == 1,
                                 "all" => true,
+                                "mixed alternating" | "mixed pairs" => q >= 500.0,
                                 _ => unreachable!(),
                             } {
                                 p.track_deg = f32::NAN;
+                            }
+                            if q >= 500.0
+                                && match availability {
+                                    "mixed alternating" => (q as i64 / 20) % 2 == missing_phase,
+                                    "mixed pairs" => (q as i64 / 20) % 3 == missing_phase,
+                                    _ => false,
+                                }
+                            {
+                                p.gs_mps = f32::NAN;
                             }
                             p.t = epoch + t;
                         }
@@ -4000,7 +4039,7 @@ mod tests {
                         assert_eq!(models.len(), 1);
                         let model = &models[0];
                         eprintln!(
-                            "headingless {availability}, epoch={epoch}, reverse={reverse}, axis={axis:?}: retained {} of {} reports",
+                            "headingless {availability}, phase={missing_phase}, epoch={epoch}, reverse={reverse}, axis={axis:?}: retained {} of {} reports",
                             model.t.len(),
                             times.len()
                         );
@@ -4012,7 +4051,7 @@ mod tests {
                         let reported = leg
                             .points
                             .iter()
-                            .filter(|p| p.track_deg.is_finite())
+                            .filter(|p| p.gs_mps.is_finite() && p.track_deg.is_finite())
                             .count();
                         assert_eq!(
                             model.reported_vel_frac,
@@ -4077,7 +4116,7 @@ mod tests {
         let times: Vec<_> = (0..=37).map(|k| k as f64 * 20.0).collect();
         let state = |t| mixed_speed_state(&enu, false, [1.0, 0.0], t);
         let physical = leg_from_states(&times, state);
-        for invalid in [
+        for (invalid, mixed_speeds) in [
             "stale",
             "infinite heading",
             "contradictory heading",
@@ -4087,8 +4126,21 @@ mod tests {
             "infinite speed",
             "height jump",
             "changing direction",
-        ] {
+            "stale anchors",
+        ]
+        .into_iter()
+        .flat_map(|invalid| [false, true].map(|mixed_speeds| (invalid, mixed_speeds)))
+        {
+            if invalid == "stale anchors" && !mixed_speeds {
+                continue;
+            }
             let mut leg = physical.clone();
+            if invalid == "stale anchors" {
+                // No fresh complete velocity pair may authorize the mixed retry.
+                for p in leg.points.iter_mut().filter(|p| p.t < 1500.0) {
+                    p.flags |= pt_flags::STALE;
+                }
+            }
             for p in leg.points.iter_mut().filter(|p| p.t >= 1500.0) {
                 p.track_deg = f32::NAN;
                 match invalid {
@@ -4114,12 +4166,15 @@ mod tests {
                     }
                     _ => {}
                 }
+                if mixed_speeds && ((p.t - 1500.0) as i64 / 20) % 2 == 0 {
+                    p.gs_mps = f32::NAN;
+                }
             }
             let models = build(&leg, &BuildParams::default());
             assert!(!models.is_empty(), "the earlier supported flight was lost");
             assert!(
                 models.iter().all(|m| !(m.t0() < 1650.0 && m.t1() > 1650.0)),
-                "{invalid} justified an unsupported headingless cruise"
+                "{invalid} justified an unsupported headingless cruise, mixed={mixed_speeds}"
             );
         }
         // Two fast reports offer only one secant. Neither their speed magnitudes nor
@@ -4130,9 +4185,19 @@ mod tests {
         for p in pair.points.iter_mut().filter(|p| p.t >= 1500.0) {
             p.track_deg = f32::NAN;
         }
-        let models = build(&pair, &BuildParams::default());
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].t1(), 1500.0);
+        for missing_speed in [None, Some(1500.0), Some(1540.0)] {
+            let mut leg = pair.clone();
+            if let Some(t) = missing_speed {
+                leg.points.iter_mut().find(|p| p.t == t).unwrap().gs_mps = f32::NAN;
+            }
+            let models = build(&leg, &BuildParams::default());
+            assert_eq!(models.len(), 1);
+            assert_eq!(
+                models[0].t1(),
+                1500.0,
+                "one chord cannot justify mixed metadata recovery: {missing_speed:?}"
+            );
+        }
     }
 
     #[test]

@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve supported faster tracks through combined telemetry gaps
+
+- Let the existing anchored mixed-speed retry use a valid speed without a heading by
+  checking its magnitude against independently agreeing position chords. Include the
+  finite-speed, missing-heading edge within a mixed triplet.
+- Carry these validated local edge permissions into the final headingless retry even
+  when a connecting bridge has not yet been recovered. Final selection still preserves
+  the preceding winner and separately supported portions; thresholds and interpolation
+  are unchanged.
+- Extend the existing physical trajectory regression from 24 to 64 configurations and
+  its refusal controls for combined missing telemetry, stale anchors and lone chords.
+  New mixed edges retain the existing fresh-triplet and reported-anchor requirements.
+- Independent source review and numerical chain-selection exploration support the fix.
+  Native formatting, compilation, Clippy, tests, release CLI selftest and reference/field
+  replays did not run after the environment disconnected. No native or field-accuracy claim.
+
+
 ### Recover sparse aircraft motion when ground-speed telemetry is negative
 
 - Require nonnegative ground speed before accepting a complete reported velocity,

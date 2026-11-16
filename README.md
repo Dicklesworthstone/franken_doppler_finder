@@ -1515,6 +1515,11 @@ Design notes:
   permissions remain available; the new pass can only extend the preceding winner, preserving
   all of its reports and separately supported parts. Complete preceding results stay unchanged,
   and missing velocities remain derived from positions rather than counted as reported measurements.
+  The anchored mixed retry also permits a missing heading on a valid speed report, checking
+  its magnitude against both adjacent position chords. Those checked edges remain available
+  for the final retry even before they form a longer chain: a mixed-speed section can then
+  connect through a headingless bridge. Available headings, fresh-triplet requirements and
+  the preceding winner's independent reported-motion anchor still constrain these new edges.
   A final recovery also permits missing headings when three consecutive fresh positions give
   two agreeing secants and all three valid speed reports agree with their adjacent chords.
   Available headings must still agree as vectors. Only adjacent edges touching a missing
@@ -2046,6 +2051,24 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Preserve faster flyovers through combined speed and heading gaps
+
+The existing `headingless_speeds_preserve_a_supported_faster_pass` regression now covers
+64 trajectory/telemetry combinations, including 40 added mixed-speed cases: both alternating
+phases and all three missing/present/present phases, two time origins, both chronological
+directions and two flight axes. They require all 38 physical reports, the original position,
+velocity and Doppler tolerances, and no reported-velocity credit for missing telemetry.
+The refusal matrix adds combined missing-speed cases, stale anchors and one-chord controls.
+Validated mixed edges must remain available until the headingless retry can connect them;
+neither retry alone has to provide the complete extension.
+
+These additions are source-reviewed but have not run natively. Independent numerical
+exploration of the chain selection supports the intended recovery; it is not execution of
+the Rust tests. The earlier native evidence below covers the original 24 configurations.
+Native formatting, compilation, Clippy, workspace tests, release CLI selftest and
+reference/field replays remain unrun after the execution environment disconnected.
+
 
 ### Recover usable sparse flight geometry from negative speed reports
 
