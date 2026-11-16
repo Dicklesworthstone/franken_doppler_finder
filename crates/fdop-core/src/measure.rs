@@ -28,8 +28,7 @@ use crate::fit::{Best, FitResult, PreparedFit, Side, prepare_constant_velocity};
 use crate::physics::{cv_curve, readouts, window_for_roc};
 use crate::spectro::{Spec, stft_band_db};
 use crate::trace::{
-    Trace, TraceParams, guided_raw_ridge_peak, guided_ridge_peak, guided_ridge_peak_with_exclusion,
-    ridge_trace,
+    Trace, TraceParams, guided_raw_ridge_peak, guided_ridge_peak_with_exclusion, ridge_trace,
 };
 use serde::Serialize;
 
@@ -352,7 +351,7 @@ fn guided_trace_with_background(
                         let peak = match (short_background, raw_only) {
                             (Some(background), true) => guided_raw_ridge_peak(
                                 short, j, fp, along, band, peak_band, reference, half, min_snr,
-                                min_z, background,
+                                min_z, background, band,
                             ),
                             _ => guided_ridge_peak_with_exclusion(
                                 short,
@@ -366,6 +365,7 @@ fn guided_trace_with_background(
                                 min_snr,
                                 min_z,
                                 short_background,
+                                band,
                             ),
                         };
                         (peak, band)
@@ -384,11 +384,11 @@ fn guided_trace_with_background(
                         let peak = match (background, raw_only) {
                             (Some(background), true) => guided_raw_ridge_peak(
                                 spec, j, fp, along, peak_band, peak_band, reference, half, min_snr,
-                                min_z, background,
+                                min_z, background, band,
                             ),
-                            _ => guided_ridge_peak(
-                                spec, j, fp, along, peak_band, reference, half, min_snr, min_z,
-                                background,
+                            _ => guided_ridge_peak_with_exclusion(
+                                spec, j, fp, along, peak_band, peak_band, reference, half, min_snr,
+                                min_z, background, band,
                             ),
                         };
                         (peak, band)
@@ -1204,6 +1204,217 @@ mod tests {
     use super::*;
     use crate::detect::{DetectParams, detect, refine, survey};
     use crate::fit::fit_constant_velocity;
+    use crate::trace::guided_ridge_peak;
+
+    #[test]
+    fn guided_measurement_retains_an_in_band_ridge_after_raw_frequency_correction() {
+        // The nearer normalised peak moves outside the actual one-Hz position
+        // tolerance when its local row background is restored. The other
+        // qualified peak has an independently known, in-band raw vertex.
+        for direction in [-1.0, 1.0] {
+            let t = vec![0.0, 1.0, 2.0];
+            let f: Vec<_> = (0..=160).map(|i| 80.0 + 0.25 * i as f64).collect();
+            let background: Vec<_> = f
+                .iter()
+                .map(|&frequency| (direction * 8.0 * (frequency - 100.0)) as f32)
+                .collect();
+            let db = f
+                .iter()
+                .flat_map(|&frequency| {
+                    let offset = direction * (frequency - 100.0);
+                    let value = (12.0 - 30.0 * (offset - 0.96).powi(2)).max(0.0)
+                        + (10.0 - 30.0 * (offset + 1.0).powi(2)).max(0.0);
+                    [value as f32; 3]
+                })
+                .collect();
+            let spec = Spec {
+                t,
+                f,
+                db,
+                meta: crate::spectro::SpecMeta {
+                    sr: 1000,
+                    win_s: 0.5,
+                    hop_s: 1.0,
+                    nfft: 4000,
+                    df: 0.25,
+                    fmin: 80.0,
+                    fmax: 120.0,
+                    norm: "analytic normalised two-peak profile".into(),
+                },
+            };
+            let original = guided_ridge_peak(
+                &spec,
+                1,
+                100.0,
+                |_| 0.0,
+                4.0,
+                16.0,
+                2,
+                3.0,
+                4.0,
+                Some(&background),
+            )
+            .unwrap();
+            assert!((original.0 - 100.0).abs() > 1.0, "{original:?}");
+            for raw_only in [false, true] {
+                let trace = guided_trace_with_background(
+                    &spec,
+                    Some(&background),
+                    None,
+                    &|_| 100.0,
+                    0.0,
+                    2.0,
+                    1.0,
+                    3.0,
+                    4.0,
+                    raw_only,
+                );
+                assert_eq!(trace.len(), 3, "raw_only={raw_only}, direction={direction}");
+                let expected = 100.0 + direction * (-1.0 + 8.0 / 60.0);
+                assert!(trace.f.iter().all(|&f| (f - expected).abs() < 2e-5));
+            }
+        }
+    }
+
+    /// Analytic spectral evidence, not PCM or a localization run. Solve the
+    /// retarded arrival equation independently, then place two narrow parabolic
+    /// log-spectral lobes on neighbouring received tones. Removing a linear row
+    /// background shifts each normalised vertex by -slope / (2 * curvature).
+    fn corrected_frequency_scene(
+        direction: f64,
+        target_height: f64,
+        other_height: f64,
+    ) -> (Spec, Vec<f32>, Vec<f64>) {
+        let t: Vec<_> = (0..=400).map(|i| i as f64 * 0.1).collect();
+        let f: Vec<_> = (0..=160).map(|i| 80.0 + i as f64 * 0.25).collect();
+        let truth: Vec<_> = t
+            .iter()
+            .map(|&heard| {
+                let relative = heard - (20.0 - 12_000.0 / 343.0);
+                let (mut lo, mut hi) = (-1000.0, relative);
+                for _ in 0..70 {
+                    let emitted = 0.5 * (lo + hi);
+                    let range = 12_000.0_f64.hypot(40.0 * emitted);
+                    if emitted + range / 343.0 < relative {
+                        lo = emitted;
+                    } else {
+                        hi = emitted;
+                    }
+                }
+                let emitted = 0.5 * (lo + hi);
+                let range = 12_000.0_f64.hypot(40.0 * emitted);
+                100.0 * 343.0 / (343.0 + 40.0 * 40.0 * emitted / range)
+            })
+            .collect();
+        let background = f
+            .iter()
+            .map(|&frequency| (direction * 8.0 * (frequency - 100.0)) as f32)
+            .collect();
+        let db = f
+            .iter()
+            .flat_map(|&frequency| {
+                truth.iter().map(move |&ridge| {
+                    let displaced = frequency + direction * 8.0 / 60.0;
+                    let other = ridge * (1.0 + direction * 0.02);
+                    ((target_height - 30.0 * (displaced - ridge).powi(2)).max(0.0)
+                        + (other_height - 30.0 * (displaced - other).powi(2)).max(0.0))
+                        as f32
+                })
+            })
+            .collect();
+        (
+            Spec {
+                t,
+                f,
+                db,
+                meta: crate::spectro::SpecMeta {
+                    sr: 1000,
+                    win_s: 0.5,
+                    hop_s: 0.1,
+                    nfft: 4000,
+                    df: 0.25,
+                    fmin: 80.0,
+                    fmax: 120.0,
+                    norm: "analytic received Doppler ridges with removed row background".into(),
+                },
+            },
+            background,
+            truth,
+        )
+    }
+
+    #[test]
+    fn corrected_frequency_bounds_preserve_a_physical_trace_and_reject_outside_only_evidence() {
+        for direction in [-1.0, 1.0] {
+            let guide = |t: f64| {
+                cv_curve(
+                    t,
+                    100.0 + direction * 0.9,
+                    40.0,
+                    12_000.0,
+                    20.0 - 12_000.0 / 343.0,
+                    343.0,
+                )
+            };
+            for (target_height, other_height) in [(12.0, 12.0), (0.0, 12.0), (12.0, 0.0)] {
+                let (spec, background, truth) =
+                    corrected_frequency_scene(direction, target_height, other_height);
+                let trace = guided_trace_with_background(
+                    &spec,
+                    Some(&background),
+                    None,
+                    &guide,
+                    0.0,
+                    40.0,
+                    1.0,
+                    3.0,
+                    4.0,
+                    true,
+                );
+                if target_height == 0.0 {
+                    assert!(
+                        trace.is_empty(),
+                        "out-of-band evidence is not an observed point"
+                    );
+                    continue;
+                }
+                assert_eq!(trace.len(), spec.nt());
+                let rms = (trace
+                    .f
+                    .iter()
+                    .zip(&truth)
+                    .map(|(found, expected)| (found - expected).powi(2))
+                    .sum::<f64>()
+                    / trace.len() as f64)
+                    .sqrt();
+                assert!(rms < 0.05, "direction={direction}: ridge RMS {rms} Hz");
+                if other_height == 0.0 {
+                    // Every original winner is eligible in this control. Preserve
+                    // its measured frequency and SNR exactly, including sub-bin phase.
+                    for j in (0..spec.nt()).step_by(20) {
+                        let time = spec.t[j];
+                        let fp = guide(time);
+                        let chirp = (guide(time + 0.125) - guide(time - 0.125)).abs() / 0.25;
+                        let peak_band = 1.0_f64.max(4.0 + 0.25 * chirp);
+                        let original = guided_ridge_peak(
+                            &spec,
+                            j,
+                            fp,
+                            |t| guide(t) - fp,
+                            peak_band,
+                            4.0 * peak_band,
+                            15,
+                            3.0,
+                            4.0,
+                            Some(&background),
+                        )
+                        .unwrap();
+                        assert_eq!((trace.f[j], trace.snr[j]), (original.0, original.1));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn repeated_short_windows_reuse_the_fresh_spectrum_exactly() {

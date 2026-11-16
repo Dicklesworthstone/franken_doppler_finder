@@ -1656,7 +1656,11 @@ Design notes:
   three-bin interpolation, including a vertex between the selected bin and a neighbouring basin
   boundary; without one, the normalized vertex stands during discovery. A restored vertex stays inside the original
   frequency tolerance, so restoration cannot cross to another ridge or a removed hum, and the original
-  SNR/z thresholds stay in force. There is no climb toward a raw maximum several bins away: tried,
+  SNR/z thresholds stay in force. If that local correction leaves the guide's narrower positional
+  tolerance, another already-qualified peak inside the tolerance remains eligible. Raw-only
+  calibration also requires a valid local raw vertex before ranking these alternatives.
+  An eligible original winner keeps its exact selection and interpolation.
+  There is no climb toward a raw maximum several bins away: tried,
   it made Livermore distances worse and raised the evidence of wrong-date runs. No extra full
   spectrogram is retained.
 - **Accepted aircraft can improve their frequency and geometry without changing discovery.** After
@@ -2020,6 +2024,23 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Retain qualified ridges after local frequency calibration
+
+`guided_measurement_retains_an_in_band_ridge_after_raw_frequency_correction` and
+`corrected_frequency_bounds_preserve_a_physical_trace_and_reject_outside_only_evidence`
+both fail on the preceding production code: their static profile loses all 3 points,
+and their independently generated retarded Doppler ridge loses all 401. The correction
+retains every point in both mirrored directions, during discovery and raw-only calibration.
+Outside-only evidence remains refused, and eligible original measurements retain their
+exact frequency and SNR bits. A three-peak control checks that an alternative without
+a valid raw vertex cannot hide a farther valid raw vertex during calibration.
+
+All 24 tests pass in a native component using the pinned toolchain and real dependencies.
+It compiles the complete production physics, spectrogram and trace modules plus the
+verbatim guided-measurement functions and regression bodies. Full-core compilation,
+workspace checks, release CLI selftest and reference/field replays are separate validation
+requirements; this component result does not establish them or a field-accuracy change.
+
 ### Recover a faster cruise when every speed report is missing
 
 `position_only_variable_speed_retains_the_supported_cruise` checks a long 45 m/s
@@ -2028,6 +2049,8 @@ combinations of two timestamp origins, both directions in time, two orientations
 optional valid headings retain all 51 positions. The maximum sampled errors are
 0.000061 m in position, 0.0000026 m/s in velocity and 0.0000021 Hz in received tone.
 No missing velocity is counted as a reported measurement.
+The same native regression against the preceding track module fails with only 39 of
+51 reports, ending at 780 s and losing the cruise instead of retaining the full 1000 s.
 
 `position_only_variable_speed_requires_fresh_independent_motion` checks stale positions,
 contradictory headings, height jumps, supersonic motion, invalid speed values and an

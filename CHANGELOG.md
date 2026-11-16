@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain qualified aircraft ridges after frequency calibration
+
+- When the nearest normalized peak's local raw-frequency correction falls outside the
+  guide's existing positional tolerance, consider the other already-qualified peaks.
+  Raw-only calibration requires a valid local raw vertex during fallback selection.
+  Eligible original winners retain their exact arithmetic; significance, prominence,
+  frequency tolerances and the three-bin-only correction policy are unchanged.
+- Native counterfactuals lose all 3 static-profile points and all 401 independently
+  generated retarded-curve points. The fix retains every point in mirrored discovery
+  and calibration cases. Outside-only refusals, bit-identical eligible originals and
+  a three-peak raw-vertex fallback control pass.
+- All 24 native signal-component tests pass with real locked dependencies, complete
+  production physics/spectrogram/trace modules and verbatim guided-measurement code.
+  Full core/workspace, release CLI selftest and reference/field checks remain separate
+  and incomplete. No real-recording improvement is claimed.
+
 ### Recover a coherent faster cruise without ground-speed telemetry
 
 - Let an entirely missing-speed track use the existing local three-position recovery
@@ -29,6 +45,8 @@ at that commit, not per-change commits.
   motion, invalid reports and a lone fast chord. All positive cases retain 51 of 51
   reports without fabricating reported-velocity credit; maximum sampled errors stay
   below 0.000061 m, 0.0000026 m/s and 0.0000021 Hz.
+- The same native positive regression fails on the preceding complete track module:
+  only 39 of 51 reports survive, stopping at 780 s before the fast cruise finishes.
 - All 80 active tests in the complete native track and physics modules pass using
   the pinned toolchain and real dependencies; one timing benchmark is ignored.
   Full-core LLVM compilation was killed in unchanged `fsci-stats`. Workspace checks,

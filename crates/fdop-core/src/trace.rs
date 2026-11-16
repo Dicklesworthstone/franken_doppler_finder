@@ -128,6 +128,7 @@ fn ridge_peak(
 /// the integration length, and a tangent would smear it away where it is steepest.
 /// If provided, `background` contains the row offsets removed from `spec`; they restore the
 /// local spectral shape for frequency interpolation only, after normalised peak qualification.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn guided_ridge_peak(
     spec: &Spec,
@@ -142,12 +143,13 @@ pub(crate) fn guided_ridge_peak(
     background: Option<&[f32]>,
 ) -> Option<(f64, f64, f64)> {
     guided_ridge_peak_with_exclusion(
-        spec, j, f_pred, along, band, band, noise_band, half, min_snr, min_z, background,
+        spec, j, f_pred, along, band, band, noise_band, half, min_snr, min_z, background, band,
     )
 }
 
-/// Exclude the signal's full spectral lobe from the noise reference without
-/// changing the positional bounds on peak selection or raw interpolation.
+/// Exclude the signal's full spectral lobe from the noise reference. `band` bounds
+/// normalised peak selection and its local raw interpolation; `position_band`
+/// separately bounds the measured frequency after that interpolation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn guided_ridge_peak_with_exclusion(
     spec: &Spec,
@@ -161,6 +163,7 @@ pub(crate) fn guided_ridge_peak_with_exclusion(
     min_snr: f64,
     min_z: f64,
     background: Option<&[f32]>,
+    position_band: f64,
 ) -> Option<(f64, f64, f64)> {
     profile_peak(
         spec,
@@ -171,7 +174,12 @@ pub(crate) fn guided_ridge_peak_with_exclusion(
         noise_exclusion,
         noise_band,
         half,
-        PeakChoice::NearestQualified { min_snr, min_z },
+        PeakChoice::NearestQualified {
+            min_snr,
+            min_z,
+            position_band,
+            require_raw_fallback: false,
+        },
         background,
     )
     .map(|peak| peak.values)
@@ -195,6 +203,7 @@ pub(crate) fn guided_raw_ridge_peak(
     min_snr: f64,
     min_z: f64,
     background: &[f32],
+    position_band: f64,
 ) -> Option<(f64, f64, f64)> {
     profile_peak(
         spec,
@@ -205,7 +214,12 @@ pub(crate) fn guided_raw_ridge_peak(
         noise_exclusion,
         noise_band,
         half,
-        PeakChoice::NearestQualified { min_snr, min_z },
+        PeakChoice::NearestQualified {
+            min_snr,
+            min_z,
+            position_band,
+            require_raw_fallback: true,
+        },
         Some(background),
     )
     .filter(|peak| peak.local_raw_vertex)
@@ -228,6 +242,8 @@ enum PeakChoice {
     NearestQualified {
         min_snr: f64,
         min_z: f64,
+        position_band: f64,
+        require_raw_fallback: bool,
     },
 }
 
@@ -342,7 +358,16 @@ fn profile_peak(
             && (peak_frequency(k) - f_pred).abs() <= band
             && clearance(&prof, k) >= min_snr
     };
-    let (k, qualified) = match choice {
+    let position_gate = match &choice {
+        PeakChoice::NearestQualified {
+            min_snr,
+            min_z,
+            position_band,
+            require_raw_fallback,
+        } => Some((*min_snr, *min_z, *position_band, *require_raw_fallback)),
+        _ => None,
+    };
+    let (mut k, qualified) = match choice {
         #[cfg(test)]
         PeakChoice::Strongest => (kin?, false),
         PeakChoice::StrongestQualified { min_snr, min_z } => {
@@ -359,7 +384,7 @@ fn profile_peak(
             // SNR/z may be high even when it is an out-of-band tone's shoulder.
             (peak.or(kin)?, peak.is_some())
         }
-        PeakChoice::NearestQualified { min_snr, min_z } => (
+        PeakChoice::NearestQualified { min_snr, min_z, .. } => (
             (1..n_off - 1)
                 .filter(|&k| qualifies(k, min_snr, min_z))
                 .min_by(|&a, &b| {
@@ -372,51 +397,79 @@ fn profile_peak(
             true,
         ),
     };
-    let snr = prof[k] - med;
-    let mut fhat = peak_frequency(k);
-    let mut local_raw_vertex = false;
-    if let Some(background) = background.filter(|offsets| offsets.len() == spec.nf())
-        && k > 0
-        && k + 1 < n_off
-    {
-        // Normalisation selects the ridge above persistent hum, but its frequency-dependent
-        // subtraction tilts the local peak. Restore only the three bins used for metrology,
-        // after every normalised qualification gate, whose SNR/z stay on the normalised
-        // profile. There is deliberately no climb to a raw maximum further out: on real
-        // recordings it moved distances away from the ADS-B truth and raised wrong-date
-        // evidence (CHANGELOG, "Restore only the three-bin correction").
-        let raw = |o: usize| {
-            let (mut sum, mut count) = (0.0, 0usize);
-            for &(sampler, shift) in &path {
-                let fq = f_pred + offs[o] + shift;
-                if let Some(value) = sampler.and_then(|s| s.sample(fq)) {
-                    let fi = ((fq - spec.f[0]) / df).min(spec.nf() as f64 - 1.000_001);
-                    let row = fi as usize;
-                    let weight = fi - row as f64;
-                    let offset = background[row] as f64 * (1.0 - weight)
-                        + background[row + 1] as f64 * weight;
-                    sum += value as f64 + offset;
-                    count += 1;
+    let measured_peak = |k: usize| {
+        let mut fhat = peak_frequency(k);
+        let mut local_raw_vertex = false;
+        if let Some(background) = background.filter(|offsets| offsets.len() == spec.nf())
+            && k > 0
+            && k + 1 < n_off
+        {
+            // Normalisation selects the ridge above persistent hum, but its frequency-dependent
+            // subtraction tilts the local peak. Restore only the three bins used for metrology,
+            // after every normalised qualification gate, whose SNR/z stay on the normalised
+            // profile. There is deliberately no climb to a raw maximum further out: on real
+            // recordings it moved distances away from the ADS-B truth and raised wrong-date
+            // evidence (CHANGELOG, "Restore only the three-bin correction").
+            let raw = |o: usize| {
+                let (mut sum, mut count) = (0.0, 0usize);
+                for &(sampler, shift) in &path {
+                    let fq = f_pred + offs[o] + shift;
+                    if let Some(value) = sampler.and_then(|s| s.sample(fq)) {
+                        let fi = ((fq - spec.f[0]) / df).min(spec.nf() as f64 - 1.000_001);
+                        let row = fi as usize;
+                        let weight = fi - row as f64;
+                        let offset = background[row] as f64 * (1.0 - weight)
+                            + background[row + 1] as f64 * weight;
+                        sum += value as f64 + offset;
+                        count += 1;
+                    }
+                }
+                (count >= need).then_some(sum / count as f64)
+            };
+            // A raw maximum on a basin-boundary bin can still have its interpolated vertex
+            // inside the basin; the whole [k - 1, k + 1] neighbourhood belongs to the selected
+            // peak. A concave vertex within one bin and inside the band is a local correction.
+            if let (Some(a), Some(b), Some(c)) = (raw(k - 1), raw(k), raw(k + 1)) {
+                let curvature = a - 2.0 * b + c;
+                let offset = 0.5 * (a - c) / curvature;
+                if curvature < 0.0
+                    && offset.is_finite()
+                    && offset.abs() <= 1.0
+                    && (offs[k] + offset * df).abs() <= band
+                {
+                    fhat = f_pred + offs[k] + offset * df;
+                    local_raw_vertex = true;
                 }
             }
-            (count >= need).then_some(sum / count as f64)
-        };
-        // A raw maximum on a basin-boundary bin can still have its interpolated vertex
-        // inside the basin; the whole [k - 1, k + 1] neighbourhood belongs to the selected
-        // peak. A concave vertex within one bin and inside the band is a local correction.
-        if let (Some(a), Some(b), Some(c)) = (raw(k - 1), raw(k), raw(k + 1)) {
-            let curvature = a - 2.0 * b + c;
-            let offset = 0.5 * (a - c) / curvature;
-            if curvature < 0.0
-                && offset.is_finite()
-                && offset.abs() <= 1.0
-                && (offs[k] + offset * df).abs() <= band
-            {
-                fhat = f_pred + offs[k] + offset * df;
-                local_raw_vertex = true;
-            }
         }
+        (fhat, local_raw_vertex)
+    };
+    let (mut fhat, mut local_raw_vertex) = measured_peak(k);
+    if let Some((min_snr, min_z, position_band, require_raw_fallback)) = position_gate
+        && (fhat - f_pred).abs() > position_band
+    {
+        // The noise exclusion may span a whole spectral lobe while the actual
+        // position tolerance is narrower. Restoring a local raw vertex can move
+        // the nearest normalised peak outside that tolerance. Keep every valid
+        // original winner exactly; otherwise consider only already-qualified
+        // normalised peaks, with the same three-bin raw interpolation per peak.
+        let (next, measured) = (1..n_off - 1)
+            .filter(|&i| i != k && qualifies(i, min_snr, min_z))
+            .map(|i| (i, measured_peak(i)))
+            .filter(|(_, (f, raw_vertex))| {
+                (*f - f_pred).abs() <= position_band && (!require_raw_fallback || *raw_vertex)
+            })
+            .min_by(|(a, _), (b, _)| {
+                (peak_frequency(*a) - f_pred)
+                    .abs()
+                    .total_cmp(&(peak_frequency(*b) - f_pred).abs())
+                    .then_with(|| prof[*b].total_cmp(&prof[*a]))
+                    .then(a.cmp(b))
+            })?;
+        k = next;
+        (fhat, local_raw_vertex) = measured;
     }
+    let snr = prof[k] - med;
     Some(ProfilePeak {
         values: (fhat, snr, snr / mad),
         local_raw_vertex,
@@ -1060,6 +1113,7 @@ mod tests {
                 3.0,
                 4.0,
                 None,
+                5.0,
             )
             .is_none()
         );
@@ -1080,9 +1134,80 @@ mod tests {
             3.0,
             4.0,
             Some(&background),
+            5.0,
         )
         .unwrap();
         assert!((peak.0 - 104.95).abs() < 2e-5, "{peak:?}");
+    }
+
+    #[test]
+    fn raw_only_fallback_keeps_a_farther_qualified_local_vertex() {
+        // The original peak restores outside the ten-Hz position bound. Its
+        // nearest normalised fallback has a convex raw neighbourhood, while a
+        // farther qualified peak has a local raw vertex just inside the bound.
+        let f: Vec<_> = (0..35).map(|i| 100.0 - 16.95 + i as f64).collect();
+        let mut normalized = [0.0_f32; 35];
+        for (index, value) in [
+            (6, 15.0),
+            (7, 9.0),
+            (8, 13.0),
+            (9, -10.0),
+            (25, 8.0),
+            (26, 15.0),
+            (27, 10.0),
+        ] {
+            normalized[index] = value;
+        }
+        let mut background = [0.0; 35];
+        for (index, raw) in [
+            (5, 0.0),
+            (6, 3.02),
+            (7, 4.0),
+            (8, 0.0),
+            (9, 4.0),
+            (25, 0.0),
+            (26, 3.02),
+            (27, 4.0),
+        ] {
+            background[index] = raw - normalized[index];
+        }
+        let spec = Spec {
+            t: vec![0.0, 1.0, 2.0],
+            f,
+            db: normalized.iter().flat_map(|&value| [value; 3]).collect(),
+            meta: SpecMeta {
+                sr: 1000,
+                win_s: 1.0,
+                hop_s: 1.0,
+                nfft: 1000,
+                df: 1.0,
+                fmin: 83.05,
+                fmax: 117.05,
+                norm: "analytic qualified peaks with local raw vertices".into(),
+            },
+        };
+        let measured = |position_band| {
+            guided_raw_ridge_peak(
+                &spec,
+                1,
+                100.0,
+                |_| 0.0,
+                12.0,
+                12.0,
+                16.95,
+                1,
+                3.0,
+                4.0,
+                &background,
+                position_band,
+            )
+        };
+        let original = measured(12.0).unwrap();
+        assert!(original.0 > 110.0, "{original:?}");
+        let recovered = measured(10.0).unwrap();
+        let expected = 100.0 - 10.95 + 0.5 * (0.0 - 4.0) / (0.0 - 2.0 * 3.02 + 4.0);
+        assert!((recovered.0 - expected).abs() < 2e-5, "{recovered:?}");
+        assert!((recovered.0 - 100.0).abs() <= 10.0);
     }
 
     #[test]
@@ -1101,6 +1226,7 @@ mod tests {
                 3.0,
                 4.0,
                 background,
+                5.0,
             )
         };
         for slope in [-0.4, 0.0, 0.4] {
