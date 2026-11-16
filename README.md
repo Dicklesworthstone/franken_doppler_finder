@@ -1668,7 +1668,9 @@ Design notes:
   frequency tolerance, so restoration cannot cross to another ridge or a removed hum, and the original
   SNR/z thresholds stay in force. If that local correction leaves the guide's narrower positional
   tolerance, another already-qualified peak inside the tolerance remains eligible. Raw-only
-  calibration also requires a valid local raw vertex before ranking these alternatives.
+  calibration also tries those alternatives when the original peak has no local raw vertex,
+  even if its normalized frequency stays in the tolerance. Every calibration alternative
+  must supply a valid local raw vertex before it can be ranked.
   An eligible original winner keeps its exact selection and interpolation.
   There is no climb toward a raw maximum several bins away: tried,
   it made Livermore distances worse and raised the evidence of wrong-date runs. No extra full
@@ -2033,6 +2035,22 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover calibration beside an unusable nearer spectral peak
+
+`raw_calibration_recovers_a_physical_ridge_beside_an_unusable_nearer_vertex` uses the
+existing independently solved received aircraft frequencies. Its nearest qualified normalized
+peak is inside the guide tolerance but has no raw vertex in its three-bin neighborhood.
+The regression asks calibration to retain a farther qualified physical ridge at 21 frames
+in each frequency-direction mirror, refuse absent and below-SNR alternatives, and preserve
+eligible original frequency/SNR/z tuples exactly. This prevents a rejected first choice from
+discarding usable calibration evidence; the caller still retains its previous accepted
+measurement if calibration cannot complete.
+
+This regression is authored and independently source-reviewed. Native formatting, compilation,
+Clippy, tests, release CLI selftest and reference/field replays did not run because the execution
+environment disconnected. Separate numerical fixture exploration is not a native test pass,
+and no whole-recording accuracy improvement is claimed.
 
 ### Restore missing midnight flight support from completed raw feeds
 

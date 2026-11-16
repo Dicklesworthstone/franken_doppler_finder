@@ -189,7 +189,8 @@ pub(crate) fn guided_ridge_peak_with_exclusion(
 /// for its measured frequency. A long tonal asymptote can contaminate the row median and
 /// leave a displaced normalised peak with no raw maximum in its three-bin neighbourhood.
 /// Such a peak is useful for tracing, but cannot supply an unbiased frequency to the fit.
-/// No search for another raw peak, or change to the normalised qualification, is allowed.
+/// Only already-qualified normalised peaks can supply an alternative local vertex; there is
+/// no search for another raw peak and no change to the normalised qualification.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn guided_raw_ridge_peak(
     spec: &Spec,
@@ -446,11 +447,13 @@ fn profile_peak(
     };
     let (mut fhat, mut local_raw_vertex) = measured_peak(k);
     if let Some((min_snr, min_z, position_band, require_raw_fallback)) = position_gate
-        && (fhat - f_pred).abs() > position_band
+        && ((fhat - f_pred).abs() > position_band
+            || (require_raw_fallback && !local_raw_vertex))
     {
         // The noise exclusion may span a whole spectral lobe while the actual
         // position tolerance is narrower. Restoring a local raw vertex can move
-        // the nearest normalised peak outside that tolerance. Keep every valid
+        // the nearest normalised peak outside that tolerance, or calibration can
+        // require a local raw vertex that this peak does not have. Keep every valid
         // original winner exactly; otherwise consider only already-qualified
         // normalised peaks, with the same three-bin raw interpolation per peak.
         let (next, measured) = (1..n_off - 1)
@@ -1208,6 +1211,92 @@ mod tests {
         let expected = 100.0 - 10.95 + 0.5 * (0.0 - 4.0) / (0.0 - 2.0 * 3.02 + 4.0);
         assert!((recovered.0 - expected).abs() < 2e-5, "{recovered:?}");
         assert!((recovered.0 - 100.0).abs() <= 10.0);
+    }
+
+    #[test]
+    fn raw_calibration_recovers_a_physical_ridge_beside_an_unusable_nearer_vertex() {
+        // Reuse independently solved reception frequencies, not a guide-generated trace.
+        // A linear row background displaces the broad nearer peak's raw vertex by
+        // 0.5 Hz, beyond its three-bin neighbourhood. The narrower aircraft peak's
+        // 0.1 Hz correction is local and restores the known physical frequency.
+        // This is spectral evidence only, not PCM or a localization result.
+        for direction in [-1.0, 1.0] {
+            for height in [0.0, 2.0, 30.0] {
+                let (mut spec, received) = qualified_slope_scene(0.0);
+                let background: Vec<f32> = spec
+                    .f
+                    .iter()
+                    .map(|&f| (12.0 * direction * (f - 100.0)) as f32)
+                    .collect();
+                let nt = spec.nt();
+                for (row, &frequency) in spec.db.chunks_mut(nt).zip(&spec.f) {
+                    for (value, &ridge) in row.iter_mut().zip(&received) {
+                        *value = ((30.0 - 12.0 * (frequency - ridge - 3.0 * direction).powi(2))
+                            .max(0.0)
+                            + (height - 60.0 * (frequency - ridge + 0.1 * direction).powi(2))
+                                .max(0.0)) as f32;
+                    }
+                }
+                for j in (0..nt).step_by(20) {
+                    let along = |t: f64| received[spec.frame_index(t)] - received[j];
+                    let read = |guide, raw_only| {
+                        profile_peak(
+                            &spec,
+                            j,
+                            guide,
+                            along,
+                            4.0,
+                            4.0,
+                            16.0,
+                            15,
+                            PeakChoice::NearestQualified {
+                                min_snr: 3.0,
+                                min_z: 4.0,
+                                position_band: 4.0,
+                                require_raw_fallback: raw_only,
+                            },
+                            Some(&background),
+                        )
+                    };
+                    let guide = received[j] + 3.0 * direction;
+                    let original = read(guide, false).unwrap();
+                    assert!(!original.local_raw_vertex);
+                    assert!((original.values.0 - guide).abs() < spec.df());
+                    let calibrated = guided_raw_ridge_peak(
+                        &spec,
+                        j,
+                        guide,
+                        along,
+                        4.0,
+                        4.0,
+                        16.0,
+                        15,
+                        3.0,
+                        4.0,
+                        &background,
+                        4.0,
+                    );
+                    if height < 3.0 {
+                        assert!(
+                            calibrated.is_none(),
+                            "an absent or sub-SNR alternative must not supply a raw frequency"
+                        );
+                    } else {
+                        let calibrated = calibrated.unwrap();
+                        assert!(
+                            (calibrated.0 - received[j]).abs() < spec.df(),
+                            "direction={direction}, frame={j}: {calibrated:?}"
+                        );
+                        // An eligible nearest original keeps its exact frequency and scores.
+                        let eligible = read(received[j], false).unwrap();
+                        assert!(eligible.local_raw_vertex);
+                        let retained = read(received[j], true).unwrap();
+                        assert!(retained.local_raw_vertex);
+                        assert_eq!(retained.values, eligible.values);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -19,6 +19,18 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover raw-frequency calibration past an unusable nearest peak
+
+- Try the other already-qualified normalized peaks when the original in-band peak
+  cannot supply a local raw vertex. Retain every existing qualification, prominence,
+  frequency and three-bin interpolation bound, and the exact eligible-original path.
+- Add a moving physical-spectrum regression with both frequency-direction mirrors,
+  absent/below-SNR alternatives and exact eligible-winner preservation. This addresses
+  discarded calibration points; unsuccessful calibration still keeps the accepted trace.
+- Independently source-reviewed with numerical fixture exploration. Native formatting,
+  compilation, Clippy, tests, release CLI selftest and reference/field replays did not run
+  after the execution environment disconnected. No native pass or field-accuracy claim.
+
 ### Restore legacy midnight flight coverage from completed raw feeds
 
 - Before accepting an offline multi-day processed cache without verified boundary support,
