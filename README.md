@@ -2066,6 +2066,9 @@ replay even though real and decoy searches share the scorer and the acceptance t
 Weather retrieval overlaps audio analysis. After audio analysis, the pipeline waits up to 190 s for weather:
 the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. Usable hourly
 surface weather or radiosonde profiles are retained as they arrive; updates do not restart that deadline.
+Each usable radiosonde response publishes an immutable upper-air profile before requests for later
+soundings or other stations finish. These provisional profiles explicitly warn that retrieval is still
+in progress and include only the accepted soundings; invalid responses publish nothing.
 If both fallback sources finish, their final combined profile is used. If retrieval times out or stops early,
 the best received profile survives, with winds aloft preferred over surface-only data and warnings describing
 what is missing. The 15 °C standard atmosphere is used only when no usable profile has arrived.
@@ -2074,6 +2077,21 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Keep accepted upper-air profiles while later weather requests are pending
+
+`accepted_soundings_publish_before_later_profiles_are_requested` exercises the public
+offline weather path using the real radiosonde parser and cache. Its second sounding is
+created only by the callback for the first accepted sounding, so a callback delayed until
+all requests finish cannot pass. The regression checks immutable earlier snapshots and
+the final two-sounding atmosphere at three times and two height intervals, plus final
+description/warning stability. `invalid_cached_soundings_do_not_publish_partial_weather`
+requires unusable cached soundings to produce no provisional profile.
+
+These deterministic regressions use no network, sockets or timing sleeps. They are authored
+and independently source-reviewed, but have not run because the execution environment
+disconnected. Native formatting, compilation, Clippy, workspace tests, release CLI selftest
+and reference/field replays remain unrun; no native or field-accuracy improvement is claimed.
 
 ### Reuse completed jet-inclusive downloads for ordinary searches
 

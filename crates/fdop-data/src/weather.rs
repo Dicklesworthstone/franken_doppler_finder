@@ -717,12 +717,24 @@ fn raob_url(t: f64, station: &str) -> String {
     format!("{IEM_RAOB}?ts={y:04}{m:02}{d:02}{hh:02}00&station={station}")
 }
 
+#[cfg(test)]
 fn raob_atmosphere(
     b: &BBox,
     t_start: f64,
     t_end: f64,
     cache: &Path,
     offline: bool,
+) -> Result<ScatteredAtmosphere, DataError> {
+    raob_atmosphere_with_progress(b, t_start, t_end, cache, offline, &|_| {})
+}
+
+fn raob_atmosphere_with_progress(
+    b: &BBox,
+    t_start: f64,
+    t_end: f64,
+    cache: &Path,
+    offline: bool,
+    on_profile: &dyn Fn(ScatteredAtmosphere),
 ) -> Result<ScatteredAtmosphere, DataError> {
     // Select stations for the 00Z/12Z brackets too, not just times inside the recording.
     let t0 = (t_start / 43200.0).floor() * 43200.0;
@@ -778,6 +790,22 @@ fn raob_atmosphere(
             ) {
                 series.push((t, lv));
                 n_ok += 1;
+                // A later sounding or station can stall past the pipeline deadline.
+                // Publish only already validated profiles; the final blend below keeps
+                // its original station selection and time interpolation.
+                let mut available = stations.clone();
+                available.push((*la, *lo, series.clone()));
+                let mut ids = used.clone();
+                ids.push(id.as_str());
+                if let Ok(profile) = ScatteredAtmosphere::new(
+                    available,
+                    format!(
+                        "NWS radiosondes {} (IEM RAOB archive, retrieval in progress: {n_ok} usable soundings)",
+                        ids.join(", ")
+                    ),
+                ) {
+                    on_profile(profile);
+                }
             }
             t += 43200.0;
         }
@@ -861,11 +889,29 @@ pub fn fetch_atmosphere_with_progress(
         om_grid(OM_HIST_FORECAST, &b, t_start, t_end, &c1, offline, true)
     });
     let (c2, c3) = (cache.to_path_buf(), cache.to_path_buf());
+    let om = join_weather(h_om);
+    let preferred_failure = om
+        .as_ref()
+        .err()
+        .map(|e| format!("Open-Meteo pressure levels unavailable ({e})"))
+        .unwrap_or_default();
+    let updates = Arc::new(on_fallback);
+    let raob_updates = Arc::clone(&updates);
     fetch_with_fallbacks(
-        join_weather(h_om),
+        om,
         move || om_grid(OM_ARCHIVE, &b, t_start, t_end, &c2, offline, false),
-        move || raob_atmosphere(&b, t_start, t_end, &c3, offline),
-        on_fallback,
+        move || {
+            raob_atmosphere_with_progress(&b, t_start, t_end, &c3, offline, &|profile| {
+                let mut source = WeatherSource::complete(profile);
+                source.warnings.push(
+                    "radiosonde retrieval is still in progress; using only the soundings already received"
+                        .into(),
+                );
+                let _ =
+                    publish_fallback(Ok(source), &preferred_failure, true, &*raob_updates);
+            })
+        },
+        move |weather| updates(weather),
     )
 }
 
@@ -1947,6 +1993,130 @@ mod tests {
             parse_raob_stations(listing, (day, day + 43_200.0)).unwrap(),
             vec![("KOLD".to_string(), 40.876466, -73.524951, 100.0)]
         );
+    }
+
+    #[test]
+    fn accepted_soundings_publish_before_later_profiles_are_requested() {
+        use std::sync::Mutex;
+
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let bbox = BBox::new(lat, lon, lat, lon);
+        let (dir, index_path) = weather_test_cache(IEM_RAOB_NETWORK, "raob-progress");
+        std::fs::write(&index_path, raob_station_index_fixture().to_string()).unwrap();
+        let profile = |speed: f64| {
+            let levels: Vec<_> = (0..6)
+                .map(|i| {
+                    serde_json::json!({
+                        "hght": 100.0 + 1200.0 * f64::from(i),
+                        "tmpc": 15.0 - 6.0 * f64::from(i),
+                        "dwpc": 5.0 - 6.0 * f64::from(i),
+                        "drct": 270.0,
+                        "sknt": speed,
+                    })
+                })
+                .collect();
+            serde_json::json!({"profiles": [{"profile": levels}]})
+        };
+        let (first, second) = (profile(20.0), profile(40.0));
+        let at = |time| {
+            dir.join("weather")
+                .join(format!("{:016x}.json", fnv(&raob_url(time, "KOLD"))))
+        };
+        std::fs::write(at(day), first.to_string()).unwrap();
+        let later_path = at(day + 43_200.0);
+        assert!(!later_path.exists());
+        let first_only = ScatteredAtmosphere::new(
+            vec![(lat, lon, vec![(day, parse_raob_response(first.clone()).unwrap())])],
+            "first sounding".into(),
+        )
+        .unwrap();
+        let expected = ScatteredAtmosphere::new(
+            vec![(
+                lat,
+                lon,
+                vec![
+                    (day, parse_raob_response(first).unwrap()),
+                    (day + 43_200.0, parse_raob_response(second.clone()).unwrap()),
+                ],
+            )],
+            "both soundings".into(),
+        )
+        .unwrap();
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&snapshots);
+        let weather = fetch_atmosphere_with_progress(
+            &bbox,
+            day + 3600.0,
+            day + 39_600.0,
+            &dir,
+            true,
+            move |update| {
+                let mut snapshots = observed.lock().unwrap();
+                if snapshots.is_empty() {
+                    // Make the later profile available only after a real accepted
+                    // sounding reaches the callback. No sleeps, sockets or network:
+                    // publishing only after the entire RAOB fetch loses this bracket.
+                    assert!(update.winds_aloft);
+                    assert!(update.warnings.iter().any(|w| w.contains("still in progress")));
+                    std::fs::write(&later_path, second.to_string()).unwrap();
+                }
+                snapshots.push(update);
+            },
+        );
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 3, "two partial profiles, then the completed source");
+        assert!(weather.winds_aloft);
+        assert!(weather.atmo.describe().contains("2 of 2 soundings usable"));
+        assert!(weather.warnings.iter().all(|w| !w.contains("still in progress")));
+        for time in [day, day + 21_600.0, day + 43_200.0] {
+            for heights in [(30.0, 1000.0), (2500.0, 6000.0)] {
+                let sample = |atmo: &dyn Atmosphere| {
+                    atmo.medium(lat, lon, time, heights.0, heights.1)
+                };
+                assert_eq!(sample(&*snapshots[0].atmo), sample(&first_only));
+                for complete in [&snapshots[1], &snapshots[2], &weather] {
+                    assert_eq!(sample(&*complete.atmo), sample(&expected));
+                }
+            }
+        }
+        // Finishing the same cached request keeps the previous final-result contract.
+        let final_only = fetch_atmosphere(&bbox, day + 3600.0, day + 39_600.0, &dir, true);
+        assert_eq!(final_only.atmo.describe(), weather.atmo.describe());
+        assert_eq!(final_only.warnings, weather.warnings);
+    }
+
+    #[test]
+    fn invalid_cached_soundings_do_not_publish_partial_weather() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let bbox = BBox::new(lat, lon, lat, lon);
+        let (dir, index_path) = weather_test_cache(IEM_RAOB_NETWORK, "raob-no-progress");
+        std::fs::write(index_path, raob_station_index_fixture().to_string()).unwrap();
+        for time in [day, day + 43_200.0] {
+            let path = dir.join("weather").join(format!(
+                "{:016x}.json",
+                fnv(&raob_url(time, "KOLD"))
+            ));
+            std::fs::write(path, r#"{"profiles": []}"#).unwrap();
+        }
+        let updates = Arc::new(AtomicUsize::new(0));
+        let received = Arc::clone(&updates);
+        let weather = fetch_atmosphere_with_progress(
+            &bbox,
+            day + 3600.0,
+            day + 39_600.0,
+            &dir,
+            true,
+            move |_| {
+                received.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert_eq!(updates.load(Ordering::Relaxed), 0);
+        assert!(!weather.winds_aloft);
+        assert!(weather.warnings.iter().any(|w| w.contains("radiosondes unavailable")));
     }
 
     #[test]

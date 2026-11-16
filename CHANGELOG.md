@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain accepted radiosondes while later weather requests are pending
+
+- Publish an immutable upper-air snapshot after each accepted sounding instead of
+  withholding all radiosonde data until the remaining station/time requests finish.
+  The existing weather deadline can now retain already received winds aloft.
+- Mark provisional profiles as incomplete, reject invalid responses, and preserve
+  the existing final station selection, interpolation and surface-adjustment behavior.
+  The pipeline still prefers received winds aloft over a later surface-only update.
+- Add deterministic offline regressions using the real cache/parser and public weather
+  path. The first callback creates the next sounding, earlier snapshots must remain
+  unchanged, final interpolation must match both soundings, and invalid profiles must
+  not emit updates.
+- Independent source review completed. Native formatting, compilation, Clippy, Rust
+  tests, release selftest and reference/field replays remain unrun after the execution
+  environment disconnected. No native test pass or field-accuracy claim is made.
+
 ### Reuse completed jet-inclusive raw downloads for ordinary searches
 
 - Let ordinary requests reuse certified covering jet-inclusive raw checkpoints after
