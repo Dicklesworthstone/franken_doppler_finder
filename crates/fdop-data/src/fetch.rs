@@ -815,16 +815,22 @@ fn fetch_window_with_sources(
             ..*spec
         };
         let required_context = (days.len() > 1).then(|| day_context(day));
+        let mut partial = None;
         if let Some((p, s)) = find_cached(&dir, feedset, &want, &label, opts, required_context) {
-            opts.say(&format!(
-                "[adsb] {label}: cached {} ({} legs)",
-                p.display(),
-                s.leg_count
-            ));
-            notes.extend(cache_context_note(&label, &s, required_context));
-            day_stores[i] = Some(s);
-            cache_hits += 1;
-            continue;
+            if cache_context_note(&label, &s, required_context).is_none() {
+                opts.say(&format!(
+                    "[adsb] {label}: cached {} ({} legs)",
+                    p.display(),
+                    s.leg_count
+                ));
+                day_stores[i] = Some(s);
+                cache_hits += 1;
+                continue;
+            }
+            // Offline legacy stores can omit an aircraft whose two day fragments
+            // only cross the region after joining. Completed raw feeds may already
+            // contain the missing boundary support; keep this store as a fallback.
+            partial = Some((feedset, p, s));
         }
         // a store built while a release was missing: use it when nothing better exists
         let mut discovery_error = None;
@@ -857,9 +863,9 @@ fn fetch_window_with_sources(
             }
         };
         let available = feedset_available(&rels, opts.include_mlat);
-        let mut partial = None;
         for fs in partial_feedsets(feedset) {
-            if (opts.offline || available.as_ref().is_none_or(|a| a.as_str() == *fs))
+            if partial.is_none()
+                && (opts.offline || available.as_ref().is_none_or(|a| a.as_str() == *fs))
                 && let Some((p, s)) = find_cached(&dir, fs, &want, &label, opts, required_context)
             {
                 partial = Some((*fs, p, s));
@@ -867,6 +873,16 @@ fn fetch_window_with_sources(
             }
         }
         let local_recovery = opts.offline || discovery_error.is_some();
+        let context_recovery = partial.as_ref().is_some_and(|(_, _, store)| {
+            cache_context_note(&label, store, required_context).is_some()
+        });
+        let selected_main = partial.as_ref().map(|(fs, _, _)| {
+            if fs.starts_with("prod") {
+                Feed::Prod
+            } else {
+                Feed::Staging
+            }
+        });
         let upgrade_main = if opts.include_mlat {
             partial.as_ref().and_then(|(fs, _, _)| match *fs {
                 "prod" => Some(Feed::Prod),
@@ -876,13 +892,15 @@ fn fetch_window_with_sources(
         } else {
             None
         };
-        if local_recovery && (partial.is_none() || upgrade_main.is_some()) {
+        if local_recovery && (partial.is_none() || upgrade_main.is_some() || context_recovery) {
             // A completed raw pair can upgrade a main-only processed fallback after
             // interrupted publication. Keep its selected main feed and require MLAT
-            // too; complete processed stores and partial-cache ordering stay unchanged.
+            // too. A legacy store can instead gain verified midnight support, but
+            // only from the same main feed without losing any existing MLAT coverage.
             // Cached release identities cannot trigger another network request. Use
             // the same padded spec as online, never the clipped want.
-            let rels = match discover(None, day.0, day.1, day.2, &dir, true, opts.include_mlat) {
+            let mut rels = match discover(None, day.0, day.1, day.2, &dir, true, opts.include_mlat)
+            {
                 Ok(found) => found.releases,
                 Err(error) if partial.is_some() => {
                     let note = format!(
@@ -894,6 +912,15 @@ fn fetch_window_with_sources(
                 }
                 Err(error) => return Err(discovery_error.unwrap_or(error)),
             };
+            let require_mlat = if context_recovery {
+                rels.retain(|rel| rel.feed == Feed::Mlatonly || Some(rel.feed) == selected_main);
+                partial
+                    .as_ref()
+                    .filter(|(fs, _, _)| fs.contains("mlatonly"))
+                    .and(selected_main)
+            } else {
+                upgrade_main
+            };
             let sp = day_spec(day);
             let context = day_context(day);
             let rebuilt = crate::raw_cache::rebuild_day(
@@ -902,7 +929,7 @@ fn fetch_window_with_sources(
                 &sp,
                 context,
                 opts.include_mlat,
-                upgrade_main,
+                require_mlat,
                 |rel, error| {
                     let unavailable = if opts.offline {
                         "unavailable offline"
@@ -1422,6 +1449,278 @@ mod tests {
             path, legacy_path,
             "offline fallback must keep the smallest usable legacy cache"
         );
+    }
+
+    #[test]
+    fn completed_raw_feeds_restore_legacy_midnight_crossings_without_losing_feeds() {
+        use crate::ingest::tests::{gz, tar_of};
+        use fdop_types::geo::Enu;
+
+        let (lat, lon) = (40.876466, -73.524951);
+        let midnight = fdop_types::time::unix_from_utc(2026, 9, 9, 0, 0, 0.0);
+        let enu = Enu::new(lat, lon, 0.0);
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                // A main-only legacy cache can gain boundary support without gaining
+                // MLAT, even when MLAT is requested. A combined cache cannot lose it.
+                for (request_mlat, cached_mlat) in [(false, false), (true, false), (true, true)] {
+                    for problem in [
+                        "none",
+                        "missing main",
+                        "missing mlat",
+                        "context",
+                        "corrupt",
+                        "other main",
+                    ] {
+                        if problem == "missing mlat" && !request_mlat {
+                            continue;
+                        }
+                        let nonce = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos();
+                        let cache = std::env::temp_dir().join(format!(
+                            "fdop-legacy-midnight-{}-{nonce}",
+                            std::process::id()
+                        ));
+                        let want = IngestSpec {
+                            bbox: BBox::new(lat - 0.001, lon - 0.001, lat + 0.001, lon + 0.001),
+                            t_start: midnight - 10.0,
+                            t_end: midnight + 10.0,
+                            geoid_n_m: -28.0,
+                            keep_unknown: true,
+                            include_jets,
+                        };
+                        let (bbox, key) = bbox_key(&want.bbox);
+                        let mut fresh = Vec::new();
+                        for (index, offsets) in [[-105.0, -70.0, -35.0], [35.0, 70.0, 105.0]]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let day = (2026, 9, 8 + index as u32);
+                            let context = day_context(day);
+                            let spec = IngestSpec {
+                                bbox,
+                                t_start: context.day_start - DAY_CACHE_PAD_S,
+                                t_end: context.day_start + 86_400.0 + DAY_CACHE_PAD_S,
+                                ..want
+                            };
+                            let dir = day_dir(&cache, day);
+                            let mut releases = Vec::new();
+                            let mut legacy_parts = Vec::new();
+                            let mut legacy_tags = Vec::new();
+                            let mut full_parts = Vec::new();
+                            let mut full_tags = Vec::new();
+                            for feed in [main, Feed::Mlatonly] {
+                                if feed == Feed::Mlatonly && !request_mlat {
+                                    continue;
+                                }
+                                let rows: Vec<_> = offsets
+                                    .iter()
+                                    .map(|dt| {
+                                        let (la, lo, height) =
+                                            enu.to_geodetic([220.0 * dt, 0.0, 1200.0]);
+                                        serde_json::json!([
+                                            midnight + dt - context.day_start,
+                                            la,
+                                            lo,
+                                            height / 0.3048,
+                                            220.0 / 0.514444,
+                                            90,
+                                            0,
+                                            0,
+                                            null,
+                                            if feed == Feed::Mlatonly {
+                                                "mlat"
+                                            } else {
+                                                "adsb_icao"
+                                            },
+                                            (height + spec.geoid_n_m) / 0.3048,
+                                            0,
+                                            null,
+                                            null
+                                        ])
+                                    })
+                                    .collect();
+                                let json = serde_json::json!({
+                                    "icao": "a1b2c3", "r": "TEST",
+                                    "t": if include_jets { "B738" } else { "PC12" },
+                                    "timestamp": context.day_start, "trace": rows
+                                });
+                                let archive =
+                                    tar_of(&[("trace_full_a1b2c3.json", gz(&json.to_string()))]);
+                                let tag = crate::adsblol::tag_for(day.0, day.1, day.2, feed, 0);
+                                let mut rel = DayRelease {
+                                    feed,
+                                    tag: tag.clone(),
+                                    repo: crate::adsblol::repo_for_year(day.0),
+                                    parts: vec![crate::adsblol::AssetPart {
+                                        name: format!("{tag}.tar"),
+                                        url: format!("https://example.invalid/{tag}.tar"),
+                                        size: archive.len() as u64,
+                                    }],
+                                };
+                                let part = ingest_day_reader(
+                                    archive.as_slice(),
+                                    feed.label(),
+                                    &spec,
+                                    &|_| {},
+                                    context,
+                                )
+                                .unwrap();
+                                assert_eq!(
+                                    part.0.len(),
+                                    1,
+                                    "boundary-aware ingest must retain both fragments"
+                                );
+                                if feed == main || cached_mlat {
+                                    legacy_parts.push(
+                                        ingest_reader(
+                                            archive.as_slice(),
+                                            feed.label(),
+                                            &spec,
+                                            &|_| {},
+                                        )
+                                        .unwrap(),
+                                    );
+                                    legacy_tags.push(tag.clone());
+                                }
+                                if problem != "missing mlat" || feed != Feed::Mlatonly {
+                                    full_parts.push(part.clone());
+                                    full_tags.push(tag);
+                                }
+                                if problem == "other main" && feed == main {
+                                    rel.feed = if main == Feed::Prod {
+                                        Feed::Staging
+                                    } else {
+                                        Feed::Prod
+                                    };
+                                    rel.tag =
+                                        crate::adsblol::tag_for(day.0, day.1, day.2, rel.feed, 0);
+                                    rel.parts[0].name = format!("{}.tar", rel.tag);
+                                    rel.parts[0].url =
+                                        format!("https://example.invalid/{}.tar", rel.tag);
+                                }
+                                let missing = (problem == "missing main" && feed == main)
+                                    || (problem == "missing mlat" && feed == Feed::Mlatonly);
+                                if !missing {
+                                    let raw_part = if rel.feed == feed {
+                                        part
+                                    } else {
+                                        ingest_day_reader(
+                                            archive.as_slice(),
+                                            rel.feed.label(),
+                                            &spec,
+                                            &|_| {},
+                                            context,
+                                        )
+                                        .unwrap()
+                                    };
+                                    let raw_context = if problem == "context" {
+                                        DayContext::new(
+                                            context.day_start,
+                                            DAY_JOIN_GAP_S / 2.0,
+                                            DAY_CACHE_PAD_S,
+                                        )
+                                    } else {
+                                        context
+                                    };
+                                    crate::raw_cache::save(
+                                        &dir,
+                                        &rel,
+                                        &spec,
+                                        raw_context,
+                                        &raw_part,
+                                    )
+                                    .unwrap();
+                                    if problem == "corrupt" && feed == main {
+                                        std::fs::write(
+                                            crate::raw_cache::path(&dir, &rel, &spec),
+                                            b"truncated checkpoint",
+                                        )
+                                        .unwrap();
+                                    }
+                                }
+                                releases.push(rel);
+                            }
+                            let legacy = build_store(legacy_parts, &spec, legacy_tags);
+                            assert!(
+                                legacy.legs.is_empty(),
+                                "neither day alone crosses the rounded region"
+                            );
+                            let fs = cache_feedset(&feedset_name(main, cached_mlat), include_jets);
+                            legacy.save(&dir.join(format!("{fs}_{key}.fdtrk"))).unwrap();
+                            std::fs::write(
+                                dir.join("releases.json"),
+                                serde_json::to_vec(&releases).unwrap(),
+                            )
+                            .unwrap();
+                            fresh.push(build_day_store(full_parts, &spec, full_tags, context));
+                        }
+                        let expected = merge_stores(fresh, DAY_JOIN_GAP_S).filtered(
+                            &want.bbox,
+                            want.t_start,
+                            want.t_end,
+                        );
+                        assert_eq!(expected.legs.len(), 1);
+                        assert_eq!(expected.n_points(), 6);
+                        let opts = FetchOptions {
+                            offline: true,
+                            include_mlat: request_mlat,
+                            ..Default::default()
+                        };
+                        let got = fetch_window(&want, &cache, &opts).unwrap();
+                        let recovered =
+                            problem == "none" || (problem == "missing mlat" && !cached_mlat);
+                        let notes = got.meta.stats["notes"].as_array().unwrap();
+                        let legacy_warnings = notes
+                            .iter()
+                            .filter(|note| note.as_str().unwrap().contains("legacy day cache"))
+                            .count();
+                        if recovered {
+                            assert_same_legs(&got.legs, &expected.legs);
+                            assert_eq!(legacy_warnings, 0);
+                            for day in got.meta.stats["day_stores"].as_array().unwrap() {
+                                assert!(DayContext::from_stats(&day["stats"]).is_some());
+                            }
+                            let cached = fetch_window_with_sources(
+                                &want,
+                                &cache,
+                                &opts,
+                                |net, y, m, d, dir, offline, include_mlat| {
+                                    assert!(request_mlat && problem == "missing mlat");
+                                    assert!(net.is_none() && offline, "MLAT retry must stay local");
+                                    find_day_releases_for_fetch_cached(
+                                        net,
+                                        y,
+                                        m,
+                                        d,
+                                        dir,
+                                        offline,
+                                        include_mlat,
+                                    )
+                                },
+                                |_, _, _, _| panic!("offline recovery must never open an archive"),
+                            )
+                            .unwrap();
+                            assert_eq!(cached.meta.stats["cache_hits"], 2);
+                            assert_same_legs(&cached.legs, &got.legs);
+                        } else {
+                            assert!(
+                                got.legs.is_empty(),
+                                "incompatible raw evidence must retain the selected legacy cache"
+                            );
+                            assert_eq!(legacy_warnings, 2);
+                        }
+                        assert_eq!(
+                            got.meta.stats["cache_hits"],
+                            if recovered { 0 } else { 2 },
+                            "{main:?} {request_mlat}/{cached_mlat} {include_jets}: {problem}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn synthetic_tag(feed: Feed) -> String {

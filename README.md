@@ -1092,9 +1092,10 @@ A missing, incompatible or damaged checkpoint causes a fresh download of that fe
 A checkpoint-write failure warns and keeps the current successful ingest; it does not
 change final day-store publication errors.
 
-Complete processed day caches keep their priority. When MLAT is requested, a main-only
-processed fallback no longer hides completed raw feeds: `--offline` upgrades it when
-compatible checkpoints can rebuild the same main feed together with MLAT. Joint raw
+Complete processed day caches satisfying the requested coverage keep their priority. When
+MLAT is requested, a main-only processed fallback no longer hides completed raw feeds:
+`--offline` upgrades it when compatible checkpoints can rebuild the same main feed together
+with MLAT. Joint raw
 reconciliation restores MLAT-only aircraft and retains the shared altitude and aircraft-type
 evidence. Missing, damaged or incompatible raw feeds leave the processed fallback usable;
 MLAT-disabled requests retain their main-only cache path.
@@ -1107,9 +1108,9 @@ reports the lookup failure and that newer or additional feeds could not be check
 It validates that each release belongs to the requested day and feed, then applies the same
 raw identity checks and geoid conversion as an online retry. A usable prod checkpoint takes priority over staging. Available requested
 MLAT is reconciled with the main feed; if requested MLAT is unavailable, a main-only result
-keeps its missing-feed warning. MLAT alone cannot supply a day. Upgrading an existing
-processed fallback requires its selected main feed and MLAT, so recovery cannot silently
-substitute a different main feed or replace a usable cache with an incomplete reconstruction.
+keeps its missing-feed warning. MLAT alone cannot supply a day. An upgrade that adds MLAT
+to an existing processed fallback requires its selected main feed together with MLAT;
+a different main feed cannot substitute for the selected one.
 
 The rebuilt day is atomically saved for later searches, so this recovery needs a writable
 cache. A final day-store write failure remains an error. No network client or archive
@@ -1122,7 +1123,7 @@ and unfinished UTC days remain pending.
 These checkpoints add disk usage for the filtered raw reports. They do not save entire
 multi-gigabyte archives, resume an unfinished feed across process restarts, or recover
 raw information from older processed-only caches. No extra flag is required, and ordinary
-completed-day cache hits still take precedence.
+completed-day cache hits with sufficient requested coverage still take precedence.
 
 Cached day stores are tried from the smallest covering box to the largest. A store is reused only when it
 can be read and its stored box and time interval cover the requested slice of that UTC day. Loading also
@@ -1150,10 +1151,19 @@ preserve cuts made by spatial filtering and ground or restart boundaries, includ
 a feed's last airborne report or in a ground-only companion feed. A midnight join
 may bridge a filtering cut only when both day stores certify that their boundary support was retained.
 
-Online multi-day requests refresh older day stores without this coverage marker. Offline requests can
-still use those older stores, but warn that missing midnight reports cannot be recovered from them;
-the warning remains in the final report, including when it comes from the curve matcher's separate
-real/decoy catalogue. Single-day requests continue to reuse older caches. The coverage marker does not
+Online multi-day requests refresh older day stores without this coverage marker. Before
+using such a legacy store offline, the fetcher tries compatible completed raw feeds and
+cached release metadata to rebuild verified boundary support. This can restore an aircraft
+whose two day fragments enter the requested region only after joining across midnight.
+The retry keeps the selected prod or staging feed and cannot drop MLAT already present in
+the processed store. A main-only store can gain boundary support even when requested MLAT
+is unavailable; its missing-feed warning remains. Complete caches with valid required
+coverage keep their fast path; single-day cache reuse is unchanged.
+
+This reconstruction opens neither a network connection nor an archive stream. Missing,
+corrupt or incompatible raw evidence leaves the selected legacy store usable with its
+midnight-coverage warning. That warning remains in the final report, including when it
+comes from the curve matcher's separate real/decoy catalogue. The coverage marker does not
 survive spatial/time cropping, which may remove the reports it certifies.
 
 Concurrent searches publish track stores through separate, exclusively created staging files, so one
@@ -2024,6 +2034,30 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Restore missing midnight flight support from completed raw feeds
+
+`completed_raw_feeds_restore_legacy_midnight_crossings_without_losing_feeds`
+exercises 68 offline scenarios using compressed synthetic archives, persisted raw
+checkpoints and legacy processed stores that each omit the same cross-midnight aircraft.
+The matrix covers prod/staging, ordinary/jet-inclusive policy and requested/existing MLAT.
+Its 16 recovery cases require the six-point joined flight to match a fresh boundary-aware
+build and verify subsequent processed-cache reuse. The remaining 52 cases require a warned
+legacy fallback for missing main data, missing previously retained MLAT, incompatible
+boundary context, corruption or a different main feed. Archive-opening callbacks reject
+any attempt to open an archive during the local cache checks.
+
+All 68 scenarios pass in a native offline runner using the pinned toolchain and real locked
+dependencies. It compiles the complete production data crate; only HTTP transport is
+replaced with panic-on-use calls, retaining the original atomic-write implementation.
+No transport call is reached. The identical regression on the preceding fetch code fails
+with zero recovered legs rather than one.
+The existing processed-cache MLAT recovery regression and both repeated-timestamp merge
+regressions also pass in this runner: four targeted test functions in total.
+
+This does not establish a full-package, workspace or live-HTTP pass. Full package compilation
+and workspace Clippy were killed in unchanged dependencies; release CLI selftest and
+reference/field replays remain incomplete. No field-accuracy improvement is claimed.
+
 ### Retain qualified ridges after local frequency calibration
 
 `guided_measurement_retains_an_in_band_ridge_after_raw_frequency_correction` and
@@ -2088,9 +2122,8 @@ preference, motion recovery, duplicate intervals and real flight-leg breaks.
 changes, repeated timestamps, separate duplicate groups, relative/Unix times and ground
 boundaries. `repeated_duplicate_times_keep_cross_store_leg_boundaries` exercises three
 overlapping stores in both input orders, checking the selected points, the two-leg split
-and aircraft metadata. Source review and the local whitespace check passed. The execution
-environment disconnected before native tests or formatting could run; these regressions,
-workspace checks, CLI selftest and reference/field replays remain unexecuted.
+and aircraft metadata. Both regressions now pass in the native offline data runner described
+above. Full-package/workspace checks, CLI selftest and reference/field replays remain incomplete.
 
 ### Recover completed MLAT data hidden by a main-only processed cache
 

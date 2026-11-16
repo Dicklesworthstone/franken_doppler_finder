@@ -19,6 +19,31 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Restore legacy midnight flight coverage from completed raw feeds
+
+- Before accepting an offline multi-day processed cache without verified boundary support,
+  try compatible completed raw feeds and cached release metadata. Two individually omitted
+  day fragments can then recover the aircraft crossing the requested region at midnight.
+- Keep the selected main feed and all already-retained MLAT coverage. Main-only stores may
+  gain boundary support while retaining a requested-but-missing MLAT warning. Complete
+  caches with required context and single-day reuse remain unchanged. No network
+  connection or archive stream opens.
+- Missing, damaged or incompatible raw evidence preserves the selected legacy fallback and
+  its midnight-coverage warning. Final atomic publication errors remain errors.
+- Add a 68-case offline integration matrix: 16 recovery cases compare the six-point
+  joined flight with a fresh boundary-aware build; 52 controls require warned fallback.
+  Cases cover prod/staging, jet policy, existing/requested MLAT, raw integrity and context,
+  selected-feed preservation and subsequent processed-cache reuse.
+- All 68 cases pass in a native runner compiling the complete production data crate with
+  real locked dependencies and the original atomic-write implementation. Only HTTP
+  transport is replaced by panic-on-use calls; none is reached. The identical regression
+  on the preceding fetch code fails with zero legs instead of one.
+- The existing processed-cache MLAT recovery regression and both repeated-timestamp merge
+  regressions also pass in that runner, for four targeted test functions in total.
+- Full-package compilation and workspace Clippy were killed in unchanged dependencies.
+  Full workspace tests, release CLI selftest and reference/field replays remain incomplete;
+  this bounded offline result makes no live-HTTP or field-accuracy claim.
+
 ### Retain qualified aircraft ridges after frequency calibration
 
 - When the nearest normalized peak's local raw-frequency correction falls outside the
