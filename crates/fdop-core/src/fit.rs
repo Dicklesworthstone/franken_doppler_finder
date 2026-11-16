@@ -668,27 +668,37 @@ fn finish_fit(prepared: PreparedFit) -> FitResult {
         let base = p_best[k];
         let mut warm = p_best;
         let (mut ok_rel, mut rel) = (0.0f64, 0.002f64);
+        // The last geometric step can cross the intended exploration limit or a
+        // physical bound. Test that endpoint before calling this side open: the
+        // preceding step can still be far inside an admissible short-arc range.
+        let limit = (base * (1.0 + sign * max_rel)).clamp(lo_b[k], hi_b[k]);
+        let limit_rel = ((limit - base) / base).abs();
         let fail_rel;
         loop {
-            let g = base * (1.0 + sign * rel);
-            if g <= lo_b[k] || g >= hi_b[k] || rel > max_rel {
-                return (base * (1.0 + sign * ok_rel), true);
-            }
+            rel = rel.min(limit_rel);
+            let g = if rel == limit_rel {
+                limit
+            } else {
+                base * (1.0 + sign * rel)
+            };
             let (cost, p) = prof_at(k, g, warm);
-            if cost > thr {
+            if !cost.is_finite() || cost > thr {
                 fail_rel = rel;
                 break;
             }
             acc.push(p);
             ok_rel = rel;
             warm = p;
+            if g == limit {
+                return (limit, true);
+            }
             rel *= 1.6;
         }
         let mut fail_rel = fail_rel;
         for _ in 0..8 {
             let mid = 0.5 * (ok_rel + fail_rel);
             let (cost, p) = prof_at(k, base * (1.0 + sign * mid), warm);
-            if cost <= thr {
+            if cost.is_finite() && cost <= thr {
                 ok_rel = mid;
                 warm = p;
                 acc.push(p);
@@ -1355,32 +1365,88 @@ mod tests {
         assert!((28.0..=0.8 * c).contains(&best.v));
         assert!((200.0..=25_000.0).contains(&best.d));
 
-        // A slower, closer pass can explain this short observed arc as well. Its
-        // acceptance must survive projecting the fitted region onto each coordinate.
-        let (witness, cost, _) = ls(
-            &prepared.t_i,
-            &prepared.f_i,
-            c,
-            prepared.p_best,
-            &[0, 2, 3],
-            &[(1, 40.0)],
-            LossKind::Linear,
-        );
+        // Slower, closer passes can explain this short observed arc as well.
+        // The 40 m/s witness exercises the accepted-coordinate envelope; the lower
+        // speeds also need the terminal profile step to reach its intended limit.
+        // These are independent speed prescriptions, not samples of the profile walk.
+        let witnesses: Vec<_> = [28.0, 32.0, 36.0, 40.0]
+            .into_iter()
+            .map(|speed| {
+                ls(
+                    &prepared.t_i,
+                    &prepared.f_i,
+                    c,
+                    prepared.p_best,
+                    &[0, 2, 3],
+                    &[(1, speed)],
+                    LossKind::Linear,
+                )
+            })
+            .collect();
         let minimum = prepared.cmin;
         let result = prepared.complete();
         let threshold = minimum * (1.0 + result.diagnostics.delta);
-        assert!(cost.is_finite() && cost <= threshold);
-        assert!((200.0..=25_000.0).contains(&witness[2]));
-        for (name, interval, value) in [
-            ("speed", result.ranges.v, witness[1]),
-            ("distance", result.ranges.d, witness[2]),
-            ("search speed", result.ranges_generous.v, witness[1]),
-            ("search distance", result.ranges_generous.d, witness[2]),
+        for (witness, cost, _) in witnesses {
+            assert!(cost.is_finite() && cost <= threshold);
+            assert!((200.0..=25_000.0).contains(&witness[2]));
+            for (name, interval, value) in [
+                ("speed", result.ranges.v, witness[1]),
+                ("distance", result.ranges.d, witness[2]),
+                ("search speed", result.ranges_generous.v, witness[1]),
+                ("search distance", result.ranges_generous.d, witness[2]),
+            ] {
+                assert!(
+                    (interval[0]..=interval[1]).contains(&value),
+                    "accepted profile {witness:?}, SSE {cost} <= {threshold}: {name} {value} outside {interval:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_arc_geometry_profiles_remain_closed_and_constrained() {
+        let c = 343.0;
+        let (t, f) = emitted_trace(112.7, 140.0, 6100.0, 150, 0.37);
+        let prepared = prepare_constant_velocity(&t, &f, c, Side::Both).unwrap();
+        assert_eq!(prepared.t_i.len(), t.len());
+        let (ti, fi, best, minimum) = (
+            prepared.t_i.clone(),
+            prepared.f_i.clone(),
+            prepared.p_best,
+            prepared.cmin,
+        );
+        let result = prepared.complete();
+        let threshold = minimum * (1.0 + result.diagnostics.delta);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("unbounded-within-search")),
+            "{:?}",
+            result.warnings
+        );
+        for (k, truth, interval) in [
+            (1, 140.0, result.ranges.v),
+            (2, 6100.0, result.ranges.d),
         ] {
-            assert!(
-                (interval[0]..=interval[1]).contains(&value),
-                "accepted profile {witness:?}, SSE {cost} <= {threshold}: {name} {value} outside {interval:?}"
-            );
+            assert!((interval[0]..=interval[1]).contains(&truth));
+            assert!(interval[0] > 0.95 * best[k] && interval[1] < 1.05 * best[k]);
+            let free: Vec<_> = (0..4).filter(|&coordinate| coordinate != k).collect();
+            for endpoint in interval {
+                let (_, inside_cost, _) =
+                    ls(&ti, &fi, c, best, &free, &[(k, endpoint)], LossKind::Linear);
+                assert!(
+                    inside_cost <= threshold,
+                    "coordinate {k}: {inside_cost} > {threshold}"
+                );
+                let outside = best[k] + 1.02 * (endpoint - best[k]);
+                let (_, outside_cost, _) =
+                    ls(&ti, &fi, c, best, &free, &[(k, outside)], LossKind::Linear);
+                assert!(
+                    outside_cost > threshold,
+                    "coordinate {k}: {outside_cost} <= {threshold}"
+                );
+            }
         }
     }
 

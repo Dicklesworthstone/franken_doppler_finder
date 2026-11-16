@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain admissible aircraft beyond the last geometric uncertainty probe
+
+- Evaluate speed and distance profiles at their existing relative or physical limit
+  when a geometric step would overshoot it. Retain an accepted endpoint or bisect from
+  a rejected one, preserving the earlier probes, warm starts, point estimate and
+  likelihood cutoff. Nonfinite profile costs are rejected explicitly.
+- Extend the established physical short-arc regression to prescribed 28, 32, 36 and
+  40 m/s alternatives; add a constrained long-arc likelihood-boundary control.
+- A newly resolved closed crossing can remove a false open-range warning and its
+  generic generous-floor multiplier. No physical or statistical threshold changes.
+- Independent source review and numerical exploration support the mechanism. Native
+  formatting, compilation, Clippy, tests, release CLI selftest and reference/field
+  replays remain unexecuted after the execution environment disconnected. No native
+  regression pass, field-accuracy improvement or performance claim.
+
 ### Keep repeated ADS-B timestamps from cycling during catalogue merges
 
 - Resolve discarded processed-store timestamps directly to their final duplicate winner,

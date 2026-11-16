@@ -2017,6 +2017,23 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Carry admissible short-arc geometry through the terminal profile probe
+
+Speed and distance uncertainty sweeps evaluate their intended terminal probe, clipped to
+the existing relative exploration and physical limits. A geometric step that overshoots
+the limit no longer stops at its preceding accepted point. The endpoint must pass the same
+likelihood cutoff; otherwise the existing bisection locates the crossing. Point estimates,
+physical domains and acceptance thresholds are unchanged. A genuine closed crossing can
+remove a formerly false open-range warning and its generic generous-floor multiplier.
+
+The existing `short_two_sided_trace_retains_accepted_profile_geometry` regression now checks
+independently prescribed 28, 32, 36 and 40 m/s alternatives against the same physical
+24-second trace and likelihood criterion. `long_arc_geometry_profiles_remain_closed_and_constrained`
+checks a 300-second trace, including likelihood tests just inside and outside its bounds.
+Source review and independent numerical exploration support the change; these Rust
+assertions, formatting, compilation, Clippy, workspace tests, release CLI selftest and
+reference/field replays have not run because the execution environment disconnected.
+
 ### Keep overlapping flight catalogues from hanging on repeated timestamps
 
 Processed ADS-B stores can contain stale and fresh reports at the same instant. Duplicate
