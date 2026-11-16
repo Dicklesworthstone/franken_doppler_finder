@@ -2243,7 +2243,7 @@ fn eval_point_weighted(
     keep_rejected_fit: bool,
 ) -> Option<PointEval> {
     debug_assert!(weights.is_none_or(|w| w.len() == assign.len()));
-    if !region_ok {
+    if !region_ok || p.start_lo.is_nan() || p.start_hi.is_nan() || p.start_lo > p.start_hi {
         return None;
     }
     let x = o.x;
@@ -2286,9 +2286,17 @@ fn eval_point_weighted(
         return None;
     }
     if hi < lo {
-        let m = ts_imp.iter().sum::<f64>() / ts_imp.len() as f64;
-        lo = m - 5.0;
-        hi = m + 5.0;
+        // A contour may relax event geometry and clock gates, but not the recording-start
+        // prior. Otherwise parallel flights can trade position for an off-prior clock.
+        // Center inside the prior first so a disjoint fallback still has finite support.
+        let m = (ts_imp.iter().sum::<f64>() / ts_imp.len() as f64)
+            .max(p.start_lo - 1.0)
+            .min(p.start_hi + 1.0);
+        lo = (m - 5.0).max(p.start_lo - 1.0);
+        hi = (m + 5.0).min(p.start_hi + 1.0);
+        if !lo.is_finite() || !hi.is_finite() {
+            return None;
+        }
     }
     // ratio curves on a reception-time grid (warm-started emission solves); the quick check uses
     // the coarse 40-point trace subset and a 0.5 s grid
@@ -6676,6 +6684,213 @@ mod tests {
                     fitted.t_s - case.t_s
                 );
                 assert!(fitted.chis.iter().all(|fit| fit.chi < 0.1));
+            }
+        }
+    }
+
+    #[test]
+    fn ungated_refinement_keeps_the_clock_prior_for_parallel_flyovers() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let truth = observer(case.obs.0, case.obs.1, &dem);
+        let mut parallel = straight_track(
+            &enu,
+            [0.0, -3000.0, 900.0],
+            [137.0, 0.0, 0.0],
+            case.t_s + 1900.0,
+            case.t_s + 1300.0,
+            case.t_s + 2500.0,
+            5.0,
+        );
+        parallel.key = "B".into();
+        case.events[1] = synth_event(
+            "e2",
+            &parallel,
+            truth.x,
+            case.t_s,
+            129.5,
+            343.0,
+            case.t_s + 1900.0,
+            &Prop::still(343.0),
+        );
+        case.tracks[1] = parallel;
+        for event in &mut case.events {
+            event.t_tol = 1.0;
+        }
+        let assign = [(0, 0, case.t_s + 1000.0), (1, 1, case.t_s + 1900.0)];
+        for east in [-1370.0, 1370.0] {
+            // Parallel 137 m/s passes trade this displacement for ten seconds of
+            // clock. A known recording start must remove that along-track alias.
+            let (lat, lon, _) = enu.to_geodetic([east, 0.0, 0.0]);
+            let o = observer(lat, lon, &dem);
+            let relaxed = eval_point(
+                &o,
+                &assign,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+            assert!((relaxed.t_s - case.t_s).abs() > 6.0);
+            let implied: Vec<_> = relaxed
+                .cpas
+                .iter()
+                .zip(&relaxed.props)
+                .zip(&case.events)
+                .map(|((cpa, prop), event)| cpa.t_r_fit_p(prop) - event.t_rec)
+                .collect();
+            let mean = implied.iter().sum::<f64>() / implied.len() as f64;
+            for half in [0.0, 0.5] {
+                let mut bounded = case.p.clone();
+                bounded.start_lo = case.t_s - half;
+                bounded.start_hi = case.t_s + half;
+                let (lo, hi) = (bounded.start_lo - 1.0, bounded.start_hi + 1.0);
+                assert!(
+                    mean + 5.0 < lo || mean - 5.0 > hi,
+                    "the former ungated fallback must lie wholly outside the prior"
+                );
+                for quick in [false, true] {
+                    assert!(
+                        eval_point(
+                            &o,
+                            &assign,
+                            &case.events,
+                            &case.tracks,
+                            &bounded,
+                            &atmo,
+                            true,
+                            true,
+                            quick,
+                        )
+                        .is_none(),
+                        "ordinary clock gates must stay enforced"
+                    );
+                    let fit = eval_point(
+                        &o,
+                        &assign,
+                        &case.events,
+                        &case.tracks,
+                        &bounded,
+                        &atmo,
+                        true,
+                        false,
+                        quick,
+                    )
+                    .expect("ungated contour evaluation must retain finite support");
+                    assert!(
+                        (lo..=hi).contains(&fit.t_s),
+                        "offset {east}, prior half {half}, quick {quick}: {} s",
+                        fit.t_s - case.t_s
+                    );
+                    assert!(fit.total.is_finite());
+                    assert!(fit.chis.iter().all(|f| f.chi.is_finite() && f.cov >= 0.6));
+                    let at_truth = eval_point(
+                        &truth,
+                        &assign,
+                        &case.events,
+                        &case.tracks,
+                        &bounded,
+                        &atmo,
+                        true,
+                        false,
+                        quick,
+                    )
+                    .unwrap();
+                    assert!(
+                        at_truth.total < fit.total,
+                        "the permitted clock must distinguish the observer from its along-track alias"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ungated_refinement_preserves_an_overlapping_clock_profile() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let o = observer(case.obs.0, case.obs.1, &dem);
+        let assign = [(0, 0, case.t_s + 1000.0), (1, 1, case.t_s + 1900.0)];
+        for half in [0.0, 0.5, 30.0, f64::INFINITY] {
+            case.p.start_lo = case.t_s - half;
+            case.p.start_hi = case.t_s + half;
+            let gated = eval_point(
+                &o,
+                &assign,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                true,
+                true,
+                false,
+            )
+            .unwrap();
+            let ungated = eval_point(
+                &o,
+                &assign,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(ungated.t_s, gated.t_s);
+            assert_eq!(ungated.total, gated.total);
+            for (a, b) in ungated.chis.iter().zip(&gated.chis) {
+                assert_eq!(
+                    (a.chi, a.f0, a.rms, a.cov, a.brk),
+                    (b.chi, b.f0, b.rms, b.cov, b.brk)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ungated_refinement_rejects_invalid_recording_clock_priors() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = two_flyover_case(med);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let o = observer(case.obs.0, case.obs.1, &dem);
+        let assign = [(0, 0, case.t_s + 1000.0), (1, 1, case.t_s + 1900.0)];
+        for (lo, hi) in [
+            (f64::NAN, case.t_s),
+            (case.t_s, f64::NAN),
+            (case.t_s + 0.25, case.t_s),
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        ] {
+            case.p.start_lo = lo;
+            case.p.start_hi = hi;
+            for gates in [false, true] {
+                assert!(
+                    eval_point(
+                        &o,
+                        &assign,
+                        &case.events,
+                        &case.tracks,
+                        &case.p,
+                        &atmo,
+                        true,
+                        gates,
+                        false,
+                    )
+                    .is_none(),
+                    "invalid recording-start prior {lo}..{hi}"
+                );
             }
         }
     }

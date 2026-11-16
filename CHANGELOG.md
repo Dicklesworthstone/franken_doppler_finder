@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve known recording clocks throughout location refinement
+
+- Keep the ungated joint-clock fallback inside the requested recording-start prior,
+  with the existing one-second allowance. Center the fallback inside the prior before
+  intersecting it, so contour points retain finite objective support even when their
+  event-implied intervals disagree. Geometry, trace gates and confidence thresholds
+  are unchanged; overlapping clock intervals keep their original evaluation path.
+- Reject NaN, reversed and impossible infinite priors without panicking. Genuinely
+  open clock windows remain supported.
+- Add physical parallel-flight regressions for both along-track directions, exact and
+  narrow priors, quick and full scoring, finite ungated contour support and the
+  ordinary clock-gate refusals. Controls compare unchanged overlapping profiles and
+  cover invalid priors.
+- An independent analytic Doppler check reproduced the false position/time tie: a
+  750 m observer displacement along two 75 m/s flights was compensated by an excluded
+  ten-second clock shift. Bounding that fallback removes the tie. This arithmetic
+  check is not execution of the Rust search.
+- Native regression execution, Clippy, release selftest and reference/wrong-date/field
+  replays remain unrun: dependency compilation was killed by SIGKILL, and the execution
+  environment then became unavailable. Baseline workspace formatting also already
+  differed in eleven files. No real-recording accuracy or radius improvement is claimed.
+
 ### Recover raw-frequency calibration past an unusable nearest peak
 
 - Try the other already-qualified normalized peaks when the original in-band peak

@@ -371,6 +371,13 @@ slack hypotheses get: those bounds limit the search, and the trace fit is what s
 still fails reevaluation, the coherent coarse candidate is retained with a warning and no refined radius. A changed
 ranking causes the newly promoted leader to be checked and refined before reporting it.
 
+Refinement's shared-clock fit retains the requested recording-start window, including the
+search's existing one-second numerical allowance. When event-implied clock intervals do not
+overlap, an ungated contour evaluation can still profile a local clock inside that window;
+it cannot reopen a clock outside the prior. This prevents parallel flight paths from recovering
+an otherwise excluded position/time trade. Geometry and trace support remain ungated while
+profiling the contour, and reported candidates still pass the normal reevaluation checks.
+
 The rival is the different explanation with the smallest comparable score gap: refined scores when both
 refinements succeeded, or both fine-grid scores otherwise. The search attempts refinement for that rival too,
 then checks whether another explanation now gives a smaller comparable gap. Each candidate is attempted at
