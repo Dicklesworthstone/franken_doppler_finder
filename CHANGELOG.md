@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Reuse completed jet-inclusive raw downloads for ordinary searches
+
+- Let ordinary requests reuse certified covering jet-inclusive raw checkpoints after
+  exact and covering ordinary checkpoints. Keep the release, asset, time, unknown-aircraft,
+  coverage and midnight-context checks; only the one-way jet-policy fallback is new.
+- Remove known jets before cross-feed/type reconciliation and regional altitude
+  correction, then recompute retained-aircraft/point counts. Ordinary checkpoints still
+  cannot satisfy jet-inclusive requests, and processed jet-inclusive day stores cannot
+  substitute for an ordinary ingest.
+- Add raw-cache refusal/priority controls and offline prod/staging-plus-MLAT regressions
+  requiring the recovered ordinary store to match fresh ingestion, including geoid
+  conversion, type reconciliation, altitude correction and preservation of source bytes.
+- Independent source review and a local whitespace check completed. Native formatting,
+  compilation, Clippy, Rust tests, release selftest and reference/field replays remain
+  unrun after the execution environment disconnected; no native or field pass is claimed.
+
 ### Fetch online data through an explicitly configured proxy
 
 - Add `FDOP_PROXY` for HTTP, HTTPS and SOCKS5 endpoints using the pinned asupersync

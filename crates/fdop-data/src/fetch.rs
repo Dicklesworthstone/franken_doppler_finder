@@ -2847,6 +2847,149 @@ mod tests {
     }
 
     #[test]
+    fn offline_ordinary_search_rebuilds_jet_raw_feeds_like_fresh_ingestion() {
+        use crate::ingest::tests::{gz, pc12_json, tar_of};
+        use std::io::Read;
+
+        for main in [Feed::Prod, Feed::Staging] {
+            let mut f = offline_raw_fixture(main, false);
+            let context = day_context((2026, 9, 8));
+            let expanded = IngestSpec {
+                include_jets: true,
+                geoid_n_m: -30.0,
+                ..f.spec
+            };
+            let mut jet: serde_json::Value = serde_json::from_str(&pc12_json()).unwrap();
+            jet["icao"] = serde_json::json!("000001");
+            jet["r"] = serde_json::json!("");
+            jet["t"] = serde_json::json!("B738");
+            for row in jet["trace"].as_array_mut().unwrap() {
+                row[10] = serde_json::json!(7000);
+            }
+            let mut baro: serde_json::Value = serde_json::from_str(&pc12_json()).unwrap();
+            baro["icao"] = serde_json::json!("000002");
+            baro["r"] = serde_json::json!("");
+            baro["t"] = serde_json::json!("C172");
+            for row in baro["trace"].as_array_mut().unwrap() {
+                row[10] = serde_json::Value::Null;
+            }
+            for i in 0..f.archives.len() {
+                // Keep the fixture's main/MLAT type and altitude handoff, adding a
+                // baro-only aircraft whose correction would be biased by these jets.
+                let mut original = Vec::new();
+                {
+                    let mut archive = tar::Archive::new(f.archives[i].as_slice());
+                    archive
+                        .entries()
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .read_to_end(&mut original)
+                        .unwrap();
+                }
+                let mut members = vec![
+                    ("trace_full_a1b2c3.json", original),
+                    ("trace_full_000001.json", gz(&jet.to_string())),
+                ];
+                if i == 0 {
+                    members.push(("trace_full_000002.json", gz(&baro.to_string())));
+                }
+                f.archives[i] = tar_of(&members);
+                f.releases[i] = checkpoint_release(f.releases[i].feed, &f.archives[i]);
+            }
+            std::fs::write(
+                f.dir.join("releases.json"),
+                serde_json::to_vec(&f.releases).unwrap(),
+            )
+            .unwrap();
+            let ingest = |spec: &IngestSpec| -> [Part; 2] {
+                std::array::from_fn(|i| {
+                    ingest_day_reader(
+                        f.archives[i].as_slice(),
+                        f.releases[i].feed.label(),
+                        spec,
+                        &|_| {},
+                        context,
+                    )
+                    .unwrap()
+                })
+            };
+            let expanded_parts = ingest(&expanded);
+            let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
+            tags.sort();
+            let expanded_store = build_day_store(
+                expanded_parts.to_vec(),
+                &expanded,
+                tags.clone(),
+                context,
+            );
+            let expanded_path = f.dir.join(format!(
+                "{}+jets_{}.fdtrk",
+                feedset_name(main, true),
+                bbox_key(&f.spec.bbox).1
+            ));
+            expanded_store.save(&expanded_path).unwrap();
+            let expanded_bytes = std::fs::read(&expanded_path).unwrap();
+            let opts = FetchOptions {
+                offline: true,
+                ..Default::default()
+            };
+            // A processed expanded store has already calibrated heights with jets;
+            // only the completed raw feeds can reproduce ordinary ingest semantics.
+            assert!(fetch_window(&f.want, &f.cache, &opts).is_err());
+            for (i, part) in expanded_parts.iter().enumerate() {
+                crate::raw_cache::save(&f.dir, &f.releases[i], &expanded, context, part)
+                    .unwrap();
+            }
+            let raw_bytes: [Vec<u8>; 2] = std::array::from_fn(|i| {
+                std::fs::read(crate::raw_cache::path(&f.dir, &f.releases[i], &expanded))
+                    .unwrap()
+            });
+            let fresh = build_day_store(ingest(&f.spec).to_vec(), &f.spec, tags.clone(), context);
+            let expected = merge_stores(vec![fresh.clone()], DAY_JOIN_GAP_S).filtered(
+                &f.want.bbox,
+                f.want.t_start,
+                f.want.t_end,
+            );
+            let got = fetch_window(&f.want, &f.cache, &opts).unwrap();
+            assert_eq!(got.meta.stats["cache_hits"], 0);
+            assert_eq!(got.meta.stats["include_jets"], false);
+            assert_eq!(got.meta.sources, tags);
+            assert_same_legs(&got.legs, &expected.legs);
+            assert!(got.legs.iter().all(|leg| leg.engine.tonal()));
+            assert!(got.legs.iter().any(|leg| leg.typ == "PC12"));
+            assert!(got.legs.iter().any(|leg| {
+                leg.typ == "C172"
+                    && leg.points.iter().all(|p| p.alt_src == alt_src::BARO_CORRECTED)
+            }));
+            let saved = TrackStore::load(&f.dir.join(format!(
+                "{}_{}.fdtrk",
+                feedset_name(main, true),
+                bbox_key(&f.spec.bbox).1
+            )))
+            .unwrap();
+            assert_eq!(saved.meta.stats, fresh.meta.stats);
+            assert_same_legs(&saved.legs, &fresh.legs);
+            assert_eq!(std::fs::read(&expanded_path).unwrap(), expanded_bytes);
+            for (i, bytes) in raw_bytes.iter().enumerate() {
+                assert_eq!(
+                    &std::fs::read(crate::raw_cache::path(
+                        &f.dir,
+                        &f.releases[i],
+                        &expanded,
+                    ))
+                    .unwrap(),
+                    bytes
+                );
+            }
+            let cached = fetch_window(&f.want, &f.cache, &opts).unwrap();
+            assert_eq!(cached.meta.stats["cache_hits"], 1);
+            assert_same_legs(&cached.legs, &got.legs);
+        }
+    }
+
+    #[test]
     fn offline_raw_main_only_retains_partial_warnings_and_mlat_option() {
         for main in [Feed::Prod, Feed::Staging] {
             for include_mlat in [false, true] {

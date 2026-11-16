@@ -3,8 +3,9 @@
 //! This is disposable cache data, not a public interchange format: a version, release,
 //! coverage or policy mismatch is a miss and an unreadable file is refetched. A change
 //! only to the geoid re-references GNSS heights without discarding the completed ingest.
-//! After an exact miss, a covering spatial checkpoint can supply a narrower retry; all
-//! other filter, policy, release and midnight-context fields must still match exactly.
+//! After an exact miss, a covering spatial checkpoint can supply a narrower retry. An
+//! ordinary request may also remove known jets from a certified jet-inclusive raw feed;
+//! every ordinary checkpoint keeps priority, and all other identity fields still match.
 
 use crate::DataError;
 use crate::adsblol::{DayRelease, Feed};
@@ -102,6 +103,7 @@ pub(crate) fn load(
         rel.feed.tag_word(),
         if spec.include_jets { "+jets" } else { "" },
     );
+    let expanded_feed = format!("{}+jets", rel.feed.tag_word());
     let mut candidates = Vec::new();
     for entry in entries.flatten() {
         let candidate = entry.path();
@@ -111,16 +113,38 @@ pub(crate) fn load(
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(stem) = name.strip_suffix(".fdopraw.gz")
             && let Some((label, bbox)) = crate::fetch::parse_cache_name(&format!("{stem}.fdtrk"))
-            && label == feed
+            && (label == feed || (!spec.include_jets && label == expanded_feed))
             && covers_bbox(bbox, spec.bbox)
         {
-            candidates.push((bbox.area_km2(), candidate));
+            candidates.push((label != feed, bbox.area_km2(), candidate));
         }
     }
-    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    for (_, candidate) in candidates {
-        match load_path(&candidate, rel, spec, context, true) {
-            Ok(Some(part)) => return Ok(Some(part)),
+    // Preserve the existing exact/covering ordinary preference before trying the
+    // broader aircraft policy, even when its bbox is a closer fit.
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.total_cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    for (from_expanded, _, candidate) in candidates {
+        let cached_spec = IngestSpec {
+            include_jets: spec.include_jets || from_expanded,
+            ..*spec
+        };
+        match load_path(&candidate, rel, &cached_spec, context, true) {
+            Ok(Some((mut aircraft, mut stats))) => {
+                if from_expanded {
+                    // The embedded identity must certify the expanded ingest. Drop
+                    // jets before normal feed/type reconciliation and regional height
+                    // correction, exactly as an ordinary fresh ingest would do.
+                    let before = aircraft.len();
+                    aircraft.retain(|a| a.engine != fdop_types::engine::EngineClass::Jet);
+                    stats.jets_dropped += (before - aircraft.len()) as u64;
+                    stats.kept_aircraft = aircraft.len() as u64;
+                    stats.points_kept = aircraft.iter().map(|a| a.points.len() as u64).sum();
+                }
+                return Ok(Some((aircraft, stats)));
+            }
             Ok(None) => {}
             Err(e) => {
                 first_error
@@ -939,6 +963,79 @@ pub(crate) mod tests {
             assert!(load(&dir, &rel, &spec, changed).unwrap().is_none());
         }
         assert!(load(&dir, &rel, &spec, context).unwrap().is_some());
+    }
+
+    #[test]
+    fn certified_jet_checkpoint_recovers_ordinary_reports_without_changing_priority() {
+        let (dir, rel, spec, context) = fixture();
+        let want = IngestSpec {
+            bbox: BBox::new(0.2, 0.2, 0.4, 0.4),
+            geoid_n_m: -30.0,
+            ..spec
+        };
+        let expanded = IngestSpec {
+            bbox: want.bbox,
+            include_jets: true,
+            ..spec
+        };
+        let mut ordinary = part();
+        let sample = ordinary.0[0].points[0];
+        ordinary.0[0].points.push(RawPoint {
+            alt_geom_msl: 880.0,
+            ..sample
+        });
+        ordinary.1.points_kept = 2;
+        let mut complete = ordinary.clone();
+        let mut jet = ordinary.0[0].clone();
+        jet.icao = "000002".into();
+        jet.typ = "B738".into();
+        jet.engine = EngineClass::Jet;
+        complete.0.push(jet);
+        complete.1.members += 1;
+        complete.1.aircraft_overlap += 1;
+        complete.1.kept_aircraft += 1;
+        complete.1.points_kept += 2;
+        save(&dir, &rel, &expanded, context, &complete).unwrap();
+        let expanded_path = path(&dir, &rel, &expanded);
+        let bytes = std::fs::read(&expanded_path).unwrap();
+        let restored = load(&dir, &rel, &want, context).unwrap().unwrap();
+        let mut expected = ordinary.clone();
+        expected.0[0].points[1].alt_geom_msl = 878.0;
+        expected.1.members += 1;
+        expected.1.aircraft_overlap += 1;
+        expected.1.jets_dropped = 1;
+        assert_eq!(restored.1, expected.1);
+        assert_eq!(
+            serde_json::to_vec(&restored.0).unwrap(),
+            serde_json::to_vec(&expected.0).unwrap()
+        );
+        assert_eq!(std::fs::read(&expanded_path).unwrap(), bytes);
+
+        // A renamed ordinary checkpoint is not an expanded-ingest certificate.
+        let source = dir.join("ordinary-source");
+        save(&source, &rel, &want, context, &ordinary).unwrap();
+        std::fs::copy(path(&source, &rel, &want), &expanded_path).unwrap();
+        assert!(load(&dir, &rel, &want, context).unwrap().is_none());
+        assert!(load(&source, &rel, &expanded, context).unwrap().is_none());
+        std::fs::write(&expanded_path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(load(&dir, &rel, &want, context).is_err());
+        std::fs::write(&expanded_path, &bytes).unwrap();
+        let wrong_time = IngestSpec {
+            t_end: want.t_end + 1.0,
+            ..want
+        };
+        assert!(load(&dir, &rel, &wrong_time, context).unwrap().is_none());
+
+        // Even the exact expanded bbox cannot displace a usable wider ordinary
+        // checkpoint; the exact ordinary checkpoint still takes priority over both.
+        ordinary.1.bytes += 1;
+        save(&dir, &rel, &spec, context, &ordinary).unwrap();
+        let restored = load(&dir, &rel, &want, context).unwrap().unwrap();
+        assert_eq!(restored.1, ordinary.1);
+        ordinary.1.bytes += 1;
+        save(&dir, &rel, &want, context, &ordinary).unwrap();
+        let restored = load(&dir, &rel, &want, context).unwrap().unwrap();
+        assert_eq!(restored.1, ordinary.1);
     }
 
     #[test]

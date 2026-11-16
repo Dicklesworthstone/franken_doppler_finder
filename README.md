@@ -1089,10 +1089,22 @@ stay unchanged, and track construction keeps its existing motion checks. This re
 vertical motion for interpolation instead of forcing it to be reconstructed from sparse heights.
 
 Reuse requires the exact release metadata and ordered assets, time filter,
-unknown/jet policy and midnight-context version. The exact spatial checkpoint takes
-priority. If it is absent, incompatible or unreadable, a retry for a narrower region
-can reuse the smallest usable completed raw checkpoint covering that region. Both its
-filename and embedded coverage must contain the request; a filename alone is not proof.
+unknown-aircraft policy and midnight-context version. The exact spatial checkpoint with
+the requested jet policy takes priority. If it is absent, incompatible or unreadable, a
+retry for a narrower region can reuse the smallest usable completed raw checkpoint
+covering that region with the same jet policy. Both its filename and embedded coverage
+must contain the request; a filename alone is not proof.
+
+An ordinary search can also reuse a completed `--include-jets` raw checkpoint after all
+usable ordinary checkpoints have been considered. Its embedded identity must certify the
+jet-inclusive ingest. Known jets are removed before cross-feed/type reconciliation and
+regional altitude correction, and retained-aircraft/point counts are recomputed. This
+preserves the ordinary ingestion policy without downloading the completed feeds again.
+The reverse reuse is forbidden: an ordinary checkpoint cannot satisfy a jet-inclusive
+request. A processed jet-inclusive day store cannot satisfy an ordinary request either,
+because its altitude corrections may already incorporate the jets. Source checkpoints
+and processed stores remain unchanged.
+
 All retained raw reports still enter the ordinary altitude and boundary reconciliation
 before the final requested-region filter. This also lets an offline retry recover a
 narrower region after a larger download completed but its day-store publication was
@@ -2062,6 +2074,22 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Reuse completed jet-inclusive downloads for ordinary searches
+
+`certified_jet_checkpoint_recovers_ordinary_reports_without_changing_priority`
+checks one-way policy reuse, embedded identity, ordinary-cache priority, geoid
+conversion, unchanged source bytes, incompatible time windows and truncated gzip data.
+`offline_ordinary_search_rebuilds_jet_raw_feeds_like_fresh_ingestion` exercises prod
+and staging with MLAT, aircraft-type reconciliation and regional altitude correction.
+It requires recovered ordinary tracks and retained statistics to match fresh ordinary
+ingestion, refuses processed-only jet-inclusive reuse, preserves the original caches,
+and verifies reuse of the newly built ordinary day store.
+
+These regressions are authored and independently source-reviewed; they have not run.
+A local whitespace check passed before the execution environment disconnected.
+Native formatting, compilation, Clippy, workspace tests, release CLI selftest and
+reference/field replays remain unrun. No native test pass or field improvement is claimed.
 
 ### Preserve faster flyovers through combined speed and heading gaps
 
