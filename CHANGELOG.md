@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover sparse aircraft motion when ground-speed telemetry is negative
+
+- Require nonnegative ground speed before accepting a complete reported velocity,
+  including the sparse-sample exemption. Negative speed is a magnitude error, not
+  evidence that the aircraft flew backwards.
+- Keep the observed positions and use the existing component recovery: horizontal
+  motion comes from positions while a supported climb/descent report survives.
+  Valid sparse reports, including the existing vertical-rate contract, are unchanged.
+- Add a 48-case analytic regression spanning level/climbing/descending flight,
+  isolated/repeated bad reports and both sides of the 30 s sampling boundary.
+- Source review only: the execution environment disconnected before native checks.
+  The new regression, formatting, Clippy, workspace tests, release CLI selftest and
+  reference/field replays did not run. No accuracy or performance claim.
+
 ### Preserve known recording clocks throughout location refinement
 
 - Keep the ungated joint-clock fallback inside the requested recording-start prior,

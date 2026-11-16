@@ -776,7 +776,9 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
                     let mut vel = fd.clone();
                     let mut n_rep = 0usize;
                     for (k, p) in seg.iter().enumerate() {
-                        if p.gs_mps.is_finite() && p.track_deg.is_finite() {
+                        // Ground speed is a magnitude. Sparse samples may excuse an
+                        // uncertain tangent, but never a negative speed report.
+                        if p.gs_mps.is_finite() && p.gs_mps >= 0.0 && p.track_deg.is_finite() {
                             let (gs, trk) = (p.gs_mps as f64, (p.track_deg as f64).to_radians());
                             let enu = Enu::new(p.lat, p.lon, 0.0);
                             // vertical: reported rate, else finite difference
@@ -2761,6 +2763,79 @@ mod tests {
                 assert_eq!(model.vel[k].map(f64::to_bits), expected.map(f64::to_bits));
             }
         }
+    }
+
+    #[test]
+    fn negative_groundspeed_recovers_position_supported_sparse_motion() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let observer = enu.to_ecef([0.0, 0.0, 0.0]);
+        let mut maximum_error = (0.0_f64, 0.0_f64);
+        // The full-report path changes at 30 s. Include both sides, plus a
+        // longer interval; the dense cases already reject a backwards velocity.
+        for dt in [10.0, 29.999, 30.0, 60.0] {
+            let times = [0.0, dt, 2.0 * dt, 3.0 * dt, 4.0 * dt];
+            for sign in [-1.0, 0.0, 1.0] {
+                // A cubic climb has exact endpoint rates. Recover those supported
+                // rates independently of the unusable horizontal report, so the
+                // correction cannot merely replace every velocity with a secant.
+                let state = |t: f64| {
+                    let u = (t - 2.0 * dt) / (2.0 * dt);
+                    (
+                        enu.to_ecef([
+                            100.0 * (t - 2.0 * dt),
+                            800.0,
+                            1200.0 + sign * 300.0 * u.powi(3),
+                        ]),
+                        enu.vec_to_ecef([100.0, 0.0, sign * 450.0 / dt * u.powi(2)]),
+                    )
+                };
+                let original = leg_from_states(&times, state);
+                let expected = build(&original, &BuildParams::default()).remove(0);
+                for all in [false, true] {
+                    for magnitude in [1.0, 100.0] {
+                        let mut corrupt = original.clone();
+                        let mut missing = original.clone();
+                        let mut bad = 0usize;
+                        for k in 0..times.len() {
+                            if all || k == 2 {
+                                corrupt.points[k].gs_mps = -magnitude;
+                                missing.points[k].gs_mps = f32::NAN;
+                                bad += 1;
+                            }
+                        }
+                        let models = build(&corrupt, &BuildParams::default());
+                        assert_eq!(models.len(), 1);
+                        let model = &models[0];
+                        let missing_models = build(&missing, &BuildParams::default());
+                        assert_eq!(missing_models.len(), 1);
+                        assert_eq!(model.t, expected.t);
+                        assert_eq!(model.pos, expected.pos);
+                        assert_eq!(model.vel, missing_models[0].vel);
+                        assert_eq!(
+                            model.reported_vel_frac,
+                            (times.len() - bad) as f64 / times.len() as f64
+                        );
+                        for (k, p) in corrupt.points.iter().enumerate() {
+                            if p.gs_mps < 0.0 {
+                                let local = Enu::new(p.lat, p.lon, 0.0);
+                                assert!(
+                                    (local.vec_from_ecef(model.vel[k])[2] - p.vrate_mps as f64).abs()
+                                        < 1e-9
+                                );
+                            } else {
+                                assert_eq!(model.vel[k], expected.vel[k]);
+                            }
+                        }
+                        let error = analytic_flight_errors(model, observer, state);
+                        assert!(error.0 < 0.2, "dt={dt} sign={sign}: position {error:?}");
+                        assert!(error.1 < 0.01, "dt={dt} sign={sign}: Doppler {error:?}");
+                        maximum_error.0 = maximum_error.0.max(error.0);
+                        maximum_error.1 = maximum_error.1.max(error.1);
+                    }
+                }
+            }
+        }
+        eprintln!("negative-groundspeed recovery [position m, frequency Hz]: {maximum_error:?}");
     }
 
     #[test]

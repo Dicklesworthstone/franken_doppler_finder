@@ -1817,7 +1817,11 @@ Design notes:
 - **Sparse turns retain valid reported velocities.** If a reported tangent disagrees with the finite
   difference of nearby positions, the track builder also checks the position chords against the circular arc
   implied by neighbouring headings. Both checks use the same 25 m/s residual limit; a turn does not disable
-  checks for incorrect ground speed, heading or vertical rate.
+  checks for incorrect ground speed, heading or vertical rate. Negative ground speed is never
+  accepted as reported motion, including when all neighbours are at least 30 s away. The
+  positions remain eligible and the existing component recovery can retain a supported climb
+  or descent rate while deriving horizontal motion from those positions. Valid sparse reports
+  keep their existing treatment; no vertical-rate cutoff is added.
 - **Dense bad-position bursts do not hide valid predecessors.** Track cleaning searches every possible
   predecessor within its allowed time gap. The former 48-report lookback could discard usable sections or
   choose the corrupt positions merely because bad reports arrived more frequently. Exact chain-length
@@ -2042,6 +2046,20 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover usable sparse flight geometry from negative speed reports
+
+`negative_groundspeed_recovers_position_supported_sparse_motion` covers 48 synthetic
+configurations: level flight, cubic climbs and descents, isolated/repeated negative
+ground speeds, and 10, 29.999, 30 and 60 s sampling. It requires the same retained
+positions and recovered velocities as missing-speed telemetry, preserves accepted
+reports, and checks the interpolated position and retarded Doppler curve against
+the analytic trajectory. The existing bitwise sparse-report controls remain intact.
+
+This regression was added during an execution-environment disconnect and has not
+run. Formatting, Clippy, workspace tests, release CLI selftest and reference/field
+replays also remain unexecuted for this change; no native pass or field improvement
+is claimed.
 
 ### Recover calibration beside an unusable nearer spectral peak
 
