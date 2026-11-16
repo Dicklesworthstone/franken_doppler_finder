@@ -990,9 +990,20 @@ the reported recording clock back a minute.
 |---|---|
 | `FDOP_CACHE` | Cache root. Precedence: `--cache`, then `FDOP_CACHE`, then `FDOP_CACHE_DIR`, then `$XDG_CACHE_HOME/fdop`, then `~/.cache/fdop` |
 | `FDOP_CACHE_DIR` | Alternative name for the cache root |
+| `FDOP_PROXY` | Explicit HTTP, HTTPS or SOCKS5 proxy for online requests, including archive streams, redirects and resumes. Unset or blank uses direct connections |
 | `GITHUB_TOKEN` | Optional. The adsb.lol archive is listed through the GitHub API, which allows 60 unauthenticated calls per hour. A day costs about 2 calls |
 | `FDOP_SURVEY_PNG`, `FDOP_EV_PNG_DIR` | `detect_file` example only: write the survey and per-event images |
 | `EXPLAIN_DUMP` | `explain` example only: dump raw ADS-B points near each CPA |
+
+For networks that require a proxy, set `FDOP_PROXY` to an endpoint such as
+`http://127.0.0.1:8080`, `https://proxy.example:8443` or `socks5://127.0.0.1:1080`.
+Optional `user:password@` credentials are passed literally to proxy authentication;
+percent escapes are not decoded. An endpoint may have a trailing slash, but no path,
+query or fragment. Invalid settings fail before a client opens a socket, and configured
+URLs and userinfo are redacted from request error messages before truncation.
+Both the regular client and background archive downloads use this setting. It applies
+to every request made by these clients: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
+`NO_PROXY` are not interpreted.
 
 Cache layout:
 

@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Fetch online data through an explicitly configured proxy
+
+- Add `FDOP_PROXY` for HTTP, HTTPS and SOCKS5 endpoints using the pinned asupersync
+  0.6.2 client. Apply it to buffered requests and streamed downloads, including
+  cross-origin redirects and ETag-protected archive resumption. Unset or blank
+  configuration retains direct connections; no dependency or pin changes.
+- Validate endpoints before opening a runtime or socket, keep invalid-setting
+  diagnostics free of credentials, and redact configured URLs and userinfo before
+  truncating response errors. Preserve CONNECT refusal status and immediately return
+  nontransient errors such as 407 instead of retrying away the useful diagnosis.
+- Add five configuration/loopback regressions for invalid settings, redirects,
+  interrupted archive resumption, HTTPS CONNECT refusal, SOCKS5 delivery and redaction
+  across the existing message-length boundary. Existing loopback tests explicitly
+  select direct clients so inherited proxy settings cannot redirect their traffic.
+- Independent source review checked the exact pinned API and protocol fixtures.
+  Native formatting, compilation, Clippy, Rust tests, release selftest and online or
+  reference/field replays remain unrun after the execution environment disconnected.
+  This is implementation and source-review evidence, not a native or end-to-end pass.
+
 ### Preserve supported faster tracks through combined telemetry gaps
 
 - Let the existing anchored mixed-speed retry use a valid speed without a heading by

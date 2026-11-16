@@ -3,12 +3,13 @@
 //! Every call runs on a private current-thread asupersync runtime owned by a [`Net`], so a
 //! `Net` is cheap to create per worker thread. Large downloads (multi-GB ADS-B archives) are
 //! consumed as a [`StreamReader`] (`std::io::Read`) fed by a background download thread that
-//! resumes with HTTP `Range` requests after a dropped connection.
+//! resumes with HTTP `Range` requests after a dropped connection. `FDOP_PROXY` explicitly
+//! routes both clients through one HTTP, HTTPS or SOCKS5 proxy, including redirects and resumes.
 
 use asupersync::bytes::Buf;
 use asupersync::cx::Cx;
 use asupersync::http::body::{Body, Frame};
-use asupersync::http::h1::HttpClient;
+use asupersync::http::h1::{ClientError, HttpClient, ParsedUrl};
 use asupersync::http::h1::types::Method;
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 use std::fmt;
@@ -298,6 +299,8 @@ pub struct Net {
     /// Streaming requests: asupersync applies `max_body_size` to streamed bodies too, and
     /// adsb.lol prod parts are 2 GB each, so streams get a 1 TiB cap.
     stream_client: HttpClient,
+    /// Kept only to redact proxy credentials from request diagnostics.
+    proxy_url: Option<String>,
     retries: u32,
     /// A streamed body that sends nothing for this long is treated as a dropped
     /// connection and resumed: `request_timeout` does not cover streamed bodies, and a
@@ -308,13 +311,91 @@ pub struct Net {
 /// Default for [`Net::with_body_idle`].
 pub const BODY_IDLE: Duration = Duration::from_secs(60);
 
+/// Validate the explicit proxy before opening a runtime or socket. The pinned client's
+/// proxy parser is private and can echo its input in errors, so diagnostics here never
+/// include the supplied URL. Paths, queries and fragments are not proxy endpoints.
+fn configured_proxy(value: Option<&str>) -> Result<Option<&str>, HttpError> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let invalid = || {
+        HttpError::new(
+            "FDOP_PROXY",
+            Some(499),
+            "expected an http://, https:// or socks5:// proxy endpoint with a valid host and port",
+        )
+    };
+    let (scheme, authority) = value.split_once("://").ok_or_else(invalid)?;
+    if !matches!(scheme, "http" | "https" | "socks5")
+        || value.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(invalid());
+    }
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.contains(['/', '?', '#', '\\']) {
+        return Err(invalid());
+    }
+    let host_port = if let Some((credentials, host_port)) = authority.rsplit_once('@') {
+        if credentials.is_empty() || credentials.contains('@') {
+            return Err(invalid());
+        }
+        if scheme == "socks5" {
+            let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+            if user.is_empty() || user.len() > 255 || password.len() > 255 {
+                return Err(invalid());
+            }
+        }
+        host_port
+    } else {
+        authority
+    };
+    // Reuse the client's host/port grammar, without exposing credentials to it.
+    let parsed = ParsedUrl::parse(&format!("http://{host_port}")).map_err(|_| invalid())?;
+    let host = parsed.host.as_str();
+    let valid_host = if let Some(ip) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        ip.parse::<std::net::Ipv6Addr>().is_ok()
+    } else {
+        host.len() <= 253
+            && host.strip_suffix('.').unwrap_or(host).split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            })
+    };
+    if !valid_host || parsed.port == 0 {
+        return Err(invalid());
+    }
+    Ok(Some(value))
+}
+
 impl Net {
     pub fn new() -> Result<Self, HttpError> {
         Self::with_timeout(Duration::from_secs(120))
     }
 
     /// Client whose buffered requests give up after `timeout`.
+    /// A nonempty FDOP_PROXY routes every request through that endpoint.
     pub fn with_timeout(timeout: Duration) -> Result<Self, HttpError> {
+        let proxy = match std::env::var("FDOP_PROXY") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(HttpError::new(
+                    "FDOP_PROXY",
+                    Some(499),
+                    "proxy endpoint must be valid UTF-8",
+                ));
+            }
+        };
+        Self::with_timeout_and_proxy(timeout, proxy.as_deref())
+    }
+
+    fn with_timeout_and_proxy(timeout: Duration, proxy: Option<&str>) -> Result<Self, HttpError> {
+        let proxy = configured_proxy(proxy)?;
         let reactor = asupersync::runtime::reactor::create_reactor()
             .map_err(|e| HttpError::new("-", None, format!("reactor: {e}")))?;
         let rt = RuntimeBuilder::current_thread()
@@ -322,9 +403,13 @@ impl Net {
             .build()
             .map_err(|e| HttpError::new("-", None, format!("runtime: {e:?}")))?;
         let builder = || {
-            HttpClient::builder()
+            let builder = HttpClient::builder()
                 .user_agent(USER_AGENT)
-                .max_redirects(10)
+                .max_redirects(10);
+            match proxy {
+                Some(url) => builder.proxy(url),
+                None => builder,
+            }
         };
         let client = builder()
             .request_timeout(timeout)
@@ -338,9 +423,39 @@ impl Net {
             rt,
             client,
             stream_client,
+            proxy_url: proxy.map(str::to_owned),
             retries: 4,
             body_idle: BODY_IDLE,
         })
+    }
+
+    fn client_error(&self, url: &str, error: ClientError) -> HttpError {
+        if self.proxy_url.is_some() {
+            if let ClientError::ConnectTunnelRefused { status, .. } = error {
+                return self.request_error(url, Some(status), "FDOP_PROXY rejected CONNECT");
+            }
+            self.request_error(url, None, error.to_string())
+        } else {
+            HttpError::new(url, None, format!("{error:?}"))
+        }
+    }
+
+    fn request_error(
+        &self,
+        url: &str,
+        status: Option<u16>,
+        message: impl Into<String>,
+    ) -> HttpError {
+        let mut message = message.into();
+        if let Some(proxy) = &self.proxy_url {
+            message = message.replace(proxy, "[FDOP_PROXY]");
+            if let Some((_, authority)) = proxy.split_once("://")
+                && let Some((credentials, _)) = authority.rsplit_once('@')
+            {
+                message = message.replace(credentials, "[proxy credentials]");
+            }
+        }
+        HttpError::new(url, status, message)
     }
 
     pub fn with_retries(mut self, retries: u32) -> Self {
@@ -374,7 +489,7 @@ impl Net {
                 let r = client
                     .request(&cx, Method::Get, &u, h, Vec::new())
                     .await
-                    .map_err(|e| HttpError::new(&u, None, format!("{e:?}")))?;
+                    .map_err(|e| self.client_error(&u, e))?;
                 Ok::<_, HttpError>(HttpResponse {
                     status: r.status,
                     headers: r.headers,
@@ -384,13 +499,16 @@ impl Net {
             match res {
                 Ok(r) if (200..300).contains(&r.status) => return Ok(r),
                 Ok(r) => {
-                    let msg: String = r.text().chars().take(300).collect();
-                    let e = HttpError::new(url, Some(r.status), msg);
+                    // Redact before truncation: a cut can leave half a credential,
+                    // which no longer matches the configured URL or userinfo.
+                    let mut e = self.request_error(url, Some(r.status), r.text());
+                    e.message = e.message.chars().take(300).collect();
                     if !e.transient() {
                         return Err(e);
                     }
                     last = Some(e);
                 }
+                Err(e) if !e.transient() => return Err(e),
                 Err(e) => last = Some(e),
             }
         }
@@ -473,7 +591,7 @@ impl Net {
                 let mut resp = client
                     .request_streaming(&cx, Method::Get, &u, hdrs, Vec::new())
                     .await
-                    .map_err(|e| HttpError::new(&u, None, format!("{e:?}")))?;
+                    .map_err(|e| self.client_error(&u, e))?;
                 let status = resp.head.status;
                 let extent = StreamExtent::from_response(
                     status,
@@ -536,7 +654,7 @@ impl Net {
                         }
                         Some(Ok(Frame::Trailers(_))) => {}
                         Some(Err(e)) => {
-                            return Err(HttpError::new(&u, None, format!("body: {e:?}")));
+                            return Err(self.request_error(&u, None, format!("body: {e:?}")));
                         }
                     }
                 }
@@ -695,6 +813,227 @@ pub fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn direct_net() -> Result<Net, HttpError> {
+        Net::with_timeout_and_proxy(Duration::from_secs(120), None)
+    }
+
+    /// A missing proxy call must fail the test instead of parking an accept forever.
+    fn proxy_connection(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    return stream;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "proxy was not contacted");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("proxy accept: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_proxy_configuration_is_validated_without_echoing_credentials() {
+        for value in [None, Some(""), Some(" \t\n")] {
+            assert_eq!(configured_proxy(value).unwrap(), None);
+        }
+        for value in [
+            "http://proxy.example:8080",
+            "https://user:pass@proxy.example/",
+            "socks5://user:pass@[::1]:1080",
+            "http://localhost",
+        ] {
+            assert_eq!(configured_proxy(Some(value)).unwrap(), Some(value));
+        }
+        for value in [
+            "ftp://user:secret@proxy.example",
+            "http://",
+            "http://user:secret@:8080",
+            "http://user:secret@proxy.example:",
+            "http://user:secret@proxy.example:+80",
+            "http://user:secret@proxy.example:65536",
+            "http://user:secret@proxy.example:0",
+            "http://user:secret@proxy.example/path",
+            "http://user:secret@proxy.example?query",
+            "http://user:secret@proxy.example#fragment",
+            "http://user:secret@proxy example",
+            "http://user:secret@[not-ipv6]",
+            "http://user:secret@::1",
+            "http://user:secret@-proxy.example",
+            "http://@proxy.example",
+            "socks5://:secret@proxy.example",
+        ] {
+            let error = match Net::with_timeout_and_proxy(Duration::from_secs(1), Some(value)) {
+                Ok(_) => panic!("invalid proxy was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.url, "FDOP_PROXY");
+            assert!(!error.transient());
+            assert!(!format!("{error:?}").contains("secret"));
+            assert!(!error.to_string().contains("user:"));
+        }
+        let too_long = format!("socks5://{}:secret@proxy.example", "x".repeat(256));
+        assert!(configured_proxy(Some(&too_long)).is_err());
+    }
+
+    #[test]
+    fn explicit_http_proxy_carries_buffered_redirects_and_stream_resumes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://user:pass@{}", listener.local_addr().unwrap());
+        // Port zero cannot be contacted directly. Only the local proxy supplies these
+        // synthetic resources, so a missing proxy configuration cannot pass accidentally.
+        let target = "http://127.0.0.1:0/manifest";
+        let redirected = "http://127.0.0.2:0/resolved";
+        let archive = "http://127.0.0.1:0/archive";
+        let server = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for i in 0..4 {
+                let mut stream = proxy_connection(&listener);
+                heads.push(read_raw_head(&mut stream));
+                match i {
+                    0 => write!(
+                        stream,
+                        "HTTP/1.1 302 Found\r\nLocation: {redirected}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap(),
+                    1 => stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nmanifest")
+                        .unwrap(),
+                    2 => {
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nETag: \"proxy-object\"\r\nConnection: close\r\n\r\n")
+                            .unwrap();
+                        stream.write_all(&(0u8..10).collect::<Vec<_>>()).unwrap();
+                    }
+                    _ => {
+                        stream
+                            .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 90\r\nContent-Range: bytes 10-99/100\r\nETag: \"proxy-object\"\r\nConnection: close\r\n\r\n")
+                            .unwrap();
+                        stream.write_all(&(10u8..100).collect::<Vec<_>>()).unwrap();
+                    }
+                }
+            }
+            heads
+        });
+        let net = Net::with_timeout_and_proxy(Duration::from_secs(3), Some(&proxy))
+            .unwrap()
+            .with_retries(0);
+        assert_eq!(net.get(target, &[]).unwrap().body, b"manifest");
+        let mut body = Vec::new();
+        assert_eq!(
+            net.stream(archive, &[], &AtomicBool::new(false), &mut |chunk| {
+                body.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap(),
+            100
+        );
+        assert_eq!(body, (0u8..100).collect::<Vec<_>>());
+        let heads = server.join().unwrap();
+        for (head, url) in heads.iter().zip([target, redirected, archive, archive]) {
+            assert!(head.starts_with(&format!("GET {url} HTTP/1.1\r\n")), "{head}");
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("proxy-authorization: basic dxnlcjpwyxnz\r\n"),
+                "configured proxy credentials were not retained"
+            );
+        }
+        assert!(!heads[2].to_ascii_lowercase().contains("range:"));
+        let resume = heads[3].to_ascii_lowercase();
+        assert!(resume.contains("range: bytes=10-\r\n"), "{resume}");
+        assert!(resume.contains("if-range: \"proxy-object\"\r\n"), "{resume}");
+    }
+
+    #[test]
+    fn https_uses_connect_and_proxy_refusals_do_not_echo_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://user:pass@{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut stream = proxy_connection(&listener);
+            let head = read_raw_head(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 407 user:pass\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            head
+        });
+        let error = Net::with_timeout_and_proxy(Duration::from_secs(3), Some(&proxy))
+            .unwrap()
+            .get("https://127.0.0.1:0/archive", &[])
+            .unwrap_err();
+        let head = server.join().unwrap();
+        assert!(head.starts_with("CONNECT 127.0.0.1:0 HTTP/1.1\r\n"), "{head}");
+        assert_eq!(error.status, Some(407));
+        assert!(!error.transient());
+        assert!(error.message.contains("FDOP_PROXY"));
+        assert!(!format!("{error:?}").contains("user:pass"));
+    }
+
+    #[test]
+    fn socks5_proxy_delivers_a_buffered_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("socks5://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut stream = proxy_connection(&listener);
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+            let mut connect = [0u8; 10];
+            stream.read_exact(&mut connect).unwrap();
+            assert_eq!(connect, [5, 1, 0, 1, 127, 0, 0, 1, 0, 0]);
+            stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            let head = read_raw_head(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nmanifest")
+                .unwrap();
+            head
+        });
+        let response = Net::with_timeout_and_proxy(Duration::from_secs(3), Some(&proxy))
+            .unwrap()
+            .with_retries(0)
+            .get("http://127.0.0.1:0/manifest", &[])
+            .unwrap();
+        assert_eq!(response.body, b"manifest");
+        let head = server.join().unwrap();
+        assert!(head.starts_with("GET /manifest HTTP/1.1\r\n"), "{head}");
+        assert!(!head.to_ascii_lowercase().contains("proxy-authorization"));
+    }
+
+    #[test]
+    fn proxy_response_errors_redact_the_endpoint_and_userinfo() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://user:pass@{}", listener.local_addr().unwrap());
+        let reflected = proxy.clone();
+        let server = std::thread::spawn(move || {
+            let mut stream = proxy_connection(&listener);
+            read_raw_head(&mut stream);
+            let body = format!("{} {reflected}, credentials user:pass", "x".repeat(285));
+            write!(
+                stream,
+                "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let error = Net::with_timeout_and_proxy(Duration::from_secs(3), Some(&proxy))
+            .unwrap()
+            .with_retries(0)
+            .get("http://127.0.0.1:0/manifest", &[])
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.status, Some(407));
+        assert!(!error.to_string().contains(&proxy));
+        assert!(!format!("{error:?}").contains("user:"));
+        assert!(!error.message.contains("pass"));
+        assert!(error.message.chars().count() <= 300);
+    }
+
     #[test]
     fn urlencode_basic() {
         assert_eq!(urlencode("New York, NY"), "New%20York%2C%20NY");
@@ -794,7 +1133,7 @@ mod tests {
                     // a correctly refused resume must not leave a server waiting.
                 });
                 let mut got = Vec::new();
-                let result = Net::new().unwrap().with_retries(0).stream(
+                let result = direct_net().unwrap().with_retries(0).stream(
                     &format!("http://{addr}/blob"),
                     &[],
                     &AtomicBool::new(false),
@@ -861,7 +1200,7 @@ mod tests {
                 (h1, h2)
             });
             let mut got = Vec::new();
-            let result = Net::new()
+            let result = direct_net()
                 .unwrap()
                 .with_retries(0)
                 .stream(
@@ -924,7 +1263,7 @@ mod tests {
                 let _ = second.write_all(reply.as_bytes());
             });
             let mut got = Vec::new();
-            let result = Net::new().unwrap().stream(
+            let result = direct_net().unwrap().stream(
                 &format!("http://{addr}/blob"),
                 &[],
                 &AtomicBool::new(false),
@@ -1078,7 +1417,7 @@ mod tests {
                     barrier.wait();
                     sock.write_all(&served[middle..]).unwrap();
                 });
-                let got = Net::new()
+                let got = direct_net()
                     .unwrap()
                     .download_to_validated(&format!("http://{addr}/table"), &path, |tmp| {
                         std::fs::read(tmp).map_err(|e| e.to_string())
@@ -1118,7 +1457,7 @@ mod tests {
                 .unwrap();
             });
             let mut validated = false;
-            let error = Net::new()
+            let error = direct_net()
                 .unwrap()
                 .with_retries(0)
                 .download_to_validated(&format!("http://{addr}/table"), &path, |_| {
@@ -1191,7 +1530,7 @@ mod tests {
             second.flush().expect("flush 2");
             h2
         });
-        let net = Net::new()
+        let net = direct_net()
             .expect("net")
             .with_retries(0)
             .with_body_idle(Duration::from_millis(300));
@@ -1297,7 +1636,7 @@ mod tests {
                     sock.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nETag: \"stable\"\r\nContent-Range: bytes */100\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("complete length");
                 }
             });
-            let net = Net::new().expect("net").with_retries(0);
+            let net = direct_net().expect("net").with_retries(0);
             let mut got = Vec::new();
             let n = net
                 .stream(
@@ -1337,7 +1676,7 @@ mod tests {
             }
         });
         let mut got = Vec::new();
-        let n = Net::new()
+        let n = direct_net()
             .expect("net")
             .stream(
                 &format!("http://{addr}/blob"),
@@ -1385,7 +1724,7 @@ mod tests {
             drop(first);
             (h1, h2)
         });
-        let net = Net::new()
+        let net = direct_net()
             .expect("net")
             .with_body_idle(Duration::from_millis(300));
         let mut got = Vec::new();
@@ -1451,7 +1790,7 @@ mod tests {
                 }
             }
         });
-        let net = Net::new().expect("net").with_retries(0);
+        let net = direct_net().expect("net").with_retries(0);
         let mut got = Vec::new();
         let n = net
             .stream(
