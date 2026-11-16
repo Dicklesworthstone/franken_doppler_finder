@@ -2017,6 +2017,21 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 
 ## Testing
 
+### Keep overlapping flight catalogues from hanging on repeated timestamps
+
+Processed ADS-B stores can contain stale and fresh reports at the same instant. Duplicate
+selection now finishes before discarded timestamps are mapped to the surviving report.
+This prevents circular boundary mappings while retaining the existing position/feed
+preference, motion recovery, duplicate intervals and real flight-leg breaks.
+
+`processed_duplicate_remaps_point_directly_to_final_survivors` covers successive winner
+changes, repeated timestamps, separate duplicate groups, relative/Unix times and ground
+boundaries. `repeated_duplicate_times_keep_cross_store_leg_boundaries` exercises three
+overlapping stores in both input orders, checking the selected points, the two-leg split
+and aircraft metadata. Source review and the local whitespace check passed. The execution
+environment disconnected before native tests or formatting could run; these regressions,
+workspace checks, CLI selftest and reference/field replays remain unexecuted.
+
 ### Recover completed MLAT data hidden by a main-only processed cache
 
 `complete_raw_pair_recovers_aircraft_hidden_by_a_processed_main_cache` uses real compressed

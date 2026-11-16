@@ -802,18 +802,23 @@ fn dedupe_store_points(
                 _ => false,
             };
             if quality.is_lt() || (quality.is_eq() && better_feed) {
-                if preferred.t != p.t {
-                    duplicate_times.insert(preferred.t.to_bits(), p.t);
-                }
                 *preferred = p;
                 preferred_rank = feed_ranks[i];
-            } else if p.t != preferred.t {
-                duplicate_times.insert(p.t.to_bits(), preferred.t);
             }
             preferred.flags = (preferred.flags
                 & !(pt_flags::CLIPPED_BEFORE | pt_flags::CLIPPED_AFTER))
                 | boundary
                 | clipped;
+        }
+        // Resolve timestamps only after the survivor is final. Two reports can
+        // share a timestamp but differ in quality: an initially rejected time can
+        // later win, so recording each intermediate choice could create a cycle.
+        // Boundaries follow the actual surviving report in one step.
+        for &i in &anchors[first..next] {
+            let t = points[i].t;
+            if t != preferred.t {
+                duplicate_times.insert(t.to_bits(), preferred.t);
+            }
         }
         if preferred.gs_mps.is_nan() || preferred.track_deg.is_nan() {
             let mut best: Option<(Option<u8>, (f32, f32))> = None;
@@ -2946,6 +2951,122 @@ mod tests {
                 engine: EngineClass::Turboprop,
                 points,
             }],
+        }
+    }
+
+    #[test]
+    fn processed_duplicate_remaps_point_directly_to_final_survivors() {
+        for epoch in [0.0, T0] {
+            let t0 = epoch + 40.0;
+            let t1 = t0 + 0.015625;
+            let t2 = t0 + 0.03125;
+            let separate = t0 + 0.0625;
+            let p = merge_test_point;
+            let points = vec![
+                p(t0, pt_flags::MLAT | pt_flags::NEW_LEG),
+                p(t1, pt_flags::STALE),
+                p(t1, 0),
+                p(t2, pt_flags::STALE),
+                p(t2, 0),
+                p(separate, 0),
+            ];
+            let merge = StoreMerge {
+                anchors: vec![0, 5],
+                feed_ranks: [
+                    Feed::Mlatonly,
+                    Feed::Prod,
+                    Feed::Staging,
+                    Feed::Prod,
+                    Feed::Prod,
+                    Feed::Prod,
+                ]
+                .into_iter()
+                .map(|feed| Some(feed.rank()))
+                .collect(),
+            };
+            let mut remaps = HashMap::new();
+            let kept = dedupe_store_points(points, merge, &mut remaps);
+            assert_eq!(kept, [p(t2, pt_flags::NEW_LEG), p(separate, 0)]);
+            // Both later timestamps first lose, then win on another report at the
+            // same instant. Neither can retain an outgoing map after becoming final.
+            assert_eq!(remaps.get(&t0.to_bits()), Some(&t2));
+            assert_eq!(remaps.get(&t1.to_bits()), Some(&t2));
+            assert_eq!(remaps.len(), 2);
+            assert!(!remaps.contains_key(&t2.to_bits()));
+            assert!(!remaps.contains_key(&separate.to_bits()));
+
+            let mut boundaries = BoundaryEvents {
+                ground: vec![(epoch + 20.0, epoch + 21.0)],
+                new_leg: vec![t0, t1, t2, separate],
+            };
+            boundaries.remap_duplicates(&remaps);
+            assert_eq!(boundaries.new_leg, [t2, separate]);
+            assert_eq!(boundaries.ground, [(epoch + 20.0, epoch + 21.0)]);
+        }
+    }
+
+    #[test]
+    fn repeated_duplicate_times_keep_cross_store_leg_boundaries() {
+        for epoch in [0.0, T0] {
+            for (initial_flags, initial_feed, final_feed) in [
+                (0, "staging", "prod"),
+                (pt_flags::MLAT, "prod+mlat", "prod+mlat"),
+            ] {
+                let p = |t, flags| merge_test_point(epoch + t, flags);
+                let mut initial = merge_test_store(
+                    vec![
+                        p(-10.0, 0),
+                        p(0.0, 0),
+                        p(40.0, initial_flags | pt_flags::NEW_LEG),
+                        p(60.0, 0),
+                    ],
+                    "initial",
+                );
+                initial.legs[0].source = initial_feed.into();
+                let mut stale = merge_test_store(
+                    vec![p(-5.0, 0), p(40.03125, pt_flags::STALE), p(60.0, 0)],
+                    "stale",
+                );
+                stale.legs[0].source = final_feed.into();
+                let mut fresh = merge_test_store(
+                    vec![p(-1.0, 0), p(40.03125, 0), p(60.0, 0)],
+                    "fresh",
+                );
+                fresh.legs[0].source = final_feed.into();
+                for reverse in [false, true] {
+                    let mut stores = vec![initial.clone(), stale.clone(), fresh.clone()];
+                    if reverse {
+                        stores.reverse();
+                    }
+                    let merged = merge_stores(stores, 300.0);
+                    assert_eq!(merged.legs.len(), 2);
+                    assert_eq!(merged.meta.stats["cross_store_joins"], 2);
+                    assert_eq!(
+                        merged.legs[0].points,
+                        [
+                            p(-10.0, 0),
+                            p(-5.0, 0),
+                            p(-1.0, 0),
+                            p(0.0, pt_flags::NEW_LEG_AFTER),
+                        ]
+                    );
+                    assert_eq!(
+                        merged.legs[1].points,
+                        [p(40.03125, pt_flags::NEW_LEG), p(60.0, 0)]
+                    );
+                    let boundaries: LegBoundaries =
+                        serde_json::from_value(merged.meta.stats["leg_boundaries"].clone())
+                            .unwrap();
+                    assert_eq!(boundaries["abc123"].new_leg, [epoch + 40.03125]);
+                    assert!(boundaries["abc123"].ground.is_empty());
+                    for leg in &merged.legs {
+                        assert_eq!(leg.icao, "abc123");
+                        assert_eq!(leg.reg, "TEST");
+                        assert_eq!(leg.typ, "PC12");
+                        assert_eq!(leg.engine, EngineClass::Turboprop);
+                    }
+                }
+            }
         }
     }
 

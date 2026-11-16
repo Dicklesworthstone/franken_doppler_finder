@@ -19,6 +19,19 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep repeated ADS-B timestamps from cycling during catalogue merges
+
+- Resolve discarded processed-store timestamps directly to their final duplicate winner,
+  after the existing freshness, non-MLAT and feed-preference selection completes. A stale
+  report followed by a better report at the same timestamp can no longer create a cycle
+  that hangs new-leg boundary remapping.
+- Preserve position selection, duplicate intervals, motion donation and flight-leg rules.
+  Add direct remapping and three-store integration regressions covering chained winner
+  changes, repeated timestamps, both input orders, relative/Unix times and leg metadata.
+- Source review and the local whitespace check passed. Native tests, formatting, Clippy,
+  workspace checks, release CLI selftest and reference/field replays did not run because
+  the execution environment disconnected. No native pass or field-accuracy claim.
+
 ### Recover completed MLAT feeds before accepting a partial offline catalogue
 
 - Upgrade a main-only processed fallback when completed, compatible raw checkpoints contain
