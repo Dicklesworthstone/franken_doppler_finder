@@ -2117,7 +2117,18 @@ fn locate_with_clock(
             v.why
         ));
     }
-    // a tile that cannot be read or fetched answers 0 m; say how much ground that covered
+    // Cached parent tiles retain real terrain when the requested resolution is unavailable.
+    // Report that loss of resolution separately from tiles with no usable terrain at all.
+    for (dem, stage) in [(&coarse, "coarse"), (&fine, "fine")] {
+        let recovered = dem.recovered_tiles();
+        if recovered > 0 {
+            warnings.push(format!(
+                "terrain: {recovered} {stage} (z{}) tiles used lower-resolution cached parent elevations down to z{} because the requested tiles could not be loaded",
+                dem.zoom(),
+                dem.lowest_used_zoom(),
+            ));
+        }
+    }
     let (lost_coarse, lost_fine) = (coarse.failures(), fine.failures());
     if lost_coarse + lost_fine > 0 {
         warnings.push(format!(

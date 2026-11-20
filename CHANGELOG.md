@@ -19,6 +19,19 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain cached terrain when fine elevation tiles are unavailable
+
+- Reuse the finest cached parent tile down to z10, the existing coarse-search
+  resolution, when a requested tile is missing, corrupt or cannot be downloaded.
+  Sample the parent at its own geographic pixel coordinates and preserve exact-tile
+  priority, bilinear interpolation and the existing ground-pixel filter.
+- Share decoded parents across missing children and keep parent lookup offline.
+  Report lower-resolution recovery separately from the remaining sea-level fallbacks.
+- All seven terrain tests pass in a native run of the complete production module
+  with pinned dependencies and a panic-on-use HTTP facade. The full data-package
+  build was interrupted during `asupersync` compilation before tests; transport,
+  workspace, release selftest and real-recording validation remain incomplete.
+
 ### Retain accepted radiosondes while later weather requests are pending
 
 - Publish an immutable upper-air snapshot after each accepted sounding instead of
