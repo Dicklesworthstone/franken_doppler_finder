@@ -3111,29 +3111,63 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         modes.extend(
             recover
                 .into_par_iter()
-                .filter_map(|m| {
-                    let (la, lo, e) = refine_point(
-                        &window,
-                        p,
-                        &bank,
-                        &keep,
-                        m.1,
-                        m.2,
-                        bin_clock(m.0.bin as usize).clamp(window.start_lo, window.start_hi),
-                    )?;
-                    let (la, lo, e) = polish_point(&window, p, &bank, &keep, la, lo, e);
-                    Some(MatchMode {
-                        lat: la,
-                        lon: lo,
-                        clock_unix: e.clock,
-                        coarse: m.0.coarse as f64,
-                        evidence: e.evidence,
-                        r50_m: e.r50_m,
-                        n_heard: e.n_heard,
-                        n_unheard_close: e.n_close,
-                        passes: e.passes,
-                    })
-                })
+                .map_init(
+                    || (vec![0f32; nbins], Vec::<u32>::new()),
+                    |(acc, touched), m| {
+                        // A rejected centre says nothing about which clock fits its disc.
+                        // Keep the same clock peaks examined at that centre: retrying only
+                        // its strongest coarse alias can still erase a supported observer.
+                        let cell = m.0.cell as usize;
+                        let rng = offs[cell] as usize..offs[cell + 1] as usize;
+                        accumulate_votes(&passes[rng], &bank, im, t_base, clock_lo, acc, touched);
+                        let seeds = clock_peak_candidates(acc, bins, m.0, p.clock_sweep_frames);
+                        for bin in touched.drain(..) {
+                            acc[bin as usize] = 0.0;
+                        }
+                        let mut swept = Vec::new();
+                        let mut best: Option<(Top, f64, f64, Exact)> = None;
+                        for seed in seeds {
+                            let clock = bin_clock(seed.bin as usize)
+                                .clamp(window.start_lo, window.start_hi);
+                            if clock_sweep_was_covered(
+                                clock,
+                                &swept,
+                                im.dt,
+                                p.clock_sweep_frames,
+                                (window.start_lo, window.start_hi),
+                            ) {
+                                continue;
+                            }
+                            let Some((la, lo, e)) =
+                                refine_point(&window, p, &bank, &keep, m.1, m.2, clock)
+                            else {
+                                continue;
+                            };
+                            let at = swept.partition_point(|&old| old < clock);
+                            swept.insert(at, clock);
+                            // Physical fitting can lower evidence. Compare every clock
+                            // on that final basis, so a new alias cannot discard the
+                            // original disc result before losing its apparent advantage.
+                            let (la, lo, e) = polish_point(&window, p, &bank, &keep, la, lo, e);
+                            if best.as_ref().is_none_or(|b| e.evidence > b.3.evidence) {
+                                best = Some((seed, la, lo, e));
+                            }
+                        }
+                        let (seed, la, lo, e) = best?;
+                        Some(MatchMode {
+                            lat: la,
+                            lon: lo,
+                            clock_unix: e.clock,
+                            coarse: seed.coarse as f64,
+                            evidence: e.evidence,
+                            r50_m: e.r50_m,
+                            n_heard: e.n_heard,
+                            n_unheard_close: e.n_close,
+                            passes: e.passes,
+                        })
+                    },
+                )
+                .flatten()
                 .collect::<Vec<_>>(),
         );
         modes.sort_by(|a, b| b.evidence.total_cmp(&a.evidence));
@@ -5083,8 +5117,7 @@ mod tests {
         assert!(top.n_heard >= 3, "{top:?}");
     }
 
-    #[test]
-    fn alternative_clock_peaks_recover_the_three_flight_recording() {
+    fn three_flight_clock_alias_case() -> Case {
         let mut heard: Vec<_> = [
             ([0.0, 800.0, 600.0 + MIC_HEIGHT_M], [80.0, 0.0, 0.0], 70.0),
             ([750.0, 0.0, 650.0], [0.0, 95.0, 0.0], 190.0),
@@ -5126,6 +5159,12 @@ mod tests {
             tr.icao = tr.key.clone();
             c.tracks.push(tr);
         }
+        c
+    }
+
+    #[test]
+    fn alternative_clock_peaks_recover_the_three_flight_recording() {
+        let c = three_flight_clock_alias_case();
         let p = MatchParams {
             decoy_span_s: 900.0,
             probe: Some((c.lat, c.lon, c.clock)),
@@ -5172,6 +5211,119 @@ mod tests {
                 "the recovered clock must retain heard-{i}: {top:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejected_centres_retain_alternative_clocks_in_their_discs() {
+        let mut c = three_flight_clock_alias_case();
+        let (mlat, mlon) = m_per_deg(c.lat);
+        // None of the 200 m coarse cells lands in the narrow valley containing
+        // the microphone. Its high-resolution terrain rejects every centre,
+        // while a 100 m refinement step reaches the real, ground-level observer.
+        c.region = BBox::new(
+            c.lat - 100.0 / mlat,
+            c.lon - 100.0 / mlon,
+            c.lat + 300.0 / mlat,
+            c.lon + 300.0 / mlon,
+        );
+        struct Valley(f64, f64);
+        impl Elevation for Valley {
+            fn elev_m(&self, lat: f64, lon: f64) -> f64 {
+                if haversine_m(lat, lon, self.0, self.1) < 75.0 {
+                    0.0
+                } else {
+                    2500.0
+                }
+            }
+
+            fn describe(&self) -> String {
+                "synthetic valley".into()
+            }
+        }
+        let coarse_dem = FlatElevation(0.0);
+        let fine_dem = Valley(c.lat, c.lon);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let p = MatchParams {
+            reach_m: 1100.0,
+            top_modes: 1,
+            refine_modes: 1,
+            decoy_span_s: 0.0,
+            ..MatchParams::default()
+        };
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &c.tracks,
+            region: c.region,
+            start_lo: c.clock - 610.0,
+            start_hi: c.clock + 10.0,
+            duration_s: c.x.len() as f64 / 2800.0,
+            catalog: (f64::NEG_INFINITY, f64::INFINITY),
+            dem: &coarse_dem,
+            fine_dem: &fine_dem,
+            atmo: &atmo,
+        };
+        let grid = make_grid(&p, &c.region, &coarse_dem);
+        for cell in 0..grid.inside.len() {
+            if grid.inside[cell] {
+                let (lat, lon) = grid.latlon(cell % grid.ncols, cell / grid.ncols);
+                assert_eq!(fine_dem.elev_m(lat, lon), 2500.0);
+            }
+        }
+        // The terrain/physical-range rejection prevents ANY centre from entering
+        // ordinary refinement. The old single-clock disc retry could credit only
+        // the two earlier flights; the third real pass fixes the weaker clock.
+        let disabled = MatchParams {
+            refine_modes: 0,
+            ..p.clone()
+        };
+        assert!(run(&inp, &disabled, &|_| {}).modes.is_empty());
+        let result = run(&inp, &p, &|line| eprintln!("{line}"));
+        let top = result
+            .modes
+            .first()
+            .expect("the retained disc contains the recording");
+        assert!((top.clock_unix - c.clock).abs() < 3.0, "{top:?}");
+        assert!(
+            haversine_m(top.lat, top.lon, c.lat, c.lon) < 100.0,
+            "{top:?}"
+        );
+        for i in 0..3 {
+            assert!(
+                top.passes.iter().any(|pass| {
+                    pass.key == format!("heard-{i}")
+                        && counts_as_heard(pass.value, pass.nats, pass.shared)
+                }),
+                "missing heard-{i}: {top:?}"
+            );
+        }
+
+        // Shifting the archived flights into a decoy window must give that
+        // window exactly the same recovered place and evidence.
+        let shift = inp.start_hi - inp.start_lo + p.decoy_guard_s;
+        let mut shifted = c.tracks.clone();
+        for tr in &mut shifted {
+            for t in &mut tr.t {
+                *t += shift;
+            }
+        }
+        let decoy_inp = MatchInputs {
+            tracks: &shifted,
+            ..inp
+        };
+        let decoy_p = MatchParams {
+            decoy_span_s: shift,
+            ..p.clone()
+        };
+        let result = run(&decoy_inp, &decoy_p, &|_| {});
+        let decoy = result
+            .decoys
+            .iter()
+            .find(|d| (d.shift_s - shift).abs() < 1e-6)
+            .expect("the shifted true window is included among decoys");
+        assert!(decoy.n_heard >= 3, "{decoy:?}");
+        assert!((decoy.best_evidence - top.evidence).abs() < 1e-6);
+        assert!(haversine_m(decoy.lat, decoy.lon, top.lat, top.lon) < 1.0);
     }
 
     /// Both knots are outside the spatial and time filters, but their interpolated pass produces

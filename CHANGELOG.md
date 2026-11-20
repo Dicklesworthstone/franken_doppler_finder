@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover locations that need both a different clock and a nearby observer
+
+- Let rejected-centre disc recovery try the existing alternative coarse clock peaks,
+  with the original seed first and redundant successful sweeps coalesced. Keep the
+  same selected discs and otherwise-unused spatial refinement slots for real and
+  decoy windows.
+- Compare recovered candidates after physical fitting, so a new clock must improve
+  the final evidence before replacing the original recovered result.
+- Add a three-aircraft synthetic recording with both a louder coarse clock alias
+  and fine terrain that rejects every coarse centre. The native regression recovers
+  the place, clock and flight identities, checks disabled recovery, and reproduces
+  the result in an equivalent decoy window. It runs complete production curve-match,
+  track, physics and spectrogram modules with the real pinned dependencies.
+- The new native regression and four existing clock-sweep, clock-alias, spatial-disc
+  and physical-fit controls pass. Full workspace compilation, Clippy, workspace tests,
+  release selftest and reference/field replays remain incomplete. The synthetic case
+  establishes recovery, not a calibrated confidence grade or field accuracy.
+
 ### Retain cached terrain when fine elevation tiles are unavailable
 
 - Reuse the finest cached parent tile down to z10, the existing coarse-search

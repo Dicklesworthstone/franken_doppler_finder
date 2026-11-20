@@ -517,8 +517,11 @@ in `crates/fdop-core/src/curvematch.rs`:
   A selected centre that fails exact scoring can still hide a supported point in that disc,
   for example where fine terrain differs from the coarse model. After preserving every
   successful centre's rank and refinement allowance, otherwise unused refinement slots
-  try rejected centres in coarse-vote order at their original coarse clocks. Failed attempts
-  consume slots too. The same bounded disc search runs for real and decoy windows; region,
+  try rejected centres in coarse-vote order. Each retained disc tries the same positive
+  clock peaks as its centre, starting with the original coarse clock and skipping fully
+  covered clock sweeps. Recovered candidates are compared after their physical fit, since
+  that fit can lower evidence. Clock alternatives can add work inside these spatial slots.
+  Failed discs consume slots too. The same disc search runs for real and decoy windows; region,
   physical reach, hearing thresholds and the four-place refinement budget remain in force.
   If two trajectories initially prefer the same bright tone, the original strongest-tone assignment
   finishes before recovery looks for a distinct, unclaimed peak for the rejected trajectory. A recovered
