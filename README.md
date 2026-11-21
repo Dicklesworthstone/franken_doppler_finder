@@ -740,6 +740,9 @@ The selected track is mixed to mono unless `--audio-channel N` selects one chann
 lets an ambient track be used instead of commentary, or one microphone channel be used when a stereo mix
 cancels its tones. An unavailable track or channel is an error. The selected audio retains its timestamps,
 including initial delays and missing-packet gaps; only the container and that track supply `creation_time`.
+The first usable finite timestamp wins, with the container taking precedence. A malformed or nonfinite
+container time can therefore recover from the selected track; unrelated tracks never supply a clock hint.
+Original tags remain in the report, including unusable timestamps.
 Decoding preserves elapsed recording time: missing packet intervals become silence, and audio delayed
 relative to video retains that delay. The container's arbitrary starting timestamp is normalized without
 collapsing internal gaps. Tones are not stretched to repair timing, so a gap does not shift later flyovers

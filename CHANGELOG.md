@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover recording clocks from the selected audio track
+
+- When the container's `creation_time` is unusable, try the selected audio track's
+  finite timestamp. A valid container still takes precedence, unrelated tracks
+  remain excluded, and original tags stay available for diagnostics.
+- Add real-parser regressions for malformed, empty, impossible-date and nonfinite
+  hints, explicit track selection, timezone conversion and unchanged precedence.
+  This restores an available narrow clock hint without changing search or grading
+  thresholds.
+- Pinned formatting and whitespace checks pass for the audio change. Native test
+  execution, Clippy, release selftest and reference/field replays remain incomplete:
+  dependency compilation was killed and the execution environment disconnected.
+  No native test pass or field-accuracy improvement is claimed.
+
 ### Recover locations that need both a different clock and a nearby observer
 
 - Let rejected-centre disc recovery try the existing alternative coarse clock peaks,

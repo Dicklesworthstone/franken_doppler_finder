@@ -23,9 +23,10 @@ pub struct MediaInfo {
     pub channels: u32,
     pub audio_stream: usize,
     pub audio_channel: Option<usize>,
-    /// `creation_time` tag (container, then selected audio stream), verbatim.
+    /// First usable `creation_time` tag (container, then selected audio stream), verbatim.
+    /// If neither parses, retain the first tag for diagnostics.
     pub creation_time: Option<String>,
-    /// Parsed creation time (unix s) when the tag carries a zone (or `Z`).
+    /// Parsed finite creation time (unix s), using the same UTC convention as `--start`.
     pub creation_unix: Option<f64>,
     /// ISO 6709 location tag (e.g. Apple `com.apple.quicktime.location.ISO6709`), verbatim.
     pub location_iso6709: Option<String>,
@@ -122,6 +123,8 @@ fn media_info(
     }
     // An unrelated track may have been dubbed or exported at a different time. Only
     // the container and the selected audio stream can supply the recording-clock hint.
+    // An unusable container tag must not hide a usable selected-stream clock. Keep the
+    // first unusable tag for diagnostics when neither source supplies a finite instant.
     for source in [fmt, a] {
         if let Some(tags) = source["tags"].as_object()
             && let Some(time) = tags
@@ -129,9 +132,16 @@ fn media_info(
                 .find(|(k, _)| k.eq_ignore_ascii_case("creation_time"))
                 .and_then(|(_, v)| v.as_str())
         {
-            info.creation_time = Some(time.to_string());
-            info.creation_unix = fdop_types::time::parse_iso_utc(time).ok();
-            break;
+            let unix = fdop_types::time::parse_iso_utc(time)
+                .ok()
+                .filter(|time| time.is_finite());
+            if info.creation_time.is_none() || unix.is_some() {
+                info.creation_time = Some(time.to_string());
+                info.creation_unix = unix;
+            }
+            if unix.is_some() {
+                break;
+            }
         }
     }
     let mut collect_tags = |v: &serde_json::Value| {
@@ -547,6 +557,141 @@ mod tests {
                     .contains("out of range")
             );
         }
+    }
+
+    #[test]
+    fn unusable_container_clock_recovers_the_selected_audio_time() {
+        let first_time = "2026-09-08T11:00:00Z";
+        let second_time = "2026-09-08T08:00:00.125-04:00";
+        let unrelated_time = "2026-09-07T10:00:00Z";
+        let mut j = serde_json::json!({
+            "format": {"tags": {}},
+            "streams": [
+                {"codec_type": "video", "tags": {"creation_time": unrelated_time}},
+                {"codec_type": "audio", "tags": {"creation_time": first_time}},
+                {"codec_type": "audio", "tags": {"CREATION_TIME": second_time}}
+            ]
+        });
+        let path = Path::new("clock_fallback.mkv");
+        for invalid in [
+            "",
+            "N/A",
+            "0000-00-00T00:00:00Z",
+            "2026-02-30T12:00:00Z",
+            "NaN",
+            "inf",
+            "1e309",
+        ] {
+            j["format"]["tags"] = serde_json::json!({"creation_time": invalid});
+            for (stream, time, hour, second) in
+                [(0, first_time, 11, 0.0), (1, second_time, 12, 0.125)]
+            {
+                let info = media_info(
+                    path,
+                    &j,
+                    AudioSelection {
+                        stream,
+                        channel: None,
+                    },
+                )
+                .unwrap();
+                assert_eq!(info.creation_time.as_deref(), Some(time), "{invalid:?}");
+                assert_eq!(
+                    info.creation_unix,
+                    Some(fdop_types::time::unix_from_utc(2026, 9, 8, hour, 0, second)),
+                    "container {invalid:?}, audio stream {stream}"
+                );
+                // Selecting a clock does not erase the original metadata from the report.
+                assert_eq!(info.tags.len(), 4);
+                for (name, value) in [
+                    ("creation_time", invalid),
+                    ("creation_time", unrelated_time),
+                    ("creation_time", first_time),
+                    ("CREATION_TIME", second_time),
+                ] {
+                    assert!(info.tags.contains(&(name.into(), value.into())));
+                }
+            }
+        }
+        // Absent and non-string container tags also leave the selected clock available.
+        for tags in [
+            serde_json::json!({}),
+            serde_json::json!({"creation_time": null}),
+            serde_json::json!({"creation_time": 123}),
+        ] {
+            j["format"]["tags"] = tags;
+            let info = media_info(path, &j, AudioSelection::default()).unwrap();
+            assert_eq!(info.creation_time.as_deref(), Some(first_time));
+            assert_eq!(
+                info.creation_unix,
+                Some(fdop_types::time::unix_from_utc(2026, 9, 8, 11, 0, 0.0))
+            );
+        }
+        // A valid container still wins, regardless of which valid audio stream is selected.
+        let container_time = "2026-09-08T13:00:00Z";
+        j["format"]["tags"] = serde_json::json!({"CrEaTiOn_TiMe": container_time});
+        for stream in [0, 1] {
+            let info = media_info(
+                path,
+                &j,
+                AudioSelection {
+                    stream,
+                    channel: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(info.creation_time.as_deref(), Some(container_time));
+            assert_eq!(
+                info.creation_unix,
+                Some(fdop_types::time::unix_from_utc(2026, 9, 8, 13, 0, 0.0))
+            );
+        }
+    }
+
+    #[test]
+    fn unusable_clock_diagnostics_never_borrow_an_unselected_stream() {
+        let mut j = serde_json::json!({
+            "format": {"tags": {"creation_time": "bad container time"}},
+            "streams": [
+                {"codec_type": "video", "tags": {"creation_time": "2026-09-08T10:00:00Z"}},
+                {"codec_type": "audio", "tags": {"creation_time": "2026-09-08T11:00:00Z"}},
+                {"codec_type": "audio", "tags": {"CREATION_TIME": "bad selected time"}}
+            ]
+        });
+        let path = Path::new("unusable_clocks.mkv");
+        let selection = AudioSelection {
+            stream: 1,
+            channel: None,
+        };
+        for selected_tags in [
+            serde_json::json!({"CREATION_TIME": "bad selected time"}),
+            serde_json::json!({"CREATION_TIME": "inf"}),
+            serde_json::json!({}),
+        ] {
+            j["streams"][2]["tags"] = selected_tags;
+            let info = media_info(path, &j, selection).unwrap();
+            assert_eq!(info.creation_time.as_deref(), Some("bad container time"));
+            assert!(info.creation_unix.is_none());
+            assert!(
+                info.tags
+                    .contains(&("creation_time".into(), "bad container time".into()))
+            );
+        }
+        j["format"]["tags"] = serde_json::json!({});
+        j["streams"][2]["tags"] = serde_json::json!({"CREATION_TIME": "bad selected time"});
+        let info = media_info(path, &j, selection).unwrap();
+        assert_eq!(info.creation_time.as_deref(), Some("bad selected time"));
+        assert!(info.creation_unix.is_none());
+
+        j["streams"][2]["tags"] = serde_json::json!({});
+        let info = media_info(path, &j, selection).unwrap();
+        assert!(info.creation_time.is_none());
+        assert!(info.creation_unix.is_none());
+        assert_eq!(
+            info.tags.len(),
+            2,
+            "unselected clocks remain diagnostic tags"
+        );
     }
 
     #[test]
