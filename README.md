@@ -1356,6 +1356,14 @@ and harmonic averaging of sound speed combine them. The report identifies that i
 separately from missing cells; a fully covered grid remains complete for cache reuse. A wrong location
 count or no complete cell still invokes the existing fallback sources and warnings.
 
+Pressure-level profiles distinguish missing wind observations from measured calm. A missing or
+invalid surface vector uses the nearest observed pressure-level wind through the existing height
+extrapolation; missing aloft vectors interpolate between observed levels or extend the nearest
+one. A finite zero speed remains calm even when its direction is undefined. Positive speeds
+require a finite direction from 0 to 360 degrees, and a profile without any observed aloft wind
+is still refused. Reports count surface and aloft recoveries separately, using only retained
+cells, hours and levels. Surface-only weather keeps its existing fallback behavior.
+
 Partial cached grids remain usable offline and still trigger an online repair attempt. A failed or
 unusable refresh preserves the cached partial response, as does another partial response with no more
 complete cells. This counts coverage, not geographic accuracy. New partial responses are cached too.

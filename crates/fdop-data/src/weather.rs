@@ -205,6 +205,20 @@ fn arr(h: &serde_json::Value, key: &str, i: usize) -> f64 {
         .unwrap_or(f64::NAN)
 }
 
+/// Pressure-profile winds must be observed, including genuine calm. Direction is
+/// undefined at zero speed; an unavailable positive-speed vector is not calm air.
+fn pressure_wind(speed: f64, direction: f64) -> Option<(f64, f64)> {
+    if !speed.is_finite() || speed < 0.0 {
+        None
+    } else if speed == 0.0 {
+        Some((0.0, 0.0))
+    } else if (0.0..=360.0).contains(&direction) {
+        Some(wind_en(speed, direction))
+    } else {
+        None
+    }
+}
+
 fn times_of(h: &serde_json::Value) -> Result<Vec<f64>, DataError> {
     let times: Vec<f64> = h
         .get("time")
@@ -246,16 +260,26 @@ fn hours_for_window(
 /// Selected original rows of one Open-Meteo hourly block -> level lists. With `levels`, pressure
 /// levels are placed by the hypsometric equation from the surface pressure and temperature;
 /// without, the profile is the surface value with a standard lapse.
+struct LocationProfiles {
+    profiles: Vec<Vec<Level>>,
+    missing_surface_winds: usize,
+    missing_aloft_winds: usize,
+}
+
 fn parse_location(
     loc: &serde_json::Value,
     levels: bool,
     hours: std::ops::Range<usize>,
-) -> Result<Vec<Vec<Level>>, DataError> {
+) -> Result<LocationProfiles, DataError> {
     let elev = loc.get("elevation").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let h = loc
         .get("hourly")
         .ok_or_else(|| DataError::new("open-meteo: no hourly block"))?;
-    let mut out = Vec::with_capacity(hours.len());
+    let mut out = LocationProfiles {
+        profiles: Vec::with_capacity(hours.len()),
+        missing_surface_winds: 0,
+        missing_aloft_winds: 0,
+    };
     for i in hours {
         let t2 = arr(h, "temperature_2m", i);
         if !t2.is_finite() {
@@ -264,13 +288,16 @@ fn parse_location(
         let rh2 = arr(h, "relative_humidity_2m", i) / 100.0;
         let rh2 = if rh2.is_finite() { rh2 } else { 0.5 };
         let (ws, wd) = (arr(h, "wind_speed_10m", i), arr(h, "wind_direction_10m", i));
-        let (we, wn) = if ws.is_finite() && wd.is_finite() {
+        let (we, wn) = if levels {
+            pressure_wind(ws, wd).unwrap_or((f64::NAN, f64::NAN))
+        } else if ws.is_finite() && wd.is_finite() {
             wind_en(ws, wd)
         } else {
             (0.0, 0.0)
         };
         if !levels {
-            out.push(standard_levels(t2, elev + 2.0, rh2, we, wn));
+            out.profiles
+                .push(standard_levels(t2, elev + 2.0, rh2, we, wn));
             continue;
         }
         let ps = arr(h, "surface_pressure", i);
@@ -296,11 +323,7 @@ fn parse_location(
                 arr(h, &format!("wind_speed_{p}hPa"), i),
                 arr(h, &format!("wind_direction_{p}hPa"), i),
             );
-            let (we, wn) = if ws.is_finite() && wd.is_finite() {
-                wind_en(ws, wd)
-            } else {
-                (f64::NAN, f64::NAN)
-            };
+            let (we, wn) = pressure_wind(ws, wd).unwrap_or((f64::NAN, f64::NAN));
             lv.push(Level {
                 z_msl: z,
                 t_c: t,
@@ -317,8 +340,12 @@ fn parse_location(
         if lv[1..].iter().all(|l| l.wind_e.is_nan()) {
             return Err(DataError::new("open-meteo: no winds aloft"));
         }
+        out.missing_surface_winds += usize::from(!lv[0].wind_e.is_finite());
+        out.missing_aloft_winds += lv[1..].iter().filter(|l| !l.wind_e.is_finite()).count();
+        // Missing surface winds take the nearest observed aloft vector, just as
+        // missing interior levels interpolate. Keep real calm as its own anchor.
         fill_wind(&mut lv);
-        out.push(lv);
+        out.profiles.push(lv);
     }
     Ok(out)
 }
@@ -428,6 +455,8 @@ fn parse_om_grid(
     }
     let mut per_loc = Vec::with_capacity(locs.len());
     let mut missing = Vec::new();
+    let mut surface_wind_recoveries = 0usize;
+    let mut aloft_wind_recoveries = 0usize;
     for (index, l) in locs.iter().enumerate() {
         let t = match times_of(&l["hourly"]) {
             Ok(t) => t,
@@ -448,7 +477,11 @@ fn parse_om_grid(
         // neither its row indices nor its time axis can stand in for another cell.
         let selected = t[hours.clone()].to_vec();
         match parse_location(l, levels, hours) {
-            Ok(p) => per_loc.push((index, selected, p)),
+            Ok(p) => {
+                surface_wind_recoveries += p.missing_surface_winds;
+                aloft_wind_recoveries += p.missing_aloft_winds;
+                per_loc.push((index, selected, p.profiles));
+            }
             Err(e) => missing.push(format!("cell {}: {e}", index + 1)),
         }
     }
@@ -463,6 +496,17 @@ fn parse_om_grid(
     } else {
         "Open-Meteo ERA5 archive (surface + standard lapse)"
     };
+    let mut wind_warnings = Vec::new();
+    if surface_wind_recoveries > 0 {
+        wind_warnings.push(format!(
+            "{src}: surface wind unavailable in {surface_wind_recoveries} retained cell-hours; extrapolating the nearest observed pressure-level wind to the surface"
+        ));
+    }
+    if aloft_wind_recoveries > 0 {
+        wind_warnings.push(format!(
+            "{src}: {aloft_wind_recoveries} retained pressure-level winds unavailable; interpolating in height and extrapolating the nearest observed wind beyond the available levels"
+        ));
+    }
     let partial = !missing.is_empty();
     let aligned = per_loc.windows(2).all(|p| p[0].1 == p[1].1);
     if partial || !aligned {
@@ -495,9 +539,11 @@ fn parse_om_grid(
             )
         };
         let atmo = ScatteredAtmosphere::new(stations, source).map_err(DataError)?;
+        let mut warnings = vec![warning];
+        warnings.extend(wind_warnings);
         return Ok(WeatherSource {
             atmo: Arc::new(atmo),
-            warnings: vec![warning],
+            warnings,
             partial_cells: partial.then_some(usable),
         });
     }
@@ -516,7 +562,11 @@ fn parse_om_grid(
         &profiles,
         src.to_string(),
     )
-    .map(WeatherSource::complete)
+    .map(|atmo| {
+        let mut source = WeatherSource::complete(atmo);
+        source.warnings = wind_warnings;
+        source
+    })
     .map_err(DataError)
 }
 
@@ -1458,7 +1508,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|loc| parse_location(loc, levels, 4..7).unwrap())
+                .map(|loc| parse_location(loc, levels, 4..7).unwrap().profiles)
                 .collect();
             let profiles: Vec<_> = (0..3)
                 .flat_map(|hour| columns.iter().map(move |column| column[hour].clone()))
@@ -1623,7 +1673,7 @@ mod tests {
                         } else {
                             (4..7, 0.0)
                         };
-                        let profiles = parse_location(cell, levels, rows.clone()).unwrap();
+                        let profiles = parse_location(cell, levels, rows.clone()).unwrap().profiles;
                         (
                             0.0,
                             index as f64,
@@ -2187,7 +2237,9 @@ mod tests {
                     vec![lon],
                     day,
                     3600.0,
-                    &parse_location(&complete, levels, 0..count).unwrap(),
+                    &parse_location(&complete, levels, 0..count)
+                        .unwrap()
+                        .profiles,
                     "complete day".into(),
                 )
                 .unwrap();
@@ -2329,8 +2381,10 @@ mod tests {
             assert!(got.partial_cells.is_none());
             // Their hour-4 rows have different temperatures and winds: using the
             // first cell's row index for the second gives the wrong atmosphere.
-            let left_profiles = parse_location(&first, false, left.clone()).unwrap();
-            let right_profiles = parse_location(&second, false, right).unwrap();
+            let left_profiles = parse_location(&first, false, left.clone())
+                .unwrap()
+                .profiles;
+            let right_profiles = parse_location(&second, false, right).unwrap().profiles;
             let profiles: Vec<_> = left_profiles
                 .iter()
                 .zip(&right_profiles)
@@ -2381,7 +2435,7 @@ mod tests {
         }
         let loc = serde_json::json!({"elevation": 30.0, "hourly": hourly});
         let t = times_of(&loc["hourly"]).unwrap();
-        let p = parse_location(&loc, true, 0..t.len()).unwrap();
+        let p = parse_location(&loc, true, 0..t.len()).unwrap().profiles;
         assert_eq!(t.len(), 2);
         // hypsometric 500 hPa height within 60 m of the model's geopotential height (5866 m)
         let z500 = p[0]
@@ -2395,6 +2449,184 @@ mod tests {
         let m = g.medium(40.9, -73.5, t[0], 32.0, 5557.0);
         assert!((m.c - 336.5).abs() < 1.5, "{}", m.c);
         assert!(m.wind_e > 5.0 && m.wind_n < -4.0, "NW wind blows SE: {m:?}");
+    }
+
+    #[test]
+    fn pressure_profiles_recover_surface_wind_without_fabricating_calm() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let bbox = BBox::new(lat, lon, lat, lon);
+        let (dir, _) = weather_test_cache("surface-wind", "surface-wind");
+        let mut observed = open_meteo_fixture(day as i64, 3);
+        // Each hourly column has an independently known constant wind with height.
+        // East, north, then west also exercise vector interpolation across UTC hours.
+        for suffix in std::iter::once("10m".to_string())
+            .chain(LEVELS_HPA.into_iter().map(|p| format!("{p}hPa")))
+        {
+            observed["hourly"][format!("wind_speed_{suffix}")] =
+                serde_json::json!([12.0, 18.0, 24.0]);
+            observed["hourly"][format!("wind_direction_{suffix}")] =
+                serde_json::json!([270.0, 180.0, 90.0]);
+        }
+        let load = |loc: &serde_json::Value| {
+            cache_open_meteo_fixture(&dir, true, "2026-09-08", loc);
+            fetch_atmosphere(&bbox, day + 900.0, day + 6300.0, &dir, true)
+        };
+        let expected = load(&observed);
+        assert!(expected.warnings.is_empty());
+        let known = [[12.0, 0.0], [0.0, 18.0], [-24.0, 0.0]];
+        for (name, speed, direction) in [
+            (
+                "missing speed",
+                serde_json::Value::Null,
+                serde_json::json!(270.0),
+            ),
+            (
+                "missing direction",
+                serde_json::json!(12.0),
+                serde_json::Value::Null,
+            ),
+            (
+                "malformed speed",
+                serde_json::json!("bad"),
+                serde_json::json!(270.0),
+            ),
+            (
+                "negative speed",
+                serde_json::json!(-12.0),
+                serde_json::json!(270.0),
+            ),
+            (
+                "negative direction",
+                serde_json::json!(12.0),
+                serde_json::json!(-90.0),
+            ),
+            (
+                "invalid direction",
+                serde_json::json!(12.0),
+                serde_json::json!(450.0),
+            ),
+        ] {
+            let mut missing = observed.clone();
+            missing["hourly"]["wind_speed_10m"] = serde_json::json!(vec![speed; 3]);
+            missing["hourly"]["wind_direction_10m"] = serde_json::json!(vec![direction; 3]);
+            // The first aloft level can be unavailable too; the next observed one
+            // is the surface anchor, rather than a zero or a reversed negative speed.
+            missing["hourly"]["wind_speed_925hPa"] = serde_json::json!(vec![-1.0; 3]);
+            let recovered = load(&missing);
+            assert!(recovered.winds_aloft, "{name}");
+            for hour in [0.25, 0.5, 1.0, 1.75] {
+                let i = hour as usize;
+                let w = hour - i as f64;
+                let wind = [
+                    known[i][0] * (1.0 - w) + known[i + 1][0] * w,
+                    known[i][1] * (1.0 - w) + known[i + 1][1] * w,
+                ];
+                for (ground, aircraft) in [(30.0, 100.0), (30.0, 4000.0), (8000.0, -100.0)] {
+                    let t = day + hour * 3600.0;
+                    let got = recovered.atmo.medium(lat, lon, t, ground, aircraft);
+                    let want = expected.atmo.medium(lat, lon, t, ground, aircraft);
+                    assert_eq!(got.c, want.c, "temperature/humidity changed: {name}");
+                    assert!((got.wind_e - wind[0]).abs() < 1e-9, "{name}: {got:?}");
+                    assert!((got.wind_n - wind[1]).abs() < 1e-9, "{name}: {got:?}");
+                    assert!((got.wind_e - want.wind_e).abs() < 1e-9, "{name}");
+                    assert!((got.wind_n - want.wind_n).abs() < 1e-9, "{name}");
+                }
+            }
+            assert_eq!(recovered.warnings.len(), 2, "{name}");
+            assert!(
+                recovered.warnings[0].contains("3 retained cell-hours"),
+                "{name}"
+            );
+            assert!(recovered.warnings[0].contains("nearest observed pressure-level wind"));
+            assert!(recovered.warnings[1].contains("3 retained pressure-level winds"));
+        }
+        // Malformed aloft data must report its interpolation even when the surface
+        // is observed; it must not be hidden behind the surface-recovery diagnostic.
+        let mut bad_aloft = observed.clone();
+        bad_aloft["hourly"]["wind_direction_925hPa"] = serde_json::json!(vec![450.0; 3]);
+        let recovered = load(&bad_aloft);
+        assert_eq!(recovered.warnings.len(), 1);
+        assert!(recovered.warnings[0].contains("3 retained pressure-level winds"));
+        assert_eq!(
+            recovered.atmo.medium(lat, lon, day + 900.0, 30.0, 4000.0),
+            expected.atmo.medium(lat, lon, day + 900.0, 30.0, 4000.0)
+        );
+        // Measured zero speed is calm even with undefined direction, and must keep
+        // its own surface anchor instead of taking the wind above it.
+        let mut calm = observed.clone();
+        calm["hourly"]["wind_speed_10m"] = serde_json::json!(vec![0.0; 3]);
+        let with_direction = load(&calm);
+        calm["hourly"]["wind_direction_10m"] = serde_json::json!([null, null, null]);
+        let without_direction = load(&calm);
+        assert!(without_direction.warnings.is_empty());
+        let near_ground = without_direction
+            .atmo
+            .medium(lat, lon, day + 900.0, 30.0, 100.0);
+        assert_eq!(
+            near_ground,
+            with_direction
+                .atmo
+                .medium(lat, lon, day + 900.0, 30.0, 100.0)
+        );
+        assert!(
+            near_ground.wind_e.abs() < 1.0,
+            "observed calm was lost: {near_ground:?}"
+        );
+        assert!(
+            expected
+                .atmo
+                .medium(lat, lon, day + 900.0, 30.0, 100.0)
+                .wind_e
+                - near_ground.wind_e
+                > 8.0,
+            "the old false-calm profile must differ materially from recovered propagation"
+        );
+        // The surface-only source keeps its existing no-direction fallback.
+        calm["hourly"]["wind_speed_10m"] = serde_json::json!(vec![12.0; 3]);
+        cache_open_meteo_fixture(&dir, false, "2026-09-08", &calm);
+        let surface_only = om_grid(
+            OM_ARCHIVE,
+            &bbox,
+            day + 900.0,
+            day + 6300.0,
+            &dir,
+            true,
+            false,
+        )
+        .unwrap()
+        .medium(lat, lon, day + 900.0, 30.0, 4000.0);
+        assert_eq!((surface_only.wind_e, surface_only.wind_n), (0.0, 0.0));
+    }
+
+    #[test]
+    fn surface_wind_warning_counts_only_retained_pressure_cells_and_hours() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let mut missing = open_meteo_fixture(day as i64, 4);
+        missing["hourly"]["wind_speed_10m"] = serde_json::json!([null, null, null, null]);
+        let mut unusable = missing.clone();
+        unusable["hourly"]["temperature_2m"][1] = serde_json::Value::Null;
+        let source = parse_om_grid(
+            serde_json::json!([missing, unusable, open_meteo_fixture(day as i64, 4)]),
+            &[0.0],
+            &[0.0, 1.0, 2.0],
+            day + 900.0,
+            day + 6300.0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(source.partial_cells, Some(2));
+        assert_eq!(source.warnings.len(), 2);
+        assert!(source.warnings[0].contains("2 of 3 grid cells"));
+        assert!(source.warnings[1].contains("3 retained cell-hours"));
+        let weather = fetch_with_fallbacks(
+            Ok(source),
+            || panic!("valid pressure profiles must retain source priority"),
+            || panic!("valid pressure profiles must retain source priority"),
+            |_| panic!("no fallback should be published"),
+        );
+        assert!(weather.winds_aloft);
+        assert_eq!(weather.warnings.len(), 2);
     }
 
     #[test]
@@ -2418,10 +2650,23 @@ mod tests {
         assert!(err.0.contains("no winds aloft"), "{err}");
         // one level with them is fine: the others take it, and the surface keeps its own
         hourly["wind_speed_500hPa"] = serde_json::json!([20.0, 20.0]);
-        let p = parse_location(&loc(&hourly), true, 0..2).unwrap();
+        let p = parse_location(&loc(&hourly), true, 0..2).unwrap().profiles;
         let (surface, top) = (p[0].first().unwrap(), p[0].last().unwrap());
         assert!(surface.wind_e > 1.9 && surface.wind_e < 2.1, "{surface:?}");
         assert!(top.wind_e > 14.0 && top.wind_n < -14.0, "{top:?}");
+        for speed in [-1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(pressure_wind(speed, 270.0).is_none());
+            hourly["wind_speed_500hPa"] = serde_json::json!([speed, speed]);
+            let err = parse_location(&loc(&hourly), true, 0..2).err().unwrap();
+            assert!(err.0.contains("no winds aloft"), "{err}");
+        }
+        // A reported calm aloft remains usable without a direction; absence or
+        // malformed speed above must never earn this observed-calm interpretation.
+        hourly["wind_speed_500hPa"] = serde_json::json!([0.0, 0.0]);
+        hourly["wind_direction_500hPa"] = serde_json::json!([null, null]);
+        let p = parse_location(&loc(&hourly), true, 0..2).unwrap().profiles;
+        let top = p[0].last().unwrap();
+        assert_eq!((top.wind_e, top.wind_n), (0.0, 0.0));
     }
 
     #[test]

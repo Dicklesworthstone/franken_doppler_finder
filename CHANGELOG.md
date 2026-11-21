@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover missing surface winds from observed pressure levels
+
+- Keep unavailable surface winds missing until height interpolation can recover them
+  from observed aloft winds. Previously these observations became an artificial calm
+  surface layer, changing the path-averaged propagation medium.
+- Preserve measured zero-speed calm even without a direction. Reject malformed
+  pressure-profile wind vectors, retain the refusal when all aloft winds are missing,
+  and keep the surface-only source's behavior. Report surface extrapolation and aloft
+  interpolation separately, counting only retained cells, hours and levels.
+- Add a public offline cached-weather regression with independently known winds across
+  time and height, six malformed surface pairs, a missing lowest aloft observation,
+  genuine-calm and surface-only controls, and partial-grid warning propagation.
+- Independent source review, pinned formatting of changed hunks and whitespace checks
+  completed. Native weather tests, workspace checks, release selftest and reference/field
+  replays remain incomplete after dependency builds encountered memory pressure and
+  execution stalls. This checkpoint makes no native-test or field-accuracy claim.
+
 ### Preserve nearby location matches behind an eligible clock alias
 
 - Carry the existing positive clock peaks through every coarse centre already
