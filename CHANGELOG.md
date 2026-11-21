@@ -68,9 +68,15 @@ at that commit, not per-change commits.
   so requested seed clocks do not prove that a later disc sweep was covered.
   Additional clock refinements can add work within the same selected cells.
 - Add a three-aircraft PCM regression with an eligible hillside clock alias,
-  disabled-refinement control and translated-decoy comparison. Its native run
-  and baseline failure remain unexecuted after environment disconnects; exact
-  candidate source received independent review. No field, grade or timing claim.
+  disabled-refinement control and translated-decoy comparison. It passes in the
+  actual `fdop-core` crate on `d423b65`; the exact previous matcher with the same
+  regression fails the true-clock assertion after passing the eligible-centre
+  setup, choosing a clock 600 seconds early. The existing rejected-centre
+  alternative-clock regression passes on `d423b65` too. Exact candidate source
+  received independent review.
+- These focused native checks use the pinned toolchain, dev opt level 1, dependency
+  opt level 0 and two Rayon threads. Reference/field replays, workspace tests,
+  Clippy and release selftest remain incomplete. No field, grade or timing claim.
 
 ### Recover completed flight downloads without release sidecars
 
@@ -85,9 +91,12 @@ at that commit, not per-change commits.
   incomplete metadata and offline/outage recovery, plus listed-authority and
   malformed/incomplete-checkpoint controls. Expected results come from the ordinary
   fresh builder, with subsequent processed-cache reuse checked separately.
-- Independently source-reviewed. Native compilation, test execution, Clippy, release
-  selftest and reference/field replays remain incomplete after the execution
-  environment disconnected. No native test pass or live-download claim is made.
+- Independently source-reviewed; the pinned formatter parses the final sources.
+  A focused native `cargo test -p fdop-data --lib --locked release_metadata` attempt
+  through RCH used one build job, disabled debug information and dependency opt
+  level 0, but the compiler was killed by SIGKILL while building the pinned
+  `asupersync 0.6.2` dependency, before any data test ran. The new matrix and
+  integrity controls remain unexecuted. No native test pass or live-download claim.
 
 ### Recover recording clocks from the selected audio track
 

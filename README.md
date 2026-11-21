@@ -2123,9 +2123,13 @@ wrong-clock centre, the three intended flight identities after refinement, and a
 shifted decoy window. The original spatial shortlist and refinement-slot count are retained;
 examining additional clocks inside those slots can increase search time.
 
-The regression is authored and independently source-reviewed, but native execution and
-reference/field replays remain incomplete after executor failures. It does not establish a
-field-accuracy, confidence-calibration or end-to-end performance improvement.
+On `d423b65`, this regression passes in the actual `fdop-core` crate on the pinned toolchain.
+The exact previous production matcher with the identical regression passes the eligible-centre
+setup but fails the true-clock assertion, selecting a clock 600 seconds early. The existing
+`rejected_centres_retain_alternative_clocks_in_their_discs` regression also passes on that commit.
+These are synthetic known-answer and shifted-decoy checks. Reference/field replays remain
+incomplete; this does not establish a field-accuracy, confidence-calibration or end-to-end
+performance improvement.
 
 ### Keep accepted upper-air profiles while later weather requests are pending
 
