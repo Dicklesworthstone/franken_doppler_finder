@@ -94,9 +94,7 @@ pub(crate) fn recovery_releases(
             && crate::adsblol::valid_archive_parts(&r.tag, &r.parts)
     };
     let main_listed = listed.iter().any(|r| r.feed != Feed::Mlatonly && valid(r));
-    if main_listed
-        && (!include_mlat || listed.iter().any(|r| r.feed == Feed::Mlatonly && valid(r)))
-    {
+    if main_listed && (!include_mlat || listed.iter().any(|r| r.feed == Feed::Mlatonly && valid(r))) {
         return Vec::new();
     }
     let Ok(entries) = std::fs::read_dir(dir.join("raw")) else {

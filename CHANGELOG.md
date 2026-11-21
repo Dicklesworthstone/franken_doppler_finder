@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve nearby location matches behind an eligible clock alias
+
+- Carry the existing positive clock peaks through every coarse centre already
+  awarded a spatial-refinement slot. Previously, a successful centre chose one
+  clock before searching nearby observers, so its plausible alias could hide the
+  correct recording time elsewhere in the retained disc.
+- Refine the original exact-winning clock first and compare alternatives after
+  physical fitting. Share the same loop with rejected-centre recovery and every
+  decoy window; retain spatial slots and all score/gate rules. Keep sweep coalescing
+  for rejected centres only: an eligible centre can recenter its disc's clock search,
+  so requested seed clocks do not prove that a later disc sweep was covered.
+  Additional clock refinements can add work within the same selected cells.
+- Add a three-aircraft PCM regression with an eligible hillside clock alias,
+  disabled-refinement control and translated-decoy comparison. Its native run
+  and baseline failure remain unexecuted after environment disconnects; exact
+  candidate source received independent review. No field, grade or timing claim.
+
 ### Recover completed flight downloads without release sidecars
 
 - Reconstruct missing release identities from completed raw checkpoints during
@@ -45,10 +62,12 @@ at that commit, not per-change commits.
   hints, explicit track selection, timezone conversion and unchanged precedence.
   This restores an available narrow clock hint without changing search or grading
   thresholds.
-- Pinned formatting and whitespace checks pass for the audio change. Native test
-  execution, Clippy, release selftest and reference/field replays remain incomplete:
-  dependency compilation was killed and the execution environment disconnected.
-  No native test pass or field-accuracy improvement is claimed.
+- Pinned formatting and whitespace checks pass for the audio change. An isolated
+  component build includes the exact production `audio.rs` and `fdop-types/time.rs`
+  with the pinned serde dependencies: all 15 tests pass, including both new parser
+  regressions and all four ffmpeg/ffprobe integration tests (12.46 s test execution).
+  This is component validation, not a workspace, release-selftest or field replay.
+  No field-accuracy improvement is claimed.
 
 ### Recover locations that need both a different clock and a nearby observer
 

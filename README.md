@@ -507,9 +507,14 @@ in `crates/fdop-core/src/curvematch.rs`:
   retain searchable locations at their edges instead of losing them to a tangent-plane approximation.
   At each selected place,
   positive local peaks in the clock votes, including tied plateaus, supply alternative recording times.
-  Exact evidence chooses the clock that reaches spatial refinement; a stronger coarse alias is no longer
-  the only timing seed. The original seed is tried first. A later sweep is skipped only when every
-  in-window timestamp it would score was already covered on the same clock lattice by successful sweeps.
+  Exact evidence ranks the centres for spatial refinement. Each centre awarded an existing refinement
+  slot tries its winning exact clock first, then the other positive clock peaks across that same disc.
+  Final evidence after physical fitting chooses the clock, so a weaker clock at the centre can win at
+  a nearby observer. Centres outside that budget retain their original centre scoring and polishing.
+  Initial centre scoring and rejected-centre disc recovery skip a later clock sweep only when every
+  in-window timestamp was already covered on the same clock lattice by successful sweeps. Eligible
+  centres keep every seed through refinement: their exact centre winner can move the disc's search
+  clock, so coverage inferred from the requested seeds would incorrectly hide unsearched timestamps.
   Each of the best 4 places stands for every place within 1 km of it, so every point of that disc is scored
   on a 100 m grid before it is climbed to 25 m. A close pass with no energy costs evidence, as in the trace
   search, and one audio event can credit only one flight. This recovers clock alternatives at selected
@@ -2091,6 +2096,19 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Retain alternative clocks around an eligible coarse location
+
+`successful_centres_retain_alternative_clocks_in_their_discs` adds a catalogued aircraft
+that can explain one tone at a coarse hillside location while the three synthesised sources
+agree at a nearby lower observer and a different recording clock. It checks the eligible
+wrong-clock centre, the three intended flight identities after refinement, and an equivalent
+shifted decoy window. The original spatial shortlist and refinement-slot count are retained;
+examining additional clocks inside those slots can increase search time.
+
+The regression is authored and independently source-reviewed, but native execution and
+reference/field replays remain incomplete after executor failures. It does not establish a
+field-accuracy, confidence-calibration or end-to-end performance improvement.
 
 ### Keep accepted upper-air profiles while later weather requests are pending
 

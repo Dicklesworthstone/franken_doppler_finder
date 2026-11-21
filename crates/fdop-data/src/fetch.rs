@@ -2492,11 +2492,8 @@ mod tests {
                                             format!("https://example.invalid/{}.tar", release.tag);
                                     }
                                 }
-                                std::fs::write(
-                                    &listing_path,
-                                    serde_json::to_vec(&listed).unwrap(),
-                                )
-                                .unwrap();
+                                std::fs::write(&listing_path, serde_json::to_vec(&listed).unwrap())
+                                    .unwrap();
                             }
                             "mlat only" => std::fs::write(
                                 &listing_path,
@@ -2575,9 +2572,13 @@ mod tests {
                         assert_eq!(got.meta.sources, expected.meta.sources);
                         assert_eq!(got.meta.stats["cache_hits"], 0);
                         assert!(
-                            got.meta.stats["notes"].as_array().unwrap().iter().any(|note| {
-                                note.as_str().unwrap().contains("release metadata recovered")
-                            })
+                            got.meta.stats["notes"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|note| {
+                                    note.as_str().unwrap().contains("release metadata recovered")
+                                })
                         );
                         assert_eq!(std::fs::read(&listing_path).ok(), listing_before);
                         for (path, before) in raw_paths.iter().zip(raw_before) {
