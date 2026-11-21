@@ -32,11 +32,17 @@ at that commit, not per-change commits.
   failure of the fine centre and every exact node, neighbor support, recovered position,
   clock and flight identities, plus unsupported-terrain, excluded-region and forbidden-clock
   controls. Existing success-preservation tests remain in place.
-- Independent review of the exact GitHub candidate completed, and reversing only the
-  intended production/test additions reproduces its base file exactly. Native execution,
-  baseline-failure confirmation, workspace checks, release selftest and reference/field
-  replays remain incomplete after memory pressure, executor outages and shared-host
-  contention. No native-test, field-accuracy or performance claim is made.
+- Native execution on `b17843c` with the pinned nightly passes all 13 `fine_` controls
+  (0 failed; 7.67 s execution). The new hillside case recovers both mirrored observers
+  within 2 m and their relative/Unix clocks within 0.05 s, with the correct aircraft;
+  unsupported terrain, an excluded region and a forbidden clock still refuse. Existing
+  success preservation, geometry, coverage, priority and budget controls also pass.
+- Independent source review, changed-hunk formatting and inverse-patch verification
+  completed. A separate native before-fix run was not executed. The workspace formatter
+  still reports differences in the same 14 pre-existing files; the new blocks are not
+  flagged. Full workspace tests, Clippy, release selftest and reference/field replays
+  were not run. These are synthetic capability checks, not field-accuracy or performance
+  measurements.
 
 ### Recover missing surface winds from observed pressure levels
 
@@ -51,9 +57,14 @@ at that commit, not per-change commits.
   time and height, six malformed surface pairs, a missing lowest aloft observation,
   genuine-calm and surface-only controls, and partial-grid warning propagation.
 - Independent source review, pinned formatting of changed hunks and whitespace checks
-  completed. Native weather tests, workspace checks, release selftest and reference/field
-  replays remain incomplete after dependency builds encountered memory pressure and
-  execution stalls. This checkpoint makes no native-test or field-accuracy claim.
+  completed. Native weather tests and a subsequent metadata-only test-code check were
+  attempted with the pinned nightly, one build job, debug information disabled and reduced
+  optimization for heavy dependencies. Both stopped in unchanged `asupersync 0.6.2`:
+  rustc was terminated by `SIGKILL`, including the attempt that emitted metadata only.
+  Neither reached `fdop-http` or `fdop-data`; the weather implementation and its tests
+  therefore have no compilation or execution pass from this session. Full workspace
+  checks, release selftest and reference/field replays remain unperformed. No weather-test
+  or field-accuracy claim is made.
 
 ### Preserve nearby location matches behind an eligible clock alias
 
