@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover fine-grid locations across changes in terrain
+
+- When a joined centre has no objective inside the existing relaxed geometry envelope,
+  inspect the fine grid's already-defined nodes for a supported refinement seed. Keep
+  the lowest finite objective in traversal order and reuse the existing bounded polisher.
+- Preserve successful centre refinement, exact speed/range acceptance, shared-clock and
+  trace/coverage gates, region bounds and fine-seed budgets. This adds at most one scan
+  of the existing grid and one bounded polish; it can increase work on failed cells.
+- Add a mirrored two-aircraft hillside regression at relative and Unix-epoch clocks,
+  using the ordinary generous distance intervals. It checks coarse-seed eligibility,
+  failure of the fine centre and every exact node, neighbor support, recovered position,
+  clock and flight identities, plus unsupported-terrain, excluded-region and forbidden-clock
+  controls. Existing success-preservation tests remain in place.
+- Independent review of the exact GitHub candidate completed, and reversing only the
+  intended production/test additions reproduces its base file exactly. Native execution,
+  baseline-failure confirmation, workspace checks, release selftest and reference/field
+  replays remain incomplete after memory pressure, executor outages and shared-host
+  contention. No native-test, field-accuracy or performance claim is made.
+
 ### Recover missing surface winds from observed pressure levels
 
 - Keep unavailable surface winds missing until height interpolation can recover them

@@ -3319,8 +3319,28 @@ fn fine_candidate(
             }
             Some(total)
         };
-        if let Some(total) = score(0.0, 0.0) {
-            polish_grid_minimum((0.0, 0.0, total), half, p.fine_step_m, score);
+        let seed = if let Some(total) = score(0.0, 0.0) {
+            Some((0.0, 0.0, total))
+        } else {
+            // Fine terrain can reject the joined centre while a neighbouring node
+            // still supports a path into the exact range intersection. Reuse this
+            // grid, retaining only its best finite proposal in traversal order.
+            let mut seed: Option<(f64, f64, f64)> = None;
+            for &(_, _, e, n) in &grid {
+                if (e, n) == (0.0, 0.0) {
+                    continue;
+                }
+                if let Some(total) = score(e, n)
+                    && total.is_finite()
+                    && seed.is_none_or(|old| total < old.2)
+                {
+                    seed = Some((e, n, total));
+                }
+            }
+            seed
+        };
+        if let Some(seed) = seed {
+            polish_grid_minimum(seed, half, p.fine_step_m, score);
         }
     }
     let (o, pe) = best?;
@@ -8295,6 +8315,152 @@ mod tests {
                     && matched.flight == key
                     && matched.chi < 0.1
                     && matched.coverage == 1.0));
+            }
+        }
+    }
+
+    #[test]
+    fn fine_terrain_recovery_uses_a_supported_neighbor_when_the_center_is_rejected() {
+        struct Hillside {
+            enu: Enu,
+            sign: f64,
+        }
+        impl Elevation for Hillside {
+            fn elev_m(&self, lat: f64, lon: f64) -> f64 {
+                let p = self.enu.from_geodetic(lat, lon, 0.0);
+                let slope = self.sign * (p[0] + p[1]);
+                slope + slope.min(0.0)
+            }
+            fn describe(&self) -> String {
+                "synthetic hillside".into()
+            }
+        }
+
+        let coarse = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        for (start, reflected) in [(0.0, false), (1_788_895_000.0, true)] {
+            let mut case = compact_fine_grid_case(start, reflected);
+            let sign = if reflected { -1.0 } else { 1.0 };
+            let fine = Hillside {
+                enu: Enu::new(case.obs.0, case.obs.1, 0.0),
+                sign,
+            };
+            let (mlat, mlon) = fdop_types::geo::m_per_deg(case.obs.0);
+            let (low, high) = if reflected {
+                (-110.0, 50.0)
+            } else {
+                (-50.0, 110.0)
+            };
+            case.p.region = BBox::new(
+                case.obs.0 + low / mlat,
+                case.obs.1 + low / mlon,
+                case.obs.0 + high / mlat,
+                case.obs.1 + high / mlon,
+            );
+            // Preserve the exported [d/1.25, d*1.25] generous range floor. The
+            // downhill corner is outside it but inside the 12% proposal envelope.
+            let frame = Frame::new(&case.p.region);
+            let (lat, lon, _) = fine.enu.to_geodetic([sign * 75.0, sign * 75.0, 0.0]);
+            let (e, n) = frame.en(lat, lon);
+            let seed = Joined {
+                ei: 0,
+                ej: 1,
+                ti: 0,
+                tj: 1,
+                te_i: start + 120.0,
+                te_j: start + 360.0,
+                e,
+                n,
+                t_s: start,
+            };
+            let assign = [(0, 0, seed.te_i), (1, 1, seed.te_j)];
+            let evaluate = |lat, lon, dem: &dyn Elevation, gates, quick| {
+                eval_point_weighted(
+                    &observer(lat, lon, dem),
+                    &assign,
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &atmo,
+                    case.p.region.contains(lat, lon),
+                    gates,
+                    quick,
+                    None,
+                    true,
+                )
+            };
+            let quick = evaluate(lat, lon, &coarse, PointGates::All, true)
+                .expect("the original coarse seed must pass the quick check");
+            assert!(quick.chis.iter().all(|fit| fit.chi <= case.p.quick_chi));
+            assert!(evaluate(lat, lon, &fine, PointGates::QuickGeometry, false).is_none());
+            let truth = evaluate(case.obs.0, case.obs.1, &fine, PointGates::All, false)
+                .expect("the observed pair must fit the actual hillside observer");
+            assert!(truth.chis.iter().all(|fit| fit.chi < 0.1 && fit.cov == 1.0));
+            let mut relaxed_nodes = 0;
+            for (lat, lon, _, _) in local_grid(lat, lon, case.p.fine_half_m, case.p.fine_step_m) {
+                assert!(evaluate(lat, lon, &fine, PointGates::All, false).is_none());
+                relaxed_nodes +=
+                    evaluate(lat, lon, &fine, PointGates::QuickGeometry, false).is_some() as usize;
+            }
+            assert!(
+                relaxed_nodes > 0,
+                "a neighboring node must supply a recovery seed"
+            );
+            let inp = SearchInputs {
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                heard_times: vec![],
+                coarse_dem: &coarse,
+                fine_dem: &fine,
+                atmo: &atmo,
+            };
+            let answer = fine_candidate(&seed, &frame, &case.events, &inp, &case.p, &[]).expect(
+                "a rejected fine-terrain center must not hide a supported neighboring pair",
+            );
+            let error = haversine_m(case.obs.0, case.obs.1, answer.lat, answer.lon);
+            assert!(
+                error < 2.0,
+                "start={start}, reflected={reflected}, error={error} m"
+            );
+            assert!((answer.t_start_utc - start).abs() < 0.05);
+            for key in ["A", "B"] {
+                assert!(answer.events.iter().any(|matched| matched.event == key
+                    && matched.flight == key
+                    && matched.chi < 0.1
+                    && matched.coverage == 1.0));
+            }
+            // Every relaxed node can be unavailable, or the real subcell can be
+            // excluded by the requested region/clock. None permits a new answer.
+            let unavailable = FlatElevation(1000.0);
+            for condition in ["terrain", "region", "clock"] {
+                let mut restricted = case.p.clone();
+                if condition == "region" {
+                    restricted.region = BBox::new(
+                        lat - 5.0 / mlat,
+                        lon - 5.0 / mlon,
+                        lat + 5.0 / mlat,
+                        lon + 5.0 / mlon,
+                    );
+                } else if condition == "clock" {
+                    restricted.start_lo = start + 30.0;
+                    restricted.start_hi = start + 30.0;
+                }
+                let inp = SearchInputs {
+                    events: case.events.clone(),
+                    tracks: &case.tracks,
+                    heard_times: vec![],
+                    coarse_dem: &coarse,
+                    fine_dem: if condition == "terrain" {
+                        &unavailable
+                    } else {
+                        &fine
+                    },
+                    atmo: &atmo,
+                };
+                assert!(
+                    fine_candidate(&seed, &frame, &case.events, &inp, &restricted, &[]).is_none(),
+                    "the {condition} restriction must remain enforced, reflected={reflected}"
+                );
             }
         }
     }

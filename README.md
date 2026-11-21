@@ -2013,6 +2013,15 @@ shared-clock, coverage, trace, region and grid-extent checks remain in force. Or
 successes and the earlier trace-fit recovery retain their behavior. This adds at most one
 bounded polish per failed grid, under the same fine-seed budget.
 
+If the fine terrain also rejects the joined centre's relaxed geometry, the same recovery
+checks the grid's existing nodes for a usable starting point. It chooses the lowest-loss
+supported node, with the original traversal order breaking ties, and runs the same bounded
+polisher. A coarse sea-level seed therefore need not discard a valid nearby hillside observer
+when its centre's fine elevation is unsuitable. Successful centre recovery is unchanged;
+accepted points still need the exact distance, speed, clock, coverage and trace gates.
+The fallback adds at most one scan of the existing grid and one bounded polish, with no
+additional search area or fine-seed allowance.
+
 **Pair-join component measurement, 2026-11-07.** The
 `dense_pair_join_with_one_million_raw_matches` workload has 1,024 hypotheses on each side,
 1,048,576 compatible raw pairs and one retained seed. Exact original and updated join source
