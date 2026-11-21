@@ -1038,7 +1038,7 @@ Fetches with MLAT disabled also skip its release lookup. With MLAT enabled, an o
 MLAT lookup failure keeps the successfully discovered main feed and records the error in
 progress and final notes, so a usable main cache or archive can still supply the day.
 A failed main-feed lookup can also reuse a readable, covering processed main-feed catalogue,
-or rebuild one from completed raw feeds and cached release metadata. A main-only processed
+or rebuild one from completed raw feeds and release metadata retained in sidecars or checkpoints. A main-only processed
 fallback can be upgraded when verified local checkpoints contain that same main feed plus MLAT.
 The report retains its existing missing-feed warnings and adds that newer or additional feeds
 could not be checked. Feed preference, aircraft policy, certified jet coverage and midnight
@@ -1056,6 +1056,14 @@ Main-only discoveries use `releases-main.json`. They never replace `releases.jso
 certify that MLAT is absent. A later online request for both feeds retries MLAT unless an
 existing full listing is reusable under the established publication rules. Offline reconstruction
 can combine main-only metadata with an existing MLAT-only listing without rewriting either.
+
+Offline searches and release-lookup outage recovery can also rebuild when release sidecars
+are missing, damaged, for another day, or omit a feed. Completed raw checkpoints retain the
+release identity needed for local reconstruction. Valid listed feed/asset identities and
+main-feed selection keep priority; embedded identities never initiate archive downloads.
+The recent-day availability check recognizes these feeds, and the rebuild still verifies the
+full payload, coverage, time window, aircraft policy and midnight context before reconciling
+heights and publishing a store. Reports note recovered metadata; source cache files stay unchanged.
 
 Completed raw feed checkpoints live under `adsb/<YYYY-MM-DD>/raw/` as
 `<feed[+jets]>_<S>_<W>_<N>_<E>.fdopraw.gz`. They retain the filtered reports before

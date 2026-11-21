@@ -110,7 +110,7 @@ fn api_headers() -> Vec<(String, String)> {
 
 /// A release is either one tar or the consecutive split pieces of that same tar.
 /// A final missing piece is detected by the tar terminator when the stream is ingested.
-fn valid_archive_parts(tag: &str, parts: &[AssetPart]) -> bool {
+pub(crate) fn valid_archive_parts(tag: &str, parts: &[AssetPart]) -> bool {
     if parts.is_empty()
         || parts.len() > 26 * 26
         || parts.iter().any(|p| p.size == 0 || p.url.is_empty())

@@ -493,10 +493,13 @@ pub fn published_until(
             let raw_cached = if cached {
                 false
             } else {
-                let rels = find_day_releases_for_fetch_cached(
+                let mut rels = find_day_releases_for_fetch_cached(
                     None, day.0, day.1, day.2, &dir, true, false,
                 )?
                 .releases;
+                let recovered =
+                    crate::raw_cache::recovery_releases(&dir, &rels, day_context(day), false);
+                rels.extend(recovered);
                 std::fs::read_dir(dir.join("raw")).is_ok_and(|rd| {
                     rd.flatten().any(|entry| {
                         entry.path().is_file()
@@ -912,6 +915,13 @@ fn fetch_window_with_sources(
                 }
                 Err(error) => return Err(discovery_error.unwrap_or(error)),
             };
+            let recovered_releases = crate::raw_cache::recovery_releases(
+                &dir,
+                &rels,
+                day_context(day),
+                opts.include_mlat,
+            );
+            rels.extend(recovered_releases.iter().cloned());
             let require_mlat = if context_recovery {
                 rels.retain(|rel| rel.feed == Feed::Mlatonly || Some(rel.feed) == selected_main);
                 partial
@@ -947,6 +957,14 @@ fn fetch_window_with_sources(
             if let Some((main, mlat, store)) = rebuilt {
                 let fs = feedset_name(main, mlat);
                 notes.extend(feedset_gaps(&label, &fs, opts.include_mlat));
+                if recovered_releases
+                    .iter()
+                    .any(|r| store.meta.sources.contains(&r.tag))
+                {
+                    notes.push(format!(
+                        "{label}: release metadata recovered from completed raw checkpoints; newer or additional releases could not be checked"
+                    ));
+                }
                 let path = dir.join(format!(
                     "{}_{key}.fdtrk",
                     cache_feedset(&fs, spec.include_jets)
@@ -2435,6 +2453,156 @@ mod tests {
     }
 
     #[test]
+    fn completed_raw_feeds_recover_missing_release_metadata_without_archive_io() {
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                for listing in [
+                    "absent",
+                    "empty",
+                    "corrupt",
+                    "invalid assets",
+                    "wrong day",
+                    "mlat only",
+                    "main only",
+                ] {
+                    for offline in [false, true] {
+                        let f = offline_raw_fixture(main, include_jets);
+                        f.checkpoint(0);
+                        f.checkpoint(1);
+                        let listing_path = f.dir.join("releases.json");
+                        match listing {
+                            "absent" => {
+                                std::fs::rename(&listing_path, f.dir.join("release-backup.json"))
+                                    .unwrap();
+                            }
+                            "empty" => std::fs::write(&listing_path, b"[]").unwrap(),
+                            "corrupt" => {
+                                std::fs::write(&listing_path, b"interrupted JSON").unwrap();
+                            }
+                            "invalid assets" | "wrong day" => {
+                                let mut listed = f.releases.clone();
+                                if listing == "invalid assets" {
+                                    listed[0].parts[0].size = 0;
+                                } else {
+                                    for release in &mut listed {
+                                        release.tag =
+                                            crate::adsblol::tag_for(2026, 9, 9, release.feed, 0);
+                                        release.parts[0].name = format!("{}.tar", release.tag);
+                                        release.parts[0].url =
+                                            format!("https://example.invalid/{}.tar", release.tag);
+                                    }
+                                }
+                                std::fs::write(
+                                    &listing_path,
+                                    serde_json::to_vec(&listed).unwrap(),
+                                )
+                                .unwrap();
+                            }
+                            "mlat only" => std::fs::write(
+                                &listing_path,
+                                serde_json::to_vec(&f.releases[1..]).unwrap(),
+                            )
+                            .unwrap(),
+                            "main only" => std::fs::write(
+                                &listing_path,
+                                serde_json::to_vec(&f.releases[..1]).unwrap(),
+                            )
+                            .unwrap(),
+                            _ => unreachable!(),
+                        }
+                        let listing_before = std::fs::read(&listing_path).ok();
+                        let raw_paths = f
+                            .releases
+                            .each_ref()
+                            .map(|r| crate::raw_cache::path(&f.dir, r, &f.spec));
+                        let raw_before = raw_paths.each_ref().map(|p| std::fs::read(p).unwrap());
+                        let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
+                        tags.sort();
+                        let fresh = build_day_store(
+                            f.parts.to_vec(),
+                            &f.spec,
+                            tags,
+                            day_context((2026, 9, 8)),
+                        );
+                        let expected = merge_stores(vec![fresh], DAY_JOIN_GAP_S).filtered(
+                            &f.want.bbox,
+                            f.want.t_start,
+                            f.want.t_end,
+                        );
+                        // The CLI's availability preflight must not clip a recent day
+                        // before fetch gets a chance to rebuild its completed raw feeds.
+                        assert_eq!(
+                            published_until(
+                                f.want.t_start,
+                                f.want.t_end,
+                                &f.cache,
+                                true,
+                                crate::ingest::tests::T0 + 90_000.0,
+                            )
+                            .unwrap(),
+                            (f.want.t_end, Vec::new()),
+                            "{main:?}/{include_jets}/{listing}/{offline}"
+                        );
+                        let opts = FetchOptions {
+                            offline,
+                            ..Default::default()
+                        };
+                        let got = fetch_window_with_sources(
+                            &f.want,
+                            &f.cache,
+                            &opts,
+                            |net, y, m, d, dir, local, include_mlat| {
+                                if local {
+                                    assert!(net.is_none());
+                                    find_day_releases_for_fetch_cached(
+                                        None,
+                                        y,
+                                        m,
+                                        d,
+                                        dir,
+                                        true,
+                                        include_mlat,
+                                    )
+                                } else {
+                                    Err(DataError("synthetic release lookup outage".into()))
+                                }
+                            },
+                            |_, _, _, _| panic!("completed raw recovery must not open an archive"),
+                        )
+                        .unwrap();
+                        assert!(!got.legs.is_empty());
+                        assert_same_legs(&got.legs, &expected.legs);
+                        assert_eq!(got.meta.sources, expected.meta.sources);
+                        assert_eq!(got.meta.stats["cache_hits"], 0);
+                        assert!(
+                            got.meta.stats["notes"].as_array().unwrap().iter().any(|note| {
+                                note.as_str().unwrap().contains("release metadata recovered")
+                            })
+                        );
+                        assert_eq!(std::fs::read(&listing_path).ok(), listing_before);
+                        for (path, before) in raw_paths.iter().zip(raw_before) {
+                            assert_eq!(std::fs::read(path).unwrap(), before);
+                        }
+                        let reused = fetch_window_with_sources(
+                            &f.want,
+                            &f.cache,
+                            &FetchOptions {
+                                offline: true,
+                                ..opts
+                            },
+                            |_, _, _, _, _, _, _| panic!("complete processed cache keeps priority"),
+                            |_, _, _, _| panic!("processed cache must not open an archive"),
+                        )
+                        .unwrap();
+                        assert_eq!(reused.meta.stats["cache_hits"], 1);
+                        assert_same_legs(&reused.legs, &got.legs);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn completed_raw_pair_upgrades_a_processed_main_only_fallback() {
         use crate::raw_cache::tests::rebuild_fixture;
 
@@ -2535,7 +2703,7 @@ mod tests {
     }
 
     #[test]
-    fn unusable_raw_upgrades_keep_the_selected_processed_cache() {
+    fn raw_upgrades_keep_selected_feeds_and_recover_missing_metadata() {
         use crate::raw_cache::tests::rebuild_fixture;
 
         for problem in [
@@ -2565,6 +2733,8 @@ mod tests {
                     let mut staging = f.releases[0].clone();
                     staging.feed = Feed::Staging;
                     staging.tag = crate::adsblol::tag_for(2026, 9, 8, Feed::Staging, 0);
+                    staging.parts[0].name = format!("{}.tar", staging.tag);
+                    staging.parts[0].url = format!("https://example.invalid/{}.tar", staging.tag);
                     let mut part = f.parts[0].clone();
                     for aircraft in &mut part.0 {
                         aircraft.feed = "staging".into();
@@ -2594,15 +2764,24 @@ mod tests {
                 |_, _, _, _| panic!("a usable offline cache cannot require an archive"),
             )
             .unwrap();
-            let old = TrackStore::load(&f.partial_path).unwrap();
-            let expected = merge_stores(vec![old], DAY_JOIN_GAP_S).filtered(
+            let recovered = problem == "metadata";
+            let source = if recovered {
+                f.complete()
+            } else {
+                TrackStore::load(&f.partial_path).unwrap()
+            };
+            let expected = merge_stores(vec![source], DAY_JOIN_GAP_S).filtered(
                 &f.want.bbox,
                 f.want.t_start,
                 f.want.t_end,
             );
-            assert_eq!(got.meta.stats["cache_hits"], 1, "{problem}");
+            assert_eq!(
+                got.meta.stats["cache_hits"],
+                if recovered { 0 } else { 1 },
+                "{problem}"
+            );
             assert_same_legs(&got.legs, &expected.legs);
-            assert_eq!(got.legs.len(), 1);
+            assert_eq!(got.legs.len(), if recovered { 2 } else { 1 });
             assert_eq!(std::fs::read(&f.partial_path).unwrap(), before);
         }
     }
@@ -3623,8 +3802,6 @@ mod tests {
             "wrong_feed",
             "wrong_repo",
             "corrupt",
-            "missing_listing",
-            "invalid_listing",
         ] {
             let mut f = offline_raw_fixture(Feed::Prod, false);
             let mut saved_release = f.releases[0].clone();
@@ -3664,15 +3841,6 @@ mod tests {
                 std::fs::write(
                     f.dir.join("releases.json"),
                     serde_json::to_vec(&[saved_release]).unwrap(),
-                )
-                .unwrap();
-            } else if case == "missing_listing" {
-                std::fs::write(f.dir.join("releases.json"), b"[]").unwrap();
-            } else if case == "invalid_listing" {
-                f.releases[0].parts[0].size = 0;
-                std::fs::write(
-                    f.dir.join("releases.json"),
-                    serde_json::to_vec(&f.releases).unwrap(),
                 )
                 .unwrap();
             } else if case == "corrupt" {
@@ -3817,10 +3985,17 @@ mod tests {
                     std::fs::write(final_path.with_extension("tmp-123-0"), b"unfinished").unwrap();
                 }
                 "wrong_day" => {
-                    f.checkpoint(0);
                     let mut wrong = f.releases[0].clone();
                     wrong.tag = crate::adsblol::tag_for(2026, 9, 9, Feed::Prod, 0);
                     wrong.parts[0].name = format!("{}.tar", wrong.tag);
+                    crate::raw_cache::save(
+                        &f.dir,
+                        &wrong,
+                        &f.spec,
+                        day_context((2026, 9, 8)),
+                        &f.parts[0],
+                    )
+                    .unwrap();
                     std::fs::write(
                         f.dir.join("releases.json"),
                         serde_json::to_vec(&[wrong]).unwrap(),

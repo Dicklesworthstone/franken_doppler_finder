@@ -69,6 +69,97 @@ struct Checkpoint {
     stats: IngestStats,
 }
 
+/// Recover missing release identities locally, never as a source for network downloads.
+/// A valid sidecar keeps authority over its listed feed and its main-feed selection.
+/// Reading only the identity avoids allocating the aircraft twice, while deserializing
+/// the whole document still checks JSON and the completed gzip before using metadata.
+pub(crate) fn recovery_releases(
+    dir: &Path,
+    listed: &[DayRelease],
+    context: DayContext,
+    include_mlat: bool,
+) -> Vec<DayRelease> {
+    #[derive(Deserialize)]
+    struct Header {
+        identity: Identity,
+        #[serde(rename = "aircraft")]
+        _aircraft: Vec<serde::de::IgnoredAny>,
+        #[serde(rename = "stats")]
+        _stats: IngestStats,
+    }
+
+    let day = fdop_types::time::civil_from_days((context.day_start / 86_400.0).floor() as i64);
+    let valid = |r: &DayRelease| {
+        crate::fetch::release_for_day(r, day)
+            && crate::adsblol::valid_archive_parts(&r.tag, &r.parts)
+    };
+    let main_listed = listed.iter().any(|r| r.feed != Feed::Mlatonly && valid(r));
+    if main_listed
+        && (!include_mlat || listed.iter().any(|r| r.feed == Feed::Mlatonly && valid(r)))
+    {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir.join("raw")) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((label, bbox)) = name
+            .strip_suffix(".fdopraw.gz")
+            .and_then(|stem| crate::fetch::parse_cache_name(&format!("{stem}.fdtrk")))
+        else {
+            continue;
+        };
+        let (label, jets) = label
+            .strip_suffix("+jets")
+            .map_or((label.as_str(), false), |s| (s, true));
+        let Some(feed) = Feed::from_label(label) else {
+            continue;
+        };
+        if feed.tag_word() != label
+            || !covers_bbox(bbox, bbox)
+            || (feed == Feed::Mlatonly && !include_mlat)
+            || (feed != Feed::Mlatonly && main_listed)
+            || listed.iter().any(|r| r.feed == feed && valid(r))
+        {
+            continue;
+        }
+        candidates.push((jets, bbox.area_km2(), entry.path(), feed));
+    }
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.total_cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let mut recovered = Vec::new();
+    for (jets, _, path, feed) in candidates {
+        let Ok(file) = File::open(path) else { continue };
+        let Ok(header) =
+            serde_json::from_reader::<_, Header>(BufReader::new(MultiGzDecoder::new(file)))
+        else {
+            continue;
+        };
+        let id = header.identity;
+        if id.version == VERSION
+            && id.release.feed == feed
+            && id.include_jets == jets
+            && id.keep_unknown
+            && id.context_bits == context.cache_identity()
+            && valid(&id.release)
+            && !recovered.contains(&id.release)
+        {
+            // Actual aircraft decoding, coverage/policy checks and geoid conversion
+            // remain mandatory in load before this identity can build a day store.
+            recovered.push(id.release);
+        }
+    }
+    recovered
+}
+
 /// The filename narrows the lookup; the embedded identity is authoritative.
 pub(crate) fn path(dir: &Path, rel: &DayRelease, spec: &IngestSpec) -> PathBuf {
     let (_, bbox) = crate::fetch::bbox_key(&spec.bbox);
@@ -900,6 +991,152 @@ pub(crate) mod tests {
         let restored = load(&dir, &rel, &spec, context).unwrap().unwrap();
         assert!(restored.0.is_empty());
         assert_eq!(restored.1, empty.1);
+    }
+
+    #[test]
+    fn recovered_release_metadata_never_replaces_listed_assets_or_main_feed() {
+        let f = rebuild_fixture(Feed::Prod, false);
+        f.checkpoint(0);
+        f.checkpoint(1);
+        assert!(recovery_releases(&f.dir, &f.releases, f.context, true).is_empty());
+        assert_eq!(
+            recovery_releases(&f.dir, &[], f.context, false),
+            vec![f.releases[0].clone()]
+        );
+        for other_main in [false, true] {
+            let mut listed_main = f.releases[0].clone();
+            if other_main {
+                listed_main.feed = Feed::Staging;
+                listed_main.tag = crate::adsblol::tag_for(2026, 9, 8, Feed::Staging, 0);
+                listed_main.parts[0].name = format!("{}.tar", listed_main.tag);
+                listed_main.parts[0].url =
+                    format!("https://example.invalid/{}.tar", listed_main.tag);
+            } else {
+                listed_main.parts[0].size += 1;
+            }
+            let mut releases = vec![listed_main];
+            let recovered = recovery_releases(&f.dir, &releases, f.context, true);
+            assert_eq!(recovered, vec![f.releases[1].clone()]);
+            releases.extend(recovered);
+            assert!(
+                rebuild_day(
+                    &f.dir,
+                    &releases,
+                    &f.spec,
+                    f.context,
+                    true,
+                    None,
+                    |_, error| panic!("valid checkpoint with a different identity: {error}"),
+                )
+                .is_none(),
+                "embedded metadata must not override a listed main identity"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_release_metadata_requires_a_completed_certified_checkpoint() {
+        for problem in [
+            "none",
+            "version",
+            "context",
+            "unknown policy",
+            "jet label",
+            "feed",
+            "day",
+            "repository",
+            "no assets",
+            "empty asset",
+            "mixed assets",
+            "missing aircraft",
+            "missing stats",
+            "aircraft shape",
+            "stats shape",
+            "truncated",
+            "trailing",
+            "temporary",
+            "directory",
+        ] {
+            let f = rebuild_fixture(Feed::Prod, false);
+            let mut identity = Identity::new(&f.releases[0], &f.spec, f.context);
+            match problem {
+                "version" => identity.version += 1,
+                "context" => identity.context_bits[0] += 1,
+                "unknown policy" => identity.keep_unknown = false,
+                "jet label" => identity.include_jets = true,
+                "feed" => identity.release.feed = Feed::Staging,
+                "day" => {
+                    identity.release.tag = crate::adsblol::tag_for(2026, 9, 9, Feed::Prod, 0);
+                    identity.release.parts[0].name = format!("{}.tar", identity.release.tag);
+                }
+                "repository" => identity.release.repo.push_str("-other"),
+                "no assets" => identity.release.parts.clear(),
+                "empty asset" => identity.release.parts[0].size = 0,
+                "mixed assets" => {
+                    let mut split = identity.release.parts[0].clone();
+                    split.name.push_str(".aa");
+                    identity.release.parts.push(split);
+                }
+                _ => {}
+            }
+            let mut payload = serde_json::to_value(CheckpointRef {
+                identity: &identity,
+                aircraft: &f.parts[0].0,
+                stats: &f.parts[0].1,
+            })
+            .unwrap();
+            match problem {
+                "missing aircraft" => {
+                    payload.as_object_mut().unwrap().remove("aircraft");
+                }
+                "missing stats" => {
+                    payload.as_object_mut().unwrap().remove("stats");
+                }
+                "aircraft shape" => payload["aircraft"] = serde_json::json!({}),
+                "stats shape" => payload["stats"] = serde_json::json!([]),
+                _ => {}
+            }
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            serde_json::to_writer(&mut encoder, &payload).unwrap();
+            let mut bytes = encoder.finish().unwrap();
+            if problem == "truncated" {
+                bytes.pop();
+            }
+            if problem == "trailing" {
+                bytes.extend_from_slice(b"unfinished next gzip");
+            }
+            let final_path = path(&f.dir, &f.releases[0], &f.spec);
+            std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+            if problem == "directory" {
+                std::fs::create_dir_all(&final_path).unwrap();
+            } else {
+                let path = if problem == "temporary" {
+                    final_path.with_extension("tmp-123-0")
+                } else {
+                    final_path
+                };
+                std::fs::write(path, bytes).unwrap();
+            }
+            let recovered = recovery_releases(&f.dir, &[], f.context, true);
+            if problem == "none" {
+                assert_eq!(recovered, vec![f.releases[0].clone()]);
+                let (main, mlat, rebuilt) = rebuild_day(
+                    &f.dir,
+                    &recovered,
+                    &f.spec,
+                    f.context,
+                    true,
+                    None,
+                    |_, error| panic!("valid checkpoint: {error}"),
+                )
+                .unwrap();
+                assert_eq!(main, Feed::Prod);
+                assert!(!mlat);
+                assert!(!rebuilt.legs.is_empty());
+            } else {
+                assert!(recovered.is_empty(), "{problem}");
+            }
+        }
     }
 
     #[test]

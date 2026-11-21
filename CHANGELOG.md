@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover completed flight downloads without release sidecars
+
+- Reconstruct missing release identities from completed raw checkpoints during
+  offline searches and release-lookup outages, including the recent-day availability
+  check that runs before fetch. Recovered identities never initiate network downloads.
+- Preserve valid listed assets and selected main feeds, processed-cache priority,
+  complete payload/coverage/policy/context checks, and the normal altitude/type
+  reconciliation. Warn when reconstructed metadata contributes to the result; retain
+  all source files unchanged and keep failed publication fatal.
+- Add a 56-case integration matrix across prod/staging, aircraft policy, absent or
+  incomplete metadata and offline/outage recovery, plus listed-authority and
+  malformed/incomplete-checkpoint controls. Expected results come from the ordinary
+  fresh builder, with subsequent processed-cache reuse checked separately.
+- Independently source-reviewed. Native compilation, test execution, Clippy, release
+  selftest and reference/field replays remain incomplete after the execution
+  environment disconnected. No native test pass or live-download claim is made.
+
 ### Recover recording clocks from the selected audio track
 
 - When the container's `creation_time` is unusable, try the selected audio track's
