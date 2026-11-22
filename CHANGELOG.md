@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain measured calm winds in radiosonde profiles
+
+- Reuse the existing observed-wind parser for IEM radiosondes: measured zero-speed
+  calm survives an absent direction, while nonzero vectors still require valid
+  direction and nonnegative finite speed. Preserve the existing level/height checks
+  and rejection of profiles with no observed winds aloft.
+- Restore usable all-calm soundings and calm layers that otherwise became interpolated
+  wind. Add a public offline cached-weather regression with two sounding times and
+  analytic path means, plus missing/malformed, surface-only and wind-only controls.
+- Independent source review and exact change-scope checks completed. Native formatting,
+  compilation, Clippy, Rust tests, release selftest and reference/field replays remain
+  unrun after the execution environment became unavailable. No native pass or
+  field-accuracy improvement is claimed.
+
 ### Recover fine-grid locations across changes in terrain
 
 - When a joined centre has no objective inside the existing relaxed geometry envelope,

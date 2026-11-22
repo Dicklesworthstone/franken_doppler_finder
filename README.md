@@ -1384,6 +1384,10 @@ preferred blend is never mixed with these farther recovery stations. This also w
 when the alternative profiles are cached. The atmosphere description names the stations actually
 used, counts failed attempts, and identifies recovery from an unavailable preferred station.
 Missing temporal brackets retain the existing radiosonde interpolation policy.
+A measured zero-speed radiosonde wind remains calm even without a direction tag, including
+wind-only levels between temperature observations. Nonzero winds need a finite direction
+from 0 through 360 degrees; missing or malformed vectors remain missing and can only be
+filled from usable observations. A sounding with no observed winds aloft is still refused.
 
 | Data | Source | Notes |
 |---|---|---|
@@ -2113,6 +2117,17 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Retain measured calm layers in radiosonde weather
+
+The offline cached-weather regression `cached_radiosondes_keep_measured_calm_without_a_direction`
+covers two sounding times, all-calm profiles, calm layers surrounded by wind, and unchanged
+ordinary winds through the public atmosphere fetch path. Its temperature and path-mean wind
+expectations are analytic. The companion parser regression keeps missing/malformed wind
+vectors and surface-only observations ineligible, and retains a wind-only calm level with
+interpolated temperature. Independent source review completed; the execution environment
+became unavailable before native validation. These new tests have not compiled or run.
+No workspace, release-selftest, live-weather or field-accuracy result is claimed.
 
 ### Retain alternative clocks around an eligible coarse location
 

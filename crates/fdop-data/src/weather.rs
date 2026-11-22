@@ -205,7 +205,7 @@ fn arr(h: &serde_json::Value, key: &str, i: usize) -> f64 {
         .unwrap_or(f64::NAN)
 }
 
-/// Pressure-profile winds must be observed, including genuine calm. Direction is
+/// Profile winds must be observed, including genuine calm. Direction is
 /// undefined at zero speed; an unavailable positive-speed vector is not calm air.
 fn pressure_wind(speed: f64, direction: f64) -> Option<(f64, f64)> {
     if !speed.is_finite() || speed < 0.0 {
@@ -678,8 +678,9 @@ fn parse_raob(profile: &serde_json::Value) -> Vec<Level> {
     for r in profile.as_array().into_iter().flatten() {
         let g = |k: &str| r.get(k).and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
         let (z, t, td, dd, ff) = (g("hght"), g("tmpc"), g("dwpc"), g("drct"), g("sknt"));
-        if z.is_finite() && dd.is_finite() && ff.is_finite() {
-            let (we, wn) = wind_en(ff * KT, dd);
+        if z.is_finite()
+            && let Some((we, wn)) = pressure_wind(ff * KT, dd)
+        {
             winds.push((z, we, wn));
         }
         if z.is_finite() && t.is_finite() && z < 16_000.0 {
@@ -2697,6 +2698,129 @@ mod tests {
             lv.iter().all(|l| (l.wind_e - 20.0 * KT).abs() < 0.01),
             "{lv:?}"
         );
+    }
+
+    #[test]
+    fn cached_radiosondes_keep_measured_calm_without_a_direction() {
+        use fdop_types::atmo::sound_speed;
+        let (lat, lon) = (40.876466, -73.524951);
+        let day = fdop_types::time::unix_from_utc(2024, 9, 8, 0, 0, 0.0);
+        let bbox = BBox::new(lat, lon, lat, lon);
+        let (dir, index) = weather_test_cache(IEM_RAOB_NETWORK, "calm-raob");
+        std::fs::write(
+            index,
+            serde_json::json!({"features": [{
+                "id": "KAAA", "properties": {"country": "US"},
+                "geometry": {"coordinates": [lon, lat]},
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        for (label, fractions, expected_fraction) in [
+            ("calm", [0.0; 6], 0.0),
+            ("calm layer", [1.0, 1.0, 0.0, 0.0, 1.0, 1.0], 0.6),
+            ("ordinary wind", [1.0; 6], 1.0),
+        ] {
+            for (hour, speed) in [("00", 20.0), ("12", 40.0)] {
+                let profile: Vec<_> = fractions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &fraction)| {
+                        serde_json::json!({
+                            "hght": 1200.0 * i as f64,
+                            "tmpc": 10.0, "dwpc": 10.0,
+                            "sknt": speed * fraction,
+                            "drct": (fraction > 0.0).then_some(270.0),
+                        })
+                    })
+                    .collect();
+                let url = format!("{IEM_RAOB}?ts=20240908{hour}00&station=AAA");
+                let path = dir.join("weather").join(format!("{:016x}.json", fnv(&url)));
+                std::fs::write(
+                    path,
+                    serde_json::json!({"profiles": [{"profile": profile}]}).to_string(),
+                )
+                .unwrap();
+            }
+            let weather = fetch_atmosphere(&bbox, day + 3600.0, day + 39_600.0, &dir, true);
+            let source = weather.atmo.describe();
+            assert!(
+                weather.winds_aloft,
+                "{label}: {source}; {:?}",
+                weather.warnings
+            );
+            assert!(source.contains("KAAA") && source.contains("2 of 2 soundings usable"));
+            assert!(
+                !weather
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("standard atmosphere"))
+            );
+            // Equal-height trapezoids give 0, 3/5 or 1 of the observed wind;
+            // the halfway clock gives 30 knots before this height average.
+            for t in [day, day + 21_600.0, day + 43_200.0] {
+                let speed = 20.0 + 20.0 * (t - day) / 43_200.0;
+                let medium = weather.atmo.medium(lat, lon, t, 0.0, 6000.0);
+                assert!(
+                    (medium.c - sound_speed(10.0, 1.0)).abs() < 1e-8,
+                    "{label}: {medium:?}"
+                );
+                assert!(
+                    (medium.wind_e - expected_fraction * speed * KT).abs() < 1e-8,
+                    "{label}: {medium:?}"
+                );
+                assert!(medium.wind_n.abs() < 1e-8, "{label}: {medium:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn radiosonde_calm_does_not_turn_missing_or_malformed_vectors_into_wind() {
+        let profile = |speed: serde_json::Value, direction: serde_json::Value| {
+            serde_json::json!((0..6).map(|i| serde_json::json!({
+                "hght": 1200.0 * f64::from(i), "tmpc": 10.0, "dwpc": 10.0,
+                "sknt": speed, "drct": direction,
+            })).collect::<Vec<_>>())
+        };
+        // A direction tag is optional only for measured zero-speed calm.
+        for direction in [serde_json::json!(null), serde_json::json!(270.0)] {
+            let rows = profile(serde_json::json!(0.0), direction);
+            let parsed = parse_raob(&rows);
+            assert_eq!(parsed.len(), 6);
+            assert!(parsed.iter().all(|l| l.wind_e == 0.0 && l.wind_n == 0.0));
+        }
+        for (speed, direction) in [
+            (serde_json::json!(null), serde_json::json!(null)),
+            (serde_json::json!(20.0), serde_json::json!(null)),
+            (serde_json::json!(-1.0), serde_json::json!(270.0)),
+            (serde_json::json!(20.0), serde_json::json!(-1.0)),
+            (serde_json::json!(20.0), serde_json::json!(361.0)),
+            (serde_json::json!("bad"), serde_json::json!(270.0)),
+        ] {
+            let mut rows = profile(speed, direction);
+            assert!(parse_raob(&rows).is_empty(), "{rows}");
+            // Surface-only observations still cannot supply winds aloft.
+            rows[0]["sknt"] = serde_json::json!(20.0);
+            rows[0]["drct"] = serde_json::json!(270.0);
+            assert!(parse_raob(&rows).is_empty(), "{rows}");
+        }
+        // A wind-only calm level must remain an anchor between real temperature levels.
+        let mut rows = profile(serde_json::json!(20.0), serde_json::json!(270.0));
+        rows[2]["tmpc"] = serde_json::Value::Null;
+        rows[2]["sknt"] = serde_json::json!(0.0);
+        rows[2]["drct"] = serde_json::Value::Null;
+        let parsed = parse_raob(&rows);
+        assert_eq!(parsed.len(), 6);
+        assert_eq!((parsed[2].z_msl, parsed[2].t_c), (2400.0, 10.0));
+        assert_eq!((parsed[2].wind_e, parsed[2].wind_n), (0.0, 0.0));
+        for (i, level) in parsed.iter().enumerate().filter(|(i, _)| *i != 2) {
+            let expected = wind_en(20.0 * KT, 270.0);
+            assert_eq!(
+                (level.wind_e.to_bits(), level.wind_n.to_bits()),
+                (expected.0.to_bits(), expected.1.to_bits()),
+                "level {i}"
+            );
+        }
     }
 
     #[test]
