@@ -19,6 +19,27 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Require a common place and recording time before accepting curve corroboration
+
+- Score the trace answer's actual refined observer and recording start against the curve
+  matcher's existing bank and catalogue. Corroboration requires two independently heard
+  flyovers, a lead over the same best decoy, and the existing 3-nat evidence tie, alongside
+  the existing spatial agreement rule. Nearby best locations alone no longer confirm
+  incompatible recording clocks.
+- Keep physically supported position/time trades eligible without adding a raw clock-distance
+  cutoff. The report and predicted trace overlays use the same refined recording start as
+  the shared-point check, and unsupported common points get an explanation in the report.
+- Preserve the full-date retry after an unconfirmed metadata attempt, including when the two
+  searches found nearby places at incompatible clocks. Explicit starts remain binding, and
+  a curve match standing alone remains low confidence.
+- Add assessment controls for valid place/time trades, missing or mismatched checks, insufficient
+  heard passes, decoy ties, nonfinite evidence, refinement coherence and reopening the full dates.
+- Eight native assessment checks passed using the exact pipeline helpers with the actual
+  `fdop-core` and `fdop-types` crates. Two actual-core checkpoint tests also passed, including
+  a supported 2400 m / 40 s place/clock trade and unchanged ordinary search output. Source
+  review, scoped pinned formatting and static checks completed. The full CLI and fetch/retry
+  orchestration were not executed; no reference or field replay pass is claimed.
+
 ### Check reflected flight locations and exact place/clock evidence
 
 - Include the opposite-side observer implied by each heard flight's plane of motion in the
@@ -33,9 +54,22 @@ at that commit, not per-change commits.
   nor modifies the search. The ordinary `run` API and serialized match-result shape remain intact.
 - Add synthetic mirror and crossing-flight controls, plus exact-checkpoint tests for valid
   place/clock trades, incompatible combinations, fractional starts and unchanged search results.
-- Source review, scoped pinned formatting and static checks are complete. Native execution is
-  pending while the pinned numerical dependencies compile; no full-workspace, release selftest,
-  reference replay or field-accuracy pass is claimed for this change.
+- Five focused checks passed in the actual Cargo-built core crate: the two checkpoint controls,
+  the 6 km mirror, exact shared-clock preservation, and the existing tied-radius control.
+  Replacing only the alias function with its original implementation makes the same physical
+  6 km fixture fail specifically because the reflection is missing, after both observers pass
+  the two-heard and tied-evidence prerequisites.
+- The crossing control passed with the complete production curve, spectrogram, physics and
+  track modules and real pinned dependencies. Its final fixture rotates a supported trajectory
+  about the microphone, preserving the generated audio and empirical null. Both reflected
+  proposals fall outside the unchanged 3-nat tie; the explicit reflection trails by 3.69 nats.
+  Initial crossing fixtures failed their audibility prerequisites. A weaker distant crossing
+  remains legitimately ambiguous, so crossing paths alone are not treated as proof of uniqueness.
+- Source review, scoped pinned formatting and static checks completed. Storage and compiler
+  memory limits prevented a final full test rebuild; only unrelated test registrations were
+  disabled in temporary copies for the last crossing check. Full-workspace tests, full CLI,
+  Clippy, release selftest and reference/field replays remain incomplete. No field-accuracy
+  improvement is claimed.
 
 ### Keep usable flight catalogues when an online archive upgrade fails
 

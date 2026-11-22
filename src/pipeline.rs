@@ -571,11 +571,11 @@ enum CurveCall {
     /// No verdict, or one that does not stand, on an answer `Unsupported` does not cover: the trace
     /// search's answer is untouched.
     Silent,
-    /// Trace answer asserted, curve match stands at the same place.
+    /// Trace answer asserted, curve match supports its place and recording clock.
     Agrees,
-    /// Trace answer asserted, curve match stands somewhere else: nobody gets to assert.
+    /// Trace answer asserted, curve match stands elsewhere or at an incompatible clock.
     Conflicts,
-    /// Trace answer low, curve match stands at the same place: asserted at medium, trace position.
+    /// Trace answer low, curve match supports its place and clock: medium, trace position.
     Confirms,
     /// Trace answer low or absent, curve match stands elsewhere: its position, at low. Its decoys
     /// are other clocks, and they test the clock, not the place: on the right date the real window
@@ -601,6 +601,7 @@ fn curve_call(
     trace_at: Option<(f64, f64)>,
     verdict: Option<&curvematch::CurveVerdict>,
     judged: bool,
+    supports_trace: bool,
 ) -> CurveCall {
     let Some(v) = verdict.filter(|v| v.stands) else {
         return if judged && trace_confidence == "medium" {
@@ -611,16 +612,77 @@ fn curve_call(
     };
     let apart = trace_at.map(|(la, lo)| fdop_types::geo::haversine_m(la, lo, v.lat, v.lon));
     if matches!(trace_confidence, "high" | "medium") {
-        if apart.is_some_and(|d| d <= CURVE_CONFLICT_M) {
+        if supports_trace && apart.is_some_and(|d| d <= CURVE_CONFLICT_M) {
             CurveCall::Agrees
         } else {
             CurveCall::Conflicts
         }
-    } else if apart.is_some_and(|d| d <= v.radius_m) {
+    } else if supports_trace && apart.is_some_and(|d| d <= v.radius_m) {
         CurveCall::Confirms
     } else {
         CurveCall::Adopts
     }
+}
+
+/// The trace report's observer and admitted joint clock, kept at the same stage of refinement.
+fn trace_answer_at(res: &search::SearchResult) -> Option<(f64, f64, f64)> {
+    let top = res.candidates.first()?;
+    Some(
+        res.refine
+            .as_ref()
+            .map_or((top.lat, top.lon, top.t_start_utc), |r| {
+                (r.lat, r.lon, r.t_start_utc)
+            }),
+    )
+}
+
+/// Nearby observers can trade position for recording clock, so compare the actual curves at
+/// the trace answer instead of imposing an arbitrary difference between two best clocks.
+/// The checkpoint must hear two independent passes, beat the same decoys, and remain inside
+/// the curve search's existing evidence tie. It cannot borrow another point's score.
+fn curve_support_at(
+    (lat, lon, clock): (f64, f64, f64),
+    verdict: &curvematch::CurveVerdict,
+    checked: Option<&curvematch::MatchMode>,
+) -> (bool, String) {
+    if !lat.is_finite() || !lon.is_finite() || !clock.is_finite() {
+        return (
+            false,
+            "the trace answer has a nonfinite place or recording start, so no common point can be checked".into(),
+        );
+    }
+    let Some(at) = checked.filter(|m| m.lat == lat && m.lon == lon && m.clock_unix == clock) else {
+        return (
+            false,
+            format!(
+                "logged curves could not be scored at the trace answer's place and recording start {}; the standing curve's start is {}",
+                iso_utc(clock),
+                iso_utc(verdict.clock_unix),
+            ),
+        );
+    };
+    let lead = at.evidence - (verdict.evidence - verdict.margin);
+    let gap = verdict.evidence - at.evidence;
+    let supported = verdict.stands
+        && verdict.n_decoys >= curvematch::MIN_DECOYS
+        && at.n_heard >= 2
+        && at.evidence.is_finite()
+        && lead.is_finite()
+        && gap.is_finite()
+        && lead > curvematch::ASSERT_MARGIN_NATS
+        && gap <= curvematch::TIED_NATS;
+    (
+        supported,
+        format!(
+            "logged curves at the trace answer's exact place and recording start {}: {} independent flyovers (need 2), {:.2} nats, {lead:+.2} over the best decoy (must exceed {:+.1}), {gap:.2} below the best curve match (at most {:.1}); the standing curve's start is {}",
+            iso_utc(clock),
+            at.n_heard,
+            at.evidence,
+            curvematch::ASSERT_MARGIN_NATS,
+            curvematch::TIED_NATS,
+            iso_utc(verdict.clock_unix),
+        ),
+    )
 }
 
 /// Whether the measurement at rank `k`, of detection `d`, is one the old measurement line would not
@@ -672,6 +734,7 @@ struct AnswerAssessment {
     radius_basis: String,
     radius_unresolved: bool,
     evidence: Option<f64>,
+    curve_support: Option<(bool, String)>,
     decoy_gate: Option<(bool, String)>,
 }
 
@@ -680,6 +743,7 @@ impl AnswerAssessment {
         res: &search::SearchResult,
         events: &[search::SearchEvent],
         curve: Option<&curvematch::CurveVerdict>,
+        curve_check: Option<&curvematch::MatchMode>,
         judged: bool,
         added: &std::collections::HashSet<String>,
     ) -> Self {
@@ -696,6 +760,7 @@ impl AnswerAssessment {
             radius_basis: "no candidate".into(),
             radius_unresolved: true,
             evidence: None,
+            curve_support: None,
             decoy_gate: None,
         };
         let trace_at = res.candidates.first().map(|top| {
@@ -746,7 +811,17 @@ impl AnswerAssessment {
             };
             (answer.lat, answer.lon)
         });
-        answer.call = curve_call(answer.trace_confidence, trace_at, curve, judged);
+        answer.curve_support = curve
+            .filter(|v| v.stands)
+            .zip(trace_answer_at(res))
+            .map(|(v, at)| curve_support_at(at, v, curve_check));
+        answer.call = curve_call(
+            answer.trace_confidence,
+            trace_at,
+            curve,
+            judged,
+            answer.curve_support.as_ref().is_some_and(|s| s.0),
+        );
         let core_ids: Vec<&str> = res
             .candidates
             .first()
@@ -837,6 +912,11 @@ fn curve_catalog_span(
     curvematch::catalog_span(p, clock.0, clock.1, duration, limits)
 }
 
+struct CurveRun {
+    result: curvematch::MatchResult,
+    trace_check: Option<curvematch::MatchMode>,
+}
+
 /// Fetch the flights of the decoy clocks too and run the curve match. Its own ADS-B fetch keeps the
 /// trace search's tracks exactly as they were. Returns None when this recording's clock or region
 /// is too wide for it, which says nothing about the recording.
@@ -855,8 +935,9 @@ fn run_curve_match(
     fine: &dyn fdop_types::Elevation,
     atmo: &dyn fdop_types::atmo::Atmosphere,
     log: &Arc<Log>,
+    trace_at: Option<(f64, f64, f64)>,
     warnings: &mut Vec<String>,
-) -> Result<Option<curvematch::MatchResult>, String> {
+) -> Result<Option<CurveRun>, String> {
     let (s_lo, s_hi) = clock;
     if let Some(why) = curve_match_skip_reason(p, bbox, clock) {
         log.say(&format!("curve match skipped: {why}"));
@@ -905,7 +986,12 @@ fn run_curve_match(
         atmo,
     };
     let lg = log.clone();
-    Ok(Some(curvematch::run(&inp, p, &move |s: &str| lg.say(s))))
+    let (result, trace_check) =
+        curvematch::run_with_check(&inp, p, &move |s: &str| lg.say(s), trace_at);
+    Ok(Some(CurveRun {
+        result,
+        trace_check,
+    }))
 }
 
 /// Both searches must see the same engine policy, including every decoy clock. Keeping
@@ -1827,6 +1913,7 @@ fn locate_with_clock(
     let (mut weather_fetch_s, mut weather_wait_s, mut search_s) = (0.0, 0.0, 0.0);
     let mut curve_match_s = curve_image_s;
     let mut curve = None;
+    let mut curve_check = None;
     let (tracks, atmo, has_wind, sevs, res, assessment) = loop {
         // ---- ADS-B for this attempt ------------------------------------------------------
         let spec = archive.track_spec(fetch_box, dur, geoid_n, a.include_jets);
@@ -1934,7 +2021,7 @@ fn locate_with_clock(
             let t = Instant::now();
             curve_clock = archive.clock;
             curve_from_metadata = meta_window;
-            curve = match run_curve_match(
+            let checked = match run_curve_match(
                 a,
                 &curve_params,
                 im,
@@ -1948,6 +2035,7 @@ fn locate_with_clock(
                 &fine,
                 &*atmo,
                 log,
+                trace_answer_at(&res),
                 &mut warnings,
             ) {
                 Ok(r) => r,
@@ -1956,6 +2044,7 @@ fn locate_with_clock(
                     None
                 }
             };
+            (curve, curve_check) = checked.map_or((None, None), |r| (Some(r.result), r.trace_check));
             curve_match_s += t.elapsed().as_secs_f64();
         }
         if !meta_window {
@@ -1971,9 +2060,15 @@ fn locate_with_clock(
             &res,
             &sevs,
             verdict.as_ref().filter(|_| curve_clock == archive.clock),
+            curve_check.as_ref().filter(|_| curve_clock == archive.clock),
             curve_judged,
             added,
         );
+        if let Some((false, why)) = &assessment.curve_support {
+            let warning = format!("the curve match does not corroborate the trace answer: {why}");
+            log.say(&warning);
+            warnings.push(warning);
+        }
         // Grade the metadata attempt completely before accepting its clock. Decoys can
         // reject a provisional high answer too, and must then leave the full dates available.
         let decoy_window = match given_start {
@@ -2238,6 +2333,7 @@ fn locate_with_clock(
     };
     if found {
         let top = &res.candidates[0];
+        let trace_clock = trace_answer_at(&res).expect("a trace candidate is present").2;
         let (lat, lon, radius) = (assessment.lat, assessment.lon, assessment.radius);
         let (basis, radius_unresolved) = (
             assessment.radius_basis.clone(),
@@ -2357,8 +2453,8 @@ fn locate_with_clock(
                 },
             ),
         ];
-        // The curve match is a second, independent reading of the recording: it can confirm a
-        // low trace answer, replace it, or stop an asserted one that names another place.
+        // The curve match is a second reading of the recording. Corroboration requires actual
+        // curve support at the trace observer and clock, as well as nearby best places.
         let trace_confidence = assessment.trace_confidence;
         let call = assessment.call;
         curve_used = call;
@@ -2374,9 +2470,16 @@ fn locate_with_clock(
                 call != CurveCall::Conflicts,
                 if call == CurveCall::Conflicts {
                     format!(
-                        "another place stands {:.1} km away: {}",
+                        "the standing curve match is {:.1} km away and does not corroborate one place and recording clock: {}; {}",
                         apart / 1000.0,
+                        assessment.curve_support.as_ref().map_or("no common-point score", |s| s.1.as_str()),
                         v.why
+                    )
+                } else if matches!(call, CurveCall::Agrees | CurveCall::Confirms) {
+                    format!(
+                        "{}; {}",
+                        v.why,
+                        assessment.curve_support.as_ref().map_or("no common-point score", |s| s.1.as_str()),
                     )
                 } else {
                     v.why.clone()
@@ -2491,7 +2594,7 @@ fn locate_with_clock(
                             ))
                             .collect::<Vec<_>>()
                             .join(", "),
-                        iso_utc(top.t_start_utc)
+                        iso_utc(trace_clock)
                     ),
                 )
             },
@@ -2597,7 +2700,7 @@ fn locate_with_clock(
                 let mut pts = Vec::new();
                 let mut warm = None;
                 for &tr in sp.t.iter().step_by(4) {
-                    let tu = top.t_start_utc + tr;
+                    let tu = trace_clock + tr;
                     if let Some((te, _, ratio)) = tm.solve_emission_p(tu, xo, &prop, warm) {
                         warm = Some(te);
                         let f0 = match m.f0_change {
@@ -4826,6 +4929,23 @@ mod tests {
         }
     }
 
+    fn checked_at_trace(
+        result: &search::SearchResult,
+        verdict: &curvematch::CurveVerdict,
+    ) -> Option<curvematch::MatchMode> {
+        trace_answer_at(result).map(|(lat, lon, clock_unix)| curvematch::MatchMode {
+            lat,
+            lon,
+            clock_unix,
+            coarse: 0.0,
+            evidence: verdict.evidence,
+            r50_m: 2000.0,
+            n_heard: verdict.n_heard,
+            n_unheard_close: 0,
+            passes: Vec::new(),
+        })
+    }
+
     #[test]
     fn a_standing_curve_match_on_an_empty_metadata_trace_search_is_low_and_widens() {
         let good = stands_at(40.876466, -73.524951, true);
@@ -4837,12 +4957,12 @@ mod tests {
         // A usable metadata clock must reach the independent matcher even when no trace
         // survived measurement. Standing alone, its place is graded low (`CurveCall::Adopts`),
         // so the metadata attempt has located nothing and the full date window is searched.
-        let alone = AnswerAssessment::new(&empty, &[], Some(&good), true, &added);
+        let alone = AnswerAssessment::new(&empty, &[], Some(&good), None, true, &added);
         assert_eq!(alone.call, CurveCall::Adopts);
         assert_eq!(alone.confidence, "low");
         assert!(metadata_needs_fallback(true, alone.confidence));
         for curve in [None, Some(&weak)] {
-            let absent = AnswerAssessment::new(&empty, &[], curve, true, &added);
+            let absent = AnswerAssessment::new(&empty, &[], curve, None, true, &added);
             assert!(metadata_needs_fallback(true, absent.confidence));
             // An explicit --start never widens, whether or not either search succeeded.
             assert!(!metadata_needs_fallback(false, absent.confidence));
@@ -4851,13 +4971,13 @@ mod tests {
         // trace answer that was found only after widening to the full date window.
         let judged = curve_judges_window((1000.0, 1200.0), (0.0, 86_400.0), weak.n_decoys);
         assert_eq!(
-            curve_call("medium", Some((40.876466, -73.524951)), Some(&weak), judged),
+            curve_call("medium", Some((40.876466, -73.524951)), Some(&weak), judged, false),
             CurveCall::Silent
         );
     }
 
-    /// A low trace answer that the curve match confirms in place is raised to medium: two readings
-    /// of the recording agree on the place. Where the curve match stands somewhere the trace search
+    /// A low trace answer confirmed at its place and clock is raised to medium: two readings
+    /// of the recording agree. Where the curve match stands somewhere the trace search
     /// does not support, or the trace search found nothing, its place is reported at low.
     #[test]
     fn only_a_place_the_trace_search_supports_is_raised_to_medium() {
@@ -4870,11 +4990,12 @@ mod tests {
         let here = stands_at(40.876466, -73.524951, true);
         let away = stands_at(40.876466, -73.3, true);
         let grade = |r: &search::SearchResult, v: &curvematch::CurveVerdict| {
-            let a = AnswerAssessment::new(r, &[], Some(v), true, &added);
+            let checked = checked_at_trace(r, v);
+            let a = AnswerAssessment::new(r, &[], Some(v), checked.as_ref(), true, &added);
             (a.call, a.confidence)
         };
         assert_eq!(
-            AnswerAssessment::new(&low, &[], None, true, &added).confidence,
+            AnswerAssessment::new(&low, &[], None, None, true, &added).confidence,
             "low"
         );
         assert_eq!(grade(&low, &here), (CurveCall::Confirms, "medium"));
@@ -4883,10 +5004,123 @@ mod tests {
     }
 
     #[test]
+    fn common_curve_evidence_keeps_supported_clocks_and_reopens_full_dates() {
+        let added = std::collections::HashSet::new();
+        let mut low = assessment_result();
+        low.candidates[0].events[1].core = false;
+        let (lat, lon, clock) = trace_answer_at(&low).unwrap();
+        let mut curve = stands_at(lat + 2400.0 / fdop_types::geo::m_per_deg(lat).0, lon, true);
+        curve.radius_m = 3000.0;
+        curve.clock_unix = clock + 40.0;
+        let mut checked = checked_at_trace(&low, &curve).unwrap();
+        checked.evidence -= curvematch::TIED_NATS;
+        let assess = |result: &search::SearchResult, check: Option<&curvematch::MatchMode>| {
+            AnswerAssessment::new(result, &[], Some(&curve), check, true, &added)
+        };
+        // The core checkpoint test supplies an actual parallel-flight example of this
+        // position/clock trade. Pipeline grading must use its evidence, not reject a
+        // supported shared hypothesis merely because the two best clocks differ by 40 s.
+        let supported = assess(&low, Some(&checked));
+        assert_eq!(
+            (supported.call, supported.confidence),
+            (CurveCall::Confirms, "medium")
+        );
+        assert!(!metadata_needs_fallback(true, supported.confidence));
+        assert!(supported.curve_support.unwrap().0);
+
+        let mut high = assessment_result();
+        for medium in [false, true] {
+            if medium {
+                high.margin["margin_nats"] = json!(4.0);
+            }
+            let supported = assess(&high, Some(&checked));
+            assert_eq!(supported.call, CurveCall::Agrees);
+            assert_eq!(supported.confidence, if medium { "medium" } else { "high" });
+        }
+        for defect in [
+            "unheard",
+            "decoy_tie",
+            "excluded_clock",
+            "wrong_point",
+            "wrong_clock",
+            "nonfinite",
+            "missing",
+        ] {
+            let mut bad = checked.clone();
+            match defect {
+                "unheard" => bad.n_heard = 1,
+                "decoy_tie" => bad.evidence = curve.evidence - curve.margin,
+                "excluded_clock" => bad.evidence = curve.evidence - curvematch::TIED_NATS - 0.01,
+                "wrong_point" => bad.lat += 0.0001,
+                "wrong_clock" => bad.clock_unix += 0.5,
+                "nonfinite" => bad.evidence = f64::NAN,
+                "missing" => {}
+                _ => unreachable!(),
+            }
+            let checkpoint = (defect != "missing").then_some(&bad);
+            for (result, call) in [(&low, CurveCall::Adopts), (&high, CurveCall::Conflicts)] {
+                let rejected = assess(result, checkpoint);
+                assert_eq!(
+                    (rejected.call, rejected.confidence),
+                    (call, "low"),
+                    "{defect}"
+                );
+                assert!(
+                    rejected.retries_metadata(true, (0.0, 240.0), (0.0, 86_400.0)),
+                    "{defect}"
+                );
+                assert!(
+                    !rejected.retries_metadata(false, (0.0, 240.0), (0.0, 86_400.0)),
+                    "an explicit start stays binding: {defect}"
+                );
+                let support = rejected.curve_support.unwrap();
+                assert!(!support.0);
+                assert!(support.1.contains("recording start"), "{}", support.1);
+            }
+        }
+        // The reopened attempt can retain a valid full-date answer. A narrow curve check
+        // is not carried into its assessment, as at the production window boundary.
+        let mut recovered = assessment_result();
+        recovered.candidates[0].t_start_utc = 10_000.0;
+        recovered.refine.as_mut().unwrap().t_start_utc = 10_000.0;
+        let recovered = AnswerAssessment::new(&recovered, &[], None, None, false, &added);
+        assert_eq!(recovered.confidence, "high");
+        assert_eq!(recovered.call, CurveCall::Silent);
+    }
+
+    #[test]
+    fn curve_check_uses_the_refined_place_and_clock_together() {
+        let added = std::collections::HashSet::new();
+        let mut result = assessment_result();
+        result.candidates[0].t_start_utc = 100.0;
+        let r = result.refine.as_mut().unwrap();
+        r.lat += 0.001;
+        r.lon -= 0.001;
+        r.t_start_utc = 140.0;
+        let point = (r.lat, r.lon, r.t_start_utc);
+        assert_eq!(trace_answer_at(&result), Some(point));
+        let mut curve = stands_at(point.0, point.1, true);
+        curve.clock_unix = point.2;
+        let mut check = checked_at_trace(&result, &curve).unwrap();
+        let assess = |check: &curvematch::MatchMode| {
+            AnswerAssessment::new(&result, &[], Some(&curve), Some(check), true, &added)
+        };
+        assert_eq!(assess(&check).call, CurveCall::Agrees);
+        check.clock_unix = result.candidates[0].t_start_utc;
+        assert_eq!(assess(&check).call, CurveCall::Conflicts);
+        result.refine = None;
+        assert_eq!(
+            trace_answer_at(&result),
+            Some((result.candidates[0].lat, result.candidates[0].lon, 100.0))
+        );
+    }
+
+    #[test]
     fn metadata_retries_candidates_rejected_by_the_report_gates() {
         let base = assessment_result();
         let added = std::collections::HashSet::new();
-        let assess = |r: &search::SearchResult| AnswerAssessment::new(r, &[], None, false, &added);
+        let assess =
+            |r: &search::SearchResult| AnswerAssessment::new(r, &[], None, None, false, &added);
         let high = assess(&base);
         assert_eq!(high.confidence, "high");
         assert!(!metadata_needs_fallback(true, high.confidence));
@@ -4930,15 +5164,15 @@ mod tests {
             assert!(!metadata_needs_fallback(true, accepted.confidence));
         }
         let added = ["e2".to_string()].into();
-        let unchecked = AnswerAssessment::new(&medium, &[], None, false, &added);
+        let unchecked = AnswerAssessment::new(&medium, &[], None, None, false, &added);
         assert!(unchecked.unchecked);
         assert!(metadata_needs_fallback(true, unchecked.confidence));
         let weak = stands_at(40.876466, -73.524951, false);
-        let unsupported = AnswerAssessment::new(&medium, &[], Some(&weak), true, &added);
+        let unsupported = AnswerAssessment::new(&medium, &[], Some(&weak), None, true, &added);
         assert_eq!(unsupported.call, CurveCall::Unsupported);
         assert!(metadata_needs_fallback(true, unsupported.confidence));
         let conflict = stands_at(40.876466, -73.3, true);
-        let conflict = AnswerAssessment::new(&base, &[], Some(&conflict), true, &added);
+        let conflict = AnswerAssessment::new(&base, &[], Some(&conflict), None, true, &added);
         assert_eq!(conflict.call, CurveCall::Conflicts);
         assert!(metadata_needs_fallback(true, conflict.confidence));
         // Even a provisional high must retry if the decoys explain it by chance. Applying
@@ -4955,6 +5189,7 @@ mod tests {
         let mut answer = AnswerAssessment::new(
             &assessment_result(),
             &[],
+            None,
             None,
             false,
             &std::collections::HashSet::new(),
@@ -5274,6 +5509,7 @@ mod tests {
             &dem,
             &atmo,
             &Log::new(true),
+            None,
             &mut warnings,
         )
         .unwrap()
@@ -5285,9 +5521,10 @@ mod tests {
                 "curve match ADS-B 2026-09-08: no mlatonly data in this catalogue, so aircraft located only by multilateration (transponders without ADS-B Out) are missing"
             ]
         );
-        assert_eq!(result.n_tracks, 1);
-        assert_eq!(result.decoys.len(), 48);
-        let mut shifts: Vec<_> = result.decoys.iter().map(|d| d.shift_s).collect();
+        assert!(result.trace_check.is_none());
+        assert_eq!(result.result.n_tracks, 1);
+        assert_eq!(result.result.decoys.len(), 48);
+        let mut shifts: Vec<_> = result.result.decoys.iter().map(|d| d.shift_s).collect();
         shifts.sort_by(f64::total_cmp);
         assert_eq!(
             shifts,
@@ -5370,47 +5607,47 @@ mod tests {
         let weak = stands_at(40.0, east(50.0), false);
         for conf in ["high", "medium", "low", "none"] {
             for verdict in [Some(&weak), None] {
-                assert_eq!(curve_call(conf, at(0.0), verdict, false), CurveCall::Silent);
+                assert_eq!(curve_call(conf, at(0.0), verdict, false, true), CurveCall::Silent);
                 let judged = if conf == "medium" {
                     CurveCall::Unsupported
                 } else {
                     CurveCall::Silent
                 };
-                assert_eq!(curve_call(conf, at(0.0), verdict, true), judged, "{conf}");
+                assert_eq!(curve_call(conf, at(0.0), verdict, true, true), judged, "{conf}");
             }
         }
         // asserted answers, judged or not: standing settles them
         for judged in [false, true] {
             for conf in ["high", "medium"] {
                 assert_eq!(
-                    curve_call(conf, at(0.5), Some(&v), judged),
+                    curve_call(conf, at(0.5), Some(&v), judged, true),
                     CurveCall::Agrees
                 );
                 assert_eq!(
-                    curve_call(conf, at(2.9), Some(&v), judged),
+                    curve_call(conf, at(2.9), Some(&v), judged, true),
                     CurveCall::Agrees
                 );
                 assert_eq!(
-                    curve_call(conf, at(3.1), Some(&v), judged),
+                    curve_call(conf, at(3.1), Some(&v), judged, true),
                     CurveCall::Conflicts
                 );
             }
             // a low answer inside the curve match's radius is confirmed, outside it is replaced
             assert_eq!(
-                curve_call("low", at(0.9), Some(&v), judged),
+                curve_call("low", at(0.9), Some(&v), judged, true),
                 CurveCall::Confirms
             );
             assert_eq!(
-                curve_call("low", at(1.1), Some(&v), judged),
+                curve_call("low", at(1.1), Some(&v), judged, true),
                 CurveCall::Adopts
             );
             assert_eq!(
-                curve_call("low", at(100.0), Some(&v), judged),
+                curve_call("low", at(100.0), Some(&v), judged, true),
                 CurveCall::Adopts
             );
             // the trace search found nothing
             assert_eq!(
-                curve_call("none", None, Some(&v), judged),
+                curve_call("none", None, Some(&v), judged, true),
                 CurveCall::Adopts
             );
         }
@@ -5528,7 +5765,7 @@ mod tests {
         v.radius_m = 4000.0;
         let trace = (40.0, east(-0.9));
         assert_eq!(
-            curve_call("low", Some(trace), Some(&v), true),
+            curve_call("low", Some(trace), Some(&v), true, true),
             CurveCall::Confirms
         );
         let r = confirmed_radius(250.0, trace, &v);

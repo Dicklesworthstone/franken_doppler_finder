@@ -5987,13 +5987,16 @@ mod tests {
     /// specified observer and its longitude reflection have identical source ranges
     /// and radial velocities at the same recording clock.
     fn collinear_mirror_scores(
+        offset_m: f64,
         crossing: bool,
+        check_clock: bool,
+        duration_s: f64,
     ) -> (MatchMode, MatchMode, Vec<MatchMode>, Vec<MatchMode>) {
         let (lat, lon, clock) = SCENE_AT;
-        let mid_lon = lon + 3000.0 / m_per_deg(lat).1;
+        let mid_lon = lon + offset_m / m_per_deg(lat).1;
         let reflected_lon = 2.0 * mid_lon - lon;
         let enu = Enu::new(lat, mid_lon, 0.0);
-        let mut tracks: Vec<_> = [(70.0, 700.0, 300.0), (-65.0, 900.0, 550.0)]
+        let tracks: Vec<_> = [(70.0, 700.0, 300.0), (-65.0, 900.0, 550.0)]
             .into_iter()
             .enumerate()
             .map(|(i, (speed, height, cpa))| {
@@ -6011,19 +6014,40 @@ mod tests {
                 tr
             })
             .collect();
+        // Broad distant passes need off-pass audio for the recording-derived null.
+        // Extending the recording keeps the signals and noise in its prefix unchanged.
+        let mut c = scene_for(tracks, 10_000.0, duration_s);
         if crossing {
-            let mut tr = scene_track(
-                [0.0, -1000.0, 700.0],
-                [70.0, 0.0, 0.0],
-                720.0,
-                -1500.0,
-                3000.0,
-            );
+            // Rotate the second trajectory 60 degrees about the actual observer.
+            // This orthogonal map preserves every range and radial velocity there,
+            // including between knots, so the same PCM and empirical null remain
+            // valid. Only the independent spatial constraint changes: at the first
+            // flight's mirror the rotated flight now passes nearly overhead at a different time.
+            let frame = Enu::new(lat, lon, 0.0);
+            let observer = frame.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+            let (sin, cos) = 60.0_f64.to_radians().sin_cos();
+            let rotate = |v| {
+                let [east, north, up] = frame.vec_from_ecef(v);
+                frame.vec_to_ecef([cos * east + sin * north, -sin * east + cos * north, up])
+            };
+            let original = c.tracks[1].clone();
+            let tr = &mut c.tracks[1];
+            for (position, velocity) in tr.pos.iter_mut().zip(&mut tr.vel) {
+                let relative = rotate(sub(*position, observer));
+                *position = std::array::from_fn(|i| observer[i] + relative[i]);
+                *velocity = rotate(*velocity);
+            }
             tr.key = "crossing".into();
             tr.icao = tr.key.clone();
-            tracks.push(tr);
+            for t in [-100.0, 0.0, 300.25, 550.75, 900.5, 1799.5] {
+                let (a, va) = original.pv(clock + t);
+                let (b, vb) = tr.pv(clock + t);
+                let (ra, rb) = (sub(a, observer), sub(b, observer));
+                assert!((norm(ra) - norm(rb)).abs() < 1e-6);
+                assert!((norm(va) - norm(vb)).abs() < 1e-6);
+                assert!((dot(ra, va) / norm(ra) - dot(rb, vb) / norm(rb)).abs() < 1e-6);
+            }
         }
-        let c = scene_of(tracks, 10_000.0);
         let p = MatchParams {
             clock_sweep_frames: 0,
             ..params()
@@ -6065,8 +6089,11 @@ mod tests {
             }
         };
         let (top, reflected) = (mode_at(lat, lon), mode_at(lat, reflected_lon));
+        eprintln!(
+            "collinear mirror offset={offset_m}, crossing={crossing}: observer {top:?}; reflected {reflected:?}"
+        );
         let aliases = along_track_aliases(&inp, &p, &bank, &idx, &top);
-        if !crossing {
+        if check_clock {
             // A wider prior must not let the mirror silently choose a better clock.
             // Move the real shared clock by exactly the existing per-pass slack: its
             // independent curves remain heard, while an ordinary sweep can undo it.
@@ -6096,7 +6123,7 @@ mod tests {
                 passes: e.passes,
                 ..top.clone()
             };
-            assert!(delayed.n_heard >= 2);
+            assert!(delayed.n_heard >= 2, "{delayed:?}");
             let reswept = score_exact(
                 &wider,
                 &sweeping,
@@ -6135,9 +6162,10 @@ mod tests {
 
     #[test]
     fn fixed_clock_collinear_passes_retain_a_cross_track_mirror() {
-        let (top, reflected, aliases, restricted) = collinear_mirror_scores(false);
-        assert_eq!(top.n_heard, 2);
-        assert_eq!(reflected.n_heard, 2);
+        let (top, reflected, aliases, restricted) =
+            collinear_mirror_scores(3000.0, false, false, 1800.0);
+        assert_eq!(top.n_heard, 2, "{top:?}");
+        assert_eq!(reflected.n_heard, 2, "{reflected:?}");
         assert!((top.evidence - reflected.evidence).abs() <= TIED_NATS);
         assert!(haversine_m(top.lat, top.lon, reflected.lat, reflected.lon) > MAX_ASSERT_RADIUS_M);
         assert!(
@@ -6156,18 +6184,43 @@ mod tests {
 
     #[test]
     fn a_crossing_flight_breaks_the_fixed_clock_cross_track_mirror() {
-        let (top, reflected, aliases, _) = collinear_mirror_scores(true);
-        assert_eq!(top.n_heard, 3);
-        assert!(top.evidence - reflected.evidence > TIED_NATS);
-        let far: Vec<_> = aliases
-            .iter()
-            .filter(|a| haversine_m(top.lat, top.lon, a.lat, a.lon) > MAX_ASSERT_RADIUS_M)
-            .collect();
+        // This nearer recording independently supports both curves strongly enough
+        // to resolve the crossing geometry. The weaker 3 km recording's 2.36-nat
+        // gap correctly retains ambiguity: crossing directions alone do not prove
+        // uniqueness. The separate collinear test covers the 6 km radius boundary.
+        let (top, reflected, aliases, _) = collinear_mirror_scores(900.0, true, false, 900.0);
+        assert_eq!(top.n_heard, 2, "{top:?}");
         assert!(
-            !far.is_empty(),
-            "the geometric alternatives must actually be scored"
+            top.evidence - reflected.evidence > TIED_NATS,
+            "{top:?}; {reflected:?}"
         );
-        assert!(far.iter().all(|a| top.evidence - a.evidence > TIED_NATS));
+        let alternatives: Vec<_> = aliases
+            .iter()
+            .filter(|a| haversine_m(top.lat, top.lon, a.lat, a.lon) > RADIUS_FLOOR_M)
+            .collect();
+        assert_eq!(
+            alternatives.len(),
+            2,
+            "both flights' geometric alternatives must actually be scored: {aliases:?}"
+        );
+        assert!(
+            alternatives
+                .iter()
+                .any(|a| { haversine_m(a.lat, a.lon, reflected.lat, reflected.lon) < 1.0 })
+        );
+        assert!(
+            alternatives
+                .iter()
+                .all(|a| top.evidence - a.evidence > TIED_NATS),
+            "{alternatives:?}"
+        );
+    }
+
+    #[test]
+    fn cross_track_mirrors_keep_the_supplied_shared_clock() {
+        // Clock preservation does not require a far-away alternative. The closer
+        // passes leave enough evidence after the existing per-pass timing penalty.
+        collinear_mirror_scores(900.0, false, true, 900.0);
     }
 
     /// One aircraft flying the same leg twice, the same way at the same speed (a circuit), is one

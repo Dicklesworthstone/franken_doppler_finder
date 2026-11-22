@@ -279,7 +279,7 @@ retain their original results.
 | margin | no pair, fine or confirmation comparison cut was recorded, and the answer beats the best *different* explanation by ≥ 6 nats or no rival survived. A rival is different if it matches a shared event to another flight, shares no match, or lies more than 5 km away. Both are compared at the same polish (below) |
 | no unheard close pass | no supported tonal aircraft passed much closer than the heard ones without leaving a detection; its closest approach must be interior to the archived track and its surrounding reports at most 90 s apart |
 | radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
-| curve match | listed when the [curve match](#the-curve-match) stands: the answer is within 3 km of where it stands. Also listed, failed, on a medium answer when the curve match ran with enough decoy clocks to judge (40) and stands nowhere |
+| curve match | listed when the [curve match](#the-curve-match) stands: an asserted trace answer is within 3 km of it, and the curves support the trace answer's exact place and recording start under the common-point checks below. Also listed, failed, on a medium answer when the curve match ran with enough decoy clocks to judge (40) and stands nowhere |
 | measurement line | listed, failed, only on a medium answer that rests on a core match measured past the old line (a detection score under 4.5, past the strongest 24, found only on the contrast image, from a faster supplemental seed, or recovered from a harmonic after its primary failed) when no curve match ran with enough decoy clocks to judge it |
 | decoy clocks | listed on a high or medium answer from the trace search when `--start` is given or the answer came from the file's `creation_time` window: `locate` runs again with that clock window moved by −2, −1, +1 and +2 steps (the next of ±3 and ±4 steps when a window would leave `--dates`), and the answer's evidence must lead the best decoy's by ≥ 3 nats. A step is whole hours, at least the window's width plus 10 minutes: 1 h for `--start`. Fewer than four decoys that run fail it |
 
@@ -412,21 +412,28 @@ labelled provisional: an unchecked rival can increase its score or overtake the 
 evidence-score differences, not calibrated likelihood ratios or a correction for searching many events.
 
 The curve match then reads the recording a second way, independent of the traces. Where it stands it can raise a
-low trace answer that lies inside its radius to **medium**. Where the trace answer lies outside its radius, or the
-trace search found nothing, the answer is the curve match's own place at **low**, and the verdict says it comes
+low trace answer that lies inside its radius to **medium**, provided the curves also support that trace answer's
+exact place and recording start. The matcher scores that common point with its existing bank and catalogue,
+fixing the shared clock while retaining normal penalized per-pass timing slack. It must hear two independently
+credited flyovers, beat the same best decoy, and remain within the existing 3-nat evidence tie. This allows a
+physically supported trade between nearby positions and recording times; it adds no arbitrary clock-difference
+cutoff. The verdict reports the common-point evidence and the two recording starts.
+
+For a low trace answer without that common-point support or outside the curve radius, or when the trace search
+found nothing, the answer is the curve match's own place at **low**, and the verdict says it comes
 from the curve match alone. Its decoy clocks test the recording's clock, not its place: on the right date a place
 near the aircraft heard can beat every decoy clock. Before this rule such an answer was medium, and on the
 benchmark's set M it put Washington Square 5.9 km off ([Known issues](#known-issues)). It does not stand on one
 heard pass: one pass's Doppler curve fixes when and how close it passed, which leaves place and clock free to trade
 along its track, and its decoy test checks the clock, not the place. That rule was added after a curve match on one
 heard pass graded a marina medium 8 km off on the benchmark's sealed set E (CHANGELOG).
-Where it stands more than 3 km from a high or medium
-answer, that answer becomes **low**. It never makes an answer high. Where it ran with at least 40 decoy clocks
+Where it stands more than 3 km from a high or medium answer, or cannot support that answer's exact place and
+recording start, that answer becomes **low**. It never makes an answer high. Where it ran with at least 40 decoy clocks
 and stands nowhere, a **medium** trace answer becomes **low**. The medium grade's margin has no calibrated
 false-alarm rate. The curve match's decoy test has one: with a wrong date or place, the real window is one of at
 least 41 interchangeable clocks, so it stands by chance about once in 41 at most. This rule was added after a
 wrong-date run graded medium at a wrong place (CHANGELOG), so its effect on the development recordings is not a
-test. A high answer keeps its grade. Where the curve match does not run or has too few decoy clocks, the grade
+test. An otherwise high answer keeps its grade when the curve match stands nowhere. Where the curve match does not run or has too few decoy clocks, the grade
 is the trace search's, except that a medium answer resting on a core match measured past the old line (below)
 becomes **low**: nothing calibrated then checks that the extra events did not just give chance more to work with.
 
@@ -813,7 +820,9 @@ conventions, and a high or medium trace answer found there meets the [decoy cloc
 search and, when eligible, the independent curve match try that window. A standing curve match with no trace
 answer at its place gives a low answer, so it does not keep that window by itself. The metadata window is
 retained only if the complete assessment reaches high or medium confidence, including any required decoy-clock
-check. A low or absent answer retries the full date window when it adds available recording start times, so a
+check. Agreement on a nearby place at incompatible recording times cannot confirm a trace answer and keep the
+metadata window: the curves must support its actual refined place and recording start. A low or absent answer
+retries the full date window when it adds available recording start times, so a
 chance candidate at an export timestamp cannot block the rest of the dates. If publication limits leave the
 same or a narrower available window, the original grade and failed checks are retained. The audio, detections and
 measurements are reused. The curve match
