@@ -640,7 +640,7 @@ fn parse_raob_stations(
         if !(id.len() == 4
             && id
                 .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
             && us_station)
         {
             continue;
@@ -743,27 +743,36 @@ fn parse_raob(profile: &serde_json::Value) -> Vec<Level> {
     out
 }
 
+#[cfg(test)]
 fn parse_raob_response(v: serde_json::Value) -> Result<Vec<Level>, DataError> {
-    let profile = v
+    select_raob_profile(v).map(|(levels, _)| levels)
+}
+
+fn select_raob_profile(v: serde_json::Value) -> Result<(Vec<Level>, usize), DataError> {
+    let profiles = v
         .get("profiles")
         .and_then(|p| p.as_array())
-        .and_then(|a| a.first())
+        .filter(|a| !a.is_empty())
         .ok_or_else(|| DataError::new("RAOB: no sounding profile"))?;
-    let levels = parse_raob(&profile["profile"]);
-    if levels.len() >= 5 && levels.last().is_some_and(|l| l.z_msl > 5000.0) {
-        Ok(levels)
-    } else {
-        Err(DataError::new(
-            "RAOB: sounding lacks usable levels through 5 km",
-        ))
+    // A virtual station can return several historical station aliases for the
+    // requested launch time. Keep the first usable sounding, without combining
+    // different profiles or letting an incomplete first alias hide a complete one.
+    for (index, profile) in profiles.iter().enumerate() {
+        let levels = parse_raob(&profile["profile"]);
+        if levels.len() >= 5 && levels.last().is_some_and(|l| l.z_msl > 5000.0) {
+            return Ok((levels, index));
+        }
     }
+    Err(DataError::new(
+        "RAOB: sounding lacks usable levels through 5 km",
+    ))
 }
 
 fn raob_url(t: f64, station: &str) -> String {
     let (y, m, d) = utc_date(t);
     let hh = ((t.rem_euclid(86400.0)) / 3600.0).round() as u32;
     // IEM prefixes three-character inputs with K. Keep that spelling for existing
-    // continental cache keys, but pass other US station identifiers intact.
+    // continental cache keys, but pass other US and virtual station identifiers intact.
     let station = station.strip_prefix('K').unwrap_or(station);
     format!("{IEM_RAOB}?ts={y:04}{m:02}{d:02}{hh:02}00&station={station}")
 }
@@ -775,7 +784,7 @@ fn raob_atmosphere(
     t_end: f64,
     cache: &Path,
     offline: bool,
-) -> Result<ScatteredAtmosphere, DataError> {
+) -> Result<WeatherSource, DataError> {
     raob_atmosphere_with_progress(b, t_start, t_end, cache, offline, &|_| {})
 }
 
@@ -785,8 +794,8 @@ fn raob_atmosphere_with_progress(
     t_end: f64,
     cache: &Path,
     offline: bool,
-    on_profile: &dyn Fn(ScatteredAtmosphere),
-) -> Result<ScatteredAtmosphere, DataError> {
+    on_profile: &dyn Fn(WeatherSource),
+) -> Result<WeatherSource, DataError> {
     // Select stations for the 00Z/12Z brackets too, not just times inside the recording.
     let t0 = (t_start / 43200.0).floor() * 43200.0;
     let t1 = (t_end / 43200.0).ceil() * 43200.0;
@@ -821,6 +830,16 @@ fn raob_atmosphere_with_progress(
     let mut used = Vec::new();
     let mut recovered = false;
     let (mut n_ok, mut n_tried) = (0, 0);
+    let mut alias_recoveries = 0;
+    let profile_warnings = |count| {
+        if count == 0 {
+            Vec::new()
+        } else {
+            vec![format!(
+                "radiosondes: recovered {count} sounding(s) from later returned profiles after incomplete aliases; profiles were not combined"
+            )]
+        }
+    };
     for (id, la, lo, _) in &chosen {
         let outside_preferred =
             fdop_types::geo::haversine_m(clat, clon, *la, *lo) > preferred_distance;
@@ -832,15 +851,16 @@ fn raob_atmosphere_with_progress(
         let mut t = t0;
         while t <= t1 + 1.0 {
             n_tried += 1;
-            if let Ok(lv) = get_cached_validated(
+            if let Ok((lv, index)) = get_cached_validated(
                 &raob_url(t, id),
                 cache,
                 offline,
                 (20, None, 1),
-                parse_raob_response,
+                select_raob_profile,
             ) {
                 series.push((t, lv));
                 n_ok += 1;
+                alias_recoveries += usize::from(index > 0);
                 // A later sounding or station can stall past the pipeline deadline.
                 // Publish only already validated profiles; the final blend below keeps
                 // its original station selection and time interpolation.
@@ -855,7 +875,9 @@ fn raob_atmosphere_with_progress(
                         ids.join(", ")
                     ),
                 ) {
-                    on_profile(profile);
+                    let mut source = WeatherSource::complete(profile);
+                    source.warnings = profile_warnings(alias_recoveries);
+                    on_profile(source);
                 }
             }
             t += 43200.0;
@@ -894,6 +916,11 @@ fn raob_atmosphere_with_progress(
             used.join(", ")
         ),
     )
+    .map(|profile| {
+        let mut source = WeatherSource::complete(profile);
+        source.warnings = profile_warnings(alias_recoveries);
+        source
+    })
     .map_err(DataError)
 }
 
@@ -952,8 +979,7 @@ pub fn fetch_atmosphere_with_progress(
         om,
         move || om_grid(OM_ARCHIVE, &b, t_start, t_end, &c2, offline, false),
         move || {
-            raob_atmosphere_with_progress(&b, t_start, t_end, &c3, offline, &|profile| {
-                let mut source = WeatherSource::complete(profile);
+            raob_atmosphere_with_progress(&b, t_start, t_end, &c3, offline, &|mut source| {
                 source.warnings.push(
                     "radiosonde retrieval is still in progress; using only the soundings already received"
                         .into(),
@@ -1019,7 +1045,7 @@ fn publish_fallback(
 fn fetch_with_fallbacks(
     om: AtmosphereResult,
     surface: impl FnOnce() -> AtmosphereResult + Send + 'static,
-    raob: impl FnOnce() -> Result<ScatteredAtmosphere, DataError> + Send + 'static,
+    raob: impl FnOnce() -> AtmosphereResult + Send + 'static,
     on_fallback: impl Fn(Weather) + Send + Sync + 'static,
 ) -> Weather {
     choose_atmosphere(om, |preferred_failure| {
@@ -1035,7 +1061,7 @@ fn fetch_with_fallbacks(
         });
         let h_rb = std::thread::spawn(move || {
             publish_fallback(
-                raob().map(WeatherSource::complete),
+                raob(),
                 &raob_failure,
                 true,
                 &*on_fallback,
@@ -1216,7 +1242,7 @@ mod tests {
                     },
                     move || {
                         raob_rx.recv().unwrap();
-                        Ok(test_soundings())
+                        Ok(WeatherSource::complete(test_soundings()))
                     },
                     move |weather| assert!(update_tx.send(weather).is_ok()),
                 )
@@ -1627,7 +1653,7 @@ mod tests {
                 let weather = fetch_with_fallbacks(
                     Err(DataError::new("pressure failed")),
                     move || Ok(recovered),
-                    || Ok(test_soundings()),
+                    || Ok(WeatherSource::complete(test_soundings())),
                     move |weather| tx.send(weather).unwrap(),
                 );
                 assert!(weather.winds_aloft);
@@ -2701,6 +2727,129 @@ mod tests {
     }
 
     #[test]
+    fn cached_radiosondes_retain_observed_calm_without_a_direction() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let bbox = BBox::new(lat, lon, lat, lon);
+        let (dir, index_path) = weather_test_cache(IEM_RAOB_NETWORK, "raob-calm");
+        std::fs::write(index_path, raob_station_index_fixture().to_string()).unwrap();
+        let profile = |speed: f64, direction: Option<f64>| {
+            (0..6)
+                .map(|i| {
+                    serde_json::json!({
+                        "hght": 100.0 + 1200.0 * f64::from(i),
+                        "tmpc": 10.0, "dwpc": 10.0,
+                        "drct": direction, "sknt": speed,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let put = |hour, rows: &[serde_json::Value]| {
+            let path = dir.join("weather").join(format!(
+                "{:016x}.json",
+                fnv(&format!("{IEM_RAOB}?ts=20260908{hour:02}00&station=OLD"))
+            ));
+            std::fs::write(
+                path,
+                serde_json::json!({"profiles": [{"profile": rows}]}).to_string(),
+            )
+            .unwrap();
+        };
+        let load = || fetch_atmosphere(&bbox, day + 3600.0, day + 39_600.0, &dir, true);
+        // The calm 00Z sounding must remain an interpolation anchor, not disappear
+        // and let the later 12Z wind be extrapolated over the entire recording.
+        for later_speed in [0.0, 20.0] {
+            put(0, &profile(0.0, None));
+            put(
+                12,
+                &profile(later_speed, (later_speed > 0.0).then_some(270.0)),
+            );
+            let weather = load();
+            assert!(weather.winds_aloft, "{:?}", weather.warnings);
+            assert!(weather.atmo.describe().contains("2 of 2 soundings usable"));
+            assert!(
+                weather
+                    .warnings
+                    .iter()
+                    .all(|w| !w.contains("radiosondes unavailable"))
+            );
+            for hour in [1.0, 6.0, 11.0] {
+                for heights in [(30.0, 1000.0), (2500.0, 6000.0)] {
+                    let m =
+                        weather
+                            .atmo
+                            .medium(lat, lon, day + hour * 3600.0, heights.0, heights.1);
+                    assert!(
+                        (m.c - fdop_types::atmo::sound_speed(10.0, 1.0)).abs() < 1e-8,
+                        "{m:?}"
+                    );
+                    assert!(
+                        (m.wind_e - later_speed * KT * hour / 12.0).abs() < 1e-8,
+                        "{m:?}"
+                    );
+                    assert!(m.wind_n.abs() < 1e-8, "{m:?}");
+                }
+            }
+        }
+        // A wind-only calm layer must also survive between windier rows.
+        // Its triangular wind profile integrates to half the surrounding speed.
+        let mut rows = profile(20.0, Some(270.0));
+        rows.insert(3, serde_json::json!({"hght": 3100.0, "sknt": 0.0}));
+        put(0, &rows);
+        put(12, &rows);
+        let weather = load();
+        assert!(weather.winds_aloft, "{:?}", weather.warnings);
+        let m = weather
+            .atmo
+            .medium(lat, lon, day + 21_600.0, 2500.0, 3700.0);
+        assert!((m.wind_e - 10.0 * KT).abs() < 1e-8, "{m:?}");
+        assert!(m.wind_n.abs() < 1e-8, "{m:?}");
+    }
+
+    #[test]
+    fn radiosondes_recover_invalid_wind_rows_only_from_observed_vectors() {
+        for (speed, direction) in [
+            (serde_json::Value::Null, serde_json::json!(270.0)),
+            (serde_json::json!("missing"), serde_json::json!(270.0)),
+            (serde_json::json!(-1.0), serde_json::json!(270.0)),
+            (serde_json::json!(20.0), serde_json::Value::Null),
+            (serde_json::json!(20.0), serde_json::json!("missing")),
+            (serde_json::json!(20.0), serde_json::json!(-1.0)),
+            (serde_json::json!(20.0), serde_json::json!(361.0)),
+        ] {
+            let mut rows: Vec<_> = (0..6)
+                .map(|i| {
+                    serde_json::json!({
+                        "hght": 100.0 + 1200.0 * f64::from(i), "tmpc": 10.0,
+                        "sknt": speed, "drct": direction,
+                    })
+                })
+                .collect();
+            assert!(
+                parse_raob(&serde_json::json!(rows)).is_empty(),
+                "{speed}, {direction}"
+            );
+            rows[0]["sknt"] = serde_json::json!(20.0);
+            rows[0]["drct"] = serde_json::json!(270.0);
+            assert!(
+                parse_raob(&serde_json::json!(rows)).is_empty(),
+                "surface wind alone"
+            );
+            rows[5]["sknt"] = serde_json::json!(40.0);
+            rows[5]["drct"] = serde_json::json!(270.0);
+            let levels = parse_raob(&serde_json::json!(rows));
+            assert_eq!(levels.len(), 6);
+            for (i, level) in levels.iter().enumerate() {
+                assert!(
+                    (level.wind_e - (20.0 + 4.0 * i as f64) * KT).abs() < 1e-8,
+                    "{level:?}"
+                );
+                assert!(level.wind_n.abs() < 1e-8, "{level:?}");
+            }
+        }
+    }
+
+    #[test]
     fn cached_radiosondes_keep_measured_calm_without_a_direction() {
         use fdop_types::atmo::sound_speed;
         let (lat, lon) = (40.876466, -73.524951);
@@ -2826,7 +2975,12 @@ mod tests {
     #[test]
     fn radiosonde_request_ids_preserve_us_prefixes_and_continental_cache_keys() {
         let t = fdop_types::time::unix_from_utc(2024, 9, 8, 12, 0, 0.0);
-        for (id, requested) in [("KAAA", "AAA"), ("PAAA", "PAAA"), ("PHAA", "PHAA")] {
+        for (id, requested) in [
+            ("KAAA", "AAA"),
+            ("PAAA", "PAAA"),
+            ("PHAA", "PHAA"),
+            ("_AAA", "_AAA"),
+        ] {
             assert_eq!(
                 raob_url(t, id),
                 format!("{IEM_RAOB}?ts=202409081200&station={requested}")
@@ -2869,6 +3023,12 @@ mod tests {
                 "AAA",
                 serde_json::json!({"country": "US", "state": "NY"}),
             ),
+            (
+                "virtual",
+                "_AAA",
+                "_AAA",
+                serde_json::json!({"country": "US", "state": "NY"}),
+            ),
             ("legacy", "KAAA", "AAA", serde_json::json!({})),
         ] {
             let dir = std::env::temp_dir().join(format!(
@@ -2890,7 +3050,9 @@ mod tests {
                     feature("CNEA", serde_json::json!({"country": "CA"})),
                     feature("PNEA", serde_json::json!({"country": "JP"})),
                     feature("KNEA", serde_json::json!({"country": "CA"})),
-                    feature("_ALL", serde_json::json!({"country": "US"})),
+                    feature("_ALL", serde_json::json!({"country": "CA"})),
+                    feature("_LONG", serde_json::json!({"country": "US"})),
+                    feature("_A&B", serde_json::json!({"country": "US"})),
                     feature("PNON", serde_json::json!({})),
                     feature(id, properties),
                 ]}),
@@ -2910,10 +3072,13 @@ mod tests {
                 // Spell the expected provider URL independently of raob_url: truncating a
                 // non-K identifier must miss the cache, rather than create its own oracle.
                 let url = format!("{IEM_RAOB}?ts=20240908{hour}00&station={requested}");
-                put(
-                    &url,
-                    serde_json::json!({"profiles": [{"profile": profile}]}),
-                );
+                let selected = serde_json::json!({"station": "KAAA", "profile": profile});
+                let profiles = if label == "virtual" {
+                    vec![serde_json::json!({"station": "KOLD", "profile": []}), selected]
+                } else {
+                    vec![selected]
+                };
+                put(&url, serde_json::json!({"profiles": profiles}));
             }
             let chosen = raob_stations(&dir, true, (day, day + 43_200.0)).unwrap();
             assert_eq!(chosen.len(), 1, "{label}: {chosen:?}");
@@ -2936,6 +3101,14 @@ mod tests {
             );
             assert!((medium.wind_e - 30.0 * KT).abs() < 1e-8, "{medium:?}");
             assert!(medium.wind_n.abs() < 1e-8, "{medium:?}");
+            assert_eq!(
+                weather.warnings.iter().any(|w| w.contains(
+                    "recovered 2 sounding(s) from later returned profiles"
+                )),
+                label == "virtual",
+                "{:?}",
+                weather.warnings
+            );
             assert!(
                 weather
                     .warnings
@@ -2943,6 +3116,85 @@ mod tests {
                     .any(|w| w.contains("hourly surface temperatures unavailable"))
             );
         }
+    }
+
+    #[test]
+    fn radiosonde_alias_selection_preserves_the_first_usable_profile() {
+        let rows = |speed: serde_json::Value| {
+            (0..6)
+                .map(|i| {
+                    serde_json::json!({
+                        "hght": 100.0 + 1200.0 * f64::from(i),
+                        "tmpc": 10.0, "dwpc": 10.0,
+                        "drct": null, "sknt": speed,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let calm_rows = rows(serde_json::json!(0.0));
+        let calm = serde_json::json!({"station": "KAAA", "profile": calm_rows});
+        let mut windy = calm.clone();
+        for level in windy["profile"].as_array_mut().unwrap() {
+            level["drct"] = serde_json::json!(270.0);
+            level["sknt"] = serde_json::json!(20.0);
+        }
+        let (expected, index) = select_raob_profile(serde_json::json!({
+            "profiles": [calm, windy]
+        }))
+        .unwrap();
+        assert_eq!(
+            index, 0,
+            "measured calm remains authoritative without direction"
+        );
+        assert_eq!(expected.len(), 6);
+        assert!(expected.iter().all(|l| l.wind_e == 0.0 && l.wind_n == 0.0));
+        let invalid = vec![
+            serde_json::Value::Null,
+            serde_json::json!({"profile": []}),
+            serde_json::json!({"profile": &calm_rows[..4]}),
+            serde_json::json!({"profile": rows(serde_json::Value::Null)}),
+            serde_json::json!({"profile": rows(serde_json::json!(20.0))}),
+        ];
+        for partial in &invalid {
+            let (actual, index) = select_raob_profile(serde_json::json!({
+                "profiles": [partial, calm, windy]
+            }))
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(index, 1);
+        }
+        assert!(select_raob_profile(serde_json::json!({"profiles": invalid})).is_err());
+        assert!(select_raob_profile(serde_json::json!({"profiles": []})).is_err());
+    }
+
+    #[test]
+    fn virtual_radiosonde_ids_keep_country_geometry_and_lifetime_checks() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let mut index = raob_station_index_fixture();
+        index["features"][0]["id"] = serde_json::json!("_AAA");
+        let selected = parse_raob_stations(index.clone(), (day, day + 43_200.0)).unwrap();
+        assert_eq!(
+            selected,
+            vec![("_AAA".to_string(), 40.876466, -73.524951, 100.0)]
+        );
+        for bad_id in ["_AA", "_LONG", "_A&B", "_A/B", "_A?B", "_A B", "_éA", ""] {
+            let mut bad = index.clone();
+            bad["features"][0]["id"] = serde_json::json!(bad_id);
+            assert!(parse_raob_stations(bad, (day, day)).is_err(), "{bad_id}");
+        }
+        for country in [serde_json::Value::Null, serde_json::json!("CA")] {
+            let mut bad = index.clone();
+            bad["features"][0]["properties"]["country"] = country;
+            assert!(parse_raob_stations(bad, (day, day)).is_err());
+        }
+        let mut bad = index.clone();
+        bad["features"][0]["geometry"]["coordinates"][1] = serde_json::json!(91.0);
+        assert!(parse_raob_stations(bad, (day, day)).is_err());
+        assert!(
+            parse_raob_stations(index, (day + 86_400.0, day + 129_600.0))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

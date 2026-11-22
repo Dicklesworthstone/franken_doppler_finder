@@ -1377,6 +1377,14 @@ An unusable refresh leaves a valid stale listing available. Invalid individual e
 skipped; a valid catalogue with no stations covering the requested dates remains reusable
 for other dates.
 
+The station catalogue also accepts IEM's four-character virtual IDs, such as `_AAA`,
+which group historical station aliases. US metadata, valid coordinates and archive-date
+checks still apply; existing continental station cache keys are unchanged. If a response
+contains several profiles, the first usable sounding through 5 km is retained. An incomplete
+earlier alias cannot hide a later usable one, and a warning counts these recoveries. Profiles
+are not combined, and a usable first profile, including measured calm, keeps its priority.
+This follows the [IEM radiosonde archive's station-ID scheme](https://mesonet.agron.iastate.edu/archive/raob/).
+
 Radiosonde selection first keeps the existing nearby-station blend. If none of those stations
 has a usable sounding, it tries the next-nearest stations within 700 km until one supplies usable
 profiles. Preferred and recovery attempts share the existing limit of four stations; a working

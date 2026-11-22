@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover virtual radiosonde stations and usable alias profiles
+
+- Accept IEM's virtual station identifiers while retaining the existing US metadata,
+  coordinate, archive-lifetime and cache-key rules. These IDs thread historical aliases
+  in the provider's station catalogue.
+- Retain the first usable sounding through 5 km when a response contains multiple profiles.
+  Incomplete earlier aliases no longer hide a complete later profile. Keep profiles separate
+  and report the number of recovered soundings in provisional and final weather warnings.
+- Cover virtual requests through the public cached-weather path with independently spelled
+  provider URLs, temperature/wind checks and recovery warnings. Add country, geometry,
+  lifetime, malformed-ID and first-usable-profile controls, including measured calm.
+- Extend calm-wind coverage with calm-to-windy time interpolation, a wind-only calm layer,
+  and malformed nonzero rows recovered only from observed vectors.
+
 ### Preserve supported fast flights with negative groundspeed telemetry
 
 - Treat finite negative groundspeeds as unavailable in the track builder's local copies,
