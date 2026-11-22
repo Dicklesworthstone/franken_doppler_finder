@@ -4227,16 +4227,16 @@ mod tests {
             free_reseed: false,
             ..on.clone()
         };
-        // This coarse curve crosses the true approach near 101.5 s, where its chirp is
-        // about 23 Hz/s and the pass's is 4 Hz/s. The twelve-Hz guidance band holds
-        // less than two seconds of the real ridge, while the original analysis window
-        // and frequency band still contain both sides of the complete pass.
+        // Near the analysis window's left edge (65 s), the guide and real approach
+        // are nearly parallel, so integration can retain the observed ridge. Their
+        // separation then leaves the guidance profile's eligible peak bins while
+        // the complete physical pass remains inside the original 65..155 s window.
         let det = Detection {
             id: 0,
             t0r: 110.0,
-            f0,
-            v: 175.0,
-            d: 2000.0,
+            f0: 333.95,
+            v: 150.0,
+            d: 1600.0,
             score: 8.0,
             score_approach: 8.0,
             score_recede: 8.0,
@@ -4286,6 +4286,23 @@ mod tests {
             1
         );
 
+        // A steeper coarse curve integrates away even this strong real pass. With
+        // no qualified observed points, free tracing must not invent a starting ridge.
+        let no_seed = measure(
+            &x,
+            sr,
+            &Detection {
+                f0: 367.0,
+                v: 175.0,
+                d: 2000.0,
+                ..det.clone()
+            },
+            "unobserved",
+            &on,
+        );
+        assert!(no_seed.trace.is_empty());
+        assert!(no_seed.fit.is_none() && !no_seed.quality.ok && !no_seed.quality.reseeded);
+
         // Only the observed ridge can seed this retry. No signal must not reach the
         // solver, and noise, a steady crossing tone or a three-second fragment cannot
         // replace the original refusal with a complete aircraft measurement.
@@ -4306,14 +4323,14 @@ mod tests {
         assert_eq!(silent_fits, 0);
         assert!(silent.fit.is_none() && !silent.quality.ok && !silent.quality.reseeded);
         let noise = wrong_shape_audio(None, None, t0r, dur, 0.6);
-        let crossing = model_fn(f0, v, d, t0r, on.c)(101.5);
+        let crossing = model_fn(f0, v, d, t0r, on.c)(65.0);
         let steady = wrong_shape_audio(None, Some(crossing), t0r, dur, 0.6);
         let fragment: Vec<f32> = x
             .iter()
             .zip(&noise)
             .enumerate()
             .map(|(i, (&sample, &background))| {
-                if (100.0..=103.0).contains(&(i as f64 / sr as f64)) {
+                if (63.5..=66.5).contains(&(i as f64 / sr as f64)) {
                     sample
                 } else {
                     background

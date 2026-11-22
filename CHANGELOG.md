@@ -47,9 +47,15 @@ at that commit, not per-change commits.
 - Add a physical-PCM regression requiring a short initial trace, a recovered fit with the
   established parameter tolerances, and a usable independent search event. Cover silence,
   noise, a steady tone, an isolated real ridge fragment and a solver failure with enough points.
-- Source and regression review is complete. Native measurement tests, release selftest and
-  reference/field replays remain unrun: the core build was killed in unchanged `fsci-stats`
-  before reaching the tests. No native pass or measured field-accuracy improvement is claimed.
+- A native core build completed with one frontend and one backend compiler worker. The
+  original steep-crossing PCM fixture then failed its setup assertion: the guide qualified
+  zero points, so it never exercised partial-ridge recovery. Retain that crossing as an
+  explicit no-seed refusal control, and use a nearly parallel guide at the analysis-window
+  boundary for the positive fixture. Keep the 1–19-point assertion and all physical tolerances.
+- The corrected positive fixture remains native-unverified after the executor disconnected
+  during a bounded probe build. Source review is complete; full workspace checks, release
+  selftest and reference/field replays remain incomplete. No measurement-test pass or
+  measured field-accuracy improvement is claimed.
 
 ### Retain corroborated faster turns when headings are missing
 
