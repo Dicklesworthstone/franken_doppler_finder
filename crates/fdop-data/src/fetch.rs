@@ -1196,9 +1196,9 @@ fn fetch_window_with_sources(
             let rels = &mut day_releases[di];
             let alternatives: Vec<_> =
                 crate::raw_cache::recovery_releases(&dir, &[], context, opts.include_mlat)
-                .into_iter()
-                .filter(|rel| !rels.iter().any(|listed| listed.feed == rel.feed))
-                .collect();
+                    .into_iter()
+                    .filter(|rel| !rels.iter().any(|listed| listed.feed == rel.feed))
+                    .collect();
             rels.extend(alternatives);
             let rebuilt = crate::raw_cache::rebuild_day(
                 &dir,

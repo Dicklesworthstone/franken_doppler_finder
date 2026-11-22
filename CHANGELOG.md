@@ -37,9 +37,10 @@ at that commit, not per-change commits.
   payloads, changed advertised asset identity and fatal publication errors.
 - Independent source review, scoped formatting with the pinned toolchain and whitespace checks
   passed. Native data-test compilation was killed in unchanged `asupersync 0.6.2`, despite
-  single compiler workers and reduced build settings, before the fetch tests ran. The new
-  tests and the preceding processed-cache regressions remain unrun; no live-service or
-  full-workspace validation pass is claimed.
+  single compiler workers and reduced build settings, before the fetch tests ran. A separate
+  metadata-only `cargo check -p fdop-data --tests --locked` was also killed in that dependency,
+  before reaching project source. The new tests and the preceding processed-cache regressions
+  remain unrun; no successful data typecheck, live-service or full-workspace pass is claimed.
 
 ### Require a common place and recording time before accepting curve corroboration
 
@@ -138,9 +139,17 @@ at that commit, not per-change commits.
 - Four targeted native core tests passed on the repair: the complete physical recovery and
   false-pass regression, successful-trace/solver-failure preservation, the existing one-sided
   clean/scintillating/null matrix, and the two-sided slow-source refusal. Scoped pinned
-  formatting, independent source review and whitespace checks passed. Full workspace checks,
-  the release CLI selftest and reference/field replays remain incomplete; no field-accuracy
-  improvement is claimed.
+  formatting, independent source review and whitespace checks passed.
+- The refreshed production library confirms that the repaired path still recovers 767 points
+  at 164.999705 Hz, 135.000472 m/s, 1758.076865 m and CPA 120.000122 s. Actual survey refinement
+  and family measurement both retain the pass with 813 points; no additional coarse fallback
+  was justified by this case.
+- The unchanged production `src/selftest.rs`, linked to the actual current core/types/rayon
+  libraries and run with real FFmpeg, passed its synthetic decode/detect/measure/search/refine
+  chain: 1.520666 m position error within a 75 m radius, 0.014271 s clock error, four measured
+  events and the correct ACE391/A1DFEB matches. This was a standalone caller with dev-profile
+  libraries, not the full release CLI. Full workspace checks, the release CLI selftest and
+  reference/field replays remain incomplete; no field-accuracy improvement is claimed.
 
 ### Retain corroborated faster turns when headings are missing
 
