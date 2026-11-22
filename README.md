@@ -1371,6 +1371,15 @@ require a finite direction from 0 to 360 degrees, and a profile without any obse
 is still refused. Reports count surface and aloft recoveries separately, using only retained
 cells, hours and levels. Surface-only weather keeps its existing fallback behavior.
 
+An observed pressure-level wind is also retained when its coincident temperature is
+missing, provided the pressure lies between retained thermal observations. Its height
+is interpolated in log pressure between the existing hypsometric endpoints; temperature
+and humidity stay on the original thermal segment. This can recover the only measured
+winds aloft without replacing them with surface weather. The profile still needs at
+least two observed aloft temperatures, and missing-temperature winds above that support
+or below the surface are not extrapolated. Reports count these recovered observations
+separately, using only retained cells and hours.
+
 Partial cached grids remain usable offline and still trigger an online repair attempt. A failed or
 unusable refresh preserves the cached partial response, as does another partial response with no more
 complete cells. This counts coverage, not geographic accuracy. New partial responses are cached too.

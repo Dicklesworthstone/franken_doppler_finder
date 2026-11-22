@@ -264,6 +264,7 @@ struct LocationProfiles {
     profiles: Vec<Vec<Level>>,
     missing_surface_winds: usize,
     missing_aloft_winds: usize,
+    wind_only_levels: usize,
 }
 
 fn parse_location(
@@ -279,6 +280,7 @@ fn parse_location(
         profiles: Vec::with_capacity(hours.len()),
         missing_surface_winds: 0,
         missing_aloft_winds: 0,
+        wind_only_levels: 0,
     };
     for i in hours {
         let t2 = arr(h, "temperature_2m", i);
@@ -311,6 +313,7 @@ fn parse_location(
             wind_e: we,
             wind_n: wn,
         }];
+        let mut thermal_pressures = vec![ps];
         let (mut z_prev, mut p_prev, mut t_prev) = (elev, ps, t2);
         for p in LEVELS_HPA {
             let pf = p as f64;
@@ -331,10 +334,50 @@ fn parse_location(
                 wind_e: we,
                 wind_n: wn,
             });
+            thermal_pressures.push(pf);
             (z_prev, p_prev, t_prev) = (z, pf, t);
         }
         if lv.len() < 3 {
             return Err(DataError::new("open-meteo: too few pressure levels"));
+        }
+        // A missing temperature does not erase an observed wind. Recover only levels
+        // inside the original thermodynamic support; the minimum above still requires
+        // two observed aloft temperatures. Log pressure locates the level within its
+        // hypsometric layer. Interpolating temperature and humidity at that height
+        // leaves the original piecewise-linear thermal profile unchanged.
+        let thermal_count = lv.len();
+        for p in LEVELS_HPA {
+            if arr(h, &format!("temperature_{p}hPa"), i).is_finite() {
+                continue;
+            }
+            let Some((we, wn)) = pressure_wind(
+                arr(h, &format!("wind_speed_{p}hPa"), i),
+                arr(h, &format!("wind_direction_{p}hPa"), i),
+            ) else {
+                continue;
+            };
+            let pf = p as f64;
+            let k = thermal_pressures.partition_point(|&known| known > pf);
+            if k == 0 || k >= thermal_count {
+                continue;
+            }
+            let (a, b) = (lv[k - 1], lv[k]);
+            let w = (thermal_pressures[k - 1] / pf).ln()
+                / (thermal_pressures[k - 1] / thermal_pressures[k]).ln();
+            if !(a.z_msl < b.z_msl && (0.0..1.0).contains(&w)) {
+                continue;
+            }
+            lv.push(Level {
+                z_msl: a.z_msl + w * (b.z_msl - a.z_msl),
+                t_c: a.t_c + w * (b.t_c - a.t_c),
+                rh: a.rh + w * (b.rh - a.rh),
+                wind_e: we,
+                wind_n: wn,
+            });
+            out.wind_only_levels += 1;
+        }
+        if lv.len() > thermal_count {
+            lv.sort_by(|a, b| a.z_msl.total_cmp(&b.z_msl));
         }
         // the surface wind alone would be copied to every height and pass for winds aloft
         if lv[1..].iter().all(|l| l.wind_e.is_nan()) {
@@ -457,6 +500,7 @@ fn parse_om_grid(
     let mut missing = Vec::new();
     let mut surface_wind_recoveries = 0usize;
     let mut aloft_wind_recoveries = 0usize;
+    let mut wind_only_recoveries = 0usize;
     for (index, l) in locs.iter().enumerate() {
         let t = match times_of(&l["hourly"]) {
             Ok(t) => t,
@@ -480,6 +524,7 @@ fn parse_om_grid(
             Ok(p) => {
                 surface_wind_recoveries += p.missing_surface_winds;
                 aloft_wind_recoveries += p.missing_aloft_winds;
+                wind_only_recoveries += p.wind_only_levels;
                 per_loc.push((index, selected, p.profiles));
             }
             Err(e) => missing.push(format!("cell {}: {e}", index + 1)),
@@ -505,6 +550,11 @@ fn parse_om_grid(
     if aloft_wind_recoveries > 0 {
         wind_warnings.push(format!(
             "{src}: {aloft_wind_recoveries} retained pressure-level winds unavailable; interpolating in height and extrapolating the nearest observed wind beyond the available levels"
+        ));
+    }
+    if wind_only_recoveries > 0 {
+        wind_warnings.push(format!(
+            "{src}: retained {wind_only_recoveries} observed pressure-level winds without temperatures; heights interpolated in log pressure within observed thermodynamic layers, preserving their temperature and humidity profiles"
         ));
     }
     let partial = !missing.is_empty();
@@ -2654,6 +2704,226 @@ mod tests {
         );
         assert!(weather.winds_aloft);
         assert_eq!(weather.warnings.len(), 2);
+    }
+
+    fn wind_only_pressure_fixture(day: i64) -> serde_json::Value {
+        let mut value = open_meteo_fixture(day, 3);
+        value["hourly"]["temperature_2m"] = serde_json::json!(vec![15.0; 3]);
+        value["hourly"]["relative_humidity_2m"] = serde_json::json!(vec![30.0; 3]);
+        value["hourly"]["wind_speed_10m"] = serde_json::json!([null, null, null]);
+        for p in LEVELS_HPA {
+            value["hourly"][format!("temperature_{p}hPa")] = serde_json::json!(vec![15.0; 3]);
+            value["hourly"][format!("wind_speed_{p}hPa")] = serde_json::json!([null, null, null]);
+        }
+        value["hourly"]["temperature_850hPa"] = serde_json::json!([null, null, null]);
+        value["hourly"]["wind_speed_850hPa"] = serde_json::json!([12.0, 18.0, 0.0]);
+        value["hourly"]["wind_direction_850hPa"] = serde_json::json!([270.0, 180.0, null]);
+        value
+    }
+
+    #[test]
+    fn cached_pressure_profiles_recover_winds_without_coincident_temperatures() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let (dir, _) = weather_test_cache("wind-only", "wind-only");
+        let fixture = wind_only_pressure_fixture(day as i64);
+        cache_open_meteo_fixture(&dir, true, "2026-09-08", &fixture);
+        let weather = fetch_atmosphere(
+            &BBox::new(lat, lon, lat, lon),
+            day + 900.0,
+            day + 6300.0,
+            &dir,
+            true,
+        );
+        assert!(weather.winds_aloft, "{:?}", weather.warnings);
+        assert!(weather.atmo.describe().contains("pressure levels"));
+        assert_eq!(weather.warnings.len(), 3);
+        assert!(weather.warnings[2].contains("retained 3 observed pressure-level winds"));
+        let winds = [[12.0, 0.0], [0.0, 18.0], [0.0, 0.0]];
+        for hour in [0.25, 0.5, 1.0, 1.75] {
+            let i = hour as usize;
+            let w = hour - i as f64;
+            for (lo, hi) in [(-100.0, 100.0), (30.0, 4000.0), (9000.0, 500.0)] {
+                let got = weather.atmo.medium(lat, lon, day + hour * 3600.0, lo, hi);
+                let want = [
+                    (1.0 - w) * winds[i][0] + w * winds[i + 1][0],
+                    (1.0 - w) * winds[i][1] + w * winds[i + 1][1],
+                ];
+                assert!((got.c - fdop_types::atmo::sound_speed(15.0, 0.3)).abs() < 1e-10);
+                assert!((got.wind_e - want[0]).abs() < 1e-10, "{got:?}");
+                assert!((got.wind_n - want[1]).abs() < 1e-10, "{got:?}");
+            }
+        }
+        // Isothermal hydrostatics independently locate the recovered wind. It lies
+        // between two pressure temperatures, so the surface's 2 m offset is irrelevant.
+        let parsed = parse_location(&fixture, true, 0..3).unwrap();
+        let z = 30.0 + 287.05 * (15.0 + 273.15) / 9.80665 * (1010.0_f64 / 850.0).ln();
+        let recovered = parsed.profiles[0]
+            .iter()
+            .find(|l| (l.z_msl - z).abs() < 1e-9)
+            .expect("observed wind must be located at the 850 hPa height");
+        assert_eq!(recovered.wind_e, 12.0);
+        assert_eq!(recovered.t_c, 15.0);
+        assert_eq!(recovered.rh, 0.3);
+    }
+
+    #[test]
+    fn wind_only_pressure_levels_preserve_thermal_profiles_and_recover_shear() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let (dir, _) = weather_test_cache("wind-only-shear", "wind-only-shear");
+        let mut fixture = open_meteo_fixture(day as i64, 3);
+        for suffix in std::iter::once("10m".to_string())
+            .chain(LEVELS_HPA.into_iter().map(|p| format!("{p}hPa")))
+        {
+            fixture["hourly"][format!("wind_speed_{suffix}")] = serde_json::json!(vec![0.0; 3]);
+        }
+        for p in [925, 850, 700] {
+            fixture["hourly"][format!("temperature_{p}hPa")] =
+                serde_json::json!([null, null, null]);
+        }
+        let load = |value: &serde_json::Value| {
+            cache_open_meteo_fixture(&dir, true, "2026-09-08", value);
+            fetch_atmosphere(
+                &BBox::new(lat, lon, lat, lon),
+                day + 900.0,
+                day + 6300.0,
+                &dir,
+                true,
+            )
+        };
+        // No missing-temperature winds in the control: it keeps exactly the original
+        // surface/500/300 hPa thermodynamic support and observed calm aloft.
+        let mut control = fixture.clone();
+        for p in [925, 850, 700] {
+            control["hourly"][format!("wind_speed_{p}hPa")] = serde_json::json!([null, null, null]);
+        }
+        let baseline = load(&control);
+        fixture["hourly"]["wind_speed_850hPa"] = serde_json::json!(vec![20.0; 3]);
+        let recovered = load(&fixture);
+        assert!(baseline.winds_aloft && recovered.winds_aloft);
+        assert!(baseline.warnings.is_empty());
+        assert_eq!(recovered.warnings.len(), 1);
+        assert!(recovered.warnings[0].contains("retained 9 observed pressure-level winds"));
+        for hour in [0.25, 0.5, 1.0, 1.75] {
+            for (lo, hi) in [
+                (-100.0, 30.0),
+                (30.0, 200.0),
+                (200.0, 2200.0),
+                (5000.0, 10000.0),
+            ] {
+                let t = day + hour * 3600.0;
+                let got = recovered.atmo.medium(lat, lon, t, lo, hi);
+                let old = baseline.atmo.medium(lat, lon, t, lo, hi);
+                assert!(
+                    (got.c - old.c).abs() < 1e-10,
+                    "thermal profile changed: {got:?} {old:?}"
+                );
+            }
+        }
+        // A 50 m-aligned interval inside the 925..850 hPa linear wind segment
+        // has the analytic midpoint wind; no cumulative-grid kink is crossed.
+        let layer_log_pressure = (1010.0_f64 / 500.0).ln();
+        let top = 30.0 + 287.05 / 9.80665 * (273.15 + 0.5 * (15.25 - 25.75)) * layer_log_pressure;
+        let height = |p| 32.0 + (top - 32.0) * (1010.0_f64 / p).ln() / layer_log_pressure;
+        let (calm, peak) = (height(925.0), height(850.0));
+        let lo = (calm / 50.0).ceil() * 50.0;
+        let hi = (peak / 50.0).floor() * 50.0;
+        assert!(hi > lo);
+        let want = 20.0 * (0.5 * (lo + hi) - calm) / (peak - calm);
+        let got = recovered.atmo.medium(lat, lon, day + 3600.0, lo, hi);
+        assert!((got.wind_e - want).abs() < 1e-10, "{got:?} expected {want}");
+        assert!(got.wind_n.abs() < 1e-10);
+        assert!(
+            got.wind_e > 5.0,
+            "the original calm profile must be materially different"
+        );
+    }
+
+    #[test]
+    fn wind_only_pressure_recovery_keeps_support_gates_and_partial_warnings() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let fixture = wind_only_pressure_fixture(day as i64);
+        for (speed, direction) in [
+            (serde_json::Value::Null, serde_json::json!(270.0)),
+            (serde_json::json!(-12.0), serde_json::json!(270.0)),
+            (serde_json::json!(12.0), serde_json::Value::Null),
+            (serde_json::json!(12.0), serde_json::json!(450.0)),
+        ] {
+            let mut bad = fixture.clone();
+            bad["hourly"]["wind_speed_850hPa"][0] = speed;
+            bad["hourly"]["wind_direction_850hPa"][0] = direction;
+            assert!(
+                parse_location(&bad, true, 0..1)
+                    .err()
+                    .unwrap()
+                    .0
+                    .contains("no winds aloft")
+            );
+        }
+        // A wind above the highest observed temperature, or below the surface,
+        // cannot make a usable profile by extrapolating temperature support.
+        for (p, surface_pressure) in [(300, 1010.0), (925, 900.0)] {
+            let mut unsupported = fixture.clone();
+            unsupported["hourly"]["wind_speed_850hPa"] = serde_json::json!([null, null, null]);
+            unsupported["hourly"][format!("temperature_{p}hPa")] =
+                serde_json::json!([null, null, null]);
+            unsupported["hourly"][format!("wind_speed_{p}hPa")] = serde_json::json!(vec![12.0; 3]);
+            unsupported["hourly"]["surface_pressure"] =
+                serde_json::json!(vec![surface_pressure; 3]);
+            assert!(
+                parse_location(&unsupported, true, 0..1)
+                    .err()
+                    .unwrap()
+                    .0
+                    .contains("no winds aloft")
+            );
+        }
+        let mut short = fixture.clone();
+        for p in [925, 700, 500] {
+            short["hourly"][format!("temperature_{p}hPa")] = serde_json::json!([null, null, null]);
+        }
+        assert!(
+            parse_location(&short, true, 0..1)
+                .err()
+                .unwrap()
+                .0
+                .contains("too few pressure levels")
+        );
+        let mut missing_hour = fixture.clone();
+        missing_hour["hourly"]["temperature_2m"][1] = serde_json::Value::Null;
+        let source = parse_om_grid(
+            serde_json::json!([fixture, missing_hour]),
+            &[0.0],
+            &[0.0, 1.0],
+            day + 900.0,
+            day + 6300.0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(source.partial_cells, Some(1));
+        assert!(source.warnings[0].contains("1 of 2 grid cells"));
+        assert!(
+            source
+                .warnings
+                .last()
+                .unwrap()
+                .contains("retained 3 observed pressure-level winds")
+        );
+        let weather = fetch_with_fallbacks(
+            Ok(source),
+            || panic!("recovered wind-only pressure profiles keep source priority"),
+            || panic!("recovered wind-only pressure profiles keep source priority"),
+            |_| panic!("recovered wind-only pressure profiles need no fallback"),
+        );
+        assert!(weather.winds_aloft);
+        assert!(
+            weather
+                .warnings
+                .last()
+                .unwrap()
+                .contains("retained 3 observed pressure-level winds")
+        );
     }
 
     #[test]

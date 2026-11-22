@@ -97,6 +97,21 @@ at that commit, not per-change commits.
   compilation, Clippy, tests, release selftest and reference/field replays remain unrun after
   the execution environment became unavailable. No native pass or field improvement is claimed.
 
+### Recover pressure-level winds without coincident temperatures
+
+- Retain valid observed winds on missing-temperature pressure levels when existing
+  surface/aloft thermal observations bracket them. Interpolate their heights in log
+  pressure and retain the original temperature/humidity profile; require the same
+  two observed aloft temperatures and never extend unsupported thermal coverage.
+- Restore pressure-level weather when those are the only measured winds aloft, and
+  recover otherwise lost wind shear. Report recovered levels separately, counting
+  only retained grid cells and hours; keep malformed and unbracketed winds ineligible.
+- Add public offline cached-weather regressions for independently known height,
+  time-interpolated vectors and wind-shear means, measured calm, unchanged sound-speed
+  profiles, thermal-support controls and partial-grid warning propagation.
+- Independent source review and whitespace checks completed. Native validation is
+  pending; no field-accuracy, live-weather or performance improvement is claimed.
+
 ### Retain measured calm winds in radiosonde profiles
 
 - Reuse the existing observed-wind parser for IEM radiosondes: measured zero-speed
