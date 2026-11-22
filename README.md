@@ -1069,9 +1069,17 @@ remains fatal, including when missing days would otherwise be allowed.
 If discovery succeeds but an advertised fuller or preferred main archive fails during download
 or ingestion, a verified processed main-feed catalogue can still supply the day. It must cover
 the requested region and time, aircraft policy and required midnight context under the online
-cache rules. The report retains all failed-feed details and missing-feed warnings. A successful
-new catalogue keeps priority, and later online runs retry the upgrade. This recovery never
-turns a final catalogue publication failure into a successful fetch.
+cache rules. When no processed catalogue is usable, completed raw feeds can reconstruct the day,
+including a staging download whose publication was interrupted before prod became available.
+Newly advertised release identities remain authoritative for their own feeds: an old prod
+checkpoint cannot substitute for a changed prod archive, while a verified alternate staging
+feed remains eligible. Requested MLAT can join the reconstruction from a completed download,
+including when its current release lookup failed. The normal joint builder retains aircraft
+types, altitude reconciliation, provenance and coverage checks. Recovery never downloads an
+archive identified only by a checkpoint.
+The report retains failed-feed details and actual missing-feed warnings. A successful new
+catalogue keeps priority, and later online runs retry the preferred upgrade while reusing
+completed raw feeds. Final catalogue publication failures remain errors.
 
 If a requested MLAT archive fails during download or ingestion, a completely ingested
 and successfully published prod/staging main catalogue can still supply that day. The

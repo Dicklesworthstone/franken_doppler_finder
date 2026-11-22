@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover interrupted raw downloads after a preferred archive fails
+
+- Rebuild a missing processed catalogue from completed raw feeds after an advertised main
+  archive fails, including staging downloads completed before prod became available. Keep
+  successful new archives and verified processed catalogues ahead of this recovery.
+- Preserve the current discovered identity for every advertised feed. Only unadvertised
+  feeds may recover identities from completed checkpoints; those identities never initiate
+  downloads. The existing joint builder enforces coverage, aircraft policy, geoid conversion,
+  midnight context, altitude reconciliation and a usable main feed.
+- Recover requested cached MLAT after an optional lookup outage without losing its aircraft
+  types or corrected heights. Keep the lookup and archive errors in the report, remove only
+  a proven-obsolete missing-MLAT note, and retry the preferred archive on a later online run.
+- Add real compressed-archive regressions for interrupted staging publication, ordinary and
+  jet-inclusive requests, changed geoid, exact track/provenance equivalence to fresh ingestion,
+  unchanged checkpoints and successful prod retries. Cover MLAT-only data, incomplete raw
+  payloads, changed advertised asset identity and fatal publication errors.
+- Independent source review, scoped formatting with the pinned toolchain and whitespace checks
+  passed. Native data-test compilation was killed in unchanged `asupersync 0.6.2`, despite
+  single compiler workers and reduced build settings, before the fetch tests ran. The new
+  tests and the preceding processed-cache regressions remain unrun; no live-service or
+  full-workspace validation pass is claimed.
+
 ### Require a common place and recording time before accepting curve corroboration
 
 - Score the trace answer's actual refined observer and recording start against the curve
