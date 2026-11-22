@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep usable flight catalogues when an online archive upgrade fails
+
+- Reuse a verified processed main-feed catalogue when discovery advertises a fuller or preferred
+  feedset but its main archive cannot be fetched or ingested. A successful new archive still
+  takes priority, and the next online run can retry the upgrade.
+- Retain the existing region, time, jet-policy and midnight-context checks. Cache-publication
+  failures remain fatal. Recovery warnings include the failed archive details and any missing
+  feeds, so a recovered partial catalogue does not imply full archive coverage.
+- Add generated-tar regressions through actual ingestion for prod-only and jet-inclusive staging caches. Compare
+  fallback results with ordinary offline fetches, including tracks, provenance, geoid adjustment
+  and coverage notes; compare successful retries with fresh ingestion and retain original cache
+  bytes. Cover legacy midnight context and failed final publication with refusal controls.
+- Independent source review, scoped pinned formatting and diff checks completed. Native fetch
+  tests remain unrun after execution-environment interruptions; no live archive-service or
+  full-workspace validation pass is claimed.
+
 ### Recover complete flyovers from short observed ridge fragments
 
 - Retain a qualified initial ridge fragment when a mismatched detection guide finds fewer

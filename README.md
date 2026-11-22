@@ -1050,11 +1050,18 @@ could not be checked. Feed preference, aircraft policy, certified jet coverage a
 coverage checks still apply. Without verified local main-feed data, the original lookup error
 remains fatal, including when missing days would otherwise be allowed.
 
+If discovery succeeds but an advertised fuller or preferred main archive fails during download
+or ingestion, a verified processed main-feed catalogue can still supply the day. It must cover
+the requested region and time, aircraft policy and required midnight context under the online
+cache rules. The report retains all failed-feed details and missing-feed warnings. A successful
+new catalogue keeps priority, and later online runs retry the upgrade. This recovery never
+turns a final catalogue publication failure into a successful fetch.
+
 If a requested MLAT archive fails during download or ingestion, a completely ingested
 and successfully published prod/staging main catalogue can still supply that day. The
-result retains the detailed MLAT error and missing-aircraft warning. Incomplete main data
-remains an error under the default policy, and final catalogue publication failures remain
-errors under every policy. Online retries still try to add the advertised MLAT feed,
+result retains the detailed MLAT error and missing-aircraft warning. Without a verified
+processed fallback, incomplete main data remains an error under the default policy. Final catalogue
+publication failures remain errors under every policy. Online retries still try to add the advertised MLAT feed,
 reusing the completed main raw checkpoint; partial MLAT bytes are never published.
 
 Main-only discoveries use `releases-main.json`. They never replace `releases.json` or
@@ -5021,7 +5028,7 @@ audio or video recorded somewhere sensitive:
 | Warning `the audio has little energy below 100 Hz (45-95 Hz is N dB below 150-600 Hz)` | A high-pass filter does this, removing the fundamentals of slower propellers and weakening those near the cut. Speech-heavy audio can also read low | Use the unfiltered recording if you have one. Otherwise expect fewer usable flyovers, and do not read a failed search as evidence about the place |
 | Warning `the answer lies in CT, outside the searched state NY` (or `appears to lie in`, when the state is a gazetteer estimate) | A state search covers the state's bounding box, which takes in parts of its neighbours | If you know the recording was made in the searched state, distrust the answer whatever its grade, unless its radius reaches back across the border. A narrower `--near`, such as a county, takes in less of the neighbours |
 | `needs network or a cached file: Census gazetteer ...` | No usable cached table: it is absent, unreadable, malformed or empty | Run once without `--offline` to fetch and validate a replacement, or use a state, point or box region |
-| `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days and completed raw feeds are cached when their writes succeed. Online retries reuse matching raw feeds and download missing ones. A saved partial main day can be reused offline with a missing-feed warning. A day without any main-feed data cannot be searched |
+| `ADS-B fetch: ...` | Network failure or a missing archive day | Rerun; finished days and completed raw feeds are cached when their writes succeed. Online retries reuse matching raw feeds and download missing ones. A verified saved main day can be reused offline or after a failed online archive upgrade, with failure and missing-feed warnings. A day without any main-feed data cannot be searched |
 | A download pauses for a minute, then carries on | The server stopped sending with the connection still open. After 60 s with no data, `fdop` reconnects and resumes with an HTTP `Range` request | Nothing. Resumed `206` responses are checked for their byte offset, range boundary and total length before new bytes are accepted. Capped ranges continue until the full object is proved complete; a range's body length is never treated as the archive length. After repeated failures with no new bytes it stops |
 | Warning `the ADS-B archive for UTC day(s) ... is not published yet ...: only recording starts up to ... were searched` | The local date runs into a UTC day that adsb.lol has not published yet. Each day appears some hours after it ends | Rerun after the release to search the rest of the date. A recording that ended before the cut was searched in full. With no published part at all, `locate` stops with `no published day covers ...: rerun later` |
 | Answer graded **low** | One or more gates failed | Read the gates in `report.html`. A margin marked `provisional, comparison truncated` failed because a comparison was cut: an unchecked rival could still win, so the answer is unconfirmed, not refuted. Otherwise, a small margin means other flights explain the curves almost as well, possibly at nearly the same place: `margin.next_distinct_km` in `result.json` says how far away |

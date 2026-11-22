@@ -1138,6 +1138,55 @@ fn fetch_window_with_sources(
         });
     }
 
+    // A successful lookup can advertise an upgrade over a usable local catalogue.
+    // If its main archive then fails, keep that verified catalogue just as during a
+    // lookup outage. Do not replace a newly published day or hide publication failures.
+    if failed.caches.is_empty() {
+        let mut failed_days: Vec<_> = failed.feeds.iter().map(|(di, _)| *di).collect();
+        failed_days.sort_unstable();
+        failed_days.dedup();
+        for di in failed_days {
+            if day_stores[di].is_some() {
+                continue;
+            }
+            let day = days[di];
+            let dir = day_dir(cache_dir, day);
+            let label = format!("{:04}-{:02}-{:02}", day.0, day.1, day.2);
+            let day_start = days_from_civil(day.0, day.1, day.2) as f64 * 86_400.0;
+            let want = IngestSpec {
+                t_start: spec.t_start.max(day_start),
+                t_end: spec.t_end.min(day_start + 86_400.0),
+                ..*spec
+            };
+            let required_context = (days.len() > 1).then(|| day_context(day));
+            for fs in std::iter::once(feedset).chain(partial_feedsets(feedset).iter().copied()) {
+                let Some((path, store)) =
+                    find_cached(&dir, fs, &want, &label, opts, required_context)
+                else {
+                    continue;
+                };
+                let errors = failed
+                    .feeds
+                    .iter()
+                    .filter(|(failed_day, _)| *failed_day == di)
+                    .map(|(_, error)| error.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let note = format!(
+                    "{label}: archive fetch failed; using the cached {fs} main-feed catalogue {}; rerun online to retry the failed upgrade: {errors}",
+                    path.display()
+                );
+                opts.say(&format!("[adsb] WARNING {note}"));
+                notes.push(note);
+                notes.extend(feedset_gaps(&label, fs, opts.include_mlat));
+                day_stores[di] = Some(store);
+                cache_hits += 1;
+                failed.feeds.retain(|(failed_day, _)| *failed_day != di);
+                break;
+            }
+        }
+    }
+
     failed.report(opts, &mut notes)?;
 
     // ---- combine ----
@@ -2175,6 +2224,229 @@ mod tests {
             releases,
             parts,
             archives,
+        }
+    }
+
+    #[test]
+    fn failed_main_archive_reuses_processed_cache_then_retries_the_upgrade() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (main, cached_mlat, include_jets) in
+            [(Feed::Prod, false, false), (Feed::Staging, true, true)]
+        {
+            let f = offline_raw_fixture(main, include_jets);
+            let want = IngestSpec {
+                keep_unknown: true,
+                geoid_n_m: f.want.geoid_n_m + 7.0,
+                ..f.want
+            };
+            let n = if cached_mlat { 2 } else { 1 };
+            let cached = build_day_store(
+                f.parts[..n].to_vec(),
+                &f.spec,
+                f.releases[..n].iter().map(|r| r.tag.clone()).collect(),
+                day_context((2026, 9, 8)),
+            );
+            let fs = feedset_name(main, cached_mlat);
+            let path = f.dir.join(format!(
+                "{}_{}.fdtrk",
+                cache_feedset(&fs, include_jets),
+                bbox_key(&f.spec.bbox).1
+            ));
+            cached.save(&path).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let offline = fetch_window(
+                &want,
+                &f.cache,
+                &FetchOptions {
+                    offline: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(!offline.legs.is_empty());
+            let releases = [
+                checkpoint_release(Feed::Prod, &f.archives[0]),
+                f.releases[1].clone(),
+            ];
+            let calls = [AtomicUsize::new(0), AtomicUsize::new(0)];
+            let run = |fail: bool| {
+                fetch_window_with_sources(
+                    &want,
+                    &f.cache,
+                    &FetchOptions::default(),
+                    |_, _, _, _, _, offline, include_mlat| {
+                        assert!(!offline && include_mlat);
+                        Ok(crate::adsblol::ReleaseDiscovery {
+                            releases: releases.to_vec(),
+                            mlat_error: None,
+                        })
+                    },
+                    |rel, spec, context, progress| {
+                        let i = usize::from(rel.feed == Feed::Mlatonly);
+                        calls[i].fetch_add(1, Ordering::Relaxed);
+                        // Fail both feeds in the staging case: neither failure may disappear.
+                        let bytes = &f.archives[i];
+                        // Truncate inside the first tar header so the stream cannot be complete.
+                        let end = if fail && (i == 0 || cached_mlat) {
+                            128
+                        } else {
+                            bytes.len()
+                        };
+                        ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
+                    },
+                )
+            };
+            let got =
+                run(true).expect("a verified processed fallback must survive the failed upgrade");
+            assert_same_legs(&got.legs, &offline.legs);
+            assert_eq!(got.meta.sources, offline.meta.sources);
+            assert_eq!(got.meta.geoid_n_m, want.geoid_n_m);
+            assert_eq!(got.meta.stats["cache_hits"], 1);
+            let notes = got.meta.stats["notes"].as_array().unwrap();
+            for note in offline.meta.stats["notes"].as_array().unwrap() {
+                assert!(notes.contains(note), "lost coverage warning: {note}");
+            }
+            let recovery = notes
+                .iter()
+                .filter_map(|n| n.as_str())
+                .find(|n| n.contains("archive fetch failed"))
+                .unwrap();
+            assert!(recovery.contains(&format!("cached {fs} main-feed catalogue")));
+            assert!(recovery.contains(&releases[0].tag) && recovery.contains("rerun online"));
+            if cached_mlat {
+                assert!(recovery.contains(&releases[1].tag));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+
+            let upgraded = run(false).unwrap();
+            assert_eq!(
+                calls.map(|n| n.load(Ordering::Relaxed)),
+                [2, if cached_mlat { 2 } else { 1 }]
+            );
+            let sp = IngestSpec {
+                geoid_n_m: want.geoid_n_m,
+                ..f.spec
+            };
+            let parts = releases
+                .iter()
+                .enumerate()
+                .map(|(i, rel)| {
+                    ingest_day_reader(
+                        f.archives[i].as_slice(),
+                        rel.feed.label(),
+                        &sp,
+                        &|_| {},
+                        day_context((2026, 9, 8)),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let mut tags: Vec<_> = releases.iter().map(|r| r.tag.clone()).collect();
+            tags.sort();
+            let fresh = build_day_store(parts, &sp, tags.clone(), day_context((2026, 9, 8)));
+            let fresh = merge_stores(vec![fresh], DAY_JOIN_GAP_S).filtered(
+                &want.bbox,
+                want.t_start,
+                want.t_end,
+            );
+            assert_same_legs(&upgraded.legs, &fresh.legs);
+            assert_eq!(upgraded.meta.sources, tags);
+            assert_eq!(upgraded.meta.geoid_n_m, want.geoid_n_m);
+            assert!(
+                !upgraded.meta.stats["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.as_str().unwrap().contains("archive fetch failed"))
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn failed_archive_does_not_bypass_midnight_context_or_publication_errors() {
+        use crate::ingest::tests::T0;
+        for problem in ["midnight", "publication"] {
+            let f = offline_raw_fixture(Feed::Prod, false);
+            let want = IngestSpec {
+                keep_unknown: true,
+                t_start: if problem == "midnight" {
+                    T0 - 1.0
+                } else {
+                    f.want.t_start
+                },
+                ..f.want
+            };
+            let key = bbox_key(&f.spec.bbox).1;
+            let mut cached = build_day_store(
+                vec![f.parts[0].clone()],
+                &f.spec,
+                vec![f.releases[0].tag.clone()],
+                day_context((2026, 9, 8)),
+            );
+            if problem == "midnight" {
+                cached.meta.stats = serde_json::json!({});
+                // The other day is complete, so only the legacy current-day cache
+                // could incorrectly rescue this request after its main archive fails.
+                let previous = (2026, 9, 7);
+                let sp = IngestSpec {
+                    t_start: T0 - 86_400.0 - DAY_CACHE_PAD_S,
+                    t_end: T0 + DAY_CACHE_PAD_S,
+                    ..f.spec
+                };
+                let tags = [Feed::Prod, Feed::Mlatonly]
+                    .map(|feed| {
+                        crate::adsblol::tag_for(previous.0, previous.1, previous.2, feed, 0)
+                    })
+                    .to_vec();
+                let previous_store = build_day_store(Vec::new(), &sp, tags, day_context(previous));
+                let dir = day_dir(&f.cache, previous);
+                std::fs::create_dir_all(&dir).unwrap();
+                previous_store
+                    .save(&dir.join(format!("prod+mlatonly_{key}.fdtrk")))
+                    .unwrap();
+            } else {
+                // A complete fallback exists, but a failed final publication remains fatal.
+                std::fs::create_dir_all(f.dir.join(format!("prod+mlatonly_{key}.fdtrk"))).unwrap();
+            }
+            let path = f.dir.join(format!("prod_{key}.fdtrk"));
+            cached.save(&path).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let error = fetch_window_with_sources(
+                &want,
+                &f.cache,
+                &FetchOptions::default(),
+                |_, y, m, d, _, offline, include_mlat| {
+                    assert_eq!((y, m, d), (2026, 9, 8));
+                    assert!(!offline && include_mlat);
+                    Ok(crate::adsblol::ReleaseDiscovery {
+                        releases: f.releases.to_vec(),
+                        mlat_error: None,
+                    })
+                },
+                |rel, spec, context, progress| {
+                    let i = usize::from(rel.feed == Feed::Mlatonly);
+                    let bytes = &f.archives[i];
+                    let end = if problem == "midnight" && i == 0 {
+                        128
+                    } else {
+                        bytes.len()
+                    };
+                    ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("ADS-B fetch failed"), "{problem}: {error}");
+            assert!(
+                error.contains(if problem == "midnight" {
+                    f.releases[0].tag.as_str()
+                } else {
+                    "could not cache completed day"
+                }),
+                "{problem}: {error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
         }
     }
 
