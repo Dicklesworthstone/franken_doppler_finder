@@ -2011,16 +2011,22 @@ allowance runs out, the funnel records the cut and the margin gate fails. Recove
 at most 4,096 pending seeds, without collecting raw pairs; its hash keys and accepted cells
 still grow with the input. Hypothesis clouds are released after both passes.
 
-A fine-stage cell (1 km in position and 20 s in clock) now retains its other quick-passing
-seeds until its representative's fine grid succeeds. Every original representative runs
-before recovery. If a grid finds no eligible pair, the cell can try its next deterministic
-seed; failed cells take turns, and each stops at its first successful grid. Additional grids
-consume only the remaining `max_fine` allowance and count in `funnel.fine_scored`. Untested
-alternatives at budget exhaustion produce a warning and a truncation that fails the existing
-margin gate. Successful representatives retain their original candidate. Exact duplicate
-seeds are tried once; different grid phases and source-time hypotheses remain eligible.
-Retaining alternatives and evaluating failed cells can add memory and runtime, bounded by
-the existing input and comparison budgets; no speedup or field-accuracy claim is made.
+A fine-stage cell (1 km in position and 20 s in clock) retains its other quick-passing
+seeds. Every original representative runs first, followed by the established failed-cell
+recovery: failed cells take turns until each finds its first successful grid. Then any
+remaining budget can search alternatives whose centres lie outside those successful grids'
+actual local extents, or whose source-time guesses select distinct closest-approach visits.
+A weaker successful grid therefore no longer automatically hides a better nearby location.
+Original candidates and the earlier failed-cell recovery priority are preserved.
+
+Additional grids consume only the remaining `max_fine` allowance and count in
+`funnel.fine_scored`. Untested alternatives at budget exhaustion produce a warning and a
+truncation that fails the existing margin gate. Exact duplicate seeds are tried once.
+The extent check uses the actual rounded local grid, not the larger grouping cell. It does
+not establish exhaustive coverage of shifted grid phases or partly overlapping corners
+when a seed's centre is already inside a successful extent. Retaining and evaluating
+alternatives can add memory and runtime, bounded by the existing input and comparison
+budgets; no speedup or field-accuracy claim is made.
 
 The fine grid selects the lowest-loss location where both seeding aircraft pass the
 existing per-event trace-fit and coverage gates. A lower combined loss at a point that

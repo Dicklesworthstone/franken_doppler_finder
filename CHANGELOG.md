@@ -97,6 +97,25 @@ at that commit, not per-change commits.
   compilation, Clippy, tests, release selftest and reference/field replays remain unrun after
   the execution environment became unavailable. No native pass or field improvement is claimed.
 
+### Keep better nearby locations behind an already successful fine grid
+
+- Preserve each original successful fine candidate while retaining same-cell seed
+  centres outside its actual local grid extent and distinct physical CPA visits.
+  Previously, any first success discarded all remaining seeds in that grouping cell.
+- Finish original representatives and established failed-cell recoveries before new
+  alternatives use the remaining fine-grid budget. Count every extra grid and report
+  genuine untested work through the existing truncation and margin-gate rules.
+- Add a two-aircraft synthetic trace regression with a weaker successful first grid
+  and a better true-location seed, mirrored geometry and relative/epoch clocks. Add
+  local-grid, distinct-visit, priority and exact-budget controls; preserve the old
+  successful candidate exactly. Covered-centre grid phases and partly overlapping
+  corners remain outside this bounded recovery.
+- Independent source review and pinned formatting of changed ranges completed.
+  The native core build failed when rustc was killed in unchanged `simba`, before
+  reaching project code. Prepared component checks could not run before the execution
+  environment became unavailable. No native test, field-accuracy or performance pass
+  is claimed.
+
 ### Recover pressure-level winds without coincident temperatures
 
 - Retain valid observed winds on missing-temperature pressure levels when existing

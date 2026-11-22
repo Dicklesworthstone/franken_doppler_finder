@@ -1501,44 +1501,127 @@ fn ranked_fine_seeds(quick: Vec<(Joined, f64)>) -> Vec<FineSeedGroup> {
     ranked.into_iter().map(|(_, seeds)| seeds).collect()
 }
 
-/// Score the original representatives before retrying failed cells. A successful grid
-/// releases its alternatives immediately; failed cells cycle through their next seeds.
+/// Whether another seed's centre lies in a successful fine grid's extent with the same
+/// CPA assignments there. This is not proof that every point of the second grid was sampled.
+/// The regional frame is only a grouping coordinate: invert the actual local tangent-plane
+/// grid before comparing its extent. Missing CPA support never certifies coverage.
+fn fine_seed_covered(
+    scored: &Joined,
+    seed: &Joined,
+    frame: &Frame,
+    inp: &SearchInputs,
+    p: &SearchParams,
+) -> bool {
+    if (scored.ei, scored.ej, scored.ti, scored.tj) != (seed.ei, seed.ej, seed.ti, seed.tj) {
+        return false;
+    }
+    let half = (p.fine_half_m / p.fine_step_m).round() * p.fine_step_m;
+    if !half.is_finite() || half < 0.0 {
+        return false;
+    }
+    let (lat, lon) = frame.latlon(seed.e, seed.n);
+    if (scored.e, scored.n) != (seed.e, seed.n) {
+        let (origin_lat, origin_lon) = frame.latlon(scored.e, scored.n);
+        let grid = Enu::new(origin_lat, origin_lon, 0.0);
+        let point = grid.from_geodetic(lat, lon, 0.0);
+        let up = grid.vec_from_ecef(Enu::new(lat, lon, 0.0).vec_to_ecef([0.0, 0.0, 1.0]));
+        if up[2] <= 0.0 || !up[2].is_finite() {
+            return false;
+        }
+        // Move along this geographic point's ellipsoid normal to the grid's z=0 plane.
+        // Merely projecting its zero-height ECEF point would shrink distances near an edge.
+        let east = point[0] - point[2] * up[0] / up[2];
+        let north = point[1] - point[2] * up[1] / up[2];
+        if !east.is_finite() || !north.is_finite() || east.abs() > half || north.abs() > half {
+            return false;
+        }
+    }
+    if (scored.te_i, scored.te_j) == (seed.te_i, seed.te_j) {
+        return true;
+    }
+    let x = observer(lat, lon, inp.fine_dem).x;
+    for (ti, old, new) in [
+        (scored.ti, scored.te_i, seed.te_i),
+        (scored.tj, scored.te_j, seed.te_j),
+    ] {
+        if old == new {
+            continue;
+        }
+        let tr = &inp.tracks[ti as usize];
+        let (Some(a), Some(b)) = (
+            tr.cpa_nearest_time(x, old, 150.0),
+            tr.cpa_nearest_time(x, new, 150.0),
+        ) else {
+            return false;
+        };
+        // Each CPA solve ends with a bracket shorter than 1 ms. Different brackets for
+        // the same visit can differ within that precision; another visit remains unsearched.
+        if !a.interior || !b.interior || (a.t_e - b.t_e).abs() > 1e-3 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Score the original representatives and failed-cell recoveries before new alternatives.
+/// A success releases only seeds within its grid extent with the same CPA assignments there;
+/// the others share the remaining fine-stage budget. This does not promise coverage of every
+/// partially overlapping grid corner or every sampling phase within a successful extent.
 /// The caller has already applied the original representative budget and reported its cut.
 fn score_fine_seeds<T: Send>(
     groups: Vec<FineSeedGroup>,
     budget: usize,
     score: &(impl Fn(&Joined) -> Option<T> + Sync),
+    covered: &(impl Fn(&Joined, &Joined) -> bool + Sync),
 ) -> (Vec<T>, usize, bool) {
     debug_assert!(groups.len() <= budget && groups.iter().all(|g| !g.is_empty()));
+    let next_seed = |rest: &mut std::vec::IntoIter<(Joined, f64)>, successes: &[Joined]| {
+        rest.find(|(j, _)| !successes.iter().any(|old| covered(old, j)))
+            .map(|(j, _)| j)
+    };
     let mut attempted = groups.len();
     let originals: Vec<_> = groups
         .into_par_iter()
         .map(|group| {
-            let result = score(&group[0].0);
-            let rest = if result.is_none() {
-                let mut rest = group.into_iter();
-                rest.next();
-                (rest.len() > 0).then_some(rest)
+            let first = group[0].0;
+            let result = score(&first);
+            let successes = if result.is_some() {
+                vec![first]
             } else {
-                None
+                Vec::new()
             };
+            let mut rest = group.into_iter();
+            rest.next();
+            let rest = next_seed(&mut rest, &successes).map(|next| (rest, successes, next));
             (result, rest)
         })
         .collect();
     let mut out = Vec::new();
     let mut pending = std::collections::VecDeque::new();
+    let mut uncovered = std::collections::VecDeque::new();
     for (result, rest) in originals {
         if let Some(result) = result {
             out.push(result);
         }
         if let Some(rest) = rest {
-            pending.push_back(rest);
+            if rest.1.is_empty() {
+                pending.push_back(rest);
+            } else {
+                uncovered.push_back(rest);
+            }
         }
     }
     // This is only the delivery buffer, never an additional search limit.
     const BATCH_SEEDS: usize = 4096;
-    while !pending.is_empty() {
-        let n = pending
+    while !pending.is_empty() || !uncovered.is_empty() {
+        // New alternatives cannot displace a formerly supported failed-cell recovery at
+        // a tight budget. Each legacy queue stops at its first success, exactly as before.
+        let queue = if pending.is_empty() {
+            &mut uncovered
+        } else {
+            &mut pending
+        };
+        let n = queue
             .len()
             .min(budget.saturating_sub(attempted))
             .min(BATCH_SEEDS);
@@ -1547,17 +1630,21 @@ fn score_fine_seeds<T: Send>(
         }
         let mut batch = Vec::with_capacity(n);
         for _ in 0..n {
-            let mut rest = pending.pop_front().unwrap();
-            let seed = rest.next().unwrap().0;
-            batch.push((rest, seed));
+            batch.push(queue.pop_front().unwrap());
         }
-        let results: Vec<_> = batch.par_iter().map(|(_, j)| score(j)).collect();
+        let results: Vec<_> = batch.par_iter().map(|(_, _, j)| score(j)).collect();
         attempted += n;
-        for ((rest, _), result) in batch.into_iter().zip(results) {
+        for ((mut rest, mut successes, seed), result) in batch.into_iter().zip(results) {
             if let Some(result) = result {
                 out.push(result);
-            } else if rest.len() > 0 {
-                pending.push_back(rest);
+                successes.push(seed);
+            }
+            if let Some(next) = next_seed(&mut rest, &successes) {
+                if successes.is_empty() {
+                    pending.push_back((rest, successes, next));
+                } else {
+                    uncovered.push_back((rest, successes, next));
+                }
             }
         }
     }
@@ -3607,17 +3694,22 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     let primary_fine = fine_in.len();
     // Finish the established representative pass before any recovery spends its budget.
     let done = AtomicUsize::new(0);
-    let (fine, attempted, alternatives_cut) = score_fine_seeds(fine_in, p.max_fine, &|j| {
-        let k = done.fetch_add(1, Ordering::Relaxed);
-        if k.is_multiple_of(20_000) && k > 0 {
-            if k < primary_fine {
-                progress(&format!("fine grid {k}/{primary_fine}"));
-            } else {
-                progress(&format!("fine alternatives: {} scored", k - primary_fine));
+    let (fine, attempted, alternatives_cut) = score_fine_seeds(
+        fine_in,
+        p.max_fine,
+        &|j| {
+            let k = done.fetch_add(1, Ordering::Relaxed);
+            if k.is_multiple_of(20_000) && k > 0 {
+                if k < primary_fine {
+                    progress(&format!("fine grid {k}/{primary_fine}"));
+                } else {
+                    progress(&format!("fine alternatives: {} scored", k - primary_fine));
+                }
             }
-        }
-        fine_candidate(j, &frame, &evs, inp, p, &nulls)
-    });
+            fine_candidate(j, &frame, &evs, inp, p, &nulls)
+        },
+        &|scored, seed| fine_seed_covered(scored, seed, &frame, inp, p),
+    );
     funnel.fine_scored = attempted;
     let recovered_grids = attempted - primary_fine;
     if recovered_grids > 0 {
@@ -12264,6 +12356,11 @@ mod tests {
         assert_eq!(summarize(ranked_fine_seeds(input)), expected);
     }
 
+    // Scheduling-only tests supply outcomes. Physical grid and CPA coverage is exercised below.
+    fn same_fine_centre(a: &Joined, b: &Joined) -> bool {
+        (a.e, a.n) == (b.e, b.n)
+    }
+
     #[test]
     fn fine_recovery_preserves_original_priority_and_counts_only_unchecked_work() {
         let seed = |id| {
@@ -12292,16 +12389,21 @@ mod tests {
         for budget in 4..=7 {
             let originals = AtomicUsize::new(0);
             let visited = std::sync::Mutex::new(Vec::new());
-            let (out, attempted, cut) = score_fine_seeds(groups.clone(), budget, &|j| {
-                let id = j.te_i as usize;
-                if [0, 2, 5, 7].contains(&id) {
-                    originals.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    assert_eq!(originals.load(Ordering::SeqCst), 4);
-                }
-                visited.lock().unwrap().push(id);
-                [0, 4, 6, 7].contains(&id).then_some(id)
-            });
+            let (out, attempted, cut) = score_fine_seeds(
+                groups.clone(),
+                budget,
+                &|j| {
+                    let id = j.te_i as usize;
+                    if [0, 2, 5, 7].contains(&id) {
+                        originals.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        assert_eq!(originals.load(Ordering::SeqCst), 4);
+                    }
+                    visited.lock().unwrap().push(id);
+                    [0, 4, 6, 7].contains(&id).then_some(id)
+                },
+                &same_fine_centre,
+            );
             let expected = match budget {
                 4 | 5 => vec![0, 7],
                 6 => vec![0, 7, 6],
@@ -12323,12 +12425,17 @@ mod tests {
         }
 
         // Reaching the budget with no untested seed is a complete failed comparison.
-        let (out, attempted, cut) =
-            score_fine_seeds(vec![vec![seed(0)], vec![seed(2)]], 2, &|_| None::<usize>);
+        let (out, attempted, cut) = score_fine_seeds(
+            vec![vec![seed(0)], vec![seed(2)]],
+            2,
+            &|_| None::<usize>,
+            &same_fine_centre,
+        );
         assert!(out.is_empty());
         assert_eq!(attempted, 2);
         assert!(!cut);
-        let (out, attempted, cut) = score_fine_seeds(Vec::new(), 0, &|_| None::<usize>);
+        let (out, attempted, cut) =
+            score_fine_seeds(Vec::new(), 0, &|_| None::<usize>, &same_fine_centre);
         assert!(out.is_empty());
         assert_eq!(attempted, 0);
         assert!(!cut);
@@ -12360,9 +12467,12 @@ mod tests {
             assert_eq!(groups.len(), 2);
             assert_eq!(groups[0], [(seed, 2.0), (other, 1.0)]);
             assert_eq!(groups[1], [(prior, 0.5)]);
-            let (out, attempted, cut) = score_fine_seeds(groups, 3, &|j| {
-                (j.e == other.e || j.t_s == prior.t_s).then_some(*j)
-            });
+            let (out, attempted, cut) = score_fine_seeds(
+                groups,
+                3,
+                &|j| (j.e == other.e || j.t_s == prior.t_s).then_some(*j),
+                &same_fine_centre,
+            );
             assert_eq!(out, [prior, other]);
             assert_eq!(attempted, 3);
             assert!(!cut, "the exact duplicate must not spend the recovery slot");
@@ -12393,10 +12503,15 @@ mod tests {
             .collect();
         let expected: Vec<_> = (0..n).map(|id| (id as f64).to_bits()).collect();
         // All successes retain their original indexed order and release every fallback.
-        let (out, attempted, cut) = score_fine_seeds(groups.clone(), n, &|j| {
-            assert_eq!(j.te_j, 0.0);
-            Some(j.e.to_bits())
-        });
+        let (out, attempted, cut) = score_fine_seeds(
+            groups.clone(),
+            n,
+            &|j| {
+                assert_eq!(j.te_j, 0.0);
+                Some(j.e.to_bits())
+            },
+            &same_fine_centre,
+        );
         assert_eq!(out, expected);
         assert_eq!(attempted, n);
         assert!(!cut);
@@ -12407,14 +12522,19 @@ mod tests {
                 AtomicUsize::new(0),
                 AtomicUsize::new(0),
             ];
-            let (out, attempted, cut) = score_fine_seeds(groups.clone(), budget, &|j| {
-                let phase = j.te_j as usize;
-                calls[phase].fetch_add(1, Ordering::SeqCst);
-                if phase > 0 {
-                    assert_eq!(calls[0].load(Ordering::SeqCst), n);
-                }
-                (succeeds && phase == 2).then_some(j.e.to_bits())
-            });
+            let (out, attempted, cut) = score_fine_seeds(
+                groups.clone(),
+                budget,
+                &|j| {
+                    let phase = j.te_j as usize;
+                    calls[phase].fetch_add(1, Ordering::SeqCst);
+                    if phase > 0 {
+                        assert_eq!(calls[0].load(Ordering::SeqCst), n);
+                    }
+                    (succeeds && phase == 2).then_some(j.e.to_bits())
+                },
+                &same_fine_centre,
+            );
             assert_eq!(attempted, budget);
             assert_eq!(calls[0].load(Ordering::SeqCst), n);
             assert_eq!(calls[1].load(Ordering::SeqCst), n);
@@ -12435,7 +12555,151 @@ mod tests {
     }
 
     #[test]
+    fn fine_success_retries_preserve_legacy_recovery_priority_and_budget() {
+        let seed = |id, east| {
+            (
+                Joined {
+                    ei: 0,
+                    ej: 1,
+                    ti: 0,
+                    tj: 1,
+                    te_i: id as f64,
+                    te_j: 0.0,
+                    e: east,
+                    n: 0.0,
+                    t_s: 0.0,
+                },
+                1.0,
+            )
+        };
+        let groups = vec![
+            vec![seed(0, 0.0), seed(1, 100.0), seed(2, 800.0), seed(3, 850.0)],
+            vec![seed(4, -2000.0), seed(5, -2000.0), seed(6, -2000.0)],
+        ];
+        for budget in 2..=6 {
+            let visited = std::sync::Mutex::new(Vec::new());
+            let (out, attempted, cut) = score_fine_seeds(
+                groups.clone(),
+                budget,
+                &|j| {
+                    let id = j.te_i as usize;
+                    let mut visits = visited.lock().unwrap();
+                    if id == 2 {
+                        assert!(
+                            visits.contains(&6),
+                            "legacy recovery retains its budget priority"
+                        );
+                    }
+                    visits.push(id);
+                    [0, 2, 6].contains(&id).then_some(id)
+                },
+                &|a, b| (a.e - b.e).abs() <= 500.0,
+            );
+            assert_eq!(attempted, budget.min(5));
+            assert_eq!(cut, budget < 5);
+            assert_eq!(
+                out,
+                match budget {
+                    2 | 3 => vec![0],
+                    4 => vec![0, 6],
+                    _ => vec![0, 6, 2],
+                }
+            );
+            let mut visits = visited.into_inner().unwrap();
+            visits.sort_unstable();
+            assert!(!visits.contains(&1) && !visits.contains(&3));
+            assert_eq!(visits.len(), attempted);
+        }
+    }
+
+    #[test]
+    fn fine_success_extent_uses_local_grid_and_keeps_distinct_cpa_visits() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let case = narrow_circuit_case(med);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(med);
+        let inp = SearchInputs {
+            events: case.events.clone(),
+            tracks: &case.tracks,
+            heard_times: vec![],
+            coarse_dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let frame = Frame::new(&case.p.region);
+        let (e, n) = frame.en(case.obs.0, case.obs.1);
+        let scored = Joined {
+            ei: 0,
+            ej: 1,
+            ti: 0,
+            tj: 1,
+            te_i: case.t_s + 300.0,
+            te_j: case.t_s + 650.0,
+            e,
+            n,
+            t_s: case.t_s,
+        };
+        let local = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let shifted = |east, north| {
+            let (la, lo, _) = local.to_geodetic([east, north, 0.0]);
+            let (e, n) = frame.en(la, lo);
+            Joined { e, n, ..scored }
+        };
+        let mut p = case.p.clone();
+        p.fine_half_m = 540.0;
+        for (east, north, inside) in [
+            (100.0, 0.0, true),
+            (499.0, -499.0, true),
+            (-499.0, 499.0, true),
+            (501.0, 0.0, false),
+            (0.0, -501.0, false),
+            (-800.0, 800.0, false),
+        ] {
+            assert_eq!(
+                fine_seed_covered(&scored, &shifted(east, north), &frame, &inp, &p),
+                inside,
+                "({east}, {north}); extent rounds to the 500 m grid edge"
+            );
+        }
+        // A shifted centre inside the extent still has partly uncovered corners. This
+        // bounded recovery intentionally does not expand those grids or resample their phases.
+        let same_visit = Joined {
+            te_i: scored.te_i + 0.25,
+            ..scored
+        };
+        assert!(fine_seed_covered(&scored, &same_visit, &frame, &inp, &p));
+        let other_visit = Joined {
+            te_i: scored.te_i + 120.0,
+            ..scored
+        };
+        assert!(!fine_seed_covered(&scored, &other_visit, &frame, &inp, &p));
+        let absent_visit = Joined {
+            te_j: case.t_s - 500.0,
+            ..scored
+        };
+        assert!(!fine_seed_covered(&scored, &absent_visit, &frame, &inp, &p));
+        let (out, attempted, cut) = score_fine_seeds(
+            vec![vec![(scored, 2.0), (same_visit, 1.5), (other_visit, 1.0)]],
+            2,
+            &|j| Some(*j),
+            &|a, b| fine_seed_covered(a, b, &frame, &inp, &p),
+        );
+        assert_eq!(out, [scored, other_visit]);
+        assert_eq!(attempted, 2);
+        assert!(!cut);
+    }
+
+    #[test]
     fn fine_recovery_finds_the_two_flyovers_outside_the_best_quick_seeds_grid() {
+        check_fine_seed_recovery(200.0, 1200.0, false);
+    }
+
+    #[test]
+    fn fine_success_keeps_a_better_location_beyond_its_grid() {
+        check_fine_seed_recovery(100.0, 2000.0, true);
+    }
+
+    fn check_fine_seed_recovery(speed: f64, height: f64, original_succeeds: bool) {
         let (lat, lon) = (40.876466, -73.524951);
         let enu = Enu::new(lat, lon, 0.0);
         let dem = FlatElevation(0.0);
@@ -12445,14 +12709,15 @@ mod tests {
         let (mlat, mlon) = fdop_types::geo::m_per_deg(lat);
         // Both quick seeds lie in the same 1 km cell. Their 800 m separation on
         // each axis leaves the truth 300 m beyond the leading seed's fine grid.
-        let centre = (lat - 900.0 / mlat, lon - 900.0 / mlon);
-        let region = BBox::new(
-            centre.0 - 2500.0 / mlat,
-            centre.1 - 2500.0 / mlon,
-            centre.0 + 2500.0 / mlat,
-            centre.1 + 2500.0 / mlon,
-        );
         for base in [0.0, 1_788_895_000.0] {
+            let sign = if base == 0.0 { 1.0 } else { -1.0 };
+            let centre = (lat - sign * 900.0 / mlat, lon - sign * 900.0 / mlon);
+            let region = BBox::new(
+                centre.0 - 2500.0 / mlat,
+                centre.1 - 2500.0 / mlon,
+                centre.0 + 2500.0 / mlat,
+                centre.1 + 2500.0 / mlon,
+            );
             let start = base + 10.0;
             let p = SearchParams::new(start - 10.0, start + 10.0, 600.0, region);
             let frame = Frame::new(&region);
@@ -12469,8 +12734,8 @@ mod tests {
                 t_s: start,
             };
             let bad = Joined {
-                e: e - 800.0,
-                n: n - 800.0,
+                e: e - sign * 800.0,
+                n: n - sign * 800.0,
                 ..good
             };
             let (bla, blo) = frame.latlon(bad.e, bad.n);
@@ -12478,8 +12743,8 @@ mod tests {
             let mut tracks = Vec::new();
             let mut events = Vec::new();
             for (key, position, velocity, t_cpa, f0) in [
-                ("A", [0.0, 1000.0, 1200.0], [200.0, 0.0, 0.0], 120.0, 300.0),
-                ("B", [1000.0, 0.0, 1200.0], [0.0, 200.0, 0.0], 360.0, 420.0),
+                ("A", [0.0, sign * 1000.0, height], [sign * speed, 0.0, 0.0], 120.0, 300.0),
+                ("B", [sign * 1000.0, 0.0, height], [0.0, sign * speed, 0.0], 360.0, 420.0),
             ] {
                 let mut tr = straight_track(
                     &enu,
@@ -12561,18 +12826,30 @@ mod tests {
             assert_eq!(groups[0].len(), 2);
             assert_eq!(groups[0][0].0.e, bad.e);
             let score = |j: &Joined| fine_candidate(j, &frame, &events, &inp, &p, &[]);
-            let (old, attempted, cut) = score_fine_seeds(groups.clone(), 1, &score);
-            assert!(
-                old.is_empty(),
-                "the original representative's whole fine grid must fail"
+            let covered = |a: &Joined, b: &Joined| fine_seed_covered(a, b, &frame, &inp, &p);
+            assert!(!covered(&groups[0][0].0, &groups[0][1].0));
+            let (old, attempted, cut) = score_fine_seeds(groups.clone(), 1, &score, &covered);
+            assert_eq!(
+                old.len(),
+                usize::from(original_succeeds),
+                "the original grid's outcome establishes the recovery being tested"
             );
             assert_eq!(attempted, 1);
             assert!(cut);
-            let (recovered, attempted, cut) = score_fine_seeds(groups, 2, &score);
+            let (recovered, attempted, cut) = score_fine_seeds(groups, 2, &score, &covered);
             assert_eq!(attempted, 2);
             assert!(!cut);
-            assert_eq!(recovered.len(), 1);
-            let found = &recovered[0];
+            assert_eq!(recovered.len(), 1 + old.len());
+            let found = recovered.last().unwrap();
+            if let Some(original) = old.first() {
+                assert!(haversine_m(lat, lon, original.lat, original.lon) > 300.0);
+                assert_eq!(
+                    serde_json::to_value(&recovered[0]).unwrap(),
+                    serde_json::to_value(original).unwrap(),
+                    "recovery must retain the original successful candidate exactly"
+                );
+                assert!(found.pair_chi < original.pair_chi);
+            }
             assert!(haversine_m(lat, lon, found.lat, found.lon) < 150.0);
             assert!((found.t_start_utc - start).abs() < 1.0);
             assert_eq!(found.trk, [(0, 0), (1, 1)]);
