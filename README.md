@@ -1833,6 +1833,10 @@ Design notes:
   rounds start again from that fit if it is plausible. The second attempt replaces the first only if every gate
   accepts it; `reseeded` in `events.json` marks it. Side coverage uses the fitter's existing retained timestamps;
   discarded frequency outliers cannot create apparent approach/recede support or block this retry.
+  A recovery starting from fewer than 20 points must also retain a continuous ridge through its fitted
+  closest approach, with the existing eight seconds on each side and three-second maximum gap.
+  Isolated noise points beyond an unobserved side cannot supply that support. Optional raw-frequency
+  calibration must preserve it; otherwise the supported recovered fit remains available.
   Raw trace points, SNR and central-drop accounting remain unchanged. Accepted fits, and refusals whose retained trace held both sides, are
   measured exactly as before. A wrong fit can pass this way too: a climbing pass in a clip that starts mid-drop
   trades speed against distance, and the retry accepts the wrong pair.

@@ -1138,16 +1138,25 @@ fn measure_with_fit(
     let refused = p.free_reseed
         && (partial
             || (first.reasons.is_empty() && first.trace.len() >= MIN_GUIDED_POINTS && one_sided));
+    // A fragment has not established either side of the pass. Isolated retained noise
+    // must not turn it into an aircraft by extending the fit's outer time bounds.
+    let supports_cpa = |g: &Guided| {
+        g.prepared.as_ref().is_some_and(|f| {
+            contiguous_side_support(f.inlier_times(), f.best().t0r).complete(p.min_side_s)
+        })
+    };
     let mut chosen = first;
     if refused
         && let Some(second) = reseeded_rounds(&frames, &chosen.trace, p, &mut fit_trace)
         && passes(&second, det.t0r, span, p)
+        && (!partial || supports_cpa(&second))
     {
         chosen = second;
         quality.reseeded = true;
     }
     if let Some(calibrated) =
         raw_calibrated_rounds(&frames, &chosen, det.t0r, span, p, &mut fit_trace)
+        && (!partial || supports_cpa(&calibrated))
     {
         chosen = calibrated;
     }
@@ -4221,22 +4230,21 @@ mod tests {
 
     #[test]
     fn a_partial_guided_ridge_can_reseed_a_complete_physical_pass() {
-        let (sr, f0, v, d, t0r, dur) = (4000u32, 367.0, 135.0, 1758.0, 120.0, 240.0);
+        let (sr, f0, v, d, t0r, dur) = (4000u32, 165.0, 135.0, 1758.0, 120.0, 240.0);
         let on = MeasureParams::default();
         let off = MeasureParams {
             free_reseed: false,
             ..on.clone()
         };
-        // Near the analysis window's left edge (65 s), the guide and real approach
-        // are nearly parallel, so integration can retain the observed ridge. Their
-        // separation then leaves the guidance profile's eligible peak bins while
-        // the complete physical pass remains inside the original 65..155 s window.
+        // The coarse guide briefly meets the real approach near 102 s. Integration
+        // retains 16 qualified points, too few to fit, while the complete physical
+        // pass remains inside the original analysis window.
         let det = Detection {
             id: 0,
             t0r: 110.0,
-            f0: 333.95,
-            v: 150.0,
-            d: 1600.0,
+            f0,
+            v: 175.0,
+            d: 2000.0,
             score: 8.0,
             score_approach: 8.0,
             score_recede: 8.0,
@@ -4288,8 +4296,9 @@ mod tests {
 
         // A steeper coarse curve integrates away even this strong real pass. With
         // no qualified observed points, free tracing must not invent a starting ridge.
+        let unobserved = wrong_shape_audio(Some((367.0, v, d)), None, t0r, dur, 0.6);
         let no_seed = measure(
-            &x,
+            &unobserved,
             sr,
             &Detection {
                 f0: 367.0,
@@ -4304,7 +4313,7 @@ mod tests {
         assert!(no_seed.fit.is_none() && !no_seed.quality.ok && !no_seed.quality.reseeded);
 
         // Only the observed ridge can seed this retry. No signal must not reach the
-        // solver, and noise, a steady crossing tone or a three-second fragment cannot
+        // solver, and noise, a steady crossing tone or an isolated approach cannot
         // replace the original refusal with a complete aircraft measurement.
         let mut silent_fits = 0;
         let silent = measure_with_fit(
@@ -4323,23 +4332,51 @@ mod tests {
         assert_eq!(silent_fits, 0);
         assert!(silent.fit.is_none() && !silent.quality.ok && !silent.quality.reseeded);
         let noise = wrong_shape_audio(None, None, t0r, dur, 0.6);
-        let crossing = model_fn(f0, v, d, t0r, on.c)(65.0);
+        let crossing = model_fn(f0, v, d, t0r, on.c)(101.0);
         let steady = wrong_shape_audio(None, Some(crossing), t0r, dur, 0.6);
+        let pulse = |start: f64, end: f64| {
+            x.iter()
+                .zip(&noise)
+                .enumerate()
+                .map(|(i, (&sample, &background))| {
+                    if (start..=end).contains(&(i as f64 / sr as f64)) {
+                        sample
+                    } else {
+                        background
+                    }
+                })
+                .collect::<Vec<f32>>()
+        };
+        // Short pulses can have enough integrated support to fit, but must still refuse.
+        let pulse3s = pulse(99.5, 102.5);
+        let pulse1s = pulse(101.8, 102.8);
+        // Preserve the crossing's full integration context, then remove the actual CPA
+        // and receding side. Previously this produced an accepted 157-point false pass
+        // at 213.414 Hz, 71.065 m/s, 796.844 m and CPA 112.955 s: isolated noise near
+        // 155 s extended its outer support past an approach that ended before 110 s.
         let fragment: Vec<f32> = x
             .iter()
             .zip(&noise)
             .enumerate()
             .map(|(i, (&sample, &background))| {
-                if (63.5..=66.5).contains(&(i as f64 / sr as f64)) {
-                    sample
+                let t = i as f64 / sr as f64;
+                let gain = if (95.0..97.0).contains(&t) {
+                    0.5 - 0.5 * (std::f64::consts::PI * (t - 95.0) / 2.0).cos()
+                } else if (97.0..=107.0).contains(&t) {
+                    1.0
+                } else if (107.0..=109.0).contains(&t) {
+                    0.5 + 0.5 * (std::f64::consts::PI * (t - 107.0) / 2.0).cos()
                 } else {
-                    background
-                }
+                    0.0
+                };
+                (f64::from(background) + gain * (f64::from(sample) - f64::from(background))) as f32
             })
             .collect();
         for (label, audio) in [
             ("noise", &noise),
             ("steady", &steady),
+            ("pulse3s", &pulse3s),
+            ("pulse1s", &pulse1s),
             ("fragment", &fragment),
         ] {
             let refused = measure(audio, sr, &det, label, &on);
@@ -4350,10 +4387,14 @@ mod tests {
             );
             if label == "fragment" {
                 assert!(
-                    !refused.trace.is_empty(),
-                    "the control must contain observed seeds"
+                    !refused.trace.is_empty() && refused.trace.len() < MIN_GUIDED_POINTS,
+                    "the control must contain an observed partial ridge"
                 );
                 assert!(refused.fit.is_none());
+                assert!(
+                    refused.trace.t.iter().any(|t| (101.0..=104.0).contains(t)),
+                    "the control must retain a seed from the actual approach"
+                );
                 let disabled = measure(audio, sr, &det, label, &off);
                 assert_same_measurement(&refused, &disabled);
             }

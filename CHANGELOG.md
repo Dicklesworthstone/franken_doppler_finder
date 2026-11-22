@@ -115,21 +115,32 @@ at that commit, not per-change commits.
   than 20 points, then let the existing free tracer attempt to follow the full pass.
 - Recovery uses only observed ridge seeds within the existing analysis window. It must pass
   the normal guided fit, two-sided support, frequency-drop and aircraft-geometry checks.
-  Accepted recoveries carry the existing reseeded provenance and measurement-line treatment.
+  Accepted recoveries retain their detected identity and the existing reseeded provenance.
+- Require a continuous retained ridge through the fitted closest approach when recovering
+  from a short pre-fit trace, with the existing eight-second sides and three-second gap limit.
+  Apply the same requirement to optional raw-frequency calibration, keeping the supported
+  recovery if calibration loses a side. Existing fitted recovery paths retain their behavior.
 - Disabling free reseeding keeps the refusal and preserves the observed fragment for inspection.
   Empty traces and ordinary fit failures with 20 or more points do not enter this new path.
 - Add a physical-PCM regression requiring a short initial trace, a recovered fit with the
   established parameter tolerances, and a usable independent search event. Cover silence,
   noise, a steady tone, an isolated real ridge fragment and a solver failure with enough points.
-- A native core build completed with one frontend and one backend compiler worker. The
-  original steep-crossing PCM fixture then failed its setup assertion: the guide qualified
-  zero points, so it never exercised partial-ridge recovery. Retain that crossing as an
-  explicit no-seed refusal control, and use a nearly parallel guide at the analysis-window
-  boundary for the positive fixture. Keep the 1–19-point assertion and all physical tolerances.
-- The corrected positive fixture remains native-unverified after the executor disconnected
-  during a bounded probe build. Source review is complete; full workspace checks, release
-  selftest and reference/field replays remain incomplete. No measurement-test pass or
-  measured field-accuracy improvement is claimed.
+- Native execution found that the first two positive fixtures qualified zero and 68 points,
+  respectively, so neither exercised the required short pre-fit branch. Replace them with
+  an observed 165 Hz physical pass: the pre-fix API probe retained 16 points and no fit with
+  recovery disabled, then recovered 767 points and one usable independent event when enabled.
+  Keep the original 367 Hz no-seed crossing and all physical tolerances.
+- A native incomplete-pass control exposed a real false recovery: the approach fragment ended
+  at 109.75 s, but three noise points near 155 s supplied apparent receding support for a fitted
+  CPA at 112.955 s. The old path accepted 157 points as a 71.1 m/s aircraft at 797 m with no
+  observed ridge across its CPA. The new continuity requirement addresses this specific defect;
+  the regression retains the original refusal, short observed trace and no-fit assertions.
+- Four targeted native core tests passed on the repair: the complete physical recovery and
+  false-pass regression, successful-trace/solver-failure preservation, the existing one-sided
+  clean/scintillating/null matrix, and the two-sided slow-source refusal. Scoped pinned
+  formatting, independent source review and whitespace checks passed. Full workspace checks,
+  the release CLI selftest and reference/field replays remain incomplete; no field-accuracy
+  improvement is claimed.
 
 ### Retain corroborated faster turns when headings are missing
 
