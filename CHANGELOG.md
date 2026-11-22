@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover complete flyovers from short observed ridge fragments
+
+- Retain a qualified initial ridge fragment when a mismatched detection guide finds fewer
+  than 20 points, then let the existing free tracer attempt to follow the full pass.
+- Recovery uses only observed ridge seeds within the existing analysis window. It must pass
+  the normal guided fit, two-sided support, frequency-drop and aircraft-geometry checks.
+  Accepted recoveries carry the existing reseeded provenance and measurement-line treatment.
+- Disabling free reseeding keeps the refusal and preserves the observed fragment for inspection.
+  Empty traces and ordinary fit failures with 20 or more points do not enter this new path.
+- Add a physical-PCM regression requiring a short initial trace, a recovered fit with the
+  established parameter tolerances, and a usable independent search event. Cover silence,
+  noise, a steady tone, an isolated real ridge fragment and a solver failure with enough points.
+- Source and regression review is complete. Native measurement tests, release selftest and
+  reference/field replays remain unrun: the core build was killed in unchanged `fsci-stats`
+  before reaching the tests. No native pass or measured field-accuracy improvement is claimed.
+
 ### Retain corroborated faster turns when headings are missing
 
 - Recover a supported faster turning portion after a longer slow portion when valid speed

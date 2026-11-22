@@ -13,8 +13,8 @@
 //!    and the band shrinks to a few fit-RMS. Three rounds.
 //! 4. Quality gates: points, coverage of both sides of the CPA, a ridge through the fitted drop,
 //!    fit RMS, plausible v and d.
-//! 5. A fit the gates refuse because its trace held one side of the pass is followed afresh once:
-//!    from its own trace, the ridge is traced without the model, fitted, and the guided rounds
+//! 5. An observed trace too short for a fit, or a fit refused for one-sided coverage, is followed
+//!    afresh once: from its own trace, the ridge is traced without the model, fitted, and guided rounds
 //!    start again from that fit. The second attempt replaces the first only if every gate accepts it.
 //!    If that still fails on a steep ridge fitted beyond the primary detector's speed bank, and
 //!    its only missing gate is side coverage or the central drop, the original fit gets one
@@ -109,10 +109,10 @@ pub struct MeasureParams {
     pub min_drop_traversed: f64,
     pub max_rmse_hz: f64,
     pub rounds: usize,
-    /// Follow the ridge of a fit the gates refuse without the model, and measure again from
-    /// what that finds ([`reseeded_rounds`]). If that fails, a steep fit beyond the primary speed
-    /// bank whose sole refusal is side coverage or the central drop can continue from its fitted
-    /// spectral geometry.
+    /// Follow a short observed ridge or a one-sided refused fit without the model, and measure
+    /// again from what that finds ([`reseeded_rounds`]). If that fails, a steep fit beyond the
+    /// primary speed bank whose sole refusal is side coverage or the central drop can continue
+    /// from its fitted spectral geometry.
     pub free_reseed: bool,
 }
 
@@ -535,7 +535,7 @@ fn lost_ridge(m: &MeasuredEvent, p: &MeasureParams) -> bool {
         || short(q.drop_traversed, p.min_drop_traversed)
 }
 
-/// Least number of points a guided trace needs to be fitted (and so to be followed afresh).
+/// Least number of points a guided or free trace needs before fitting.
 const MIN_GUIDED_POINTS: usize = 20;
 
 /// Integration half-length (s) of a free trace along its own slope: the guided trace's, since a
@@ -584,8 +584,8 @@ fn short_spectrum(
         .map(|(spec, background)| (spec, background.as_slice()))
 }
 
-/// What a run of guided rounds produced: the last fitted trace (or, without a fit, the trace that
-/// failed to fit), its fit, and why the rounds stopped short.
+/// What a run of guided rounds produced: the last fitted trace (or, without a fit, the observed
+/// trace that was too short or failed to fit), its fit, and why the rounds stopped short.
 struct Guided {
     trace: Trace,
     prepared: Option<PreparedFit>,
@@ -706,6 +706,11 @@ fn guided_rounds(
             if round == 0 || continuation.is_some() {
                 out.reasons
                     .push(format!("guided trace found only {} ridge points", tr.len()));
+            }
+            // A short observed ridge can seed the free tracer even before it supports a fit.
+            // Never replace the trace paired with an earlier successful fit.
+            if out.prepared.is_none() {
+                out.trace = tr;
             }
             break;
         }
@@ -1119,19 +1124,20 @@ fn measure_with_fit(
         None,
         &mut fit_trace,
     );
-    // Only a fit the gates refused because its trace held one side of the pass is followed afresh:
-    // that is how a curve of the wrong shape fails. A trace too short to fit, or a fit that failed,
-    // has nothing to follow; a two-sided trace that does not fit (a ridge that hops or bends) is not
-    // helped by following it without the model.
+    // A wrong-shape guide can meet a real ridge for too few frames to fit, or hold just one side.
+    // Both retain observed seeds for the same bounded free trace. An empty trace, a failed fit
+    // with enough points, or a two-sided refusal does not establish this recovery route.
+    let partial = first.prepared.is_none()
+        && !first.trace.is_empty()
+        && first.trace.len() < MIN_GUIDED_POINTS;
     let one_sided = first.prepared.as_ref().is_some_and(|f| {
         let g = gate(&first.trace, f.inlier_times(), &f.best(), det.t0r, span, p);
         !g.reasons.is_empty()
             && (g.span_approach_s < p.min_side_s || g.span_recede_s < p.min_side_s)
     });
     let refused = p.free_reseed
-        && first.reasons.is_empty()
-        && first.trace.len() >= MIN_GUIDED_POINTS
-        && one_sided;
+        && (partial
+            || (first.reasons.is_empty() && first.trace.len() >= MIN_GUIDED_POINTS && one_sided));
     let mut chosen = first;
     if refused
         && let Some(second) = reseeded_rounds(&frames, &chosen.trace, p, &mut fit_trace)
@@ -3647,10 +3653,15 @@ mod tests {
         assert!(!interrupted.quality.ok);
         assert_eq!(interrupted.quality.reasons, ["fit: injected fit failure"]);
 
-        // If the first fit fails, keep that trace for inspection and report no fit.
+        // If the first fit fails, keep that trace for inspection and report no fit. Having
+        // enough points but a solver failure must not activate the partial-ridge recovery.
+        let mut failed_fits = 0;
         let failed = measure_with_fit(&x, sr, &det, "e1", &p, true, |_, _, _, _| {
+            failed_fits += 1;
             Err("injected fit failure".into())
         });
+        assert!(failed.trace.len() >= MIN_GUIDED_POINTS);
+        assert_eq!(failed_fits, 1);
         assert!(failed.fit.is_none());
         assert!(!failed.quality.ok);
         assert_eq!(
@@ -4206,6 +4217,130 @@ mod tests {
                 (signal + 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0)) as f32
             })
             .collect()
+    }
+
+    #[test]
+    fn a_partial_guided_ridge_can_reseed_a_complete_physical_pass() {
+        let (sr, f0, v, d, t0r, dur) = (4000u32, 367.0, 135.0, 1758.0, 120.0, 240.0);
+        let on = MeasureParams::default();
+        let off = MeasureParams {
+            free_reseed: false,
+            ..on.clone()
+        };
+        // This coarse curve crosses the true approach near 101.5 s, where its chirp is
+        // about 23 Hz/s and the pass's is 4 Hz/s. The twelve-Hz guidance band holds
+        // less than two seconds of the real ridge, while the original analysis window
+        // and frequency band still contain both sides of the complete pass.
+        let det = Detection {
+            id: 0,
+            t0r: 110.0,
+            f0,
+            v: 175.0,
+            d: 2000.0,
+            score: 8.0,
+            score_approach: 8.0,
+            score_recede: 8.0,
+            half_s: 60.0,
+            harmonic_of: None,
+            harmonics: Vec::new(),
+            from_contrast: false,
+        };
+        let x = wrong_shape_audio(Some((f0, v, d)), None, t0r, dur, 0.6);
+        let first = measure(&x, sr, &det, "partial", &off);
+        assert!(
+            !first.trace.is_empty() && first.trace.len() < MIN_GUIDED_POINTS,
+            "must exercise an observed partial ridge, not a fitted one-sided pass: {} points; {:?}",
+            first.trace.len(),
+            first.quality
+        );
+        assert!(first.fit.is_none() && !first.quality.ok && !first.quality.reseeded);
+        assert_eq!(first.quality.n_points, first.trace.len());
+        assert_eq!(
+            first.quality.reasons,
+            [format!(
+                "guided trace found only {} ridge points",
+                first.trace.len()
+            )]
+        );
+        let recovered = measure(&x, sr, &det, "partial", &on);
+        assert!(
+            recovered.is_aircraft_like() && recovered.quality.reseeded,
+            "{:?}",
+            recovered.quality
+        );
+        let b = recovered.fit.as_ref().unwrap().best;
+        assert!((b.f0 - f0).abs() <= 0.005 * f0, "{b:?}");
+        assert!((b.v - v).abs() <= 0.03 * v, "{b:?}");
+        assert!((b.d - d).abs() <= 0.05 * d, "{b:?}");
+        assert!((b.t0r - t0r).abs() <= 0.5, "{b:?}");
+        assert_eq!(
+            serde_json::to_value(&recovered.detection).unwrap(),
+            serde_json::to_value(&det).unwrap()
+        );
+        assert!(
+            crate::search::independent_measured_events(std::slice::from_ref(&first), 0.0)
+                .is_empty()
+        );
+        assert_eq!(
+            crate::search::independent_measured_events(std::slice::from_ref(&recovered), 0.0).len(),
+            1
+        );
+
+        // Only the observed ridge can seed this retry. No signal must not reach the
+        // solver, and noise, a steady crossing tone or a three-second fragment cannot
+        // replace the original refusal with a complete aircraft measurement.
+        let mut silent_fits = 0;
+        let silent = measure_with_fit(
+            &vec![0.0; x.len()],
+            sr,
+            &det,
+            "silent",
+            &on,
+            true,
+            |t, f, c, side| {
+                silent_fits += 1;
+                prepare_constant_velocity(t, f, c, side)
+            },
+        );
+        assert!(silent.trace.is_empty());
+        assert_eq!(silent_fits, 0);
+        assert!(silent.fit.is_none() && !silent.quality.ok && !silent.quality.reseeded);
+        let noise = wrong_shape_audio(None, None, t0r, dur, 0.6);
+        let crossing = model_fn(f0, v, d, t0r, on.c)(101.5);
+        let steady = wrong_shape_audio(None, Some(crossing), t0r, dur, 0.6);
+        let fragment: Vec<f32> = x
+            .iter()
+            .zip(&noise)
+            .enumerate()
+            .map(|(i, (&sample, &background))| {
+                if (100.0..=103.0).contains(&(i as f64 / sr as f64)) {
+                    sample
+                } else {
+                    background
+                }
+            })
+            .collect();
+        for (label, audio) in [
+            ("noise", &noise),
+            ("steady", &steady),
+            ("fragment", &fragment),
+        ] {
+            let refused = measure(audio, sr, &det, label, &on);
+            assert!(
+                !refused.quality.ok && !refused.quality.reseeded,
+                "{label}: {:?}",
+                refused.quality
+            );
+            if label == "fragment" {
+                assert!(
+                    !refused.trace.is_empty(),
+                    "the control must contain observed seeds"
+                );
+                assert!(refused.fit.is_none());
+                let disabled = measure(audio, sr, &det, label, &off);
+                assert_same_measurement(&refused, &disabled);
+            }
+        }
     }
 
     #[test]

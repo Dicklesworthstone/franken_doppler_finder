@@ -1782,9 +1782,12 @@ Design notes:
   fitted drop that the trace travels: each continuous stretch adds its net fall, and a stretch ends at a time gap
   or where the trace steps more than 2 Hz off the model's own step. Under 15 % the event is refused. It still
   counts as heard, but it does not use an independent-event slot.
-- **A one-sided refusal is traced once more, without the model.** A template of the wrong shape (at the edge
+- **A short observed ridge or one-sided refusal is traced once more, without the model.** A template of the wrong shape (at the edge
   of the bank, or with speed and distance wrong together) meets the ridge over one stretch and leaves the band
-  elsewhere, so the guided trace holds one side of the pass and the gates refuse the fit. When a fit is refused
+  elsewhere, so the guided trace can be too short to fit or hold only one side of the pass. An initial trace
+  with fewer than 20 qualified points can seed the existing free tracer before a fit exists. Empty traces
+  and solver failures with 20 or more points do not gain this recovery path. Disabling free reseeding keeps
+  the refusal and retains the short observed trace for inspection. When a fit is refused
   and its retained observations cover less than 8 s on either side, the ridge is followed by its own slope from that trace's
   first, strongest and last points, inside the event's analysis window. The free trace is fitted, and the guided
   rounds start again from that fit if it is plausible. The second attempt replaces the first only if every gate
