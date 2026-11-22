@@ -953,8 +953,8 @@ pub struct MatchResult {
     pub timings_s: Vec<(String, f64)>,
     /// See `MatchParams::probe`: at the given place, then after climbing from it.
     pub probe: Vec<MatchMode>,
-    /// The real window's best place moved along the tracks of the flights it heard, with the clock
-    /// moved to match (`along_track_aliases`). They only widen the radius (`verdict`).
+    /// Places suggested by heard trajectories: along-track clock trades and opposite-side
+    /// reflections at the unchanged shared clock. They only widen the radius (`verdict`).
     pub aliases: Vec<MatchMode>,
 }
 
@@ -2122,7 +2122,7 @@ fn matched_pass_cpa(
     })
 }
 
-/// Places the evidence may not tell from `top`, along the tracks of the flights it heard.
+/// Places the evidence may not tell from `top`, suggested by the flights it heard.
 ///
 /// One heard flight fixes when its closest approach was heard, not where along its track the
 /// observer stood: moving the observer `s` metres along the track and the clock `s / v` later
@@ -2133,9 +2133,14 @@ fn matched_pass_cpa(
 /// a time. So the twin `ALIAS_STEP_M`, 2 `ALIAS_STEP_M`, ... out to `ALIAS_REACH_M` either way is
 /// scored for each flight `top` heard at `HEARD_NATS`, credited or not (a superset of
 /// `counts_as_heard`, so no slide is missed), wherever the place is inside the region and the
-/// clock inside the real window, which `score_exact` keeps every clock inside. Nothing here
-/// changes any evidence or margin, so the decoy calibration holds; the decoys get no such check,
-/// and a check can only widen the real window's radius.
+/// clock inside the real window, which `score_exact` keeps every clock inside.
+///
+/// Even a fixed clock cannot distinguish the two sides of collinear paths. Reflect the observer
+/// across the plane through the Earth's centre, the source position and its velocity. This fixes
+/// a straight trajectory pointwise and preserves its ranges and radial velocities. Each suggested
+/// place is projected onto the actual terrain and scored at the unchanged shared clock: terrain,
+/// atmosphere, a curved path or another flight can reject it. Nothing here changes any original
+/// evidence or margin; the decoys get no such check, and a check can only widen the real radius.
 fn along_track_aliases(
     inp: &MatchInputs<'_>,
     p: &MatchParams,
@@ -2147,7 +2152,8 @@ fn along_track_aliases(
     let x = geodetic_to_ecef(top.lat, top.lon, z + MIC_HEIGHT_M);
     let enu = Enu::new(top.lat, top.lon, z + MIC_HEIGHT_M);
     let n_steps = (ALIAS_REACH_M / ALIAS_STEP_M).round() as i32;
-    let mut starts: Vec<(f64, f64, f64)> = Vec::new();
+    let mut starts: Vec<(f64, f64, f64, bool)> = Vec::new();
+    let mut mirrors = Vec::new();
     for ps in top
         .passes
         .iter()
@@ -2162,6 +2168,23 @@ fn along_track_aliases(
         else {
             continue;
         };
+        let position: V3 = std::array::from_fn(|i| x[i] + cpa.rv[i]);
+        let plane = [
+            position[1] * cpa.vel[2] - position[2] * cpa.vel[1],
+            position[2] * cpa.vel[0] - position[0] * cpa.vel[2],
+            position[0] * cpa.vel[1] - position[1] * cpa.vel[0],
+        ];
+        let norm2 = dot(plane, plane);
+        if norm2.is_finite() && norm2 > 0.0 {
+            let projection = 2.0 * dot(x, plane) / norm2;
+            let reflected: V3 = std::array::from_fn(|i| x[i] - projection * plane[i]);
+            let (la, lo, _) = ecef_to_geodetic(reflected);
+            if inp.region.contains(la, lo)
+                && (inp.start_lo..=inp.start_hi).contains(&top.clock_unix)
+            {
+                mirrors.push((la, lo, top.clock_unix, true));
+            }
+        }
         let v = enu.vec_from_ecef(cpa.vel);
         let vh = v[0].hypot(v[1]);
         if vh < 15.0 {
@@ -2172,14 +2195,22 @@ fn along_track_aliases(
             let (la, lo, _) = enu.to_geodetic([s * v[0] / vh, s * v[1] / vh, 0.0]);
             let clock = top.clock_unix + s / vh;
             if inp.region.contains(la, lo) && clock >= inp.start_lo && clock <= inp.start_hi {
-                starts.push((la, lo, clock));
+                starts.push((la, lo, clock, false));
             }
         }
     }
+    // Keep every original probe, its scoring parameters and its output order. A mirror is
+    // a fixed-clock alternative, with only the existing penalized per-pass timing slack.
+    starts.extend(mirrors);
+    let fixed_clock = MatchParams {
+        clock_sweep_frames: 0,
+        ..p.clone()
+    };
     starts
         .par_iter()
-        .filter_map(|&(la, lo, clock)| {
-            let e = score_exact(inp, p, bank, idx, la, lo, clock)?;
+        .filter_map(|&(la, lo, clock, reflected)| {
+            let params = if reflected { &fixed_clock } else { p };
+            let e = score_exact(inp, params, bank, idx, la, lo, clock)?;
             Some(MatchMode {
                 lat: la,
                 lon: lo,
@@ -2714,8 +2745,8 @@ pub struct CurveVerdict {
 
 /// Grade one result. The margin line comes from recordings with no right answer: see
 /// `ASSERT_MARGIN_NATS`. Places the evidence cannot rule out (the other modes, and the best place's
-/// along-track aliases) widen the radius, and an answer whose radius would be wider than
-/// `MAX_ASSERT_RADIUS_M` does not stand. At least two independently credited flyovers are
+/// along-track aliases and cross-track mirrors) widen the radius. An answer whose radius would be
+/// wider than `MAX_ASSERT_RADIUS_M` does not stand. At least two independently credited flyovers are
 /// required, as in the trace search.
 pub fn verdict(r: &MatchResult) -> Option<CurveVerdict> {
     let top = r.modes.first()?;
@@ -2743,7 +2774,7 @@ pub fn verdict(r: &MatchResult) -> Option<CurveVerdict> {
     let clears = finite && margin > ASSERT_MARGIN_NATS;
     let tight = radius_m <= MAX_ASSERT_RADIUS_M;
     let why = format!(
-        "{:.1} nats at this place and clock, {margin:+.1} over the best of {} decoy clocks (line {ASSERT_MARGIN_NATS:+.1}), {} flights heard, places within {TIED_NATS:.0} nats span {radius_m:.0} m ({n_alias_tied} of {} along their tracks){}{}",
+        "{:.1} nats at this place and clock, {margin:+.1} over the best of {} decoy clocks (line {ASSERT_MARGIN_NATS:+.1}), {} flights heard, places within {TIED_NATS:.0} nats span {radius_m:.0} m ({n_alias_tied} of {} alternative places){}{}",
         top.evidence,
         r.decoys.len(),
         top.n_heard,
@@ -2828,12 +2859,29 @@ impl SoundTable {
 
 /// Run the whole match. `say` reports progress.
 pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) -> MatchResult {
+    run_with_check(inp, p, say, None).0
+}
+
+/// Run the unchanged search and optionally evaluate another method's observer and recording
+/// clock on the same curves, nulls and catalogue. This checkpoint neither seeds nor changes the
+/// search, and fixes the shared clock while retaining the normal penalized per-flight slack.
+/// A caller can compare its evidence with the returned modes and decoys without treating a
+/// nearby place at an incompatible recording clock as corroboration.
+pub fn run_with_check(
+    inp: &MatchInputs<'_>,
+    p: &MatchParams,
+    say: &(dyn Fn(&str) + Sync),
+    check: Option<(f64, f64, f64)>,
+) -> (MatchResult, Option<MatchMode>) {
     if grid_cell_count(p, &inp.region).is_none() {
         say("curve match: the region cannot be represented by a bounded local grid");
-        return MatchResult {
-            n_tracks: inp.tracks.len(),
-            ..MatchResult::default()
-        };
+        return (
+            MatchResult {
+                n_tracks: inp.tracks.len(),
+                ..MatchResult::default()
+            },
+            None,
+        );
     }
     let mut timings = Vec::new();
     let im = inp.image;
@@ -3298,7 +3346,7 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
             / (1 + decoys.len()) as f64
     });
     let mode_margin = modes.get(1).map(|m| modes[0].evidence - m.evidence);
-    MatchResult {
+    let result = MatchResult {
         modes,
         decoys,
         decoy_margin,
@@ -3310,7 +3358,43 @@ pub fn run(inp: &MatchInputs<'_>, p: &MatchParams, say: &(dyn Fn(&str) + Sync)) 
         timings_s: timings,
         probe,
         aliases,
+    };
+    let checked = check.and_then(|at| score_checkpoint(inp, p, &bank, &keep, at));
+    (result, checked)
+}
+
+/// Score the requested point, never a clamped or optimized substitute for it.
+fn score_checkpoint(
+    inp: &MatchInputs<'_>,
+    p: &MatchParams,
+    bank: &Bank,
+    idx: &[ExactTrack],
+    (lat, lon, clock): (f64, f64, f64),
+) -> Option<MatchMode> {
+    if !lat.is_finite()
+        || !lon.is_finite()
+        || !clock.is_finite()
+        || !inp.region.contains(lat, lon)
+        || !(inp.start_lo..=inp.start_hi).contains(&clock)
+    {
+        return None;
     }
+    let fixed_clock = MatchParams {
+        clock_sweep_frames: 0,
+        ..p.clone()
+    };
+    let e = score_exact(inp, &fixed_clock, bank, idx, lat, lon, clock)?;
+    Some(MatchMode {
+        lat,
+        lon,
+        clock_unix: e.clock,
+        coarse: 0.0,
+        evidence: e.evidence,
+        r50_m: e.r50_m,
+        n_heard: e.n_heard,
+        n_unheard_close: e.n_close,
+        passes: e.passes,
+    })
 }
 
 #[cfg(test)]
@@ -3810,7 +3894,134 @@ mod tests {
         run(&inp, p, say)
     }
 
-    /// Independent trajectory oracle: use the same physical solver as exact scoring,
+    #[test]
+    fn fixed_checkpoints_preserve_supported_place_clock_trades() {
+        let c = scene(
+            &[
+                ([900.0, 0.0, 700.0], [0.0, 60.0, 0.0], 200.0),
+                ([-1200.0, 0.0, 900.0], [0.0, 60.0, 0.0], 650.0),
+            ],
+            3000.0,
+        );
+        let p = params();
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let bank = build_bank(&im, &p);
+        let idx: Vec<_> = c
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &c.tracks,
+            region: c.region,
+            start_lo: c.clock - 60.0,
+            start_hi: c.clock + 60.0,
+            duration_s: c.x.len() as f64 / 2800.0,
+            catalog: (f64::NEG_INFINITY, f64::INFINITY),
+            dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let truth = score_checkpoint(&inp, &p, &bank, &idx, (c.lat, c.lon, c.clock))
+            .expect("the observed parallel passes score");
+        assert!(truth.n_heard >= 2, "{truth:?}");
+        assert_eq!(truth.clock_unix, c.clock);
+        // Moving 2400 m along both 60 m/s flights trades exactly 40 s of clock.
+        // A raw clock-distance cutoff would reject a physically supported checkpoint.
+        let shifted = Enu::new(c.lat, c.lon, 0.0).to_geodetic([0.0, 2400.0, 0.0]);
+        let at = (shifted.0, shifted.1, c.clock + 40.0);
+        let traded = score_checkpoint(&inp, &p, &bank, &idx, at).unwrap();
+        assert_eq!((traded.lat, traded.lon, traded.clock_unix), at);
+        assert!(traded.n_heard >= 2, "{traded:?}");
+        assert!(
+            truth.evidence - traded.evidence <= TIED_NATS,
+            "truth {truth:?}; supported place-clock trade {traded:?}"
+        );
+        // Neither the changed clock alone nor the moved observer alone retains both
+        // curves. The check cannot optimize either coordinate back to the truth.
+        for at in [
+            (c.lat, c.lon, c.clock + 40.0),
+            (shifted.0, shifted.1, c.clock),
+        ] {
+            let wrong = score_checkpoint(&inp, &p, &bank, &idx, at);
+            assert!(
+                wrong
+                    .as_ref()
+                    .is_none_or(|m| { m.n_heard < 2 || truth.evidence - m.evidence > TIED_NATS }),
+                "incompatible checkpoint {wrong:?}"
+            );
+            if let Some(m) = wrong {
+                assert_eq!((m.lat, m.lon, m.clock_unix), at);
+            }
+        }
+        let fractional = (c.lat, c.lon, c.clock + 0.17);
+        let checked = score_checkpoint(&inp, &p, &bank, &idx, fractional).unwrap();
+        assert_eq!((checked.lat, checked.lon, checked.clock_unix), fractional);
+        for at in [
+            (f64::NAN, c.lon, c.clock),
+            (c.lat, f64::INFINITY, c.clock),
+            (c.lat, c.lon, f64::NAN),
+            (c.lat, c.lon, f64::INFINITY),
+            (c.region.north + 0.01, c.lon, c.clock),
+            (c.lat, c.lon, inp.start_lo - 0.001),
+            (c.lat, c.lon, inp.start_hi + 0.001),
+        ] {
+            assert!(score_checkpoint(&inp, &p, &bank, &idx, at).is_none());
+        }
+    }
+
+    #[test]
+    fn a_trace_checkpoint_does_not_change_the_curve_search() {
+        let c = scene(
+            &[
+                ([900.0, 0.0, 700.0], [0.0, 60.0, 0.0], 200.0),
+                ([0.0, -1200.0, 900.0], [60.0, 0.0, 0.0], 650.0),
+            ],
+            10.0,
+        );
+        let p = MatchParams {
+            decoy_span_s: 60.0,
+            top_modes: 1,
+            refine_modes: 0,
+            ..params()
+        };
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &c.tracks,
+            region: c.region,
+            start_lo: c.clock - 1.0,
+            start_hi: c.clock + 1.0,
+            duration_s: c.x.len() as f64 / 2800.0,
+            catalog: (f64::NEG_INFINITY, f64::INFINITY),
+            dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let ordinary = run(&inp, &p, &|_| {});
+        let (with_check, checked) =
+            run_with_check(&inp, &p, &|_| {}, Some((c.lat, c.lon, c.clock)));
+        let checked = checked.expect("the same retained catalogue supports a checkpoint");
+        assert!(checked.n_heard >= 2, "{checked:?}");
+        assert_eq!(
+            (checked.lat, checked.lon, checked.clock_unix),
+            (c.lat, c.lon, c.clock)
+        );
+        let without_timing = |result: MatchResult| {
+            let mut value = serde_json::to_value(result).unwrap();
+            value.as_object_mut().unwrap().remove("timings_s");
+            value
+        };
+        assert_eq!(without_timing(ordinary), without_timing(with_check));
+    }
+
+/// Independent trajectory oracle: use the same physical solver as exact scoring,
     /// without the constant-velocity bank's analytic range or frequency functions.
     fn track_path(
         template: &[Sample],
@@ -5771,6 +5982,194 @@ mod tests {
         assert!(v.radius_m > MAX_ASSERT_RADIUS_M && !v.stands, "{v:?}");
     }
 
+    /// Reflection across a meridian leaves the WGS84 ground height unchanged. Both
+    /// opposite-direction straight tracks lie in that plane, so the independently
+    /// specified observer and its longitude reflection have identical source ranges
+    /// and radial velocities at the same recording clock.
+    fn collinear_mirror_scores(
+        crossing: bool,
+    ) -> (MatchMode, MatchMode, Vec<MatchMode>, Vec<MatchMode>) {
+        let (lat, lon, clock) = SCENE_AT;
+        let mid_lon = lon + 3000.0 / m_per_deg(lat).1;
+        let reflected_lon = 2.0 * mid_lon - lon;
+        let enu = Enu::new(lat, mid_lon, 0.0);
+        let mut tracks: Vec<_> = [(70.0, 700.0, 300.0), (-65.0, 900.0, 550.0)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (speed, height, cpa))| {
+                let mut tr = straight_track(
+                    &enu,
+                    [0.0, 0.0, height],
+                    [0.0, speed, 0.0],
+                    clock + cpa,
+                    clock - 1500.0,
+                    clock + 3000.0,
+                    4.0,
+                );
+                tr.key = format!("collinear-{i}");
+                tr.icao = tr.key.clone();
+                tr
+            })
+            .collect();
+        if crossing {
+            let mut tr = scene_track(
+                [0.0, -1000.0, 700.0],
+                [70.0, 0.0, 0.0],
+                720.0,
+                -1500.0,
+                3000.0,
+            );
+            tr.key = "crossing".into();
+            tr.icao = tr.key.clone();
+            tracks.push(tr);
+        }
+        let c = scene_of(tracks, 10_000.0);
+        let p = MatchParams {
+            clock_sweep_frames: 0,
+            ..params()
+        };
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let im = build_image(&c.x, 2800, &p).unwrap();
+        let bank = build_bank(&im, &p);
+        let idx: Vec<_> = c
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &c.tracks,
+            region: c.region,
+            start_lo: clock,
+            start_hi: clock,
+            duration_s: c.x.len() as f64 / 2800.0,
+            catalog: (f64::NEG_INFINITY, f64::INFINITY),
+            dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let mode_at = |lat, lon| {
+            let e = score_exact(&inp, &p, &bank, &idx, lat, lon, clock).unwrap();
+            MatchMode {
+                lat,
+                lon,
+                clock_unix: e.clock,
+                coarse: 0.0,
+                evidence: e.evidence,
+                r50_m: e.r50_m,
+                n_heard: e.n_heard,
+                n_unheard_close: e.n_close,
+                passes: e.passes,
+            }
+        };
+        let (top, reflected) = (mode_at(lat, lon), mode_at(lat, reflected_lon));
+        let aliases = along_track_aliases(&inp, &p, &bank, &idx, &top);
+        if !crossing {
+            // A wider prior must not let the mirror silently choose a better clock.
+            // Move the real shared clock by exactly the existing per-pass slack: its
+            // independent curves remain heard, while an ordinary sweep can undo it.
+            let sweeping = params();
+            let span = sweeping.clock_sweep_frames as f64 * im.dt;
+            let wider = MatchInputs {
+                start_lo: clock - span,
+                start_hi: clock + span,
+                ..inp
+            };
+            let e = score_exact(
+                &wider,
+                &p,
+                &bank,
+                &idx,
+                lat,
+                lon,
+                clock + p.pass_slack_frames as f64 * im.dt,
+            )
+            .unwrap();
+            let delayed = MatchMode {
+                clock_unix: e.clock,
+                evidence: e.evidence,
+                r50_m: e.r50_m,
+                n_heard: e.n_heard,
+                n_unheard_close: e.n_close,
+                passes: e.passes,
+                ..top.clone()
+            };
+            assert!(delayed.n_heard >= 2);
+            let reswept = score_exact(
+                &wider,
+                &sweeping,
+                &bank,
+                &idx,
+                lat,
+                reflected_lon,
+                delayed.clock_unix,
+            )
+            .unwrap();
+            assert_ne!(
+                reswept.clock, delayed.clock_unix,
+                "the ordinary sweep must actually move this control's clock"
+            );
+            let checked = along_track_aliases(&wider, &sweeping, &bank, &idx, &delayed);
+            let mirrors: Vec<_> = checked
+                .iter()
+                .filter(|a| haversine_m(a.lat, a.lon, lat, reflected_lon) < 1.0)
+                .collect();
+            assert!(!mirrors.is_empty());
+            assert!(mirrors.iter().all(|a| a.clock_unix == delayed.clock_unix));
+        }
+        let restricted = MatchInputs {
+            region: BBox::new(lat - 0.1, lon - 0.01, lat + 0.1, lon + 0.01),
+            ..inp
+        };
+        let inside = along_track_aliases(&restricted, &p, &bank, &idx, &top);
+        assert!(
+            inside
+                .iter()
+                .all(|a| restricted.region.contains(a.lat, a.lon))
+        );
+        assert!(aliases.iter().chain(&inside).all(|a| a.clock_unix == clock));
+        (top, reflected, aliases, inside)
+    }
+
+    #[test]
+    fn fixed_clock_collinear_passes_retain_a_cross_track_mirror() {
+        let (top, reflected, aliases, restricted) = collinear_mirror_scores(false);
+        assert_eq!(top.n_heard, 2);
+        assert_eq!(reflected.n_heard, 2);
+        assert!((top.evidence - reflected.evidence).abs() <= TIED_NATS);
+        assert!(haversine_m(top.lat, top.lon, reflected.lat, reflected.lon) > MAX_ASSERT_RADIUS_M);
+        assert!(
+            aliases.iter().any(|a| {
+                a.n_heard >= 2
+                    && top.evidence - a.evidence <= TIED_NATS
+                    && haversine_m(a.lat, a.lon, reflected.lat, reflected.lon) < 1.0
+            }),
+            "the fixed clock hid an equivalent reflected place: top={top:?}, reflected={reflected:?}, aliases={aliases:?}"
+        );
+        assert!(
+            restricted.is_empty(),
+            "a reflected observer outside the requested region cannot widen its radius"
+        );
+    }
+
+    #[test]
+    fn a_crossing_flight_breaks_the_fixed_clock_cross_track_mirror() {
+        let (top, reflected, aliases, _) = collinear_mirror_scores(true);
+        assert_eq!(top.n_heard, 3);
+        assert!(top.evidence - reflected.evidence > TIED_NATS);
+        let far: Vec<_> = aliases
+            .iter()
+            .filter(|a| haversine_m(top.lat, top.lon, a.lat, a.lon) > MAX_ASSERT_RADIUS_M)
+            .collect();
+        assert!(
+            !far.is_empty(),
+            "the geometric alternatives must actually be scored"
+        );
+        assert!(far.iter().all(|a| top.evidence - a.evidence > TIED_NATS));
+    }
+
     /// One aircraft flying the same leg twice, the same way at the same speed (a circuit), is one
     /// track with two heard passes. The second pass fixes nothing along the track, as a second
     /// aircraft on that line would not; each pass is checked from its own closest approach.
@@ -6365,7 +6764,7 @@ mod tests {
         r.aliases.push(alias.clone());
         let v = verdict(&r).unwrap();
         assert!(v.stands && (v.radius_m - 3000.0).abs() < 50.0, "{v:?}");
-        assert!(v.why.contains("(1 of 1 along their tracks)"), "{}", v.why);
+        assert!(v.why.contains("(1 of 1 alternative places)"), "{}", v.why);
         // one tied 6 km off is wider than MAX_ASSERT_RADIUS_M: refused
         alias.lat = r.modes[0].lat + 6.0 / 111.2;
         r.aliases.push(alias.clone());
@@ -6375,7 +6774,7 @@ mod tests {
         alias.evidence = r.modes[0].evidence - TIED_NATS - 0.5;
         r.aliases.push(alias.clone());
         let v = verdict(&r).unwrap();
-        assert!(v.stands && v.why.contains("(1 of 2 along"), "{v:?}");
+        assert!(v.stands && v.why.contains("(1 of 2 alternative places)"), "{v:?}");
         r.aliases[1].evidence = r.modes[0].evidence + 2.0;
         assert!(!verdict(&r).unwrap().stands);
         // the margin and the best place never move

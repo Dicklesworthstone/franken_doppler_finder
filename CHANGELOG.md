@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Check reflected flight locations and exact place/clock evidence
+
+- Include the opposite-side observer implied by each heard flight's plane of motion in the
+  curve matcher's ambiguity checks. Two collinear passes can support this mirror at the same
+  recording clock, including aircraft flying in opposite directions. Existing along-track
+  proposals remain available.
+- Re-evaluate every reflected proposal with actual terrain, atmosphere, all candidate flights
+  and the existing exact scorer. Tied alternatives widen the radius under the existing rules;
+  winner evidence, decoys and numerical confidence thresholds are unchanged.
+- Add an optional exact observer/clock checkpoint that reuses the search's bank and catalogue,
+  fixes the shared clock, and retains normal penalized per-pass timing slack. It neither seeds
+  nor modifies the search. The ordinary `run` API and serialized match-result shape remain intact.
+- Add synthetic mirror and crossing-flight controls, plus exact-checkpoint tests for valid
+  place/clock trades, incompatible combinations, fractional starts and unchanged search results.
+- Source review, scoped pinned formatting and static checks are complete. Native execution is
+  pending while the pinned numerical dependencies compile; no full-workspace, release selftest,
+  reference replay or field-accuracy pass is claimed for this change.
+
 ### Keep usable flight catalogues when an online archive upgrade fails
 
 - Reuse a verified processed main-feed catalogue when discovery advertises a fuller or preferred

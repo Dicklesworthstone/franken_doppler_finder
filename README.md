@@ -605,8 +605,8 @@ in `crates/fdop-core/src/curvematch.rs`:
 - **When it stands.** At least two independently credited passes must be heard: each reaches the 6.9-nat
   heard line and retains positive value after the timing penalty and the shared-pixel check. The answer
   must also beat every decoy (margin over the best of them above 0), with at least 40 decoys, and every
-  place within 3 nats of it must lie within 5 km. Those places are the other modes and the answer's twins
-  along the tracks of the flights it heard (next item). Its radius is that spread, and at least
+  place within 3 nats of it must lie within 5 km. Those places are the other modes and the answer's
+  physically checked alternatives around the flights it heard (next item). Its radius is that spread, and at least
   1 km, because its places are 1 km apart. Under exchangeable windows a place beats all 48 decoys by chance
   about 1 time in 49. On 42 runs with no right answer (six recordings at wrong dates and at places 90 km or more
   from the truth) none beat every decoy. The largest margin in those logged runs was −0.47, the Ithaca feeder's
@@ -615,7 +615,7 @@ in `crates/fdop-core/src/curvematch.rs`:
   heard range was profiled, −0.6 before each start's whole disc was searched, and −0.8 on the version the line
   was set on. Those runs share six
   recordings, so they are not 42 independent trials.
-- **Twins along a track.** One heard flight fixes when its closest approach was heard, not where along its
+- **Alternative places around a track.** One heard flight fixes when its closest approach was heard, not where along its
   track the recorder stood. Move the place `s` metres along the track and the clock `s / v` later, and that
   flight's curve does not move (exactly, for a straight, level, steady flight). A second heard flight with a
   different velocity breaks the tie: a crossing track, or a parallel one flown the other way. One with the same
@@ -627,7 +627,14 @@ in `crates/fdop-core/src/curvematch.rs`:
   the radius, and a radius past 5 km removes the stand. Where the answer still stands with a wider radius, a low
   trace answer inside it keeps its own place (confirmed, medium) instead of taking the curve match's (adopted,
   low). A stand it removes no longer conflicts with the trace answer either. The verdict line says how many
-  twins tied, and `curvematch.json` lists them under `aliases`.
+  alternative places tied, and `curvematch.json` lists them under `aliases`.
+  A fixed recording clock can still leave a mirror location across collinear flight paths, even
+  when two aircraft fly in opposite directions. The matcher also reflects the observer across
+  each heard flight's plane of motion at closest approach, keeps the same recording clock, and
+  scores that place using its actual terrain, atmosphere and the full flight catalogue. This adds
+  at most one proposal per heard visit. A crossing flight or different terrain or weather can
+  reject the mirror through the ordinary evidence calculation. A surviving mirror widens the
+  radius under the same 3-nat tie and 5 km stand limits; it never replaces the winner's evidence.
 - **When it runs.** Only when the recording clock is known to 30 min or better and the region holds at most
   200,000 allocated cells, including the enclosing grid and boundary fringe (roughly 8,000 km² for a compact
   region); otherwise it is skipped with a log line. Invalid or unprojectable grids are also skipped before
@@ -5120,11 +5127,12 @@ audio or video recorded somewhere sensitive:
   match alone, so dropping that path would cost right answers too. Since `8d672af` was merged, such an answer is
   reported at low, not dropped: on `11313ba`'s runs on record it had been wrong once and never right, and set N,
   registered to test the trade, found no case ([bench/SET_N.md](bench/SET_N.md)). `9087ec4` is older code.
-- The curve match stands only on two heard passes, because one pass's curve lets place and clock
-  trade along its track: moving the observer `v·dt` along it and the clock by `dt` fits as well. Two heard passes
-  flying the same way at one speed leave the same trade: two arrivals on one approach, or one aircraft flying the
-  same lap twice, since it counts passes, not aircraft. The rule does not catch that case. The tied-place radius
-  catches it only where the other places along the track fall inside the clock window and among the kept modes.
+- Two heard passes do not by themselves establish a unique place. Parallel flights at the same
+  speed can retain an along-track place/clock trade, and collinear paths can retain a cross-track
+  mirror even with a fixed clock and opposite flight directions. Explicit along-track and mirror
+  probes now include these tested alternatives in the tied-place radius. These bounded probes
+  do not establish that every ambiguity was found, particularly for curved or repeating paths,
+  terrain-dependent solutions, or alternatives between the sampled along-track points.
 - The curve match can judge only a clock window of 300 s or less: its 40 decoy windows of the same width,
   each the width plus 60 s apart, must fit within about ±2 h (`curvematch::max_judged_window_s`). With
   `--start` that is a `--clock-tol` of 150 s or less. A `creation_time` window spans the recording's length
