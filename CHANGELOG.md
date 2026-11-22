@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve supported fast flights with negative groundspeed telemetry
+
+- Treat finite negative groundspeeds as unavailable in the track builder's local copies,
+  consistently with velocity interpolation. Apply the same normalization before separated
+  corrected-height recovery so its final reachability check sees the same inputs.
+- Reuse the existing position-supported chain recovery and physical limits. Preserve stored
+  reports, zero (including negative zero), infinities and positive-speed semantics; do not
+  change detection, scoring, confidence or aircraft-selection thresholds.
+- Add three regressions for fast/slow and mixed-speed trajectories, relative/Unix clocks,
+  available/missing headings, unchanged report bits and corrected-height segments, with
+  analytic position/Doppler checks and unsupported-motion controls. Replace two obsolete
+  negative-speed refusal expectations with negative-zero controls; the negative cases now
+  have positive recovery assertions.
+- Independent source review and exact change-scope verification completed. Native formatting,
+  compilation, Clippy, tests, release selftest and reference/field replays remain unrun after
+  the execution environment became unavailable. No native pass or field improvement is claimed.
+
 ### Retain measured calm winds in radiosonde profiles
 
 - Reuse the existing observed-wind parser for IEM radiosondes: measured zero-speed

@@ -755,6 +755,17 @@ fn separated_models_reachable(
         && (h1 - h0).abs() <= bp.max_vz_mps * dt + bp.pos_slack_m.1
 }
 
+// Groundspeed is a magnitude. Interpolation already treats a negative report as
+// unavailable; apply that same meaning before chain selection and corrected-height
+// recovery. Only local copies change; zero, infinities and valid reports stay intact.
+fn normalize_negative_groundspeeds(points: &mut [fdop_types::store::TrackPoint]) {
+    for point in points {
+        if point.gs_mps.is_finite() && point.gs_mps < 0.0 {
+            point.gs_mps = f32::NAN;
+        }
+    }
+}
+
 /// Build track models from one stored leg (possibly several, split at gaps). Corrected-height
 /// recovery keeps preferred models intact and restores only separately supported, reachable parts.
 pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
@@ -766,6 +777,7 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
         })
         .copied()
         .collect();
+    normalize_negative_groundspeeds(&mut pts);
     pts.sort_by(|a, b| a.t.total_cmp(&b.t));
     pts.dedup_by(|b, a| (b.t - a.t).abs() < 1e-3);
     let original_len = pts.len();
@@ -875,6 +887,7 @@ pub fn build(leg: &FlightLeg, bp: &BuildParams) -> Vec<TrackModel> {
         if leg.points.iter().filter(|p| eligible(p)).take(3).count() == 3 {
             let mut corrected = leg.clone();
             corrected.points.retain(eligible);
+            normalize_negative_groundspeeds(&mut corrected.points);
             let unbridged = BuildParams {
                 gnss_bridge_s: 0.0,
                 ..*bp
@@ -2859,6 +2872,156 @@ mod tests {
     }
 
     #[test]
+    fn negative_groundspeed_keeps_missing_speed_fast_track_recovery() {
+        let bp = BuildParams::default();
+        for (speed, step) in [(100.0, 45.0), (245.0, 20.0), (270.0, 45.0)] {
+            for epoch in [0.0, 1_788_895_000.0] {
+                for heading in [0.0, 1.3] {
+                    for (headings, mixture) in [(false, 0), (true, 0), (true, 1), (true, 2)] {
+                        let (mut missing, truth, enu) =
+                            position_only_leg(speed, heading, epoch, step);
+                        for (k, p) in missing.points.iter_mut().enumerate() {
+                            let local = Enu::new(p.lat, p.lon, 0.0);
+                            let [east, north, _] = local.vec_from_ecef(truth.pv(p.t).1);
+                            if headings {
+                                p.track_deg =
+                                    east.atan2(north).to_degrees().rem_euclid(360.0) as f32;
+                            }
+                            if mixture == 2 && k % 3 == 0 {
+                                p.gs_mps = east.hypot(north) as f32;
+                            }
+                        }
+                        let expected = build(&missing, &bp);
+                        assert_eq!(expected.len(), 1);
+                        assert_eq!(expected[0].t, truth.t);
+                        let mut negative = missing.clone();
+                        for (k, p) in negative.points.iter_mut().enumerate() {
+                            if p.gs_mps.is_nan() && (mixture != 1 || k % 2 == 0) {
+                                p.gs_mps = if k % 2 == 0 { -1.0 } else { -250.0 };
+                            }
+                        }
+                        let original: Vec<_> =
+                            negative.points.iter().map(|p| p.gs_mps.to_bits()).collect();
+                        let models = build(&negative, &bp);
+                        assert_eq!(
+                            models.len(),
+                            1,
+                            "lost {speed} m/s, {step} s, epoch={epoch}, heading={heading}, headings={headings}, mixture={mixture}"
+                        );
+                        assert_same_gap_model(&models[0], &expected[0]);
+                        assert_eq!(
+                            negative
+                                .points
+                                .iter()
+                                .map(|p| p.gs_mps.to_bits())
+                                .collect::<Vec<_>>(),
+                            original,
+                            "recovery must not rewrite the stored reports"
+                        );
+                        let observer = enu.to_ecef([0.0; 3]);
+                        let prop = Prop::still(343.0);
+                        for offset in [30.25, 90.0, 149.5] {
+                            let te = epoch + offset;
+                            let (pos, vel) = truth.pv(te);
+                            assert!(norm(sub(models[0].pos_at(te), pos)) < 0.001);
+                            assert!(norm(sub(models[0].pv(te).1, vel)) < 0.001);
+                            let rv = sub(pos, observer);
+                            let range = norm(rv);
+                            let (_, _, actual) = models[0]
+                                .solve_emission_p(te + range / prop.c, observer, &prop, None)
+                                .expect("the retained flight must predict its received sound");
+                            assert!((100.0 * (actual - prop.ratio(rv, range, vel))).abs() < 0.001);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn negative_groundspeed_keeps_mixed_speed_cruise_and_support_rules() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let bp = BuildParams::default();
+        for reverse in [false, true] {
+            let missing = mixed_speed_leg(&enu, reverse, [0.6, 0.8]);
+            let expected = build(&missing, &bp);
+            assert_eq!(expected.len(), 1);
+            assert_eq!(
+                expected[0].t,
+                missing.points.iter().map(|p| p.t).collect::<Vec<_>>()
+            );
+            let mut negative = missing.clone();
+            for p in &mut negative.points {
+                if p.gs_mps.is_nan() {
+                    p.gs_mps = -1.0;
+                }
+            }
+            let actual = build(&negative, &bp);
+            assert_eq!(actual.len(), 1);
+            assert_same_gap_model(&actual[0], &expected[0]);
+        }
+
+        // The missing-speed path still requires two agreeing fast chords. This
+        // slow prefix followed by only two missing reports supplies just one.
+        let mut two = mixed_speed_leg(&enu, false, [1.0, 0.0]);
+        two.points
+            .retain(|p| p.t <= 1420.0 || p.t == 1500.0 || p.t == 1540.0);
+        for p in &mut two.points {
+            if p.gs_mps.is_nan() {
+                p.gs_mps = -1.0;
+            }
+        }
+        let actual = build(&two, &bp);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].t1(), 1500.0);
+
+        let (mut impossible, _, _) = position_only_leg(5000.0, 0.0, 0.0, 10.0);
+        for p in &mut impossible.points {
+            p.gs_mps = -1.0;
+            p.alt_m = 900.0;
+        }
+        assert!(build(&impossible, &bp).is_empty());
+    }
+
+    #[test]
+    fn negative_groundspeed_keeps_separated_corrected_height_fast_tracks() {
+        let bp = BuildParams::default();
+        for speed in [100.0, 245.0, 270.0] {
+            let (missing, enu) = partial_gnss_missing_speed_leg(speed);
+            let expected = build(&missing, &bp);
+            assert_eq!(expected.len(), 3);
+            for changed in [alt_src::GEOM, alt_src::BARO_CORRECTED, u8::MAX] {
+                let mut negative = missing.clone();
+                for p in &mut negative.points {
+                    if changed == u8::MAX || p.alt_src == changed {
+                        p.gs_mps = -1.0;
+                    }
+                }
+                let actual = build(&negative, &bp);
+                assert_eq!(
+                    actual.len(),
+                    3,
+                    "lost corrected-height coverage at {speed} m/s, source={changed}"
+                );
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_same_gap_model(actual, expected);
+                }
+                for model in &actual[1..] {
+                    let span = (model.t0() - 1000.0 + 5.0, model.t1() - 1000.0 - 5.0);
+                    let observer = enu.to_ecef([0.5 * speed * (span.0 + span.1), 1500.0, 0.0]);
+                    let rms = doppler_rms_hz(model, observer, span, |t| {
+                        (
+                            enu.to_ecef([speed * t, 0.0, 1200.0]),
+                            enu.vec_to_ecef([speed, 0.0, 0.0]),
+                        )
+                    });
+                    assert!(rms < 1e-4, "{speed} m/s corrected Doppler RMS {rms} Hz");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_turn_starting_or_ending_between_knots_keeps_correct_reports() {
         // At 130 m/s with 29 s between knots, the knots either side of the partial arcs fail the
         // finite difference (about 35 m/s) and the chord over the partial arc (about 49 m/s).
@@ -4298,7 +4461,7 @@ mod tests {
                 "{invalid} justified unsupported cruise coverage"
             );
         }
-        for invalid in [0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY] {
+        for invalid in [0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY] {
             let mut leg = physical.clone();
             for p in leg.points.iter_mut().filter(|p| p.t >= 1500.0) {
                 p.gs_mps = invalid;
@@ -4799,7 +4962,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].t, vec![0.0, 60.0]);
 
-        for report in [0.0, -1.0, 80.0] {
+        for report in [0.0, -0.0, 80.0] {
             let (mut leg, _, _) = position_only_leg(270.0, 0.0, 0.0, 45.0);
             for p in &mut leg.points {
                 p.gs_mps = report;

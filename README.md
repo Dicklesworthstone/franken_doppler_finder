@@ -1525,10 +1525,13 @@ Design notes:
   kept neighbours under the same motion limits and position allowances. When speed reports
   on both sides are missing, retained preferred-model positions can supply the existing checked,
   subsonic motion envelope for this reachability test. Rejected positions cannot set that limit;
-  non-NaN speed reports retain the previous envelope. Preferred samples, velocities, order and
+  nonnegative finite speeds and infinities retain the previous envelope. Preferred samples, velocities, order and
   keys stay intact; added parts use deterministic `#correctedN` suffixes.
   No spline crosses these gaps, and raw pressure altitudes cannot enter this recovery.
-- **Missing speed reports do not impose a 200 m/s aircraft limit.** If the established track
+- **Missing speed reports do not impose a 200 m/s aircraft limit.** Finite negative groundspeeds
+  are treated as unavailable in the builder's local copies before chain selection and
+  corrected-height recovery, matching the existing velocity-interpolation policy. Stored
+  reports, nonnegative speeds and infinities remain unchanged. If the established track
   cleaner loses reports and every groundspeed report is missing, three consecutive positions
   can establish a faster motion scale. Their adjacent horizontal velocity vectors must agree
   within the existing 25 m/s tolerance and obey the existing gap and vertical-motion limits.
@@ -2117,6 +2120,22 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover fast flight tracks from finite negative speed telemetry
+
+Three `negative_groundspeed_keeps_*` regressions extend the existing slow-track negative-speed
+check through chain selection and separated corrected-height recovery. They compare the complete
+models with identical positions carrying missing-speed telemetry, covering 100, 245 and 270 m/s,
+relative and Unix clocks, heading availability, mixed reports, a slow-to-fast cruise in both
+directions, and negative reports on either altitude source. The tests also check stored-report
+bits, analytic position/velocity and received Doppler, with unsupported-extension and impossible-
+motion controls. Two old negative-speed refusal cases become explicit recovery assertions;
+their zero, infinite and conflicting-positive controls remain, with negative zero added.
+
+Independent source review and inverse-patch scope verification completed. Native formatting,
+compilation and these tests remain unrun because the execution environment is unavailable.
+Workspace checks, release selftest and reference/field replays have no result for this change;
+no recording-accuracy or confidence-grade improvement is claimed.
 
 ### Retain measured calm layers in radiosonde weather
 
@@ -3091,9 +3110,10 @@ fell back to 200 m/s, discarding independently usable fast portions. It now reus
 position-supported envelope from the original preferred models' retained samples.
 
 Inference requires at least three samples, agreeing horizontal secants and the existing
-vertical/gap checks; its envelope remains capped at nominal sound speed. Only literal missing
-values on both sides allow the retry. Finite, zero or infinite speed reports retain the former
-envelope. Rejected positions and newly appended portions cannot raise the limit. Original
+vertical/gap checks; its envelope remains capped at nominal sound speed. Missing values on
+both sides allow the retry, including finite negative groundspeeds normalized by the builder
+in its local copies. Nonnegative finite speeds and infinities retain the former envelope.
+Rejected positions and newly appended portions cannot raise the limit. Original
 preferred geometry, separate model identities and unobserved gaps remain intact.
 
 Two regression groups cover 100, 215, 245 and 270 m/s physical trajectories, both earlier and
