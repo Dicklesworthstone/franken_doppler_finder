@@ -4150,6 +4150,11 @@ fn unheard_passes(
         // The distance threshold already excludes every explained CPA. The same aircraft
         // can return much closer, so check those other passes against the detections too.
         for cpa in cpas_in(tr, o.x, scan_lo, scan_hi, thr) {
+            // Missing coverage cannot establish a silent pass. Apply the same support
+            // limits as a positive match before allowing this passage to reduce evidence.
+            if !cpa.interior || tr.gap_at(cpa.t_e) > p.max_gap_s {
+                continue;
+            }
             let t_rec = if ordinary_still_air {
                 cpa.t_r(c)
             } else {
@@ -13253,6 +13258,152 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn unheard_passes_need_supported_archive_geometry() {
+        use crate::track::{BuildParams, build};
+        use fdop_types::engine::EngineClass;
+        use fdop_types::store::{FlightLeg, TrackPoint, alt_src};
+
+        let medium = fdop_types::atmo::Medium::still(343.0);
+        let case = two_flyover_case(medium);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(medium);
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let o = observer(case.obs.0, case.obs.1, &dem);
+        let inp = SearchInputs {
+            events: case.events.clone(),
+            tracks: &case.tracks,
+            heard_times: vec![],
+            coarse_dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let candidate = explain_at(
+            &inp,
+            &case.p,
+            case.obs.0,
+            case.obs.1,
+            case.t_s,
+            5.0,
+            &[("e1".into(), "A".into()), ("e2".into(), "B".into())],
+        )
+        .expect("the two complete synthetic flyovers fit their true observer and clock");
+        assert_eq!(candidate.events.len(), 2);
+        assert!(
+            candidate
+                .events
+                .iter()
+                .all(|m| m.chi < 1.0 && m.coverage > 0.99)
+        );
+        let threshold = candidate
+            .events
+            .iter()
+            .map(|m| m.d)
+            .fold(f64::INFINITY, f64::min)
+            / 2.0;
+        let base_index = TimeIndex::new(&case.tracks);
+        assert!(
+            unheard_passes(
+                &candidate,
+                &o,
+                &case.tracks,
+                &base_index,
+                &[],
+                &case.p,
+                &atmo
+            )
+            .is_empty()
+        );
+
+        // Go through the production archive-to-track builder: its 180 s split limit
+        // legitimately retains a model whose 120 s interpolation is too sparse for
+        // the search's stricter 90 s acoustic support limit.
+        let build_pass = |times: &[f64]| {
+            let leg = FlightLeg {
+                key: "synthetic-close-pass".into(),
+                icao: String::new(),
+                reg: String::new(),
+                typ: "C172".into(),
+                source: "synthetic".into(),
+                engine: EngineClass::Piston,
+                points: times
+                    .iter()
+                    .map(|&time| {
+                        let (lat, lon, height) =
+                            enu.to_geodetic([80.0 * (time - 500.0), 300.0, 500.0]);
+                        TrackPoint {
+                            t: case.t_s + time,
+                            lat,
+                            lon,
+                            alt_m: height as f32,
+                            gs_mps: f32::NAN,
+                            track_deg: f32::NAN,
+                            vrate_mps: f32::NAN,
+                            alt_src: alt_src::GEOM,
+                            flags: 0,
+                        }
+                    })
+                    .collect(),
+            };
+            let models = build(&leg, &BuildParams::default());
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].t.len(), times.len());
+            models.into_iter().next().unwrap()
+        };
+        let dense: Vec<_> = (0..=28).map(|i| 430.0 + 5.0 * i as f64).collect();
+        let mut endpoint: Vec<_> = (0..=14).map(|i| 430.0 + 5.0 * i as f64).collect();
+        endpoint.push(500.2);
+        for (name, times, supported, expected_gap) in [
+            ("sparse", vec![430.0, 440.0, 560.0, 570.0], false, 120.0),
+            ("limit", vec![430.0, 455.0, 545.0, 570.0], true, 90.0),
+            (
+                "repaired",
+                vec![430.0, 440.0, 500.0, 560.0, 570.0],
+                true,
+                60.0,
+            ),
+            ("dense", dense, true, 5.0),
+            ("endpoint", endpoint, false, 0.2),
+        ] {
+            let pass = build_pass(&times);
+            let minima = cpas_in(&pass, o.x, f64::NEG_INFINITY, f64::INFINITY, threshold);
+            assert_eq!(
+                minima.len(),
+                1,
+                "{name}: the unchanged enumerator must find the close passage"
+            );
+            let cpa = minima[0];
+            assert!(
+                (cpa.t_e - case.t_s - 500.0).abs() < 0.002,
+                "{name}: {cpa:?}"
+            );
+            assert!(cpa.d < threshold);
+            assert_eq!(cpa.interior, name != "endpoint");
+            if name != "endpoint" {
+                assert_eq!(pass.gap_at(cpa.t_e), expected_gap);
+            }
+            let received = cpa.t_r(case.p.c) - case.t_s;
+            assert!((30.0..=case.p.duration - 30.0).contains(&received));
+            let mut tracks = case.tracks.clone();
+            tracks.push(pass);
+            let index = TimeIndex::new(&tracks);
+            let unheard = unheard_passes(&candidate, &o, &tracks, &index, &[], &case.p, &atmo);
+            assert_eq!(unheard.len(), usize::from(supported), "{name}: {unheard:?}");
+            let score = evidence(&mut candidate.events.clone(), &[], unheard.len());
+            let baseline = evidence(&mut candidate.events.clone(), &[], 0);
+            assert_eq!(
+                score,
+                baseline - UNHEARD_NATS * usize::from(supported) as f64
+            );
+            // Restoring real reports restores the penalty; an actual heard detection
+            // still excuses the same supported pass under the existing 25 s rule.
+            assert!(
+                unheard_passes(&candidate, &o, &tracks, &index, &[received], &case.p, &atmo)
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

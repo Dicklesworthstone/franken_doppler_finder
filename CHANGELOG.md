@@ -97,6 +97,23 @@ at that commit, not per-change commits.
   compilation, Clippy, tests, release selftest and reference/field replays remain unrun after
   the execution environment became unavailable. No native pass or field improvement is claimed.
 
+### Require observed flight support for unheard-pass penalties
+
+- Apply the positive-match interior-CPA and maximum-gap requirements before a close
+  aircraft can supply negative evidence. Track building can retain 180 s intervals,
+  but an interpolated passage across more than the search's 90 s support limit no
+  longer penalizes a valid location or fails its unheard-pass gate.
+- Keep the existing closest-approach enumeration, distance and hearing thresholds,
+  supported-pass penalty and heard-detection exemption.
+- Add a regression that fits two synthetic locating flyovers and builds an additional
+  aircraft from archive points. It checks a 120 s gap, the inclusive 90 s boundary,
+  repaired 60 s and dense 5 s coverage, an endpoint minimum and the evidence effect.
+- Both the new regression and the existing returning-aircraft unheard-pass regression
+  passed in a native exact-source component build with real search, track and physics
+  implementations. Independent source review, pinned changed-range formatting and
+  whitespace checks completed. Full-workspace, release-selftest and reference/field
+  validation remain incomplete; no field grade or accuracy improvement is claimed.
+
 ### Keep better nearby locations behind an already successful fine grid
 
 - Preserve each original successful fine candidate while retaining same-cell seed
@@ -110,11 +127,12 @@ at that commit, not per-change commits.
   local-grid, distinct-visit, priority and exact-budget controls; preserve the old
   successful candidate exactly. Covered-centre grid phases and partly overlapping
   corners remain outside this bounded recovery.
-- Independent source review and pinned formatting of changed ranges completed.
-  The native core build failed when rustc was killed in unchanged `simba`, before
-  reaching project code. Prepared component checks could not run before the execution
-  environment became unavailable. No native test, field-accuracy or performance pass
-  is claimed.
+- Fifteen native exact-source fine-grid component tests passed, including the new
+  recovery, CPA-visit and budget regressions plus the established physical controls.
+  Independent source review, pinned formatting of changed ranges and whitespace
+  checks completed. The full core build attempt was killed in unchanged `simba`
+  before project code; full-workspace, release-selftest and reference/field validation
+  remain incomplete. No field-accuracy or performance improvement is claimed.
 
 ### Recover pressure-level winds without coincident temperatures
 
@@ -128,8 +146,11 @@ at that commit, not per-change commits.
 - Add public offline cached-weather regressions for independently known height,
   time-interpolated vectors and wind-shear means, measured calm, unchanged sound-speed
   profiles, thermal-support controls and partial-grid warning propagation.
-- Independent source review and whitespace checks completed. Native validation is
-  pending; no field-accuracy, live-weather or performance improvement is claimed.
+- Independent source review, pinned formatting of changed ranges and whitespace
+  checks completed. Ten exact-source offline weather component tests passed, including
+  all three new pressure-recovery regressions and the incoming radiosonde compatibility
+  checks. They used real types and rejected every HTTP/cache-write path. Full
+  fdop-data/workspace, live-weather and field-accuracy validation remain incomplete.
 
 ### Retain measured calm winds in radiosonde profiles
 

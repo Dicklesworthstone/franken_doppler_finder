@@ -2825,7 +2825,7 @@ mod tests {
         // has the analytic midpoint wind; no cumulative-grid kink is crossed.
         let layer_log_pressure = (1010.0_f64 / 500.0).ln();
         let top = 30.0 + 287.05 / 9.80665 * (273.15 + 0.5 * (15.25 - 25.75)) * layer_log_pressure;
-        let height = |p| 32.0 + (top - 32.0) * (1010.0_f64 / p).ln() / layer_log_pressure;
+        let height = |p: f64| 32.0 + (top - 32.0) * (1010.0_f64 / p).ln() / layer_log_pressure;
         let (calm, peak) = (height(925.0), height(850.0));
         let lo = (calm / 50.0).ceil() * 50.0;
         let hi = (peak / 50.0).floor() * 50.0;
