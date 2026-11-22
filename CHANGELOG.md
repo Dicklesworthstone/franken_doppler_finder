@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain corroborated faster turns when headings are missing
+
+- Recover a supported faster turning portion after a longer slow portion when valid speed
+  reports remain but headings are missing. Fit the first three fresh positions and require
+  the fourth to match their prediction, with independent scalar-speed and available-heading
+  checks under the existing physical limits.
+- Require the existing two-sided finite-difference velocity tolerance to resolve the turn.
+  Malformed, stale, contradictory and coarsely sampled arcs remain ineligible. Only adjacent
+  missing-heading edges gain permission; earlier winners, separate supported parts, spline
+  interpolation and reported-velocity credit keep their existing behavior.
+- Add synthetic regressions covering both turn directions, reversed trajectories, relative
+  and Unix clocks, and all or alternating heading gaps. Verify identical spline and received
+  Doppler predictions to the same turning geometry already accepted without the slow prefix,
+  plus held-out-position, irregular-sampling and invalid-report refusal controls.
+
 ### Recover virtual radiosonde stations and usable alias profiles
 
 - Accept IEM's virtual station identifiers while retaining the existing US metadata,

@@ -218,6 +218,141 @@ fn triplet_reports_agree(
     })
 }
 
+/// Four positions can corroborate a missing heading on a resolved, steady turn. Fit
+/// a circle and its angular rate from the first three only; the fourth position is
+/// an independent prediction check, not another fitting constraint. Scalar speeds
+/// and every available heading must agree with the position-derived arc velocities.
+/// This grants local chain coverage only; interpolation and report credit stay unchanged.
+fn headingless_turn_speed(
+    pts: &[fdop_types::store::TrackPoint],
+    xy: &[[f64; 2]],
+    enu: &Enu,
+    bp: &BuildParams,
+) -> Option<f64> {
+    if pts.len() != 4
+        || xy.len() != 4
+        || !pts.iter().any(|p| p.track_deg.is_nan())
+        || pts.iter().any(|p| {
+            p.flags & pt_flags::STALE != 0
+                || !p.alt_m.is_finite()
+                || !p.gs_mps.is_finite()
+                || p.gs_mps <= 0.0
+                || p.gs_mps as f64 > fdop_types::C_SOUND
+                || (!p.track_deg.is_nan() && !(0.0..=360.0).contains(&p.track_deg))
+        })
+        || xy.iter().flatten().any(|v| !v.is_finite())
+    {
+        return None;
+    }
+    let dt = std::array::from_fn::<_, 3, _>(|i| pts[i + 1].t - pts[i].t);
+    if dt
+        .iter()
+        .any(|&t| !t.is_finite() || t <= 0.0 || t >= 30.0 || t > bp.max_gap_s)
+        || (0..3).any(|i| {
+            (pts[i + 1].alt_m - pts[i].alt_m).abs() as f64
+                > bp.max_vz_mps * dt[i] + bp.pos_slack_m.1
+        })
+    {
+        return None;
+    }
+    // Use the middle position as origin so a long leg's absolute ENU offset
+    // cannot dominate the circumcentre arithmetic.
+    let relative: [[f64; 2]; 4] =
+        std::array::from_fn(|i| [xy[i][0] - xy[1][0], xy[i][1] - xy[1][1]]);
+    let (a, b) = (relative[0], relative[2]);
+    let det = 2.0 * (a[0] * b[1] - a[1] * b[0]);
+    if !det.is_finite() || det == 0.0 {
+        return None;
+    }
+    let (aa, bb) = (a[0] * a[0] + a[1] * a[1], b[0] * b[0] + b[1] * b[1]);
+    let centre = [(aa * b[1] - bb * a[1]) / det, (a[0] * bb - b[0] * aa) / det];
+    let radial: [[f64; 2]; 4] = relative.map(|point| [point[0] - centre[0], point[1] - centre[1]]);
+    let radius = radial[1][0].hypot(radial[1][1]);
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    let angle: [f64; 3] = std::array::from_fn(|i| {
+        let (a, b) = (radial[i], radial[i + 1]);
+        (a[0] * b[1] - a[1] * b[0]).atan2(a[0] * b[0] + a[1] * b[1])
+    });
+    if angle
+        .iter()
+        .any(|a| !a.is_finite() || a.abs() >= std::f64::consts::PI || a * angle[0] <= 0.0)
+    {
+        return None;
+    }
+    let speeds: [f64; 3] = std::array::from_fn(|i| radius * angle[i].abs() / dt[i]);
+    if speeds
+        .iter()
+        .any(|&s| !s.is_finite() || s <= 0.0 || s > fdop_types::C_SOUND)
+        || (speeds[0] - speeds[1]).abs() > bp.vel_consistency_mps
+    {
+        return None;
+    }
+    let rate = (angle[0] + angle[1]) / (dt[0] + dt[1]);
+    let predicted_angle = rate * dt[2];
+    if predicted_angle.abs() >= std::f64::consts::PI {
+        return None;
+    }
+    let (s, c) = predicted_angle.sin_cos();
+    let predicted = [
+        centre[0] + c * radial[2][0] - s * radial[2][1],
+        centre[1] + s * radial[2][0] + c * radial[2][1],
+    ];
+    if (predicted[0] - relative[3][0]).hypot(predicted[1] - relative[3][1])
+        > bp.vel_consistency_mps * dt[2]
+    {
+        return None;
+    }
+    let direction: [[f64; 2]; 4] = radial.map(|r| {
+        let length = r[0].hypot(r[1]);
+        [
+            -angle[0].signum() * r[1] / length,
+            angle[0].signum() * r[0] / length,
+        ]
+    });
+    for i in 0..3 {
+        for k in [i, i + 1] {
+            let p = &pts[k];
+            if (p.gs_mps as f64 - speeds[i]).abs() > bp.vel_consistency_mps {
+                return None;
+            }
+            if p.track_deg.is_finite() {
+                let heading = (p.track_deg as f64).to_radians();
+                let reported = enu.vec_from_ecef(Enu::new(p.lat, p.lon, 0.0).vec_to_ecef([
+                    p.gs_mps as f64 * heading.sin(),
+                    p.gs_mps as f64 * heading.cos(),
+                    0.0,
+                ]));
+                if (reported[0] - speeds[i] * direction[k][0])
+                    .hypot(reported[1] - speeds[i] * direction[k][1])
+                    > bp.vel_consistency_mps
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    // A few widely separated points can describe a circle while supplying poor
+    // finite-difference tangents. Require the original interpolation's two-sided
+    // derivatives to resolve this arc within the same velocity residual allowance.
+    for k in [1, 2] {
+        let (left, right) = (dt[k - 1], dt[k]);
+        let fd: [f64; 2] = std::array::from_fn(|axis| {
+            (left * left * relative[k + 1][axis] - right * right * relative[k - 1][axis]
+                + (right * right - left * left) * relative[k][axis])
+                / (left * right * (left + right))
+        });
+        if (fd[0] - radius * rate.abs() * direction[k][0])
+            .hypot(fd[1] - radius * rate.abs() * direction[k][1])
+            > bp.vel_consistency_mps
+        {
+            return None;
+        }
+    }
+    Some(speeds.into_iter().fold(0.0, f64::max))
+}
+
 /// Missing groundspeed is not evidence for the old 200 m/s limit. A piece with missing
 /// coverage can infer its scale from three positions with agreeing horizontal secants. Use
 /// the reported-speed envelope, but cap this recovery at the nominal sound speed: repeated
@@ -471,6 +606,23 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                         if eligible {
                             added_headingless |= headingless && limit > missing_limits[i + k];
                             missing_limits[i + k] = missing_limits[i + k].max(limit);
+                        }
+                    }
+                }
+            }
+            if headingless {
+                for (i, (points, positions)) in pts.windows(4).zip(xy.windows(4)).enumerate() {
+                    let Some(speed) = headingless_turn_speed(points, positions, &enu, bp) else {
+                        continue;
+                    };
+                    let limit = (1.5 * speed + 30.0).min(fdop_types::C_SOUND);
+                    if limit > v_lim {
+                        missing_limits.resize(n, 0.0_f64);
+                        for k in 1..4 {
+                            if points[k - 1].track_deg.is_nan() || points[k].track_deg.is_nan() {
+                                added_headingless |= limit > missing_limits[i + k];
+                                missing_limits[i + k] = missing_limits[i + k].max(limit);
+                            }
                         }
                     }
                 }
@@ -3811,6 +3963,214 @@ mod tests {
                 assert!(errors.1 < 0.4, "Doppler error: {errors:?}");
             }
         }
+    }
+
+    #[test]
+    fn headingless_speeds_preserve_a_supported_faster_turn() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        for step in [10.0, 20.0] {
+            let times: Vec<_> = (0..=(740.0 / step) as usize)
+                .map(|k| k as f64 * step)
+                .collect();
+            for epoch in [1000.0, 1_788_895_000.0] {
+                for reverse in [false, true] {
+                    for turn in [-2.0_f64, 2.0] {
+                        let state = |t: f64| {
+                            let (pos, vel) = faster_turn_state(
+                                &enu,
+                                if reverse { 740.0 - t } else { t },
+                                turn.to_radians(),
+                            );
+                            (pos, scale(vel, if reverse { -1.0 } else { 1.0 }))
+                        };
+                        for alternating in [false, true] {
+                            let mut leg = leg_from_states(&times, state);
+                            for point in &mut leg.points {
+                                let t = point.t - 1000.0;
+                                let q = if reverse { 740.0 - t } else { t };
+                                if q >= 520.0
+                                    && (!alternating || (q / step).round() as usize % 2 == 0)
+                                {
+                                    point.track_deg = f32::NAN;
+                                }
+                                point.t = epoch + t;
+                            }
+                            assert!(reported_speed_limit(&leg.points) < 100.0);
+                            let models = build(&leg, &BuildParams::default());
+                            assert_eq!(models.len(), 1);
+                            let model = &models[0];
+                            assert_eq!(
+                                model.t,
+                                times.iter().map(|t| epoch + t).collect::<Vec<_>>(),
+                                "headingless turn lost positions: step={step}, epoch={epoch}, reverse={reverse}, turn={turn}, alternating={alternating}"
+                            );
+
+                            // This same turning portion already passes the original
+                            // cleaner when a longer slow portion does not set its speed
+                            // envelope. Compare its actual spline and received sound:
+                            // recovering positions must not invent heading reports or
+                            // claim the accuracy of fully reported endpoint tangents.
+                            let mut supported = leg.clone();
+                            supported.points.retain(|point| {
+                                let t = point.t - epoch;
+                                (if reverse { 740.0 - t } else { t }) >= 500.0
+                            });
+                            let reference = build(&supported, &BuildParams::default());
+                            assert_eq!(reference.len(), 1);
+                            assert_eq!(reference[0].t.len(), supported.points.len());
+                            let earlier_reports = leg.points.len() - supported.points.len();
+                            let reported = earlier_reports as f64
+                                + (reference[0].reported_vel_frac * supported.points.len() as f64)
+                                    .round();
+                            assert_eq!(model.reported_vel_frac, reported / leg.points.len() as f64);
+
+                            let pass = if reverse { 90.0 } else { 650.0 };
+                            let observer =
+                                add(state(pass).0, enu.vec_to_ecef([0.0, 800.0, -1200.0]));
+                            for k in 0..440 {
+                                let q = 520.25 + 0.5 * k as f64;
+                                let t = if reverse { 740.0 - q } else { q };
+                                let actual = model.pv(epoch + t);
+                                let expected = reference[0].pv(epoch + t);
+                                assert_eq!(actual, expected);
+                                let received = epoch + t + norm(sub(expected.0, observer)) / C_MPS;
+                                let (_, _, ratio) = model
+                                    .solve_emission_p(received, observer, &Prop::still(C_MPS), None)
+                                    .expect("the recovered turn must cover its emitted sound");
+                                let (_, _, expected_ratio) = reference[0]
+                                    .solve_emission_p(received, observer, &Prop::still(C_MPS), None)
+                                    .unwrap();
+                                assert!((F0_HZ * (ratio - expected_ratio)).abs() < 1e-5);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn headingless_turn_support_requires_a_fresh_resolved_fourth_position() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let bp = BuildParams::default();
+        let make = |times: &[f64], turn: f64| {
+            let mut leg = leg_from_states(times, |t| faster_turn_state(&enu, t, turn));
+            for p in &mut leg.points {
+                p.track_deg = f32::NAN;
+            }
+            leg
+        };
+        let support = |leg: &FlightLeg| {
+            let xy: Vec<_> = leg
+                .points
+                .iter()
+                .map(|p| {
+                    let position = enu.from_ecef(geodetic_to_ecef(p.lat, p.lon, 0.0));
+                    [position[0], position[1]]
+                })
+                .collect();
+            headingless_turn_speed(&leg.points, &xy, &enu, &bp)
+        };
+        // Unequal sampling and a clockwise/anticlockwise arc must satisfy the
+        // same held-out prediction and unequal-step derivative calculation.
+        for turn in [-2.0_f64, 2.0] {
+            for times in [[520.0, 540.0, 560.0, 580.0], [540.0, 548.0, 565.0, 579.0]] {
+                let leg = make(&times, turn.to_radians());
+                assert!(support(&leg).is_some(), "turn={turn}, times={times:?}");
+                for k in 0..4 {
+                    let mut observed = leg.clone();
+                    observed.points[k].track_deg =
+                        leg_from_states(&times, |t| faster_turn_state(&enu, t, turn.to_radians()))
+                            .points[k]
+                            .track_deg;
+                    assert!(
+                        support(&observed).is_some(),
+                        "an independent correct heading agrees"
+                    );
+                    observed.points[k].track_deg += 20.0;
+                    assert!(
+                        support(&observed).is_none(),
+                        "a contradictory heading cannot infer its own support"
+                    );
+                    for invalid in [
+                        "missing speed",
+                        "zero speed",
+                        "negative speed",
+                        "infinite speed",
+                        "supersonic speed",
+                        "slow speed",
+                        "infinite heading",
+                        "negative heading",
+                        "out-of-range heading",
+                        "stale",
+                        "height jump",
+                        "missing height",
+                    ] {
+                        let mut broken = leg.clone();
+                        let point = &mut broken.points[k];
+                        match invalid {
+                            "missing speed" => point.gs_mps = f32::NAN,
+                            "zero speed" => point.gs_mps = 0.0,
+                            "negative speed" => point.gs_mps = -145.0,
+                            "infinite speed" => point.gs_mps = f32::INFINITY,
+                            "supersonic speed" => point.gs_mps = 400.0,
+                            "slow speed" => point.gs_mps = 45.0,
+                            "infinite heading" => point.track_deg = f32::INFINITY,
+                            "negative heading" => point.track_deg = -1.0,
+                            "out-of-range heading" => point.track_deg = 720.0,
+                            "stale" => point.flags |= pt_flags::STALE,
+                            "height jump" => point.alt_m += 10_000.0,
+                            "missing height" => point.alt_m = f32::NAN,
+                            _ => unreachable!(),
+                        }
+                        assert!(
+                            support(&broken).is_none(),
+                            "{invalid} at {k}, turn={turn}, times={times:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let leg = make(&[520.0, 540.0, 560.0, 580.0], 2.0_f64.to_radians());
+        for invalid in [
+            "kink",
+            "reverse turn",
+            "wrong last time",
+            "large gap",
+            "zero gap",
+            "three positions",
+        ] {
+            let mut broken = leg.clone();
+            match invalid {
+                "kink" => {
+                    let (lat, lon, _) = ecef_to_geodetic(add(
+                        geodetic_to_ecef(broken.points[3].lat, broken.points[3].lon, 0.0),
+                        enu.vec_to_ecef([1500.0, -1500.0, 0.0]),
+                    ));
+                    (broken.points[3].lat, broken.points[3].lon) = (lat, lon);
+                }
+                "reverse turn" => {
+                    let earlier = broken.points[1];
+                    (broken.points[3].lat, broken.points[3].lon) = (earlier.lat, earlier.lon);
+                }
+                "wrong last time" => broken.points[3].t -= 10.0,
+                "large gap" => broken.points[3].t += 10.0,
+                "zero gap" => broken.points[2].t = broken.points[1].t,
+                "three positions" => {
+                    broken.points.pop();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                support(&broken).is_none(),
+                "{invalid} justified unsupported turn coverage"
+            );
+        }
+        // The same four positions with 90-degree steps describe a perfect circle,
+        // but their central finite differences miss a 145 m/s tangent by >50 m/s.
+        // Even a perfect fourth-position prediction cannot make that arc resolved.
+        let coarse = make(&[520.0, 540.0, 560.0, 580.0], 4.5_f64.to_radians());
+        assert!(support(&coarse).is_none());
     }
 
     #[test]

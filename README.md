@@ -1592,6 +1592,12 @@ Design notes:
   cannot justify it. Earlier recovered edges and every preceding winning report remain
   available. This works even when every heading is missing, without manufacturing reported
   velocity credit or changing the interpolation model.
+  Four fresh positions can also retain a faster, steadily turning portion whose valid
+  groundspeeds are present but headings are missing. The first three positions predict
+  the fourth; all speed reports and available headings must agree with the inferred arc.
+  The existing two-sided finite-difference velocity tolerance must also resolve the turn.
+  This grants only supported adjacent missing-heading edges, preserves earlier winning
+  reports and separate supported parts, and leaves interpolation and report credit unchanged.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
