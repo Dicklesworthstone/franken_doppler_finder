@@ -19,6 +19,24 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Reuse exact flight geometry across additional-event confirmation
+
+- Cache full-track closest approaches for one candidate observer and its immutable
+  trajectories. Subsequent confirming events reuse only those geometric results;
+  each event retains its own atmosphere, physical gates, pass exclusions and trace
+  scoring. Ordinary calm-air time windows keep their original sampling phase.
+- Bound storage to 4,096 track entries and 16,384 retained CPAs per active candidate.
+  A track exceeding the remaining capacity yields its collected prefix and continues
+  the same original iterator. No scan is repeated or comparison cut by that overflow.
+- Add exact-bit regression comparisons for every CPA, clipped windows after cache
+  warming, returning aircraft, excluded visits, shifted clocks, complete match output
+  and internal emission-time identity. Exercise zero, tiny and sufficient capacities,
+  repeated queries, calm air and wind.
+- Independent source review and added-text whitespace checks completed. The execution
+  host disconnected before native testing, so typechecking, formatting, Clippy, unit
+  tests, release selftest and reference/field replays remain unrun. Removing repeated
+  geometry work has not yet been measured as an end-to-end performance improvement.
+
 ### Preserve narrow-region flight crossings through speed-gate boundaries
 
 - Keep a neighboring coarse sample's geometric CPA plane when its speed is outside

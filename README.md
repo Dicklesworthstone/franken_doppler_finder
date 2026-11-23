@@ -1528,9 +1528,12 @@ Design notes:
   Additional-flight confirmation uses the raw fitted-distance shortcut only for an
   explicitly uniform matching still-air medium; otherwise exact CPA, speed, distance,
   clock and trace checks decide. This can recover a flight that the corrected gates
-  permit but the uncorrected distance excluded. Weather-dependent confirmation can
-  require more CPA evaluations. Its existing emission-time windows and the coarse
-  terrain approximation remain unchanged. Unknown providers can require more weather queries;
+  permit but the uncorrected distance excluded. Full-track closest approaches are reused
+  across confirming events at the same candidate observer, with at most 4,096 cached
+  tracks and 16,384 retained CPAs. When that storage fills, the original scan continues
+  without losing visits. Ordinary calm-air time windows, per-event weather, gates,
+  exclusions and trace scoring retain their existing behavior. These changes have no
+  measured end-to-end speedup yet. Unknown providers can require more weather queries;
   a finite sampling grid does not guarantee recovery through arbitrary discontinuous weather.
 - **Hillside rejections can reach the observer's exact closest approach.** The initial CPA line
   uses terrain beneath the aircraft. A climb or descent over a slope can therefore imply the

@@ -2935,7 +2935,83 @@ impl TimeIndex {
     }
 }
 
-/// Best explanation of event `ev` by any track at observer `o` with the recording clock fixed.
+// Per observer, not per search. An overflow keeps the complete streaming scan, so these
+// storage limits cannot remove a flight or spend any comparison budget.
+const CONFIRM_CACHE_TRACKS: usize = 4096;
+const CONFIRM_CACHE_CPAS: usize = 16_384;
+
+/// Full-track closest approaches depend only on the observer and immutable trajectories.
+/// Real-weather confirmation revisits them for every event; retain bounded geometry while
+/// continuing to evaluate each event's atmosphere, gates, exclusions and trace independently.
+struct ConfirmationGeometry<'a> {
+    observer: &'a Obs,
+    tracks: &'a [TrackModel],
+    full: HashMap<u32, Vec<crate::track::Cpa>>,
+    max_tracks: usize,
+    remaining: usize,
+}
+
+impl<'a> ConfirmationGeometry<'a> {
+    fn new(observer: &'a Obs, tracks: &'a [TrackModel]) -> Self {
+        Self::with_limits(observer, tracks, CONFIRM_CACHE_TRACKS, CONFIRM_CACHE_CPAS)
+    }
+
+    fn with_limits(
+        observer: &'a Obs,
+        tracks: &'a [TrackModel],
+        max_tracks: usize,
+        max_cpas: usize,
+    ) -> Self {
+        Self {
+            observer,
+            tracks,
+            full: HashMap::new(),
+            max_tracks,
+            remaining: max_cpas,
+        }
+    }
+
+    /// A bounded time window keeps its original sampling phase and never uses this cache.
+    /// On a full-track miss, collect at most the remaining allowance plus one. If it
+    /// overflows, yield that prefix and resume the same original iterator without a cut.
+    fn cpas(
+        &mut self,
+        ti: u32,
+        window: Option<(f64, f64)>,
+    ) -> impl Iterator<Item = crate::track::Cpa> + '_ {
+        let tr = &self.tracks[ti as usize];
+        let x = self.observer.x;
+        let full = window.is_none();
+        let cached = full && self.full.contains_key(&ti);
+        let (lo, hi) = window.unwrap_or((tr.t0(), tr.t1()));
+        let mut direct = (!cached).then(|| tr.local_cpas(x, lo, hi));
+        let mut prefix = Vec::new();
+        if full && !cached && self.full.len() < self.max_tracks {
+            prefix.extend(
+                direct
+                    .as_mut()
+                    .unwrap()
+                    .by_ref()
+                    .take(self.remaining.saturating_add(1)),
+            );
+            if prefix.len() <= self.remaining {
+                self.remaining -= prefix.len();
+                self.full.insert(ti, std::mem::take(&mut prefix));
+                direct = None;
+            }
+        }
+        let retained = full.then(|| self.full.get(&ti)).flatten();
+        retained
+            .into_iter()
+            .flatten()
+            .copied()
+            .chain(prefix)
+            .chain(direct.into_iter().flatten())
+    }
+}
+
+/// Uncached reference for regression comparisons and existing focused confirmer tests.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn best_confirmer(
     o: &Obs,
@@ -2947,6 +3023,21 @@ fn best_confirmer(
     atmo: &dyn Atmosphere,
     exclude: &[(u32, f64)],
 ) -> Option<(f64, EventMatch, u32)> {
+    let mut geometry = ConfirmationGeometry::with_limits(o, tracks, 0, 0);
+    best_confirmer_with_geometry(&mut geometry, t_start, ev, tix, p, atmo, exclude)
+}
+
+/// Best explanation of an event using this cache's fixed observer and the given recording clock.
+fn best_confirmer_with_geometry(
+    geometry: &mut ConfirmationGeometry<'_>,
+    t_start: f64,
+    ev: &SearchEvent,
+    tix: &TimeIndex,
+    p: &SearchParams,
+    atmo: &dyn Atmosphere,
+    exclude: &[(u32, f64)],
+) -> Option<(f64, EventMatch, u32)> {
+    let (o, tracks) = (geometry.observer, geometry.tracks);
     let c = p.c;
     let t_heard = t_start + ev.t_rec;
     // A certified calm provider may scale the fitted range by its maximum sound
@@ -2987,7 +3078,7 @@ fn best_confirmer(
         } else {
             (tr.t0(), tr.t1())
         };
-        for cpa in tr.local_cpas(o.x, scan_lo, scan_hi) {
+        for cpa in geometry.cpas(ti, ordinary_still_air.then_some((scan_lo, scan_hi))) {
             if cpa.d > reach {
                 continue;
             }
@@ -3770,6 +3861,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             progress(&format!("confirmers {k}/{n_conf}"));
         }
         let o = observer(cand.lat, cand.lon, inp.fine_dem);
+        let mut geometry = ConfirmationGeometry::new(&o, tracks);
         let used: Vec<usize> = cand.trk.iter().map(|t| t.0).collect();
         for (ek, ev) in evs.iter().enumerate() {
             if used.contains(&ek) {
@@ -3781,9 +3873,15 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
                 .zip(&cand.events)
                 .map(|(&(_, ti), m)| (ti, m.cpa_emission_utc()))
                 .collect();
-            if let Some((_, m, ti)) =
-                best_confirmer(&o, cand.t_start_utc, ev, tracks, &tix, p, atmo, &excl)
-            {
+            if let Some((_, m, ti)) = best_confirmer_with_geometry(
+                &mut geometry,
+                cand.t_start_utc,
+                ev,
+                &tix,
+                p,
+                atmo,
+                &excl,
+            ) {
                 cand.events.push(m);
                 cand.trk.push((ek, ti));
             }
@@ -11841,6 +11939,156 @@ mod tests {
                 explain(&[(0, emission_seed)]).is_none(),
                 "a second tone cannot count the same physical pass twice"
             );
+        }
+    }
+
+    #[test]
+    fn confirmation_geometry_preserves_every_visit_and_window_when_storage_fills() {
+        let case = narrow_circuit_case(fdop_types::atmo::Medium::still(343.0));
+        let o = observer(case.obs.0, case.obs.1, &FlatElevation(0.0));
+        let signature = |cpa: crate::track::Cpa| {
+            (
+                cpa.t_e.to_bits(),
+                cpa.d.to_bits(),
+                cpa.speed.to_bits(),
+                cpa.interior,
+                cpa.rv.map(f64::to_bits),
+                cpa.vel.map(f64::to_bits),
+            )
+        };
+        let circuit = &case.tracks[0];
+        assert!(circuit.local_cpas(o.x, circuit.t0(), circuit.t1()).count() >= 6);
+        for (max_tracks, max_cpas) in [(0, 64), (1, 0), (1, 1), (1, 64), (2, 64)] {
+            let mut geometry =
+                ConfirmationGeometry::with_limits(&o, &case.tracks, max_tracks, max_cpas);
+            for _ in 0..2 {
+                for (ti, window) in [
+                    (0, None),
+                    (1, None),
+                    // Deliberately fractional boundaries change the local survey's phase.
+                    // A full-track cache must not substitute its minima for this scan.
+                    (0, Some((case.t_s + 131.375, case.t_s + 389.625))),
+                    (0, None),
+                ] {
+                    let tr = &case.tracks[ti as usize];
+                    let (lo, hi) = window.unwrap_or((tr.t0(), tr.t1()));
+                    let expected: Vec<_> = tr.local_cpas(o.x, lo, hi).map(signature).collect();
+                    let actual: Vec<_> = geometry.cpas(ti, window).map(signature).collect();
+                    assert_eq!(
+                        actual, expected,
+                        "limits={max_tracks}/{max_cpas}, track={ti}, window={window:?}"
+                    );
+                    let retained: usize = geometry.full.values().map(Vec::len).sum();
+                    assert!(geometry.full.len() <= max_tracks && retained <= max_cpas);
+                    assert_eq!(geometry.remaining, max_cpas - retained);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_confirmation_keeps_exact_matches_clocks_and_pass_exclusions() {
+        let signature = |answer: &Option<(f64, EventMatch, u32)>| {
+            answer.as_ref().map(|(chi, matched, ti)| {
+                (
+                    chi.to_bits(),
+                    serde_json::to_vec(matched).unwrap(),
+                    *ti,
+                    matched.t_cpa_emitted_utc.map(f64::to_bits),
+                    matched.cpa_emission_utc().to_bits(),
+                )
+            })
+        };
+        for medium in [
+            fdop_types::atmo::Medium::still(343.0),
+            fdop_types::atmo::Medium {
+                c: 339.0,
+                wind_e: 7.0,
+                wind_n: -5.0,
+            },
+        ] {
+            let case = narrow_circuit_case(medium);
+            let o = observer(case.obs.0, case.obs.1, &FlatElevation(0.0));
+            let atmo = fdop_types::atmo::UniformAtmosphere(medium);
+            let tix = TimeIndex::with_atmosphere(&case.tracks, &atmo);
+            let queries = [
+                (0, 0.0, vec![]),
+                (2, 0.0, vec![(0, case.t_s + 420.0)]),
+                (2, 0.0, vec![(0, case.t_s + 300.0)]),
+                (1, 0.0, vec![]),
+                (1, 0.0, vec![(1, case.t_s + 650.0)]),
+                (2, 0.5, vec![(0, case.t_s + 420.0)]),
+                (2, 30.0, vec![]),
+                (0, 0.0, vec![(0, case.t_s + 300.0)]),
+            ];
+            let expected: Vec<_> = queries
+                .iter()
+                .map(|(ei, dt, exclude)| {
+                    best_confirmer(
+                        &o,
+                        case.t_s + dt,
+                        &case.events[*ei],
+                        &case.tracks,
+                        &tix,
+                        &case.p,
+                        &atmo,
+                        exclude,
+                    )
+                })
+                .collect();
+            for k in [0, 1, 3, 7] {
+                assert!(expected[k].as_ref().is_some_and(|(chi, _, _)| *chi < 1.0));
+            }
+            for k in [2, 4, 6] {
+                assert!(
+                    expected[k].is_none(),
+                    "same-pass and wrong-clock exclusions must hold"
+                );
+            }
+            assert_eq!(
+                expected[1].as_ref().unwrap().1.flight,
+                "narrow-circuit"
+            );
+            assert!(
+                (expected[1].as_ref().unwrap().1.cpa_emission_utc() - case.t_s - 300.0).abs()
+                    < 0.01
+            );
+            for (max_tracks, max_cpas) in [(0, 0), (1, 0), (1, 1), (1, 64), (2, 64)] {
+                let mut geometry =
+                    ConfirmationGeometry::with_limits(&o, &case.tracks, max_tracks, max_cpas);
+                for _ in 0..2 {
+                    for (k, (ei, dt, exclude)) in queries.iter().enumerate() {
+                        let actual = best_confirmer_with_geometry(
+                            &mut geometry,
+                            case.t_s + dt,
+                            &case.events[*ei],
+                            &tix,
+                            &case.p,
+                            &atmo,
+                            exclude,
+                        );
+                        assert_eq!(
+                            signature(&actual),
+                            signature(&expected[k]),
+                            "medium={medium:?}, limits={max_tracks}/{max_cpas}, query={k}"
+                        );
+                    }
+                    let retained: usize = geometry.full.values().map(Vec::len).sum();
+                    assert!(geometry.full.len() <= max_tracks && retained <= max_cpas);
+                    assert_eq!(geometry.remaining, max_cpas - retained);
+                    if medium.wind_e == 0.0 && medium.wind_n == 0.0 {
+                        assert!(
+                            geometry.full.is_empty(),
+                            "ordinary calm scans keep their original windows"
+                        );
+                    } else if max_tracks > 0 && max_cpas >= 64 {
+                        assert!(
+                            !geometry.full.is_empty(),
+                            "repeated weather confirmations must reuse retained geometry"
+                        );
+                    }
+                }
+            }
         }
     }
 
