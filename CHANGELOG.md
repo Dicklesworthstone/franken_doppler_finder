@@ -19,6 +19,31 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover compact flyover pairs between broad clock samples
+
+- After a broad fine-grid clock scan finds no eligible pair, try the recording starts
+  implied by its two exact aircraft closest approaches. Keep the original successful
+  result and every existing geometry, clock, trace-fit and coverage gate. A seed must
+  already explain both aircraft before bounded local polishing; preserve the exact
+  seed when the local samples miss its valid interval.
+- Reuse the original clock-cell width and filter duplicate, nonfinite and out-of-window
+  seeds. If recovery also fails, restore the original rejected point and trace fits so
+  spatial recovery receives the same objective. Narrow scans and quick screening retain
+  their original evaluation sequence. Ungated refinement is unchanged in this increment.
+- The native `broad_clock_profiles_retain_compact_physical_passes` regression fails on
+  the preceding production code: two physical short flyovers disappear with a 1,200 s
+  fitted-time tolerance at sampling phase 0.17. The repair passes all 24 combinations of
+  tolerance, sampling phase and relative/Unix clock in that test. These are synthesized
+  traces with deliberately widened uncertainty, not evidence of field prevalence.
+- Native validation uses exact production search helpers, complete track/physics modules
+  and genuine locked type/serialization dependencies on the pinned compiler through RCH.
+  The selected suite passes 101 tests, with no failures and one ignored timing benchmark,
+  including controls for preserved successes, rejected-fit restoration and missed seeds.
+  It includes the latest track-recovery change; its new full-search integration test is
+  outside this selected-source harness. Scoped Rust formatting and whitespace checks pass.
+  The full core/workspace build was killed in unchanged dependencies before project code;
+  full-workspace tests, Clippy, release selftest and reference/field replays remain unrun.
+
 ### Recover accelerating flight positions during velocity-report outages
 
 - Extend locally supported acceleration recovery to missing groundspeed reports after

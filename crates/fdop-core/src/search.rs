@@ -2464,7 +2464,7 @@ fn eval_point_weighted(
         (tot, eligible)
     };
     let profiled = if gates != PointGates::Off && !quick {
-        profile_valid_clock(lo, hi, cost)
+        profile_valid_clock_seeded(lo, hi, &ts_imp, cost)
     } else {
         profile_clock(lo, hi, quick, |ts| cost(ts).0)
     };
@@ -2582,6 +2582,69 @@ fn profile_valid_clock(
     // The caller retains the last clock's trace fits, even if local polishing failed.
     let (value, valid) = cost(best.0);
     valid.then_some((best.0, value))
+}
+
+/// A wide uncertainty window can put every regular sample outside a compact pass's
+/// accepted clock basin. Capped residuals may then favor a distant, invalid plateau.
+/// Preserve every original success; only a failed coarse scan tries the exact
+/// recording clocks implied by its assigned physical CPAs. Each seed must already
+/// explain every event before its original scan-cell neighborhood is polished.
+fn profile_valid_clock_seeded(
+    lo: f64,
+    hi: f64,
+    seeds: &[f64],
+    mut cost: impl FnMut(f64) -> (f64, bool),
+) -> Option<(f64, f64)> {
+    let mut last = None;
+    let original = profile_valid_clock(lo, hi, |t| {
+        last = Some(t);
+        cost(t)
+    });
+    if original.is_some() {
+        return original;
+    }
+    let n = (((hi - lo) / 0.25).ceil() as usize).clamp(1, 400);
+    let half = (hi - lo) / n as f64;
+    if !half.is_finite() || half <= 0.25 {
+        return None;
+    }
+    let restore = last?;
+    let mut tried = false;
+    let mut best: Option<(f64, f64)> = None;
+    for (i, &seed) in seeds.iter().enumerate() {
+        if !seed.is_finite() || seed < lo || seed > hi || seeds[..i].contains(&seed) {
+            continue;
+        }
+        tried = true;
+        let (value, valid) = cost(seed);
+        if !valid || !value.is_finite() {
+            continue;
+        }
+        // Keep the observed seed itself: local scan nodes need not land on it,
+        // and the capped objective need not be unimodal even within this cell.
+        let mut candidate = (seed, value);
+        if let Some(polished) =
+            profile_valid_clock((seed - half).max(lo), (seed + half).min(hi), &mut cost)
+            && polished.1 < candidate.1
+        {
+            candidate = polished;
+        }
+        if best.is_none_or(|old| candidate.1 < old.1) {
+            best = Some(candidate);
+        }
+    }
+    if let Some((clock, _)) = best {
+        let (value, valid) = cost(clock);
+        if valid && value.is_finite() {
+            return Some((clock, value));
+        }
+    }
+    if tried {
+        // Fine-grid recovery can retain the last rejected objective as a spatial
+        // seed. An unsuccessful clock retry must leave that original point intact.
+        cost(restore);
+    }
+    None
 }
 
 fn engine_str(tr: &TrackModel) -> String {
@@ -6876,6 +6939,115 @@ mod tests {
     }
 
     #[test]
+    fn seeded_clock_preserves_successes_and_narrow_failures_exactly() {
+        for (lo, hi, valid) in [(-400.0, 400.0, true), (0.0, 80.0, false)] {
+            let mut original_calls = Vec::new();
+            let original = profile_valid_clock(lo, hi, |t| {
+                original_calls.push(t);
+                (t * t, valid)
+            });
+            let mut calls = Vec::new();
+            let recovered = profile_valid_clock_seeded(lo, hi, &[1.173, 20.31], |t| {
+                calls.push(t);
+                (t * t, valid)
+            });
+            assert_eq!(recovered, original);
+            assert_eq!(calls, original_calls);
+        }
+    }
+
+    #[test]
+    fn seeded_clock_keeps_an_eligible_seed_between_local_scan_nodes() {
+        let (lo, hi, seed) = (-400.0, 401.0, 0.173);
+        let score = |t: f64| {
+            let valid = (t - seed).abs() < 1e-12;
+            (if valid { 1.0 } else { 0.0 }, valid)
+        };
+        let mut original_calls = Vec::new();
+        assert!(
+            profile_valid_clock(lo, hi, |t| {
+                original_calls.push(t);
+                score(t)
+            })
+            .is_none()
+        );
+        let mut calls = Vec::new();
+        let recovered = profile_valid_clock_seeded(lo, hi, &[seed], |t| {
+            calls.push(t);
+            score(t)
+        });
+        assert_eq!(recovered, Some((seed, 1.0)));
+        assert_eq!(&calls[..original_calls.len()], &original_calls);
+        // An odd local scan interval count misses its centre. Only the explicit
+        // seed and final state restoration should sample this tiny valid island.
+        assert_eq!(calls.iter().filter(|&&t| t == seed).count(), 2);
+        let half = (hi - lo) / 400.0;
+        assert!(
+            calls[original_calls.len()..]
+                .iter()
+                .all(|&t| (seed - half..=seed + half).contains(&t))
+        );
+        assert_eq!(calls.last().copied(), Some(seed));
+    }
+
+    #[test]
+    fn seeded_clock_restores_rejected_fits_and_filters_unused_seeds() {
+        for finite in [true, false] {
+            let score = |t: f64| (if finite { t * t } else { f64::INFINITY }, false);
+            let mut original_calls = Vec::new();
+            assert!(
+                profile_valid_clock(-400.0, 400.0, |t| {
+                    original_calls.push(t);
+                    score(t)
+                })
+                .is_none()
+            );
+            let mut calls = Vec::new();
+            let seeds = [f64::NAN, f64::INFINITY, -401.0, 1.173, 1.173, 401.0];
+            assert!(
+                profile_valid_clock_seeded(-400.0, 400.0, &seeds, |t| {
+                    calls.push(t);
+                    score(t)
+                })
+                .is_none()
+            );
+            assert_eq!(&calls[..original_calls.len()], &original_calls);
+            assert_eq!(
+                &calls[original_calls.len()..],
+                &[1.173, *original_calls.last().unwrap()]
+            );
+            calls.clear();
+            assert!(
+                profile_valid_clock_seeded(-400.0, 400.0, &seeds[..3], |t| {
+                    calls.push(t);
+                    score(t)
+                })
+                .is_none()
+            );
+            assert_eq!(calls, original_calls);
+        }
+    }
+
+    #[test]
+    fn seeded_clock_polishes_every_supported_seed_before_comparing() {
+        let score = |t: f64| {
+            if (t - 100.3).abs() < 0.1 {
+                ((t - 100.3).powi(2) + 0.001, true)
+            } else if (t - 400.3).abs() < 0.1 {
+                ((t - 400.3).powi(2), true)
+            } else {
+                (0.0, false)
+            }
+        };
+        assert!(score(100.3).0 < score(400.39).0);
+        assert!(profile_valid_clock(0.0, 800.0, score).is_none());
+        let recovered = profile_valid_clock_seeded(0.0, 800.0, &[100.3, 400.39], score)
+            .expect("the initially weaker seed reaches the better eligible basin");
+        assert!((recovered.0 - 400.3).abs() < 0.01);
+        assert!(recovered.1 < 0.0001);
+    }
+
+    #[test]
     fn broad_clock_profiles_polish_the_whole_scanned_cell() {
         let med = fdop_types::atmo::Medium::still(343.0);
         let mut case = two_flyover_case(med);
@@ -6913,6 +7085,55 @@ mod tests {
                     fitted.t_s - case.t_s
                 );
                 assert!(fitted.chis.iter().all(|fit| fit.chi < 0.1));
+            }
+        }
+    }
+
+    #[test]
+    fn broad_clock_profiles_retain_compact_physical_passes() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        for start in [0.0, 1_788_895_000.0] {
+            let mut case = compact_fine_grid_case(start, false);
+            let assignments = [(0, 0, start + 120.0), (1, 1, start + 360.0)];
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            for tolerance in [120.0, 600.0, 1200.0] {
+                for event in &mut case.events {
+                    event.t_tol = tolerance;
+                }
+                for phase in [0.17, 0.73, 1.27, 2.11] {
+                    case.p.start_lo = start - tolerance + phase;
+                    case.p.start_hi = start + tolerance - 3.27;
+                    let fitted = eval_point_weighted(
+                        &o,
+                        &assignments,
+                        &case.events,
+                        &case.tracks,
+                        &case.p,
+                        &atmo,
+                        true,
+                        PointGates::All,
+                        false,
+                        None,
+                        false,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "lost compact pair: start={start}, tolerance={tolerance}, phase={phase}"
+                        )
+                    });
+                    assert!(
+                        (fitted.t_s - start).abs() < 0.05,
+                        "start={start}, tolerance={tolerance}, phase={phase}: {}",
+                        fitted.t_s - start
+                    );
+                    assert!(
+                        fitted
+                            .chis
+                            .iter()
+                            .all(|fit| fit.chi < 0.1 && fit.cov == 1.0)
+                    );
+                }
             }
         }
     }

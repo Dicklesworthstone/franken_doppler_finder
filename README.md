@@ -2089,8 +2089,13 @@ aircraft pass those same gates. If that minimum fails an event, the fitter keeps
 best eligible clock it already examined and polishes only its neighboring scan interval.
 A failed local polish cannot erase that retained clock, and the returned trace fits are
 recomputed at the returned clock. A window with no eligible sampled clock is rejected
-without another scan. Quick screening and ungated confidence refinement keep their
-existing clock objective and evaluation sequence.
+without another scan unless the 400-cell cap widened its sampling interval. In that case,
+the fitter also tries the recording start implied by each aircraft's exact closest approach.
+Each seed must lie inside the original joint clock window and already explain both aircraft
+under the same trace and coverage gates before its neighboring scan interval is polished.
+The seed itself remains available if local polishing misses it. An unsuccessful retry
+restores the original rejected fit for spatial recovery. Quick screening and ungated
+confidence refinement keep their existing clock objective and evaluation sequence.
 
 If no sampled fine-grid location passes, a geometrically eligible node can now supply its
 already computed rejected trace fit as the starting point for the existing bounded spatial
