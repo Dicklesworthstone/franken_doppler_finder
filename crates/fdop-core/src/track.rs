@@ -364,15 +364,45 @@ fn headingless_acceleration_speed(
     enu: &Enu,
     bp: &BuildParams,
 ) -> Option<f64> {
+    if !pts.iter().any(|p| p.track_deg.is_nan()) {
+        return None;
+    }
+    resolved_acceleration_speed(pts, xy, enu, bp, false)
+}
+
+/// An acceleration can also outlive both speed and heading telemetry. Missing
+/// scalar reports need position-derived velocities that agree with BOTH adjacent
+/// observed chords; averaging the chords could hide an outlying fourth position.
+/// Available speed/heading reports remain independent constraints, never inferred
+/// reports or additional reported-velocity credit.
+fn missing_speed_acceleration_speed(
+    pts: &[fdop_types::store::TrackPoint],
+    xy: &[[f64; 2]],
+    enu: &Enu,
+    bp: &BuildParams,
+) -> Option<f64> {
+    if !pts.iter().any(|p| p.gs_mps.is_nan()) {
+        return None;
+    }
+    resolved_acceleration_speed(pts, xy, enu, bp, true)
+}
+
+fn resolved_acceleration_speed(
+    pts: &[fdop_types::store::TrackPoint],
+    xy: &[[f64; 2]],
+    enu: &Enu,
+    bp: &BuildParams,
+    allow_missing_speed: bool,
+) -> Option<f64> {
     if pts.len() != 4
         || xy.len() != 4
-        || !pts.iter().any(|p| p.track_deg.is_nan())
         || pts.iter().any(|p| {
             p.flags & pt_flags::STALE != 0
                 || !p.alt_m.is_finite()
-                || !p.gs_mps.is_finite()
-                || p.gs_mps <= 0.0
-                || p.gs_mps as f64 > fdop_types::C_SOUND
+                || (!(allow_missing_speed && p.gs_mps.is_nan())
+                    && (!p.gs_mps.is_finite()
+                        || p.gs_mps <= 0.0
+                        || p.gs_mps as f64 > fdop_types::C_SOUND))
                 || (!p.track_deg.is_nan() && !(0.0..=360.0).contains(&p.track_deg))
         })
         || xy.iter().flatten().any(|v| !v.is_finite())
@@ -415,22 +445,33 @@ fn headingless_acceleration_speed(
         if !speed.is_finite()
             || speed <= 0.0
             || speed > fdop_types::C_SOUND
-            || (p.gs_mps as f64 - speed).abs() > bp.vel_consistency_mps
+            || (p.gs_mps.is_finite() && (p.gs_mps as f64 - speed).abs() > bp.vel_consistency_mps)
         {
             return None;
         }
-        // A scalar report must also support each observed adjacent chord,
-        // as in the existing headingless triplet and straight reported pair.
+        // A scalar report must also support each observed adjacent chord, as in
+        // the existing headingless triplet and straight reported pair. Without
+        // it, require the fitted vector itself to agree with both chords.
         for chord in &chord[k.saturating_sub(1)..=k.min(2)] {
-            if (p.gs_mps as f64 - chord[0].hypot(chord[1])).abs() > bp.vel_consistency_mps {
+            let residual = if p.gs_mps.is_nan() {
+                (velocity[k][0] - chord[0]).hypot(velocity[k][1] - chord[1])
+            } else {
+                (p.gs_mps as f64 - chord[0].hypot(chord[1])).abs()
+            };
+            if residual > bp.vel_consistency_mps {
                 return None;
             }
         }
         if p.track_deg.is_finite() {
             let heading = (p.track_deg as f64).to_radians();
+            let heading_speed = if p.gs_mps.is_nan() {
+                speed
+            } else {
+                p.gs_mps as f64
+            };
             let reported = enu.vec_from_ecef(Enu::new(p.lat, p.lon, 0.0).vec_to_ecef([
-                p.gs_mps as f64 * heading.sin(),
-                p.gs_mps as f64 * heading.cos(),
+                heading_speed * heading.sin(),
+                heading_speed * heading.cos(),
                 0.0,
             ]));
             if (reported[0] - velocity[k][0]).hypot(reported[1] - velocity[k][1])
@@ -621,15 +662,17 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
     });
     let position_only = pts.iter().all(|p| p.gs_mps.is_nan());
     // Preserve every earlier winner before extending it: reported motion, missing-speed
-    // triplets, mixed triplets, then valid speeds whose headings are missing. Keep locally
-    // checked edge permissions even when their path still needs a headingless bridge.
+    // triplets, mixed triplets, valid speeds whose headings are missing, then resolved
+    // acceleration with absent speeds. Keep locally checked edge permissions even
+    // when their path still needs another independently supported bridge.
     let mut supported_missing_limits = Vec::new();
-    for recovery in 0..4 {
+    for recovery in 0..5 {
         if best[winner] == n {
             break;
         }
         let headingless = recovery == 3;
-        let mut missing_limits = if headingless || recovery == 2 {
+        let missing_acceleration = recovery == 4;
+        let mut missing_limits = if recovery >= 2 {
             supported_missing_limits.clone()
         } else {
             Vec::new()
@@ -639,10 +682,12 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
             // its locally corroborated fast edges through the same first triplet
             // retry; invalid non-NaN reports cannot request this recovery.
             // Mixed bridges still need independent fresh reports on the retained path.
-            if !pts.iter().any(|p| p.gs_mps.is_finite()) && (recovery != 1 || !position_only) {
-                break;
+            if !pts.iter().any(|p| p.gs_mps.is_finite())
+                && ((!missing_acceleration && recovery != 1) || !position_only)
+            {
+                continue;
             }
-            if recovery == 2 {
+            if recovery == 2 || (missing_acceleration && !position_only) {
                 let mut k = winner;
                 let mut reported_anchor = false;
                 while prev[k] != usize::MAX {
@@ -660,76 +705,87 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
                     continue;
                 }
             }
-            let mut added_headingless = false;
-            for (i, (points, positions)) in pts.windows(3).zip(xy.windows(3)).enumerate() {
-                let all_missing = points.iter().all(|p| p.gs_mps.is_nan());
-                if headingless {
-                    // Two independent, agreeing secants and all three speed reports
-                    // must support the motion. Only NaN means an absent heading.
-                    if !points.iter().any(|p| p.track_deg.is_nan())
-                        || points.iter().any(|p| {
-                            !p.gs_mps.is_finite()
-                                || p.gs_mps <= 0.0
-                                || p.gs_mps as f64 > fdop_types::C_SOUND
-                        })
+            let mut added = false;
+            if !missing_acceleration {
+                for (i, (points, positions)) in pts.windows(3).zip(xy.windows(3)).enumerate() {
+                    let all_missing = points.iter().all(|p| p.gs_mps.is_nan());
+                    if headingless {
+                        // Two independent, agreeing secants and all three speed reports
+                        // must support the motion. Only NaN means an absent heading.
+                        if !points.iter().any(|p| p.track_deg.is_nan())
+                            || points.iter().any(|p| {
+                                !p.gs_mps.is_finite()
+                                    || p.gs_mps <= 0.0
+                                    || p.gs_mps as f64 > fdop_types::C_SOUND
+                            })
+                        {
+                            continue;
+                        }
+                    } else if !all_missing
+                        && (recovery != 2 || !points.iter().any(|p| p.gs_mps.is_nan()))
                     {
                         continue;
                     }
-                } else if !all_missing
-                    && (recovery != 2 || !points.iter().any(|p| p.gs_mps.is_nan()))
-                {
-                    continue;
-                }
-                let Some(speed) = position_triplet_speed(points, positions, bp) else {
-                    continue;
-                };
-                if (position_only || !all_missing)
-                    && !triplet_reports_agree(
-                        points,
-                        positions,
-                        &enu,
-                        bp,
-                        headingless || recovery == 2,
-                    )
-                {
-                    continue;
-                }
-                let limit = (1.5 * speed + 30.0).min(fdop_types::C_SOUND);
-                if limit > v_lim {
-                    missing_limits.resize(n, 0.0_f64);
-                    for k in 1..3 {
-                        // An anchored mixed triplet can also support a pair whose speeds
-                        // are present but headings are absent. Without this edge, a repeating
-                        // missing/present/present pattern still loses the faster flight.
-                        let missing_heading =
-                            points[k - 1].track_deg.is_nan() || points[k].track_deg.is_nan();
-                        let eligible = if headingless {
-                            missing_heading
-                        } else {
-                            points[k - 1].gs_mps.is_nan()
-                                || points[k].gs_mps.is_nan()
-                                || (recovery == 2 && missing_heading)
-                        };
-                        if eligible {
-                            added_headingless |= headingless && limit > missing_limits[i + k];
-                            missing_limits[i + k] = missing_limits[i + k].max(limit);
+                    let Some(speed) = position_triplet_speed(points, positions, bp) else {
+                        continue;
+                    };
+                    if (position_only || !all_missing)
+                        && !triplet_reports_agree(
+                            points,
+                            positions,
+                            &enu,
+                            bp,
+                            headingless || recovery == 2,
+                        )
+                    {
+                        continue;
+                    }
+                    let limit = (1.5 * speed + 30.0).min(fdop_types::C_SOUND);
+                    if limit > v_lim {
+                        missing_limits.resize(n, 0.0_f64);
+                        for k in 1..3 {
+                            // An anchored mixed triplet can also support a pair whose speeds
+                            // are present but headings are absent. Without this edge, a repeating
+                            // missing/present/present pattern still loses the faster flight.
+                            let missing_heading =
+                                points[k - 1].track_deg.is_nan() || points[k].track_deg.is_nan();
+                            let eligible = if headingless {
+                                missing_heading
+                            } else {
+                                points[k - 1].gs_mps.is_nan()
+                                    || points[k].gs_mps.is_nan()
+                                    || (recovery == 2 && missing_heading)
+                            };
+                            if eligible {
+                                added |= headingless && limit > missing_limits[i + k];
+                                missing_limits[i + k] = missing_limits[i + k].max(limit);
+                            }
                         }
                     }
                 }
             }
-            if headingless {
+            if headingless || missing_acceleration {
                 for (i, (points, positions)) in pts.windows(4).zip(xy.windows(4)).enumerate() {
-                    let Some(speed) = headingless_turn_speed(points, positions, &enu, bp)
-                        .or_else(|| headingless_acceleration_speed(points, positions, &enu, bp))
-                    else {
+                    let speed = if missing_acceleration {
+                        missing_speed_acceleration_speed(points, positions, &enu, bp)
+                    } else {
+                        headingless_turn_speed(points, positions, &enu, bp)
+                            .or_else(|| headingless_acceleration_speed(points, positions, &enu, bp))
+                    };
+                    let Some(speed) = speed else {
                         continue;
                     };
                     let limit = (1.5 * speed + 30.0).min(fdop_types::C_SOUND);
                     if limit > v_lim {
                         missing_limits.resize(n, 0.0_f64);
                         for k in 1..4 {
-                            if points[k - 1].track_deg.is_nan() || points[k].track_deg.is_nan() {
-                                added_headingless |= limit > missing_limits[i + k];
+                            let missing_speed =
+                                points[k - 1].gs_mps.is_nan() || points[k].gs_mps.is_nan();
+                            if (missing_acceleration && missing_speed)
+                                || points[k - 1].track_deg.is_nan()
+                                || points[k].track_deg.is_nan()
+                            {
+                                added |= limit > missing_limits[i + k];
                                 missing_limits[i + k] = missing_limits[i + k].max(limit);
                             }
                         }
@@ -738,13 +794,13 @@ fn consistent_chains(pts: &[fdop_types::store::TrackPoint], bp: &BuildParams) ->
             }
             // Alternating reported/missing speeds can have no all-missing triplet.
             // An empty second pass must leave the third pass available.
-            if missing_limits.is_empty() || (headingless && !added_headingless) {
+            if missing_limits.is_empty() || ((headingless || missing_acceleration) && !added) {
                 continue;
             }
-            if recovery == 2 {
-                // These anchored triplets are valid edge permissions even if an all-finite,
-                // headingless bridge prevents this retry from extending the winning path.
-                // The final retry may use both, under the same winner-preservation checks.
+            if recovery == 2 || headingless {
+                // These are valid edge permissions even if another missing component
+                // prevents this retry from extending the winning path. Later retries
+                // may combine them under the same winner-preservation checks.
                 supported_missing_limits.clone_from(&missing_limits);
             }
         } else if !allow_reported && position_limit.is_none() {
@@ -4234,6 +4290,406 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn missing_speeds_preserve_supported_acceleration_and_deceleration() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let times: Vec<_> = (0..=26).map(|k| 20.0 * k as f64).collect();
+        for epoch in [1000.0, 1_788_895_000.0] {
+            for reverse in [false, true] {
+                for direction in [-1.0, 1.0] {
+                    // Both components absent, intermittent scalar speeds, and
+                    // headings still present must all preserve the same ramp.
+                    for telemetry in 0..3 {
+                        let mut leg = leg_from_states(&times, |t| {
+                            let q = if reverse { 520.0 - t } else { t };
+                            let (pos, vel) = accelerating_headingless_state(&enu, q, direction);
+                            (pos, scale(vel, if reverse { -1.0 } else { 1.0 }))
+                        });
+                        for point in &mut leg.points {
+                            let t = point.t - 1000.0;
+                            let q = if reverse { 520.0 - t } else { t };
+                            if q >= 420.0 {
+                                if telemetry != 1 || (q / 20.0).round() as usize % 3 == 0 {
+                                    point.gs_mps = f32::NAN;
+                                }
+                                if telemetry != 2 {
+                                    point.track_deg = f32::NAN;
+                                }
+                            }
+                            point.t = epoch + t;
+                        }
+                        assert!(reported_speed_limit(&leg.points) < 100.0);
+                        let models = build(&leg, &BuildParams::default());
+                        assert_eq!(models.len(), 1);
+                        let model = &models[0];
+                        assert_eq!(
+                            model.t,
+                            leg.points.iter().map(|p| p.t).collect::<Vec<_>>(),
+                            "lost velocity outage: epoch={epoch}, reverse={reverse}, direction={direction}, telemetry={telemetry}"
+                        );
+                        assert_eq!(model.reported_vel_frac, 21.0 / 27.0);
+
+                        // The same outage already survives without the slow prefix.
+                        // Recovery must preserve that real spline and its received
+                        // Doppler, including the late samples previously lost.
+                        let mut supported = leg.clone();
+                        supported.points.retain(|p| {
+                            let t = p.t - epoch;
+                            (if reverse { 520.0 - t } else { t }) >= 420.0
+                        });
+                        let reference = build(&supported, &BuildParams::default());
+                        assert_eq!(reference.len(), 1);
+                        assert_eq!(reference[0].t.len(), supported.points.len());
+                        assert_eq!(reference[0].reported_vel_frac, 0.0);
+                        let observer = add(
+                            accelerating_headingless_state(&enu, 470.0, direction).0,
+                            enu.vec_to_ecef([0.0, 800.0, -1200.0]),
+                        );
+                        for k in 0..120 {
+                            let q = 440.25 + 0.5 * k as f64;
+                            let t = epoch + if reverse { 520.0 - q } else { q };
+                            let expected = reference[0].pv(t);
+                            assert_eq!(model.pv(t), expected);
+                            let received = t + norm(sub(expected.0, observer)) / C_MPS;
+                            let actual = model
+                                .solve_emission_p(received, observer, &Prop::still(C_MPS), None)
+                                .expect("the missing-speed ramp must cover its emitted sound");
+                            let known = reference[0]
+                                .solve_emission_p(received, observer, &Prop::still(C_MPS), None)
+                                .unwrap();
+                            assert!((F0_HZ * (actual.2 - known.2)).abs() < 1e-5);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_speed_acceleration_restores_two_aircraft_location() {
+        use crate::search::{SearchEvent, SearchInputs, SearchParams, run};
+        use fdop_types::atmo::{Medium, UniformAtmosphere};
+        use fdop_types::geo::{haversine_m, m_per_deg};
+        use fdop_types::{BBox, FlatElevation, MIC_HEIGHT_M};
+
+        let (lat, lon) = (40.876466, -73.524951);
+        let enu = Enu::new(lat, lon, 0.0);
+        let start = 1430.0;
+        let times: Vec<_> = (0..=26).map(|k| 20.0 * k as f64).collect();
+        let mut leg = leg_from_states(&times, |t| {
+            let (pos, vel) = accelerating_headingless_state(&enu, t, 1.0);
+            (add(pos, enu.vec_to_ecef([-23025.0, 700.0, 0.0])), vel)
+        });
+        leg.key = "velocity-outage".into();
+        leg.icao = "000001".into();
+        for point in &mut leg.points {
+            if point.t >= 1420.0 {
+                point.gs_mps = f32::NAN;
+                point.track_deg = f32::NAN;
+            }
+        }
+        // The isolated ramp already survives the ordinary cleaner. It supplies
+        // actual received-time observations independently of the full leg's
+        // recovery; the old full leg ended before this flight's closest pass.
+        let mut supported = leg.clone();
+        supported.points.retain(|p| p.t >= 1420.0);
+        let reference = build(&supported, &BuildParams::default());
+        assert_eq!(reference.len(), 1);
+        assert_eq!(reference[0].t.len(), 6);
+        let mut tracks = build(&leg, &BuildParams::default());
+        assert_eq!(tracks.len(), 1);
+        let mut steady = straight_track(
+            &enu,
+            [700.0, 0.0, 900.0],
+            [0.0, 100.0, 0.0],
+            1550.0,
+            1400.0,
+            1700.0,
+            5.0,
+        );
+        steady.key = "steady-crossing".into();
+        steady.icao = "000002".into();
+        let observer = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let prop = Prop::still(C_MPS);
+        let event = |id: &str, track: &TrackModel, guess: f64, f0: f64| {
+            let cpa = track.cpa_near(observer, guess, 100.0).unwrap();
+            let (tr_t, tr_f): (Vec<_>, Vec<_>) = (0..=200)
+                .map(|k| {
+                    let received = cpa.t_r_p(&prop) - 25.0 + k as f64 * 0.25;
+                    let ratio = track
+                        .solve_emission_p(received, observer, &prop, None)
+                        .unwrap()
+                        .2;
+                    let noise = 0.05 * (((k * 7919) % 13) as f64 / 6.0 - 1.0);
+                    (received - start, f0 * ratio + noise)
+                })
+                .unzip();
+            SearchEvent {
+                id: id.into(),
+                t_rec: cpa.t_r_fit_p(&prop) - start,
+                t_tol: 3.0,
+                v_gate: [cpa.speed * 0.9, cpa.speed * 1.1],
+                d_gate: [cpa.d * 0.8, cpa.d * 1.25],
+                f0,
+                f0_tol: 4.0,
+                sigma_hz: 0.12,
+                n_eff: 20.0,
+                quality: 100.0,
+                misfit: false,
+                c_fit: prop.c,
+                q_t: tr_t.iter().step_by(5).copied().collect(),
+                q_f: tr_f.iter().step_by(5).copied().collect(),
+                tr_t,
+                tr_f,
+            }
+        };
+        let events = vec![
+            event("accelerating", &reference[0], 1470.0, 165.0),
+            event("steady", &steady, 1550.0, 149.0),
+        ];
+        tracks.push(steady);
+        let (mlat, mlon) = m_per_deg(lat);
+        let mut params = SearchParams::new(
+            start,
+            start,
+            180.0,
+            BBox::new(
+                lat - 100.0 / mlat,
+                lon - 100.0 / mlon,
+                lat + 100.0 / mlat,
+                lon + 100.0 / mlon,
+            ),
+        );
+        params.fine_half_m = 100.0;
+        params.refine_half_m = 100.0;
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(C_MPS));
+        let result = run(
+            &SearchInputs {
+                heard_times: events.iter().map(|e| e.t_rec).collect(),
+                events,
+                tracks: &tracks,
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            },
+            &params,
+            &|_| {},
+        );
+        assert!(result.funnel.truncated.is_empty());
+        let best = result
+            .candidates
+            .first()
+            .expect("velocity outages must not erase the shared location");
+        assert!(haversine_m(lat, lon, best.lat, best.lon) < 25.0);
+        assert!((best.t_start_utc - start).abs() < 1e-6);
+        assert_eq!(best.n_explained, 2);
+        for (event, flight) in [
+            ("accelerating", "velocity-outage"),
+            ("steady", "steady-crossing"),
+        ] {
+            let matched = best.events.iter().find(|e| e.event == event).unwrap();
+            assert_eq!(matched.flight, flight);
+            assert!(matched.core && matched.coverage > 0.99 && matched.chi < 1.0);
+        }
+    }
+
+    #[test]
+    fn position_only_acceleration_recovers_beyond_the_default_speed_limit() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let times: Vec<_> = (0..=30).map(|k| 20.0 * k as f64).collect();
+        for reverse in [false, true] {
+            let mut leg = leg_from_states(&times, |t| {
+                let q = if reverse { 600.0 - t } else { t };
+                let (pos, vel) = accelerating_headingless_state(&enu, q, 1.0);
+                (pos, scale(vel, if reverse { -1.0 } else { 1.0 }))
+            });
+            let mut supported = leg.clone();
+            for point in &mut leg.points {
+                point.gs_mps = f32::NAN;
+                point.track_deg = f32::NAN;
+            }
+            // One true scalar report raises the ordinary envelope but does not
+            // supply a horizontal velocity: every heading remains absent.
+            let fast = if reverse { 0 } else { times.len() - 1 };
+            for (k, point) in supported.points.iter_mut().enumerate() {
+                if k != fast {
+                    point.gs_mps = f32::NAN;
+                }
+                point.track_deg = f32::NAN;
+            }
+            assert_eq!(reported_speed_limit(&leg.points), 200.0);
+            let models = build(&leg, &BuildParams::default());
+            let reference = build(&supported, &BuildParams::default());
+            assert_eq!(models.len(), 1);
+            assert_eq!(reference.len(), 1);
+            assert_eq!(models[0].t.len(), times.len());
+            assert_eq!(models[0].t, reference[0].t);
+            assert_eq!(models[0].pos, reference[0].pos);
+            assert_eq!(models[0].vel, reference[0].vel);
+            assert_eq!(models[0].reported_vel_frac, 0.0);
+        }
+    }
+
+    #[test]
+    fn missing_speed_acceleration_needs_an_independent_anchor_in_mixed_legs() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let times: Vec<_> = (0..=26).map(|k| 20.0 * k as f64).collect();
+        for invalid in ["missing heading", "wrong heading", "stale"] {
+            let mut leg = leg_from_states(&times, |t| accelerating_headingless_state(&enu, t, 1.0));
+            for point in &mut leg.points {
+                if point.t >= 1420.0 {
+                    point.gs_mps = f32::NAN;
+                    point.track_deg = f32::NAN;
+                } else {
+                    match invalid {
+                        "missing heading" => point.track_deg = f32::NAN,
+                        "wrong heading" => point.track_deg = (point.track_deg + 180.0) % 360.0,
+                        "stale" => point.flags |= pt_flags::STALE,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let models = build(&leg, &BuildParams::default());
+            assert_eq!(models.len(), 1);
+            assert_eq!(
+                models[0].t,
+                leg.points[..24].iter().map(|p| p.t).collect::<Vec<_>>(),
+                "{invalid} cannot anchor a mixed missing-speed recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_speed_acceleration_requires_four_fresh_resolved_positions() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let bp = BuildParams::default();
+        let support = |points: &[fdop_types::store::TrackPoint]| {
+            let xy: Vec<_> = points
+                .iter()
+                .map(|p| {
+                    let position = enu.from_ecef(geodetic_to_ecef(p.lat, p.lon, 0.0));
+                    [position[0], position[1]]
+                })
+                .collect();
+            missing_speed_acceleration_speed(points, &xy, &enu, &bp)
+        };
+        for times in [[440.0, 460.0, 480.0, 500.0], [440.0, 451.0, 470.0, 489.0]] {
+            let reported =
+                leg_from_states(&times, |t| accelerating_headingless_state(&enu, t, 1.0));
+            let mut leg = reported.clone();
+            for point in &mut leg.points {
+                point.gs_mps = f32::NAN;
+                point.track_deg = f32::NAN;
+            }
+            assert!(support(&leg.points).is_some(), "times={times:?}");
+            assert!(
+                support(&leg.points[..3]).is_none(),
+                "three points fit themselves"
+            );
+            let mut noisy = leg.clone();
+            noisy.points[1].lat += 0.0001;
+            noisy.points[2].lon -= 0.0001;
+            assert!(support(&noisy.points).is_some(), "resolved noisy positions");
+            for k in 0..4 {
+                let mut observed = leg.clone();
+                observed.points[k].track_deg = reported.points[k].track_deg;
+                assert!(
+                    support(&observed.points).is_some(),
+                    "an available heading agrees"
+                );
+                observed.points[k].gs_mps = reported.points[k].gs_mps;
+                assert!(
+                    support(&observed.points).is_some(),
+                    "an available speed agrees"
+                );
+                for invalid in [
+                    "zero speed",
+                    "negative speed",
+                    "infinite speed",
+                    "supersonic speed",
+                    "contradictory speed",
+                    "wrong heading",
+                    "infinite heading",
+                    "out-of-range heading",
+                    "stale",
+                    "height jump",
+                    "missing height",
+                    "position outlier",
+                    "missing position",
+                ] {
+                    let mut broken = leg.clone();
+                    let point = &mut broken.points[k];
+                    match invalid {
+                        "zero speed" => point.gs_mps = 0.0,
+                        "negative speed" => point.gs_mps = -145.0,
+                        "infinite speed" => point.gs_mps = f32::INFINITY,
+                        "supersonic speed" => point.gs_mps = 400.0,
+                        "contradictory speed" => point.gs_mps = 10.0,
+                        "wrong heading" => {
+                            point.track_deg = (reported.points[k].track_deg + 90.0) % 360.0
+                        }
+                        "infinite heading" => point.track_deg = f32::INFINITY,
+                        "out-of-range heading" => point.track_deg = 720.0,
+                        "stale" => point.flags |= pt_flags::STALE,
+                        "height jump" => point.alt_m += 10_000.0,
+                        "missing height" => point.alt_m = f32::NAN,
+                        "position outlier" => point.lat += 0.05,
+                        "missing position" => point.lat = f64::NAN,
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        support(&broken.points).is_none(),
+                        "{invalid} at {k}, times={times:?}"
+                    );
+                }
+            }
+            let mut unsupported = leg.clone();
+            unsupported.points[3].t = unsupported.points[2].t;
+            assert!(support(&unsupported.points).is_none(), "repeated time");
+            unsupported.points[3].t = unsupported.points[2].t + 30.0;
+            assert!(
+                support(&unsupported.points).is_none(),
+                "unresolved interval"
+            );
+        }
+        // This fourth point is inside the 25 m/s * dt prediction envelope.
+        // Averaged interior derivatives would also pass, but its last chord
+        // differs from the fitted third-point velocity by 35 m/s.
+        let mut outlier = leg_from_states(&[440.0, 460.0, 480.0, 500.0], |t| {
+            let (pos, vel) = accelerating_headingless_state(&enu, t, 1.0);
+            (
+                add(
+                    pos,
+                    enu.vec_to_ecef([if t == 500.0 { 400.0 } else { 0.0 }, 0.0, 0.0]),
+                ),
+                vel,
+            )
+        });
+        for point in &mut outlier.points {
+            point.gs_mps = f32::NAN;
+            point.track_deg = f32::NAN;
+        }
+        assert!(
+            support(&outlier.points).is_none(),
+            "held-out chord must agree independently"
+        );
+        let mut abrupt = leg_from_states(&[0.0, 20.0, 40.0, 60.0], |t| {
+            (
+                enu.to_ecef([45.0 * t + 1.5 * t * t, 0.0, 1200.0]),
+                enu.vec_to_ecef([45.0 + 3.0 * t, 0.0, 0.0]),
+            )
+        });
+        for point in &mut abrupt.points {
+            point.gs_mps = f32::NAN;
+            point.track_deg = f32::NAN;
+        }
+        assert!(
+            support(&abrupt.points).is_none(),
+            "unresolved endpoint derivatives"
+        );
     }
 
     #[test]

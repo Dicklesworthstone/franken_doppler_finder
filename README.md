@@ -1628,10 +1628,10 @@ Design notes:
   and missing velocities remain derived from positions rather than counted as reported measurements.
   The anchored mixed retry also permits a missing heading on a valid speed report, checking
   its magnitude against both adjacent position chords. Those checked edges remain available
-  for the final retry even before they form a longer chain: a mixed-speed section can then
+  for the headingless retry even before they form a longer chain: a mixed-speed section can then
   connect through a headingless bridge. Available headings, fresh-triplet requirements and
   the preceding winner's independent reported-motion anchor still constrain these new edges.
-  A final recovery also permits missing headings when three consecutive fresh positions give
+  A further recovery also permits missing headings when three consecutive fresh positions give
   two agreeing secants and all three valid speed reports agree with their adjacent chords.
   Available headings must still agree as vectors. Only adjacent edges touching a missing
   heading gain this allowance; infinite headings, conflicting speeds and stale positions
@@ -1651,6 +1651,15 @@ Design notes:
   25 m/s allowance. Reports must be fresh, subsonic, and less than 30 s apart. This keeps a
   long slow segment from deleting a later supported acceleration or deceleration merely
   because its heading telemetry is missing.
+  If speed reports also disappear, a final position-based acceleration check can preserve
+  the same supported motion. Four fresh positions are required; the first three predict the
+  fourth. At a missing speed report, the fitted velocity must agree with both adjacent
+  observed chord vectors within the existing 25 m/s allowance. Available speed and heading
+  reports still constrain the recovery. Mixed-report tracks require independently supported
+  fresh reported motion in the preceding winning chain; wholly missing-speed tracks rely on
+  the four-position check. This last attempt preserves every earlier winning report and
+  separately supported part, grants only local missing-velocity edges, and keeps the existing
+  gap, vertical-motion, subsonic, interpolation and reported-velocity-credit rules.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
@@ -2200,6 +2209,18 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover a location after flight velocity reports disappear
+
+`missing_speed_acceleration_restores_two_aircraft_location` uses physical received-time
+traces from an independently retained accelerating ramp and a perpendicular steady flight.
+With a fixed clock and a 200 m observer region, the preceding `7a1a7ce` cleaner discards the
+late accelerating segment, leaving no two-event pair or location candidate. The new recovery
+retains it, and the native search matches both intended flights and locates the synthetic
+observer with about 0.21 m error and no budget truncation. The companion regressions cover 24 combinations
+of telemetry, epoch, direction and acceleration/deceleration, plus position-only motion and
+invalid-support controls. The complete track and physics modules pass 93 native tests, with
+one existing timing benchmark ignored. These are synthetic coverage checks, not field-accuracy measurements.
 
 ### Recover fast flight tracks from finite negative speed telemetry
 

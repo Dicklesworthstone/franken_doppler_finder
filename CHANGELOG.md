@@ -19,6 +19,44 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover accelerating flight positions during velocity-report outages
+
+- Extend locally supported acceleration recovery to missing groundspeed reports after
+  every existing chain-recovery path has had priority. Fit the first three fresh positions
+  and independently check the fourth, keeping the existing subsonic, vertical-motion,
+  sampling-gap and 25 m/s velocity-agreement limits.
+- A missing speed requires the inferred instantaneous velocity to agree with both
+  adjacent observed chord vectors. Available reports retain their consistency checks;
+  mixed-report tracks need independently supported fresh reported motion in the preceding
+  winner. Entirely missing-speed tracks can establish support from the four positions.
+- Retain earlier winning reports and separate supported parts. The allowance belongs
+  only to adjacent missing-velocity edges; interpolation and reported-velocity credit
+  remain unchanged.
+- Add physical regressions covering acceleration/deceleration, opposite directions,
+  relative/Unix clocks, continuous/intermittent velocity outages and available headings.
+  Compare exact supported splines and 2,880 received Doppler samples, preserve reported
+  velocity credit, exercise wholly missing-speed motion beyond the old 200 m/s default,
+  and refuse absent/wrong/stale mixed-leg anchors and unresolved or contradictory support.
+  A held-out 400 m position perturbation specifically checks both adjacent chord vectors.
+- Native pre-change reproduction on `7a1a7ce`: a physical accelerating trajectory retains
+  27 reports with speed telemetry, but only 24 when speed and heading reports disappear.
+  The identical outage ramp alone retains all six positions. With the long slow prefix,
+  the truncated track cannot predict any of 60 tested later received-time Doppler samples.
+- The updated public track API retains all 27 positions and restores all 60 samples with
+  exactly matching Doppler. The permanent
+  `missing_speed_acceleration_restores_two_aircraft_location` regression exercises the
+  actual two-aircraft search: the preceding code produces no pair or candidate, while
+  the updated code matches both intended flights and locates the synthetic observer with about 0.21 m error
+  in a fixed-clock, 200 m region, with no budget truncation.
+- The updated complete track and physics modules pass 93 native tests, with one existing
+  timing benchmark ignored, using the pinned compiler through genuine RCH and locked
+  dependencies. All five new regressions pass. The actual end-to-end selftest function
+  passes on the updated core: 1.5207 m position error, 75 m radius, 0.01427 s clock error
+  and both intended flights. This uses a non-release native build and establishes synthetic
+  coverage, not field accuracy. Changed-range formatting and whitespace checks pass;
+  the full formatter reports pre-existing differences. Full-workspace gates, the release
+  CLI selftest and reference/field replays remain incomplete.
+
 ### Retain resolved acceleration when aircraft headings are missing
 
 - Recover locally supported accelerating and decelerating flight segments after a slow
