@@ -1644,6 +1644,13 @@ Design notes:
   The existing two-sided finite-difference velocity tolerance must also resolve the turn.
   This grants only supported adjacent missing-heading edges, preserves earlier winning
   reports and separate supported parts, and leaves interpolation and report credit unchanged.
+  A resolved acceleration can supply the same local support when neither agreeing secants
+  nor a steady arc explains it. Three positions determine the acceleration; a fourth must
+  independently match its prediction. All four scalar speed reports, every available heading,
+  and the interpolation's endpoint and interior velocities must agree within the existing
+  25 m/s allowance. Reports must be fresh, subsonic, and less than 30 s apart. This keeps a
+  long slow segment from deleting a later supported acceleration or deceleration merely
+  because its heading telemetry is missing.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested

@@ -19,6 +19,30 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain resolved acceleration when aircraft headings are missing
+
+- Recover locally supported accelerating and decelerating flight segments after a slow
+  portion lowers the leg-wide speed envelope. Fit the first three fresh positions and
+  require a fourth independent position, corroborating speed reports, and agreement with
+  every available heading. Existing steady-turn recovery retains priority.
+- Keep the existing subsonic, vertical-motion, sampling-gap and 25 m/s velocity limits.
+  Check scalar reports against adjacent chords and check endpoint and interior derivative
+  fidelity. Grant only adjacent missing-heading edges; preserve earlier winners, separate
+  supported parts, interpolation and reported-velocity credit.
+- Add physical trajectory regressions for acceleration/deceleration, opposite directions,
+  relative/Unix clocks, all/alternating missing headings, identical supported splines and
+  received Doppler. Add irregular-sampling and malformed/stale/contradictory telemetry,
+  held-out-position, height-jump and unresolved-acceleration controls.
+- Native before/after proof: the positive regression on the preceding `09bcb7a` source
+  retains only 24 of 27 reports and fails; the new path retains all 27 in every tested
+  acceleration/deceleration, direction, clock and heading-availability combination.
+  The complete production track and physics modules pass 88 native tests, with one
+  existing timing benchmark ignored, using the pinned compiler through RCH and genuine
+  locked dependencies. Independent source review, changed-range formatting, whitespace
+  checks and a static UBS scan found no new defect. The full workspace formatter reports
+  pre-existing differences; full-workspace Clippy/tests, release selftest and reference/field
+  replays remain incomplete. This is synthetic coverage evidence, not measured field accuracy.
+
 ### Reuse exact flight geometry across additional-event confirmation
 
 - Cache full-track closest approaches for one candidate observer and its immutable
