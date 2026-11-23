@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve narrow-region flight crossings through speed-gate boundaries
+
+- Keep a neighboring coarse sample's geometric CPA plane when its speed is outside
+  the event's allowed interval. The existing bounded crossing probe can then reach
+  an intervening valid pass instead of losing its bracket. The recovered point still
+  satisfies every original speed, distance, terrain, clock and track-gap gate.
+- Add a physical two-aircraft regression with resolved acceleration through 80 m/s,
+  relative and Unix clocks, both flight directions, correct event/flight identities,
+  and an incompatible-speed refusal control. Original accepted samples retain their
+  arithmetic and ordering; search budgets and confidence thresholds are unchanged.
+- Independent source review and whitespace checks on the added text completed. The
+  pinned compiler became available, but the execution host disconnected before the
+  native regression process could start. Native tests, Clippy, release selftest and
+  reference/field replays remain unrun; no field-accuracy improvement is claimed.
+
 ### Recover interrupted raw downloads after a preferred archive fails
 
 - Rebuild a missing processed catalogue from completed raw feeds after an advertised main

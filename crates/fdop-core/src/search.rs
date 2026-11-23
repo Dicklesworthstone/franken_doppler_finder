@@ -1041,6 +1041,20 @@ fn hypotheses(
                         }
                     }
                 }
+                if projection.is_none() && vh > 12.0 && tr.gap_at(t) <= p.max_gap_s {
+                    // A speed gate constrains the actual CPA, not the neighbouring
+                    // coarse samples used to bracket a narrow region. Keep their
+                    // geometric planes even when their speeds fail; the intervening
+                    // sample still has to pass every original hypothesis gate.
+                    let (ux, uy) = (ve[0] / vh, ve[1] / vh);
+                    let (mlat, mlon) = fdop_types::geo::m_per_deg(la);
+                    let a0 = (h - z0 - MIC_HEIGHT_M) * ve[2] / vh;
+                    projection = Some(region_along_projection(
+                        &p.region,
+                        (la + a0 * uy / mlat, lo + a0 * ux / mlon),
+                        (uy * mlat, ux * mlon),
+                    ));
+                }
                 (dt, projection)
             };
             let sample_at = |t, out: &mut HypBuilder| {
@@ -13964,6 +13978,124 @@ mod tests {
         wrong_clock.start_lo += 30.0;
         wrong_clock.start_hi += 31.0;
         assert_eq!(generate(ev, &wrong_clock, 0.0, 10_000).count, 0);
+    }
+
+    #[test]
+    fn tight_region_crossings_survive_an_ineligible_neighboring_speed() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let prop = Prop::still(343.0);
+        for (start, direction) in [(0.0, 1.0), (1_788_895_000.0, -1.0)] {
+            let mut case = tight_region_case((25.0, 25.0), 0.0, start, 0.0, 0.0);
+            let local = Enu::new(case.obs.0, case.obs.1, 0.0);
+            let x = observer(case.obs.0, case.obs.1, &dem).x;
+            for (i, (when, tone)) in [(120.0, 112.7), (360.0, 149.3)].into_iter().enumerate() {
+                let track = &mut case.tracks[i];
+                // A resolved 1 m/s² acceleration through 80 m/s, joined continuously
+                // to steady 60 and 100 m/s legs. The known observer lies on both CPA
+                // planes at u=0; these are actual trajectory derivatives, not merely
+                // changed velocity reports on a different positional path.
+                for k in 0..track.t.len() {
+                    let u = track.t[k] - start - when;
+                    let (along, speed) = if u < -20.0 {
+                        (60.0 * u - 200.0, 60.0)
+                    } else if u > 20.0 {
+                        (100.0 * u - 200.0, 100.0)
+                    } else {
+                        (80.0 * u + 0.5 * u * u, 80.0 + u)
+                    };
+                    let (mut position, mut velocity) = ([175.0; 3], [0.0; 3]);
+                    position[i] = direction * along;
+                    position[2] = 1000.0;
+                    velocity[i] = direction * speed;
+                    track.pos[k] = local.to_ecef(position);
+                    track.vel[k] = local.vec_to_ecef(velocity);
+                }
+                let mut event = synth_event(
+                    &track.key,
+                    track,
+                    x,
+                    start,
+                    tone,
+                    343.0,
+                    start + when,
+                    &prop,
+                );
+                // The true motion sits near one edge of a broad admitted interval.
+                // Neighbouring coarse samples need not satisfy the CPA's speed gate.
+                event.v_gate = [79.9, 110.0];
+                let cpa = track.cpa_nearest_time(x, start + when, 30.0).unwrap();
+                assert!((cpa.t_e - start - when).abs() < 1e-3);
+                assert!((cpa.speed - 80.0).abs() < 1e-3);
+                assert!(gates_ok(&event, &cpa, &prop, 0.0));
+                let scan_lo =
+                    start + event.t_rec - event.t_tol - 1.1 * event.d_gate[1] / case.p.c - 5.0;
+                let step = case.p.along_dt_max;
+                let before = scan_lo + ((cpa.t_e - scan_lo) / step).floor() * step;
+                assert!(norm(track.pv(before).1) < event.v_gate[0]);
+                assert!(
+                    (event.v_gate[0]..=event.v_gate[1])
+                        .contains(&norm(track.pv(before + step).1))
+                );
+                for sample in [before, before + step] {
+                    assert!(local.from_ecef(track.pos_at(sample))[i].abs() > 25.0);
+                }
+                case.events[i] = event;
+            }
+            let frame = Frame::new(&case.p.region);
+            let counts: Vec<_> = case
+                .events
+                .iter()
+                .map(|event| {
+                    hypotheses(
+                        event,
+                        &case.tracks,
+                        &case.p,
+                        &frame,
+                        &dem,
+                        &atmo,
+                        start - 86_400.0,
+                        10_000,
+                    )
+                    .count
+                })
+                .collect();
+            assert!(
+                counts.iter().all(|&n| n > 0),
+                "lost physical crossing: {counts:?}"
+            );
+            let result = run_case(&case, fdop_types::atmo::Medium::still(343.0));
+            let top = result
+                .candidates
+                .first()
+                .unwrap_or_else(|| panic!("{:?}", result.funnel));
+            let error = haversine_m(case.obs.0, case.obs.1, top.lat, top.lon);
+            assert!(error < 25.0, "observer error {error} m");
+            assert!((top.t_start_utc - start).abs() < 0.2);
+            for key in ["A", "B"] {
+                assert!(top.events.iter().any(|event| event.event == key
+                    && event.flight == key
+                    && event.core
+                    && event.chi < 0.5));
+            }
+            assert!(result.funnel.truncated.is_empty());
+            let mut wrong_speed = case.events[0].clone();
+            wrong_speed.v_gate = [101.0, 110.0];
+            assert_eq!(
+                hypotheses(
+                    &wrong_speed,
+                    &case.tracks,
+                    &case.p,
+                    &frame,
+                    &dem,
+                    &atmo,
+                    start - 86_400.0,
+                    10_000,
+                )
+                .count,
+                0
+            );
+        }
     }
 
     #[test]

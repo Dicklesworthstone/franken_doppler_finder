@@ -1522,6 +1522,9 @@ Design notes:
   the finite cross-track interval. Narrow regions between sampling times remain eligible;
   bounded interval probes also use each observer's actual weather when its permitted range
   falls between regular cross-track samples. These probes must pass the original gates.
+  A neighboring coarse sample outside the speed gate still supplies its geometric CPA
+  plane, so acceleration cannot erase the bracket around an otherwise valid narrow-region
+  crossing. The intervening crossing must satisfy the unchanged speed and other gates.
   Additional-flight confirmation uses the raw fitted-distance shortcut only for an
   explicitly uniform matching still-air medium; otherwise exact CPA, speed, distance,
   clock and trace checks decide. This can recover a flight that the corrected gates
