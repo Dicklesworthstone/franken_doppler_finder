@@ -19,6 +19,33 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Carry broad-clock recovery through weighted position refinement
+
+- Let nonquick, ungated clock profiles consider finite, distinct closest-approach timing
+  seeds inside the original joint window when its 400-cell cap widened sampling. Only
+  seeds whose weighted loss improves the original minimum receive local polishing.
+  Compare every promising seed against that original minimum, retaining the exact seed
+  if local sampling misses it; keep original results on ties or worse fits.
+- Preserve the unconstrained contour objective and fixed event weights. Synchronize the
+  selected clock, returned per-event fits and weighted total; restore the original last
+  evaluation if all retries lose. Narrow clocks and quick screening are unchanged. Work
+  scales with the number of distinct improving seeds, without another full-window scan.
+- The preceding ungated implementation reproduced a +551.217775 s clock error on the
+  compact physical fixture at 1,200 s tolerance and phase 0.17, at both relative and Unix
+  epochs. Add weighted/unweighted physical cases, reflected flight geometry, controls
+  for ties and rejected-state restoration, and exact-seed retention coverage.
+- Native validation passes 107 repository tests plus one authored spatial diagnostic,
+  with no failures and one ignored timing benchmark. This includes 48 weighted/unweighted
+  physical timing cases and actual parallel `refine_on` checks that every contour cell
+  agrees with the returned center's weighted objective, including the unscorable mask.
+  The two spatial fixtures retain 0.157 m location error and the existing 75 m radius
+  floor; they already localized before this change, so these are consistency checks,
+  not evidence of improved spatial accuracy or calibrated confidence coverage.
+- Validation uses exact selected production sources, actual Rayon, complete production
+  track/physics code and genuine locked dependencies through RCH. Scoped formatting and
+  whitespace checks pass. Full-workspace gates and reference/field replay remain unrun;
+  the selected harness does not establish full-pipeline or field performance.
+
 ### Recover compact flyover pairs between broad clock samples
 
 - After a broad fine-grid clock scan finds no eligible pair, try the recording starts

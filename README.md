@@ -2094,8 +2094,17 @@ the fitter also tries the recording start implied by each aircraft's exact close
 Each seed must lie inside the original joint clock window and already explain both aircraft
 under the same trace and coverage gates before its neighboring scan interval is polished.
 The seed itself remains available if local polishing misses it. An unsuccessful retry
-restores the original rejected fit for spatial recovery. Quick screening and ungated
-confidence refinement keep their existing clock objective and evaluation sequence.
+restores the original rejected fit for spatial recovery.
+
+Position refinement also checks these physical timing seeds when the clock scan is
+widened by its cap. It uses the same unconstrained, fixed-weight trace objective as the
+confidence contour: a seed must improve the original minimum before its neighboring
+interval is polished. The original result wins ties, and the returned trace fits are
+recomputed at the selected clock. No fine-grid trace-acceptance gate is added to the
+contour. Each distinct improving seed can require a local scan, so cost grows with the
+number of assigned events. Quick screening and narrow clock windows retain their
+original evaluation sequence; this targeted recovery does not exhaustively search
+every possible clock interval.
 
 If no sampled fine-grid location passes, a geometrically eligible node can now supply its
 already computed rejected trace fit as the starting point for the existing bounded spatial
