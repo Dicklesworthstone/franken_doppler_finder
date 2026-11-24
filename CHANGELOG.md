@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve sound speed when radiosondes add wind-only layers
+
+- Interpolate relative humidity alongside temperature when retaining a wind-only
+  radiosonde level inside observed thermal support. Keep measured thermal rows, the
+  existing missing-dewpoint fallback, wind qualification and outside-support refusal.
+  Adding a wind observation no longer inserts a 30% humidity layer that changes sound speed.
+- The native regression demonstrates a 0.5246055005031 m/s artificial reduction over
+  a synthetic 100–1,300 m path before the repair. It now preserves sound speed within
+  1e-10 m/s over six paths and two thermal profiles, while retaining measured shear
+  and calm layers and rejecting unsupported extra levels.
+- All 22 exact-source parser/atmosphere/geodesy tests pass on the pinned compiler
+  through genuine RCH; the unchanged baseline passes 21 and fails the new invariant.
+  Focused formatting and whitespace checks pass. The additional cached-fetch assertion,
+  full workspace gates, release selftest and reference/field replays remain unrun or
+  incomplete after shared-host resource failures. No field-accuracy change is claimed.
+
 ### Recover shared clocks around rejected closest-approach estimates
 
 - Preserve successful original clock scans and exact-CPA-seed recoveries. If both fail,

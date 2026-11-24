@@ -770,17 +770,21 @@ fn parse_raob(profile: &serde_json::Value) -> Vec<Level> {
         }
     }
     with_w.sort_by(|a, b| a.z_msl.total_cmp(&b.z_msl));
-    // temperatures of wind-only levels by interpolation; drop those outside the temperature range
-    let temps: Vec<(f64, f64)> = lv.iter().map(|l| (l.z_msl, l.t_c)).collect();
+    // Wind-only knots must preserve the observed thermal profile, including humidity:
+    // Column interpolates both before computing moist-air sound speed. Keep only
+    // knots inside that original temperature support.
+    let thermal: Vec<(f64, f64, f64)> = lv.iter().map(|l| (l.z_msl, l.t_c, l.rh)).collect();
     let mut out: Vec<Level> = Vec::new();
     for mut l in with_w {
         if !l.t_c.is_finite() {
-            let k = temps.partition_point(|t| t.0 <= l.z_msl);
-            if k == 0 || k >= temps.len() {
+            let k = thermal.partition_point(|t| t.0 <= l.z_msl);
+            if k == 0 || k >= thermal.len() {
                 continue;
             }
-            let (a, b) = (temps[k - 1], temps[k]);
-            l.t_c = a.1 + (l.z_msl - a.0) / (b.0 - a.0) * (b.1 - a.1);
+            let (a, b) = (thermal[k - 1], thermal[k]);
+            let w = (l.z_msl - a.0) / (b.0 - a.0);
+            l.t_c = a.1 + w * (b.1 - a.1);
+            l.rh = a.2 + w * (b.2 - a.2);
         }
         out.push(l);
     }
@@ -3072,8 +3076,71 @@ mod tests {
         let m = weather
             .atmo
             .medium(lat, lon, day + 21_600.0, 2500.0, 3700.0);
+        assert!(
+            (m.c - fdop_types::atmo::sound_speed(10.0, 1.0)).abs() < 1e-8,
+            "a wind-only calm layer must preserve the observed saturated air: {m:?}"
+        );
         assert!((m.wind_e - 10.0 * KT).abs() < 1e-8, "{m:?}");
         assert!(m.wind_n.abs() < 1e-8, "{m:?}");
+    }
+
+    #[test]
+    fn wind_only_radiosondes_preserve_observed_thermal_profiles() {
+        for temperature_shift in [0.0, 2.0] {
+            let original: Vec<_> = (0..6)
+                .map(|i| {
+                    let t = 28.0 - 5.0 * f64::from(i) + temperature_shift;
+                    serde_json::json!({
+                        "hght": 100.0 + 1200.0 * f64::from(i),
+                        "tmpc": t, "dwpc": t - 1.0 - 2.0 * f64::from(i),
+                        "drct": 270.0, "sknt": 20.0,
+                    })
+                })
+                .collect();
+            let mut rows = original.clone();
+            rows.extend([
+                serde_json::json!({"hght": 700.0, "sknt": 40.0, "drct": 270.0}),
+                serde_json::json!({"hght": 3100.0, "sknt": 0.0}),
+                // Wind-only rows outside the observed temperature range stay unusable.
+                serde_json::json!({"hght": -200.0, "sknt": 100.0, "drct": 90.0}),
+                serde_json::json!({"hght": 8000.0, "sknt": 100.0, "drct": 90.0}),
+            ]);
+            let retained = parse_raob(&serde_json::json!(rows));
+            let observed_levels = parse_raob(&serde_json::json!(original));
+            assert_eq!(observed_levels.len(), 6);
+            assert_eq!(retained.len(), 8);
+            for observed in &observed_levels {
+                let same = retained.iter().find(|l| l.z_msl == observed.z_msl).unwrap();
+                assert_eq!(same.t_c, observed.t_c);
+                assert_eq!(same.rh, observed.rh);
+                assert_eq!(same.wind_e, observed.wind_e);
+                assert_eq!(same.wind_n, observed.wind_n);
+            }
+            let baseline = fdop_types::atmo::Column::from_levels(&observed_levels);
+            let recovered = fdop_types::atmo::Column::from_levels(&retained);
+            for (lo, hi) in [
+                (-100.0, 30.0),
+                (100.0, 1300.0),
+                (400.0, 1000.0),
+                (2500.0, 3700.0),
+                (100.0, 6100.0),
+                (6200.0, 9000.0),
+            ] {
+                let expected = baseline.mean(lo, hi);
+                let actual = recovered.mean(lo, hi);
+                assert!(
+                    (actual.c - expected.c).abs() < 1e-10,
+                    "wind-only rows changed sound speed for temperature shift {temperature_shift}, heights {lo}..{hi}: {actual:?} vs {expected:?}"
+                );
+            }
+            // Each extra wind knot forms a triangle between unchanged thermal rows.
+            // The sampled integration grid includes these 50 m-aligned endpoints.
+            for (lo, hi, factor) in [(100.0, 1300.0, 1.5), (2500.0, 3700.0, 0.5)] {
+                let m = recovered.mean(lo, hi);
+                assert!((m.wind_e - factor * 20.0 * KT).abs() < 1e-8, "{m:?}");
+                assert!(m.wind_n.abs() < 1e-8, "{m:?}");
+            }
+        }
     }
 
     #[test]

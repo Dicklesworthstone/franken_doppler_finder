@@ -1451,6 +1451,11 @@ A measured zero-speed radiosonde wind remains calm even without a direction tag,
 wind-only levels between temperature observations. Nonzero winds need a finite direction
 from 0 through 360 degrees; missing or malformed vectors remain missing and can only be
 filled from usable observations. A sounding with no observed winds aloft is still refused.
+Wind-only radiosonde levels inside the observed temperature range inherit both temperature
+and relative humidity from the same surrounding thermal observations. Adding a wind layer
+therefore preserves the original sound-speed profile while retaining its measured wind.
+Thermal observations keep their measured humidity or existing missing-dewpoint fallback;
+wind-only levels outside thermal support remain excluded.
 
 | Data | Source | Notes |
 |---|---|---|
@@ -2248,6 +2253,25 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Preserve sound speed when radiosondes add wind-only layers
+
+`wind_only_radiosondes_preserve_observed_thermal_profiles` keeps six observed thermal
+levels fixed while adding wind-only shear and calm layers. It checks two temperature
+profiles, six propagation paths, unchanged observations, analytic wind averages and
+rejection of wind knots outside thermal support. On the preceding parser, the 100–1,300 m
+path's sound speed changes from 348.0073733631496 to 347.4827678626465 m/s merely because
+wind observations were added. Interpolating humidity with temperature preserves each
+path's sound speed within 1e-10 m/s while retaining the observed wind changes.
+
+The exact-source native component suite passes 22 tests through genuine RCH and the
+pinned compiler; its baseline passed 21 and failed this new invariant. It uses the actual
+parser helpers, complete atmosphere and geodesy modules, and genuine locked serialization
+dependencies. Focused formatting and whitespace checks pass. The existing cached-fetch
+regression also gains a saturated-air invariant, but that full data-pipeline test has not
+run. Workspace checks, release selftest and field replays remain incomplete after the
+shared build host exhausted resources and disconnected; these results establish the
+synthetic propagation invariant, not improved recording accuracy.
 
 ### Recover a shared clock between uncertain closest-approach estimates
 
