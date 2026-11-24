@@ -555,7 +555,9 @@ struct SourceAudit {
 }
 
 fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
-    let streams = audio::probe_audio_streams(&d.media)?;
+    let inventory = audio::probe_audio_inventory(&d.media)?;
+    let streams = inventory.streams;
+    let location_tag_detected = inventory.location_tag_detected;
     let log = Log::new(d.quiet);
     let default = PathBuf::from("fdop_runs").join("detect-all");
     let reservation = pipeline::reserve_output(d.out.as_deref(), &default)?;
@@ -594,15 +596,25 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
         #[derive(serde::Serialize)]
         struct WholeFileAudit {
             audio_stream_count: usize,
+            location_tag_detected: bool,
             sources: Vec<SourceAudit>,
         }
         let report = WholeFileAudit {
             audio_stream_count: streams.len(),
+            location_tag_detected,
             sources,
         };
         serde_json::to_writer_pretty(&mut stdout, &report).map_err(|e| e.to_string())?;
         writeln!(stdout).map_err(|e| e.to_string())?;
     } else {
+        if streams.is_empty() {
+            let metadata = if location_tag_detected {
+                "recognized location tag detected"
+            } else {
+                "no recognized location tag detected"
+            };
+            writeln!(stdout, "no audio streams; {metadata}").map_err(|e| e.to_string())?;
+        }
         for source in sources {
             let s = source.summary;
             let view = s
@@ -910,6 +922,50 @@ mod tests {
             assert_eq!(view["events_file"], events_path.to_str().unwrap());
             assert!(events_path.is_file());
         }
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn whole_file_audit_checks_tags_after_audio_removal() {
+        let root = std::env::temp_dir().join(format!(
+            "fdop-muted-audit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |media: &std::path::Path, json: bool, out: &std::path::Path| {
+            let mut args = vec!["fdop", "detect", media.to_str().unwrap(), "--all-audio", "--quiet",
+                "-o", out.to_str().unwrap()];
+            if json { args.push("--json"); }
+            let Cmd::Detect(opts) = Cli::try_parse_from(args).unwrap().cmd else { unreachable!() };
+            let mut stdout = Vec::new();
+            let status = run_detect(opts, &mut stdout);
+            (status, String::from_utf8(stdout).unwrap())
+        };
+        for tagged in [false, true] {
+            let media = root.join(format!("{tagged}.mkv"));
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args(["-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=s=16x16:d=0.2", "-an", "-c:v", "ffv1"]);
+            if tagged { cmd.args(["-metadata:s:v:0", "location=private-place-marker"]); }
+            assert!(cmd.arg(&media).status().unwrap().success());
+            let (status, stdout) = run(&media, true, &root.join(format!("json-{tagged}")));
+            assert_eq!(status.unwrap(), 0);
+            let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(report["audio_stream_count"], 0);
+            assert_eq!(report["sources"], serde_json::json!([]));
+            assert_eq!(report["location_tag_detected"], tagged);
+            assert!(!stdout.contains("private-place-marker"));
+            let (status, stdout) = run(&media, false, &root.join(format!("text-{tagged}")));
+            assert_eq!(status.unwrap(), 0);
+            let expected = if tagged { "recognized location tag detected" } else { "no recognized location tag detected" };
+            assert_eq!(stdout.trim(), format!("no audio streams; {expected}"));
+            assert!(audio::probe(&media).is_err());
+        }
+        let bad = root.join("broken.mkv");
+        std::fs::write(&bad, b"not a media container").unwrap();
+        let (status, stdout) = run(&bad, true, &root.join("failed"));
+        assert!(status.is_err());
+        assert!(stdout.is_empty());
     }
 
     #[test]

@@ -19,6 +19,8 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+- Whole-file publication audits now check recognized location metadata on video-only files. Removed audio produces an empty source list and a file-level tag result. Failed or incomplete probing returns an error.
+
 ### Avoid detector scoring where temporal coverage cannot qualify
 
 - Compute conservative time-only coverage bounds once per template and intersect

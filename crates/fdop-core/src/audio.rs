@@ -43,12 +43,12 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
 /// Describe the selected audio stream and validate its channel before decoding. The
 /// stream ordinal counts audio streams only, matching FFmpeg's `0:a:N` mapping.
 pub fn probe_with_selection(path: &Path, selection: AudioSelection) -> Result<MediaInfo, String> {
-    media_info(path, &probe_document(path)?, selection)
+    media_info(path, &probe_document(path, false)?, selection)
 }
 
 /// Probe once so a whole-file audit uses the same stream inventory throughout.
 pub fn probe_audio_streams(path: &Path) -> Result<Vec<MediaInfo>, String> {
-    let doc = probe_document(path)?;
+    let doc = probe_document(path, false)?;
     all_stream_info(path, &doc)
 }
 
@@ -80,7 +80,41 @@ fn all_stream_info(path: &Path, doc: &serde_json::Value) -> Result<Vec<MediaInfo
         .collect()
 }
 
-fn probe_document(path: &Path) -> Result<serde_json::Value, String> {
+/// Complete audio inventory and file-wide location-tag presence for a publication audit.
+pub struct AudioInventory {
+    pub streams: Vec<MediaInfo>,
+    pub location_tag_detected: bool,
+}
+
+pub fn probe_audio_inventory(path: &Path) -> Result<AudioInventory, String> {
+    audit_inventory(path, &probe_document(path, true)?)
+}
+
+fn audit_inventory(path: &Path, doc: &serde_json::Value) -> Result<AudioInventory, String> {
+    let streams = doc["streams"]
+        .as_array()
+        .ok_or("ffprobe returned no stream inventory")?;
+    // An unidentified stream or an incomplete list cannot establish that audio is absent.
+    if streams.is_empty()
+        || doc["format"]["nb_streams"].as_u64() != Some(streams.len() as u64)
+        || doc["format"]["format_name"].as_str().is_none_or(str::is_empty)
+        || streams.iter().any(|s| !matches!(
+            s["codec_type"].as_str(),
+            Some("audio" | "video" | "subtitle" | "data" | "attachment")
+        ))
+    {
+        return Err(format!("incomplete ffprobe stream inventory for {}", path.display()));
+    }
+    let audio = if streams.iter().any(|s| s["codec_type"] == "audio") {
+        all_stream_info(path, doc)?
+    } else {
+        Vec::new()
+    };
+    let location_tag_detected = media_tags(&doc["format"], streams).any(|(k, v)| is_location_tag(k, v));
+    Ok(AudioInventory { streams: audio, location_tag_detected })
+}
+
+fn probe_document(path: &Path, require_clean_probe: bool) -> Result<serde_json::Value, String> {
     let out = Command::new("ffprobe")
         .args([
             "-v",
@@ -93,7 +127,7 @@ fn probe_document(path: &Path) -> Result<serde_json::Value, String> {
         .arg(path)
         .output()
         .map_err(|e| format!("ffprobe not runnable ({e}); install ffmpeg"))?;
-    if !out.status.success() {
+    if !out.status.success() || (require_clean_probe && !out.stderr.is_empty()) {
         return Err(format!(
             "ffprobe failed on {}: {}",
             path.display(),
@@ -181,32 +215,11 @@ fn media_info(
             }
         }
     }
-    let mut collect_tags = |v: &serde_json::Value| {
-        if let Some(m) = v["tags"].as_object() {
-            for (k, val) in m {
-                if let Some(s) = val.as_str() {
-                    info.tags.push((k.clone(), s.to_string()));
-                }
-            }
-        }
-    };
-    collect_tags(fmt);
-    for s in streams {
-        collect_tags(s);
-    }
+    info.tags = media_tags(fmt, streams)
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
     for (k, v) in &info.tags {
-        let kl = k.to_ascii_lowercase();
-        // FFmpeg can expose a localized MOV tag as "location-eng".
-        let localized = kl
-            .strip_prefix("location-")
-            .is_some_and(|lang| lang.len() == 3 && lang.bytes().all(|b| b.is_ascii_lowercase()));
-        if v.trim().is_empty()
-            || !(kl.contains("iso6709")
-                || kl == "location"
-                || localized
-                || kl.ends_with(".location")
-                || kl == "com.apple.quicktime.location.name")
-        {
+        if !is_location_tag(k, v) {
             continue;
         }
         if let Some(coords) = parse_iso6709(v) {
@@ -219,6 +232,28 @@ fn media_info(
         info.location_iso6709.get_or_insert_with(|| v.clone());
     }
     Ok(info)
+}
+
+fn media_tags<'a>(
+    format: &'a serde_json::Value,
+    streams: &'a [serde_json::Value],
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    std::iter::once(format)
+        .chain(streams)
+        .filter_map(|source| source["tags"].as_object())
+        .flatten()
+        .filter_map(|(k, v)| Some((k.as_str(), v.as_str()?)))
+}
+
+fn is_location_tag(key: &str, value: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    // FFmpeg can expose a localized MOV tag as "location-eng".
+    let localized = key
+        .strip_prefix("location-")
+        .is_some_and(|lang| lang.len() == 3 && lang.bytes().all(|b| b.is_ascii_lowercase()));
+    !value.trim().is_empty()
+        && (key.contains("iso6709") || key == "location" || localized
+            || key.ends_with(".location") || key == "com.apple.quicktime.location.name")
 }
 
 /// Parse the leading `±DD.DDDD±DDD.DDDD` of an ISO 6709 string.
@@ -446,6 +481,31 @@ mod tests {
                 .contains("audio stream 1")
         );
         assert!(all_stream_info(path, &serde_json::json!({"streams": []})).is_err());
+    }
+
+    #[test]
+    fn zero_audio_requires_a_complete_stream_inventory_and_still_checks_tags() {
+        let path = Path::new("muted.mp4");
+        let mut doc = serde_json::json!({
+            "format": {"format_name":"mov", "nb_streams":1},
+            "streams": [{"codec_type":"video","tags":{"Location":"Test place"}}]
+        });
+        let inventory = audit_inventory(path, &doc).unwrap();
+        assert!(inventory.streams.is_empty());
+        assert!(inventory.location_tag_detected);
+        assert!(media_info(path, &doc, AudioSelection::default()).is_err());
+        doc["streams"][0]["tags"] = serde_json::json!({});
+        assert!(!audit_inventory(path, &doc).unwrap().location_tag_detected);
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"streams":[]}),
+            serde_json::json!({"format":{"format_name":"mov","nb_streams":0},"streams":[]}),
+            serde_json::json!({"format":{"format_name":"mov","nb_streams":1},"streams":[]}),
+            serde_json::json!({"format":{"format_name":"mov","nb_streams":1},"streams":[{}]}),
+            serde_json::json!({"format":{"format_name":"mov","nb_streams":1},"streams":[{"codec_type":"unknown"}]}),
+        ] {
+            assert!(audit_inventory(path, &invalid).is_err());
+        }
     }
 
     #[test]
