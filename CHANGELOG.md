@@ -19,6 +19,17 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep each location answer with the artifacts from its own run
+
+- Claim a new or empty run directory exclusively. Concurrent default runs choose
+  distinct directories. The error ledger links a partial run only after that attempt
+  has claimed its directory.
+- Treat Markdown, candidate CSV and HTML output failures as run errors. Publish
+  `result.json` by rename after all three writes succeed. Print the map path when
+  the report records a successfully generated map.
+- Added regression cases for concurrent claims, preservation of a previous answer,
+  mandatory report write failures and successful publication.
+
 ### Warn about place names as well as coordinates in recording metadata
 
 - `detect` and `locate` recognize nonblank location tags on the container and every

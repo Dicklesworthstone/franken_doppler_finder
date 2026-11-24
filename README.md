@@ -783,7 +783,7 @@ or change their Doppler frequencies. A decoder-reported corrupt packet or a nonf
 | `--audio-channel <N>` | mono mix | One channel of that audio track, counted from 0; avoids mixing other microphone channels |
 | `--dates <D>` | required | Local date(s) of the recording: `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD` (also `D0 to D1`, `D0,D1`, `YYYY/MM/DD`, `YYYYMMDD`). The year comes first: `09/08/2026` is refused as ambiguous. At most 15 days |
 | `--near <REGION>` | required | Coarse US region; see [Region syntax](#region-syntax) |
-| `-o, --out <DIR>` | `fdop_runs/<name>_<unix time>` | Output directory |
+| `-o, --out <DIR>` | `fdop_runs/<name>_<unix time>` | New or empty output directory |
 | `--start <ISO>` | — | Exact recording start if known, e.g. `2026-09-08T19:17:30-04:00`. Without a zone it is read as **UTC**. Unix seconds also work. With it, a high or medium answer from the trace search is also checked at four [decoy clocks](#the-gates), which runs the search four more times without the curve match |
 | `--clock-tol <S>` | `120` | Finite, nonnegative clock tolerance (s) around `--start` or the file's `creation_time`. The [curve match](#the-curve-match) can judge only a clock window of 300 s or less: with `--start`, 150 s or less. Before 2026-11-07 the default was 180 s, at which a run with `--start` never could |
 | `--ignore-metadata-time` | off | Ignore the container's `creation_time` |
@@ -990,7 +990,12 @@ A bare place name must be unique in the US; otherwise `fdop` lists the matches a
 
 ### Outputs
 
-Each `locate` run writes a directory:
+Each `locate` run claims its own output directory. With `-o`, supply a new or empty
+directory. A second run targeting an occupied directory exits with an error so the
+earlier answer and its figures stay together. With the default directory, simultaneous
+runs with the same name use numeric suffixes. A completed run publishes `result.json`
+after writing its Markdown, HTML and candidate CSV. If report creation fails, the CLI
+returns an error and the directory contains partial outputs.
 
 | File | Contents |
 |---|---|

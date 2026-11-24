@@ -127,6 +127,80 @@ pub fn default_run_dir(media: &Path) -> PathBuf {
     PathBuf::from("fdop_runs").join(format!("{}_{}", stem(media), unix_now() as u64))
 }
 
+/// The claim lives until report publication or an error return. A terminated process
+/// can leave the marker in its partial run, which a later invocation must preserve.
+#[derive(Debug)]
+pub(crate) struct RunDirectory {
+    pub(crate) path: PathBuf,
+}
+
+impl RunDirectory {
+    pub(crate) fn partial_output(&self) -> Option<&Path> {
+        std::fs::read_dir(&self.path)
+            .ok()?
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() != ".fdop-run")
+            .then_some(self.path.as_path())
+    }
+}
+
+impl Drop for RunDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.path.join(".fdop-run"));
+    }
+}
+
+/// Claim a new or pre-created empty directory exclusively across fdop processes.
+pub(crate) fn reserve_output(
+    requested: Option<&Path>,
+    default: &Path,
+) -> Result<RunDirectory, String> {
+    let base = requested.unwrap_or(default);
+    let mut dir = base.to_owned();
+    let mut suffix = 2_u64;
+    loop {
+        let claim = || -> std::io::Result<RunDirectory> {
+            std::fs::create_dir_all(&dir)?;
+            // Check before claiming so a completed run is left entirely untouched.
+            if std::fs::read_dir(&dir)?.next().transpose()?.is_some() {
+                return Err(std::io::ErrorKind::AlreadyExists.into());
+            }
+            std::fs::File::create_new(dir.join(".fdop-run"))?;
+            let owner = RunDirectory { path: dir.clone() };
+            // A competing run can finish between the empty check and the exclusive
+            // create. Recheck under our claim before writing any artifacts.
+            for entry in std::fs::read_dir(&dir)? {
+                if entry?.file_name() != ".fdop-run" {
+                    return Err(std::io::ErrorKind::AlreadyExists.into());
+                }
+            }
+            Ok(owner)
+        };
+        match claim() {
+            Ok(owner) => return Ok(owner),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if requested.is_some() {
+                    return Err(format!(
+                        "output directory {} is occupied; choose a new or empty directory",
+                        dir.display()
+                    ));
+                }
+                dir = base.with_file_name(format!(
+                    "{}-{suffix}",
+                    base.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                suffix += 1;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot reserve output directory {}: {e}",
+                    dir.display()
+                ));
+            }
+        }
+    }
+}
+
 /// UTC window for the recording START: local midnight of the first day .. local midnight after
 /// the last day, using the region's UTC offset range (DST included).
 pub fn start_window(d0: Ymd, d1: Ymd, off: (f64, f64)) -> (f64, f64) {
@@ -1684,7 +1758,7 @@ fn decoy_clock_runs(
             break;
         }
         let d = decoy_args(a, t0, tol, s, run_dir);
-        match locate_with_clock(&d, &Log::new(true), now, true, Some(recording)) {
+        match locate_with_clock(&d, &Log::new(true), now, true, Some(recording), &mut None) {
             Ok(o) => {
                 log.say(&format!(
                     "decoy clock {:+.0} h: top evidence {}",
@@ -1705,7 +1779,17 @@ fn decoy_clock_runs(
 
 /// Run the whole pipeline.
 pub fn locate(a: &LocateArgs, log: &Arc<Log>) -> Result<LocateOutcome, String> {
-    locate_with_clock(a, log, &unix_now, false, None)
+    locate_recorded(a, log, &mut None)
+}
+
+/// Supply the CLI error ledger with the directory actually claimed by this attempt.
+pub(crate) fn locate_recorded(
+    a: &LocateArgs,
+    log: &Arc<Log>,
+    claimed_dir: &mut Option<RunDirectory>,
+) -> Result<LocateOutcome, String> {
+    *claimed_dir = None;
+    locate_with_clock(a, log, &unix_now, false, None, claimed_dir)
 }
 
 /// `decoy` marks a run made by [`decoy_clock_runs`], which checks no decoys of its own.
@@ -1715,6 +1799,7 @@ fn locate_with_clock(
     now: &dyn Fn() -> f64,
     decoy: bool,
     recording: Option<&PreparedRecording<'_>>,
+    claimed_dir: &mut Option<RunDirectory>,
 ) -> Result<LocateOutcome, String> {
     assert!(
         recording.is_none() || (decoy && !a.curve_match),
@@ -1853,9 +1938,10 @@ fn locate_with_clock(
     };
     log.say(&describe_window(&archive, meta_window, metadata_fallback));
     let curve_params = curvematch::MatchParams::default();
+    let output = reserve_output(a.out.as_deref(), &default_run_dir(&a.media))?;
+    let run_dir = output.path.clone();
+    *claimed_dir = Some(output);
     let mut weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
-    let run_dir = a.out.clone().unwrap_or_else(|| default_run_dir(&a.media));
-    std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
     let mut curve_clock = archive.clock;
     // whether `curve_clock` is the creation_time window; it stays so if a wider retry keeps the
     // metadata attempt's curve match
@@ -2996,26 +3082,29 @@ fn locate_with_clock(
         })),
         "log": log.lines(),
     });
-    write_json(&run_dir.join("result.json"), &report)?;
-    std::fs::write(
-        run_dir.join("report.md"),
-        fdop_geo::report::render_markdown(&report),
-    )
-    .map_err(|e| e.to_string())?;
-    if let Err(e) = fdop_geo::report::write_candidates_csv(&report, &run_dir.join("candidates.csv"))
-    {
-        log.say(&format!("candidates.csv: {e}"));
-    }
-    match fdop_geo::report::render_html(&report, &run_dir) {
-        Ok(p) => log.say(&format!("report: {}", p.display())),
-        Err(e) => log.say(&format!("report.html: {e}")),
-    }
+    publish_report(&run_dir, &report)?;
+    log.say(&format!("report: {}", run_dir.join("report.html").display()));
     Ok(LocateOutcome {
         run_dir,
         report,
         found,
         trace_evidence,
     })
+}
+
+/// Publish the machine-readable answer only after all mandatory report formats exist.
+fn publish_report(run_dir: &Path, report: &ReportInput) -> Result<(), String> {
+    std::fs::write(
+        run_dir.join("report.md"),
+        fdop_geo::report::render_markdown(report),
+    )
+    .map_err(|e| format!("report.md: {e}"))?;
+    fdop_geo::report::write_candidates_csv(report, &run_dir.join("candidates.csv"))
+        .map_err(|e| format!("candidates.csv: {e}"))?;
+    fdop_geo::report::render_html(report, run_dir).map_err(|e| format!("report.html: {e}"))?;
+    let partial = run_dir.join("result.json.partial");
+    write_json(&partial, report)?;
+    std::fs::rename(partial, run_dir.join("result.json")).map_err(|e| format!("result.json: {e}"))
 }
 
 #[cfg(test)]
@@ -4301,6 +4390,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn locate_outputs_belong_to_one_attempt() {
+        let base = offline_test_args("exclusive-output").out.unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let claimant = || {
+                barrier.wait();
+                reserve_output(Some(&base), &base)
+            };
+            let other = scope.spawn(claimant);
+            let this = claimant();
+            assert_ne!(this.is_ok(), other.join().unwrap().is_ok());
+        });
+        assert!(!base.join(".fdop-run").exists());
+        std::fs::write(base.join("result.json"), "prior answer").unwrap();
+        assert!(reserve_output(Some(&base), &base).is_err());
+        assert_eq!(
+            std::fs::read_to_string(base.join("result.json")).unwrap(),
+            "prior answer"
+        );
+        let other = reserve_output(None, &base).unwrap();
+        assert_ne!(other.path, base);
+        assert_eq!(other.partial_output(), None);
+        std::fs::write(other.path.join("partial"), "").unwrap();
+        assert_eq!(other.partial_output(), Some(other.path.as_path()));
+        assert_ne!(reserve_output(None, &base).unwrap().path, other.path);
+    }
+
+    #[test]
+    fn publish_result_only_after_required_reports() {
+        let base = offline_test_args("report-commit").out.unwrap();
+        for artifact in [
+            "report.md",
+            "report.html",
+            "candidates.csv",
+            "result.json.partial",
+        ] {
+            let dir = base.join(artifact);
+            std::fs::create_dir_all(dir.join(artifact)).unwrap();
+            let error = publish_report(&dir, &ReportInput::default()).unwrap_err();
+            assert!(error.contains(artifact), "{error}");
+            assert!(!dir.join("result.json").exists());
+        }
+        let output = reserve_output(None, &base.join("complete")).unwrap();
+        let dir = &output.path;
+        publish_report(dir, &ReportInput::default()).unwrap();
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("result.json")).unwrap()).unwrap();
+        assert!(result["answer"].is_object());
+        assert!(!dir.join("result.json.partial").exists());
+    }
+
     fn cache_test_day(
         a: &LocateArgs,
         bbox: BBox,
@@ -4837,7 +4979,7 @@ mod tests {
                 .err()
                 .expect("the longer container reaches an unpublished day");
             assert!(error.contains("no published day covers"), "{error}");
-            locate_with_clock(&a, &Log::new(true), &|| now, false, None).unwrap()
+            locate_with_clock(&a, &Log::new(true), &|| now, false, None, &mut None).unwrap()
         } else {
             locate(&a, &Log::new(true)).unwrap()
         };
@@ -4923,9 +5065,15 @@ mod tests {
             drop(pcm);
             let mut replay = a.clone();
             replay.out = Some(a.media.parent().unwrap().join("reused-audio-control"));
-            let reused =
-                locate_with_clock(&replay, &Log::new(true), &unix_now, true, Some(&recording))
-                    .unwrap();
+            let reused = locate_with_clock(
+                &replay,
+                &Log::new(true),
+                &unix_now,
+                true,
+                Some(&recording),
+                &mut None,
+            )
+            .unwrap();
             assert!(reused.found, "{}", reused.report.answer.verdict);
             assert_eq!(reused.trace_evidence, outcome.trace_evidence);
             for file in ["detections.json", "events.json", "search.json"] {
@@ -4947,8 +5095,15 @@ mod tests {
                 decoy_args(&a, fixture.start, a.clock_tol_s, -7_200.0, &outcome.run_dir);
             let shared_dir = fresh_decoy.out.clone().unwrap();
             fresh_decoy.out = Some(a.media.parent().unwrap().join("fresh-decoy-control"));
-            let fresh =
-                locate_with_clock(&fresh_decoy, &Log::new(true), &unix_now, true, None).unwrap();
+            let fresh = locate_with_clock(
+                &fresh_decoy,
+                &Log::new(true),
+                &unix_now,
+                true,
+                None,
+                &mut None,
+            )
+            .unwrap();
             assert_eq!(
                 std::fs::read(fresh.run_dir.join("search.json")).unwrap(),
                 std::fs::read(shared_dir.join("search.json")).unwrap()

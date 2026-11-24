@@ -104,7 +104,7 @@ pub struct LocateCli {
     /// Coarse US region: "NY", "New York", a place "Oyster Bay, NY", a county "Nassau County, NY", a ZIP, "lat,lon[,km]", "S,W,N,E", or "CONUS".
     #[arg(long)]
     pub near: String,
-    /// Output directory (default fdop_runs/<name>_<time>).
+    /// New or empty output directory (default fdop_runs/<name>_<time>).
     #[arg(short, long)]
     pub out: Option<PathBuf>,
     /// Exact recording start if known (ISO 8601, e.g. 2026-09-08T19:17:30-04:00).
@@ -197,17 +197,12 @@ fn run(cli: Cli) -> Result<i32, String> {
         Cmd::Locate(l) => {
             let log = Log::new(l.common.quiet);
             let cache = cache_of(&l.common);
-            let run_dir = l
-                .out
-                .clone()
-                .unwrap_or_else(|| pipeline::default_run_dir(&l.media));
             let args = LocateArgs {
                 media: l.media.clone(),
                 audio_selection: l.audio.selection(),
                 dates: l.dates.clone(),
                 near: l.near.clone(),
-                // fixed here, so a run that fails part-way can still name its partial outputs
-                out: Some(run_dir.clone()),
+                out: l.out.clone(),
                 cache: cache.clone(),
                 offline: l.common.offline,
                 include_jets: l.common.include_jets,
@@ -220,11 +215,14 @@ fn run(cli: Cli) -> Result<i32, String> {
                 quiet: l.common.quiet,
             };
             let (started, t0) = (pipeline::unix_now(), std::time::Instant::now());
-            let out = match pipeline::locate(&args, &log) {
+            let mut claimed_dir = None;
+            let out = match pipeline::locate_recorded(&args, &log, &mut claimed_dir) {
                 Ok(o) => o,
                 Err(e) => {
-                    // the directory counts only if the run got far enough to write into it
-                    let wrote = std::fs::read_dir(&run_dir).is_ok_and(|mut d| d.next().is_some());
+                    // Only this run's own partial artifacts belong in its error ledger row.
+                    let claimed_dir = claimed_dir
+                        .as_ref()
+                        .and_then(|owner| owner.partial_output());
                     // runs that stop with an error are recorded too, so `fdop runs` lists every attempt
                     record_run(
                         &cache,
@@ -235,21 +233,24 @@ fn run(cli: Cli) -> Result<i32, String> {
                             region: l.near.clone(),
                             confidence: "error".into(),
                             headline: e.clone(),
-                            run_dir: if wrote {
-                                run_dir.display().to_string()
-                            } else {
-                                String::new()
-                            },
+                            run_dir: claimed_dir
+                                .as_ref()
+                                .map(|dir| dir.display().to_string())
+                                .unwrap_or_default(),
                             total_s: t0.elapsed().as_secs_f64(),
                             ..Default::default()
                         },
                     );
                     // without -o the directory name has a timestamp the user never saw
-                    return Err(if l.out.is_none() && wrote {
-                        format!("{e} (partial outputs in {})", run_dir.display())
-                    } else {
-                        e
-                    });
+                    return Err(
+                        if l.out.is_none()
+                            && let Some(run_dir) = claimed_dir
+                        {
+                            format!("{e} (partial outputs in {})", run_dir.display())
+                        } else {
+                            e
+                        },
+                    );
                 }
             };
             let a = &out.report.answer;
@@ -298,7 +299,9 @@ fn run(cli: Cli) -> Result<i32, String> {
                 println!("zip        {zip}");
                 println!("verdict    {}", a.verdict);
                 println!("report     {}", out.run_dir.join("report.html").display());
-                println!("map        {}", out.run_dir.join("map.png").display());
+                if out.report.figures.iter().any(|(_, path)| path == "map.png") {
+                    println!("map        {}", out.run_dir.join("map.png").display());
+                }
             } else {
                 println!("no location: {}", a.verdict);
                 println!("report     {}", out.run_dir.join("report.html").display());
