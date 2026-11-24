@@ -124,13 +124,13 @@ pub struct LogSpec {
 }
 
 /// 1.4826 x the median absolute deviation from the median, over every value.
-fn robust_scale(v: &[f32]) -> f64 {
-    let mut tmp = v.to_vec();
-    let m = crate::spectro::median_f32(&mut tmp);
+fn robust_scale(v: &[f32], tmp: &mut [f32]) -> f64 {
+    tmp.copy_from_slice(v);
+    let m = crate::spectro::median_f32(tmp);
     for x in tmp.iter_mut() {
         *x = (*x - m).abs();
     }
-    1.4826 * crate::spectro::median_f32(&mut tmp) as f64
+    1.4826 * crate::spectro::median_f32(tmp) as f64
 }
 
 /// Gain that brings an image of robust spread `scale` up to `floor`: 1 at or above it, and at
@@ -204,33 +204,18 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
     // narrowband structure survives.
     let half_w = (p.bins_per_octave / 3).max(4);
     let mut cols = vec![0f32; n_rows * nt];
-    cols.par_chunks_mut(n_rows)
-        .enumerate()
-        .for_each(|(ti, col)| {
-            let src: Vec<f32> = (0..n_rows).map(|r| data[r * nt + ti]).collect();
-            let mut win = Vec::with_capacity(2 * half_w + 1);
-            for (r, out) in col.iter_mut().enumerate() {
-                let (a, b) = (r.saturating_sub(half_w), (r + half_w + 1).min(n_rows));
-                win.clear();
-                win.extend_from_slice(&src[a..b]);
-                let m = crate::spectro::median_f32(&mut win);
-                *out = (src[r] - m).clamp(-3.0, 8.0);
-            }
-        });
-    data.par_chunks_mut(nt).enumerate().for_each(|(r, row)| {
-        for (ti, v) in row.iter_mut().enumerate() {
-            *v = cols[ti * n_rows + r];
-        }
-    });
+    subtract_frequency_background(&mut data, &mut cols, nt, half_w, true);
     // Put a compressed image back on the spread the detection lines were set at (see
     // `DetectParams::min_image_scale`). Noise and ridge scale together, so this changes the
     // lines' meaning, not the evidence; an image at or above the floor is untouched.
-    let scale = robust_scale(&data);
+    let scale = robust_scale(&data, &mut cols);
     let gain = image_gain(scale, p.min_image_scale);
     raise(&mut data, gain);
     let contrast = (gain > 1.0).then(|| {
-        let mut c = contrast_first(&pooled, n_rows, nt, half_w);
-        let g = image_gain(robust_scale(&c), p.min_image_scale);
+        let mut c = pooled;
+        subtract_frequency_background(&mut c, &mut cols, nt, half_w, false);
+        c.par_chunks_mut(nt).for_each(robust_z_row);
+        let g = image_gain(robust_scale(&c, &mut cols), p.min_image_scale);
         raise(&mut c, g);
         c
     });
@@ -272,30 +257,54 @@ fn raise(data: &mut [f32], gain: f64) {
     }
 }
 
-/// [`LogSpec::contrast`] from the max-pooled image `pooled` (`n_rows` x `nt`, row-major): each
-/// frame's level minus its median over +-`half_w` rows, then each row on its robust z scale.
-fn contrast_first(pooled: &[f32], n_rows: usize, nt: usize, half_w: usize) -> Vec<f32> {
-    let mut cols = vec![0f32; n_rows * nt];
-    cols.par_chunks_mut(n_rows)
-        .enumerate()
-        .for_each(|(ti, col)| {
-            let src: Vec<f32> = (0..n_rows).map(|r| pooled[r * nt + ti]).collect();
-            let mut win = Vec::with_capacity(2 * half_w + 1);
-            for (r, out) in col.iter_mut().enumerate() {
-                let (a, b) = (r.saturating_sub(half_w), (r + half_w + 1).min(n_rows));
-                win.clear();
-                win.extend_from_slice(&src[a..b]);
-                *out = src[r] - crate::spectro::median_f32(&mut win);
-            }
-        });
-    let mut data = vec![0f32; n_rows * nt];
+/// Subtract the local frequency median from each frame. Both survey paths reuse the
+/// same transposed scratch image. Only the row-normalised path clips at this step.
+fn subtract_frequency_background(
+    data: &mut [f32],
+    cols: &mut [f32],
+    nt: usize,
+    half_w: usize,
+    clip: bool,
+) {
+    let nr = data.len() / nt;
+    cols.par_chunks_mut(nr).enumerate().for_each_init(
+        || (Vec::with_capacity(nr), Vec::new()),
+        |(src, sorted), (ti, col)| {
+            src.clear();
+            src.extend(data.chunks_exact(nt).map(|row| row[ti]));
+            subtract_running_median(src, half_w, sorted, col);
+        },
+    );
     data.par_chunks_mut(nt).enumerate().for_each(|(r, row)| {
         for (ti, v) in row.iter_mut().enumerate() {
-            *v = cols[ti * n_rows + r];
+            let difference = cols[ti * nr + r];
+            *v = if clip {
+                difference.clamp(-3.0, 8.0)
+            } else {
+                difference
+            };
         }
-        robust_z_row(row);
     });
-    data
+}
+
+/// Adjacent frequency windows share all but their end bins. Keep the ordered window
+/// and use the same upper median and total float order as `spectro::median_f32`.
+fn subtract_running_median(src: &[f32], half: usize, sorted: &mut Vec<f32>, out: &mut [f32]) {
+    sorted.clear();
+    sorted.extend_from_slice(&src[..half.saturating_add(1).min(src.len())]);
+    sorted.sort_unstable_by(f32::total_cmp);
+    for (r, (&value, result)) in src.iter().zip(out).enumerate() {
+        *result = value - sorted[sorted.len() / 2];
+        if r >= half {
+            let old = src[r - half];
+            let index = sorted.partition_point(|v| v.total_cmp(&old).is_lt());
+            sorted.remove(index);
+        }
+        if let Some(&new) = src.get(r.saturating_add(half).saturating_add(1)) {
+            let index = sorted.partition_point(|v| v.total_cmp(&new).is_lt());
+            sorted.insert(index, new);
+        }
+    }
 }
 
 /// A template's part in scoring ([`score_bank`]).
@@ -2130,6 +2139,30 @@ pub(crate) const FAST_PASSES: [(f64, f64, f64, f64); 3] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_frequency_background_matches_independent_medians() {
+        // Include repeated values, signed zeros, shrinking edge windows and one-row images.
+        let src: Vec<f32> = (0..193)
+            .map(|i| match i % 11 {
+                0 => -0.0,
+                1 => 0.0,
+                _ => ((i * 83) % 17) as f32 - 8.0,
+            })
+            .collect();
+        let mut sorted = Vec::new();
+        for n in [1, 2, 9, 193] {
+            for half in [0, 1, 4, 16, 64, 200] {
+                let mut got = vec![0.0; n];
+                subtract_running_median(&src[..n], half, &mut sorted, &mut got);
+                for (r, &v) in got.iter().enumerate() {
+                    let mut window = src[r.saturating_sub(half)..(r + half + 1).min(n)].to_vec();
+                    let want = src[r] - crate::spectro::median_f32(&mut window);
+                    assert_eq!(v.to_bits(), want.to_bits(), "n={n}, half={half}, row={r}");
+                }
+            }
+        }
+    }
     use crate::physics::cv_curve;
 
     /// Analytic log-image evidence, not FFT output: an independently solved received
@@ -4562,7 +4595,7 @@ mod tests {
         assert_eq!(image_gain(0.0, 0.5), 1.0);
         assert_eq!(image_gain(0.5, 0.5), 1.0);
         assert_eq!(image_gain(0.2, 0.0), 1.0);
-        assert_eq!(robust_scale(&[0.0; 9]), 0.0);
+        assert_eq!(robust_scale(&[0.0; 9], &mut [0.0; 9]), 0.0);
     }
 
     #[test]
