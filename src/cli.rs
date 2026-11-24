@@ -136,10 +136,13 @@ pub struct LocateCli {
 pub struct DetectCli {
     /// Audio or video file (anything ffmpeg reads).
     pub media: PathBuf,
+    /// Audit every audio stream, its mono mix and each channel of multichannel audio.
+    #[arg(long, conflicts_with_all = ["audio_stream", "audio_channel"])]
+    pub all_audio: bool,
     /// Print the recording audit as JSON on stdout.
     #[arg(long)]
     pub json: bool,
-    /// Output directory (default fdop_runs/detect).
+    /// Output directory (default fdop_runs/detect, or a fresh fdop_runs/detect-all for --all-audio).
     #[arg(short, long)]
     pub out: Option<PathBuf>,
     /// Less progress output on stderr.
@@ -442,10 +445,32 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
 }
 
-fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
-    let log = Log::new(d.quiet);
-    let selection = d.audio.selection();
-    let info = audio::probe_with_selection(&d.media, selection)?;
+#[derive(serde::Serialize)]
+struct AudioAuditSummary {
+    audio_stream: usize,
+    audio_channel: Option<usize>,
+    channels_in_stream: u32,
+    decoded_duration_s: f64,
+    location_tag_detected: bool,
+    independent_pass_count: usize,
+    independent_event_ids: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct DetectionAudit {
+    #[serde(flatten)]
+    summary: AudioAuditSummary,
+    events: Vec<fdop_core::measure::MeasuredEvent>,
+}
+
+fn measure_audio_source(
+    media: &std::path::Path,
+    info: &audio::MediaInfo,
+    selection: AudioSelection,
+    out: &std::path::Path,
+    log: &std::sync::Arc<Log>,
+) -> Result<DetectionAudit, String> {
     log.say(&format!(
         "audio: stream {}, {}, {} {} Hz x{}",
         selection.stream,
@@ -456,18 +481,15 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
         info.sample_rate,
         info.channels
     ));
-    let out = d
-        .out
-        .unwrap_or_else(|| PathBuf::from("fdop_runs").join("detect"));
-    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-    let x = audio::decode_with_selection(&d.media, 0.0, None, 4000, selection)?;
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let x = audio::decode_with_selection(media, 0.0, None, 4000, selection)?;
     let low_band = pipeline::low_band_warning(&x, 4000);
     if let Some(w) = &low_band {
         eprintln!("fdop: warning: {w}");
     }
     // Use exactly the observations `locate` would search, including its bounded
     // recovery after ordinary measurement finds no aircraft and its final event IDs.
-    let measured = pipeline::measure_recording(&x, 4000, &log, Some(&out.join("survey.png")))?;
+    let measured = pipeline::measure_recording(&x, 4000, log, Some(&out.join("survey.png")))?;
     let decoded_duration_s = x.len() as f64 / 4000.0;
     drop(x);
     for warning in &measured.warnings {
@@ -500,7 +522,7 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
     // A fitted harmonic can pass quality alongside another fit of the same flyover.
     // Use the search's physical eligibility and grouping for the audit count.
     let passes = fdop_core::search::independent_measured_events(&evs, 0.0);
-    let ids: Vec<_> = passes.iter().map(|p| p.id.as_str()).collect();
+    let ids: Vec<_> = passes.iter().map(|p| p.id.clone()).collect();
     log.say(&format!(
         "{} independent aircraft passes on the selected audio{}",
         ids.len(),
@@ -510,20 +532,8 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
             format!(" ({})", ids.join(", "))
         }
     ));
-    if d.json {
-        #[derive(serde::Serialize)]
-        struct DetectionAudit<'a> {
-            audio_stream: usize,
-            audio_channel: Option<usize>,
-            channels_in_stream: u32,
-            decoded_duration_s: f64,
-            location_tag_detected: bool,
-            independent_pass_count: usize,
-            independent_event_ids: Vec<&'a str>,
-            events: &'a [fdop_core::measure::MeasuredEvent],
-            warnings: Vec<String>,
-        }
-        let audit = DetectionAudit {
+    Ok(DetectionAudit {
+        summary: AudioAuditSummary {
             audio_stream: selection.stream,
             audio_channel: selection.channel,
             channels_in_stream: info.channels,
@@ -531,14 +541,104 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
             location_tag_detected,
             independent_pass_count: ids.len(),
             independent_event_ids: ids,
-            events: &evs,
             warnings,
+        },
+        events: evs,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct SourceAudit {
+    #[serde(flatten)]
+    summary: AudioAuditSummary,
+    events_file: PathBuf,
+}
+
+fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
+    let streams = audio::probe_audio_streams(&d.media)?;
+    let log = Log::new(d.quiet);
+    let default = PathBuf::from("fdop_runs").join("detect-all");
+    let reservation = pipeline::reserve_output(d.out.as_deref(), &default)?;
+    let out = &reservation.path;
+    let mut sources = Vec::new();
+    for info in &streams {
+        // The downmix can reinforce a coherent signal or cancel opposite-polarity channels.
+        // A mono stream's downmix already covers its only channel.
+        let channels = (0..info.channels as usize)
+            .filter(|_| info.channels > 1)
+            .map(Some);
+        for channel in std::iter::once(None).chain(channels) {
+            let selection = AudioSelection {
+                stream: info.audio_stream,
+                channel,
+            };
+            let view = match channel {
+                Some(n) => format!("stream-{}-channel-{n}", selection.stream),
+                None => format!("stream-{}-mix", selection.stream),
+            };
+            let dir = out.join(&view);
+            let audit =
+                measure_audio_source(&d.media, info, selection, &dir, &log).map_err(|e| {
+                    format!(
+                        "incomplete audio audit at {view}: {e} (partial outputs in {})",
+                        out.display()
+                    )
+                })?;
+            sources.push(SourceAudit {
+                summary: audit.summary,
+                events_file: dir.join("events.json"),
+            });
+        }
+    }
+    if d.json {
+        #[derive(serde::Serialize)]
+        struct WholeFileAudit {
+            audio_stream_count: usize,
+            sources: Vec<SourceAudit>,
+        }
+        let report = WholeFileAudit {
+            audio_stream_count: streams.len(),
+            sources,
         };
+        serde_json::to_writer_pretty(&mut stdout, &report).map_err(|e| e.to_string())?;
+        writeln!(stdout).map_err(|e| e.to_string())?;
+    } else {
+        for source in sources {
+            let s = source.summary;
+            let view = s
+                .audio_channel
+                .map_or_else(|| "mix".to_string(), |n| format!("channel {n}"));
+            writeln!(
+                stdout,
+                "stream {} {view}: {} independent pass(es) [{}]",
+                s.audio_stream,
+                s.independent_pass_count,
+                source.events_file.display()
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(0)
+}
+
+fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
+    if d.all_audio {
+        return run_all_audio(d, stdout);
+    }
+    let log = Log::new(d.quiet);
+    let selection = d.audio.selection();
+    let info = audio::probe_with_selection(&d.media, selection)?;
+    let out = d
+        .out
+        .unwrap_or_else(|| PathBuf::from("fdop_runs").join("detect"));
+    let audit = measure_audio_source(&d.media, &info, selection, &out, &log)?;
+    log.say(&format!("wrote {}", out.join("events.json").display()));
+    if d.json {
         serde_json::to_writer_pretty(&mut stdout, &audit).map_err(|e| e.to_string())?;
         writeln!(stdout).map_err(|e| e.to_string())?;
         return Ok(0);
     }
-    for e in &evs {
+    for e in &audit.events {
         match &e.fit {
             Some(f) => writeln!(
                 stdout,
@@ -555,11 +655,15 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
                     e.quality.reasons.join("; ")
                 }
             ),
-            None => writeln!(stdout, "{:<4} no fit: {}", e.id, e.quality.reasons.join("; ")),
+            None => writeln!(
+                stdout,
+                "{:<4} no fit: {}",
+                e.id,
+                e.quality.reasons.join("; ")
+            ),
         }
         .map_err(|e| e.to_string())?;
     }
-    log.say(&format!("wrote {}", out.join("events.json").display()));
     Ok(0)
 }
 
@@ -743,6 +847,79 @@ mod tests {
                 assert!(out.join(format!("{}.png", event.id)).is_file());
                 assert!(out.join(format!("{}_trace.csv", event.id)).is_file());
             }
+        }
+
+        // The first track is the negative control. The second contains the known pass
+        // on both channels with opposite polarity, so it disappears in a mono mix.
+        let multi = dir.join("multi.mka");
+        let encoded = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(dir.join("noise.mka"))
+            .arg("-i")
+            .arg(dir.join("fast.wav"))
+            .args([
+                "-filter_complex",
+                "[1:a]pan=stereo|c0=c0|c1=-1*c0[st]",
+                "-map",
+                "0:a:0",
+                "-map",
+                "[st]",
+                "-c:a",
+                "pcm_f32le",
+            ])
+            .arg(&multi)
+            .output()
+            .unwrap();
+        assert!(
+            encoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+        let output = dir.join("whole-file");
+        let cli = Cli::try_parse_from([
+            "fdop",
+            "detect",
+            multi.to_str().unwrap(),
+            "--all-audio",
+            "--json",
+            "--quiet",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Cmd::Detect(opts) = cli.cmd else {
+            unreachable!()
+        };
+        let mut stdout = Vec::new();
+        assert_eq!(run_detect(opts, &mut stdout).unwrap(), 0);
+        let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(report["audio_stream_count"], 2);
+        assert!(report.get("independent_pass_count").is_none());
+        let views = report["sources"].as_array().unwrap();
+        assert_eq!(views.len(), 4);
+        for (view, (stream, channel, passes, view_dir)) in views.iter().zip([
+            (0, None, 0, "stream-0-mix"),
+            (1, None, 0, "stream-1-mix"),
+            (1, Some(0), 1, "stream-1-channel-0"),
+            (1, Some(1), 1, "stream-1-channel-1"),
+        ]) {
+            assert_eq!(view["audio_stream"], stream);
+            assert_eq!(view["audio_channel"], serde_json::json!(channel));
+            assert_eq!(view["independent_pass_count"], passes);
+            let events_path = output.join(view_dir).join("events.json");
+            assert_eq!(view["events_file"], events_path.to_str().unwrap());
+            assert!(events_path.is_file());
+        }
+    }
+
+    #[test]
+    fn whole_file_audit_cannot_select_only_one_audio_source() {
+        assert!(Cli::try_parse_from(["fdop", "detect", "clip.mkv", "--all-audio"]).is_ok());
+        for flag in ["--audio-channel", "--audio-stream"] {
+            assert!(
+                Cli::try_parse_from(["fdop", "detect", "clip.mkv", "--all-audio", flag, "0"])
+                    .is_err()
+            );
         }
     }
 

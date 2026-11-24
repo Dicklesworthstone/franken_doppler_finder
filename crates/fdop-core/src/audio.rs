@@ -43,6 +43,44 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
 /// Describe the selected audio stream and validate its channel before decoding. The
 /// stream ordinal counts audio streams only, matching FFmpeg's `0:a:N` mapping.
 pub fn probe_with_selection(path: &Path, selection: AudioSelection) -> Result<MediaInfo, String> {
+    media_info(path, &probe_document(path)?, selection)
+}
+
+/// Probe once so a whole-file audit uses the same stream inventory throughout.
+pub fn probe_audio_streams(path: &Path) -> Result<Vec<MediaInfo>, String> {
+    let doc = probe_document(path)?;
+    all_stream_info(path, &doc)
+}
+
+fn all_stream_info(path: &Path, doc: &serde_json::Value) -> Result<Vec<MediaInfo>, String> {
+    let count = doc["streams"].as_array().map_or(0, |streams| {
+        streams
+            .iter()
+            .filter(|s| s["codec_type"] == "audio")
+            .count()
+    });
+    if count == 0 {
+        return Err(format!("{} has no audio stream", path.display()));
+    }
+    (0..count)
+        .map(|stream| {
+            let info = media_info(
+                path,
+                doc,
+                AudioSelection {
+                    stream,
+                    channel: None,
+                },
+            )?;
+            if info.channels == 0 {
+                return Err(format!("unknown channel count for audio stream {stream}"));
+            }
+            Ok(info)
+        })
+        .collect()
+}
+
+fn probe_document(path: &Path) -> Result<serde_json::Value, String> {
     let out = Command::new("ffprobe")
         .args([
             "-v",
@@ -62,9 +100,7 @@ pub fn probe_with_selection(path: &Path, selection: AudioSelection) -> Result<Me
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let j: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("ffprobe JSON: {e}"))?;
-    media_info(path, &j, selection)
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("ffprobe JSON: {e}"))
 }
 
 fn media_info(
@@ -385,6 +421,32 @@ pub fn decode_with_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_stream_probe_keeps_audio_ordinals_and_requires_known_channels() {
+        let mut doc = serde_json::json!({"streams": [
+            {"codec_type": "video"},
+            {"codec_type": "audio", "channels": 1},
+            {"codec_type": "subtitle"},
+            {"codec_type": "audio", "channels": 2}
+        ]});
+        let path = Path::new("recording.mkv");
+        let streams = all_stream_info(path, &doc).unwrap();
+        assert_eq!(
+            streams
+                .iter()
+                .map(|s| (s.audio_stream, s.channels))
+                .collect::<Vec<_>>(),
+            [(0, 1), (1, 2)]
+        );
+        doc["streams"][3]["channels"] = serde_json::Value::Null;
+        assert!(
+            all_stream_info(path, &doc)
+                .unwrap_err()
+                .contains("audio stream 1")
+        );
+        assert!(all_stream_info(path, &serde_json::json!({"streams": []})).is_err());
+    }
 
     #[test]
     fn streamed_pcm_preserves_samples_across_partial_reads() {

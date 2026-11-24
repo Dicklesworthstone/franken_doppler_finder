@@ -19,6 +19,10 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Audit every audio source in a recording
+
+- `fdop detect --all-audio` now measures all audio tracks, including both the downmix and individual channels of multichannel tracks. Each source has separate events and artifacts. Text and JSON report per-source counts after all measurements complete. The single-source CLI and JSON fields retain their existing meanings.
+
 ### Retain resolved turning tracks when speed telemetry disappears
 
 - Add a final local recovery for coherent turning arcs with missing groundspeeds,

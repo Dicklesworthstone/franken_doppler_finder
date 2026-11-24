@@ -891,6 +891,17 @@ output directory is `fdop_runs/detect`.
 `--audio-stream N` and `--audio-channel N` select the same source as in `locate`. For example,
 `fdop detect clip.mov --audio-stream 1 --audio-channel 0` measures the first channel of the second audio track.
 
+For a prepublication check of the whole file, run `fdop detect clip.mov --all-audio --json`.
+It measures each audio track's mono mix and each individual channel on multichannel tracks, one at a time.
+This can reveal a pass on a secondary track or on channels that cancel in the mix. The JSON gives
+`audio_stream_count` and one entry in `sources` for each view. Each entry has its own pass count,
+event IDs, warnings and `events_file` path (relative to the working directory for a relative output path).
+The same aircraft can appear in several views, so compare their counts individually.
+The complete summary appears on stdout after every view succeeds. A decode or measurement failure exits
+with an error and identifies the failed view and partial output directory. Each view has its own artifact
+directory under a fresh `fdop_runs/detect-all` (with a numeric suffix when occupied) or a new or empty
+`-o` path. Use either `--all-audio` or the individual stream/channel selectors.
+
 The default output prints one line per event. The progress output on stderr identifies the independent aircraft passes after applying the same aircraft checks and duplicate/harmonic grouping as `locate`. Several successful fits can describe one pass.
 
 Use `fdop detect clip.mov --json` for a machine-readable audit. Its stdout includes the selected stream and channel, decoded duration, a flag for a nonblank recognized location tag, independent pass count and event IDs, measured events and warnings. The tag flag covers the container and all streams. Coordinates and text in recognized location tags, such as a QuickTime place name, both trigger it. The audit omits the tag values. The count applies to the selected audio. A count of zero cannot establish that a recording is safe to publish.
@@ -5403,9 +5414,9 @@ Developer examples (`cargo run --release -p <package> --example <name> -- ...`; 
 The video's lesson is that this leak is easy to miss: the curves are usually inaudible. Before you publish
 audio or video recorded somewhere sensitive:
 
-1. **Audit it:** `fdop detect your_file.mp4`. Check the independent aircraft pass count and the location-tag warning. Two
+1. **Audit it:** `fdop detect your_file.mp4 --all-audio`. Check the independent aircraft pass count and the location-tag warning. Two
    independent passes with the time between them intact are high risk. One pass together with a known
-   recording time is also high risk. Check other audio tracks and individual channels before publishing.
+   recording time is also high risk. Check each track and channel in the summary before publishing.
 2. **What the source video found does not work:**
    - high-pass filtering (the 80–500 Hz band overlaps speech, and the curve came back after a boost). `fdop detect`
      warns on such audio and may list fewer flyovers, but a lower count there does not make the file safe;
