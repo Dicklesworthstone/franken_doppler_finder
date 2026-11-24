@@ -28,7 +28,8 @@ pub struct MediaInfo {
     pub creation_time: Option<String>,
     /// Parsed finite creation time (unix s), using the same UTC convention as `--start`.
     pub creation_unix: Option<f64>,
-    /// ISO 6709 location tag (e.g. Apple `com.apple.quicktime.location.ISO6709`), verbatim.
+    /// First parsable coordinate tag, or the first nonblank recognized location value
+    /// (which may be a place name) if no tag supplies coordinates.
     pub location_iso6709: Option<String>,
     pub location_latlon: Option<(f64, f64)>,
     /// Every tag found, for the report.
@@ -159,12 +160,27 @@ fn media_info(
     }
     for (k, v) in &info.tags {
         let kl = k.to_ascii_lowercase();
-        if (kl.contains("iso6709") || kl == "location" || kl.ends_with(".location"))
-            && info.location_iso6709.is_none()
+        // FFmpeg can expose a localized MOV tag as "location-eng".
+        let localized = kl
+            .strip_prefix("location-")
+            .is_some_and(|lang| lang.len() == 3 && lang.bytes().all(|b| b.is_ascii_lowercase()));
+        if v.trim().is_empty()
+            || !(kl.contains("iso6709")
+                || kl == "location"
+                || localized
+                || kl.ends_with(".location")
+                || kl == "com.apple.quicktime.location.name")
         {
-            info.location_iso6709 = Some(v.clone());
-            info.location_latlon = parse_iso6709(v);
+            continue;
         }
+        if let Some(coords) = parse_iso6709(v) {
+            info.location_iso6709 = Some(v.clone());
+            info.location_latlon = Some(coords);
+            break;
+        }
+        // Text can identify a place too. Keep its presence for the privacy warning,
+        // but continue looking across streams for a usable coordinate tag.
+        info.location_iso6709.get_or_insert_with(|| v.clone());
     }
     Ok(info)
 }
@@ -554,6 +570,31 @@ mod tests {
             Some((40.8765, -73.525))
         );
         assert_eq!(parse_iso6709("garbage"), None);
+    }
+
+    #[test]
+    fn location_metadata_is_audited_across_the_whole_container() {
+        let path = Path::new("tagged.mkv");
+        let mut j = serde_json::json!({
+            "format": {"tags": {"location": "  "}},
+            "streams": [
+                {"codec_type": "audio"},
+                {"codec_type": "video", "tags": {"COM.APPLE.QUICKTIME.LOCATION.NAME": "Test place"}},
+                {"codec_type": "audio", "tags": {"LOCATION-ENG": "+00.0000+000.0000/"}}
+            ]
+        });
+        let probe = |j: &serde_json::Value| media_info(path, j, AudioSelection::default()).unwrap();
+        let info = probe(&j);
+        assert_eq!(info.location_latlon, Some((0.0, 0.0)));
+        assert_eq!(info.location_iso6709.as_deref(), Some("+00.0000+000.0000/"));
+
+        j["streams"][2]["tags"] = serde_json::json!({});
+        let info = probe(&j);
+        assert!(info.location_latlon.is_none());
+        assert_eq!(info.location_iso6709.as_deref(), Some("Test place"));
+
+        j["streams"][1]["tags"] = serde_json::json!({"location-accuracy": "10"});
+        assert!(probe(&j).location_iso6709.is_none());
     }
 
     #[test]

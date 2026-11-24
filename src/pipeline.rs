@@ -1750,10 +1750,8 @@ fn locate_with_clock(
             .map_or_else(|| "mix".into(), |c| c.to_string()),
         info.creation_time
     ));
-    if info.location_latlon.is_some() {
-        warnings.push(
-            "the file carries a readable location tag. The acoustic search ignores it.".into(),
-        );
+    if info.location_iso6709.is_some() {
+        warnings.push("the file carries a location tag. The acoustic search ignores it.".into());
     }
     let ctx = RegionContext::new(a.cache.clone(), !a.offline);
     let region: Region =

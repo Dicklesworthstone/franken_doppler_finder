@@ -472,8 +472,9 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
     }
     let mut warnings = measured.warnings;
     warnings.extend(low_band);
-    if info.location_latlon.is_some() {
-        let note = "the media carries a readable location tag; removing audible flyovers alone leaves those coordinates in the file";
+    let location_tag_detected = info.location_iso6709.is_some();
+    if location_tag_detected {
+        let note = "the media carries a location tag that could disclose where it was recorded, even after audible flyovers are removed";
         eprintln!("fdop: warning: {note}");
         warnings.push(note.to_string());
     }
@@ -524,7 +525,7 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
             audio_channel: selection.channel,
             channels_in_stream: info.channels,
             decoded_duration_s,
-            location_tag_detected: info.location_latlon.is_some(),
+            location_tag_detected,
             independent_pass_count: ids.len(),
             independent_event_ids: ids,
             events: &evs,
@@ -599,7 +600,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         // The complete 30 s late-pass case from the recording-measurement regression.
-        // Float WAV preserves its exact PCM while exercising the real probe and decoder.
+        // Float PCM preserves the exact samples across both test containers.
         for (label, amplitude, n_aircraft) in [("fast", 0.32, 1), ("noise", 0.0, 0)] {
             let mut seed = 4242u64;
             let pcm: Vec<f32> = (0..30 * 4000)
@@ -617,19 +618,27 @@ mod tests {
                 })
                 .collect();
             let raw = dir.join(format!("{label}.f32le"));
-            let media = dir.join(format!("{label}.wav"));
+            // Matroska carries arbitrary per-stream text tags through FFmpeg.
+            let tagged = label == "noise";
+            let extension = if tagged { "mka" } else { "wav" };
+            let media = dir.join(format!("{label}.{extension}"));
             let out = dir.join(label);
             std::fs::write(
                 &raw,
                 pcm.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
             )
             .unwrap();
-            let encoded = Command::new("ffmpeg")
+            let mut encoder = Command::new("ffmpeg");
+            encoder
                 .args([
                     "-nostdin", "-v", "error", "-f", "f32le", "-ar", "4000", "-ac", "1", "-i",
                 ])
                 .arg(&raw)
-                .args(["-c:a", "pcm_f32le"])
+                .args(["-c:a", "pcm_f32le"]);
+            if tagged {
+                encoder.args(["-metadata:s:a:0", "location=private-place-marker"]);
+            }
+            let encoded = encoder
                 .arg(&media)
                 .output()
                 .expect("ffmpeg is required for the media command regression");
@@ -706,7 +715,16 @@ mod tests {
             assert!(audit["audio_channel"].is_null());
             assert_eq!(audit["channels_in_stream"], 1);
             assert_eq!(audit["decoded_duration_s"], 30.0);
-            assert_eq!(audit["location_tag_detected"], false);
+            assert_eq!(audit["location_tag_detected"], tagged);
+            assert_eq!(
+                audit["warnings"].as_array().unwrap().iter().any(|w| {
+                    w.as_str()
+                        .is_some_and(|w| w.contains("carries a location tag"))
+                }),
+                tagged
+            );
+            let audit_text = std::str::from_utf8(&stdout).unwrap();
+            assert!(!audit_text.contains("private-place-marker"));
             let actual = std::fs::read_to_string(out.join("events.json")).unwrap();
             assert_eq!(
                 audit["events"],

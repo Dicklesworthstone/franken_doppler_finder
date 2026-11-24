@@ -19,6 +19,13 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Warn about place names as well as coordinates in recording metadata
+
+- `detect` and `locate` recognize nonblank location tags on the container and every
+  stream, including localized MOV tags and QuickTime place names. A text tag can no
+  longer hide a later ISO 6709 coordinate. The `detect --json` audit sets
+  `location_tag_detected` for either kind and omits the values from its output.
+
 ### Retain weather-expanded physical flight positions before search
 
 - Select each attempt's atmosphere before choosing its ADS-B footprint. Expand fitted

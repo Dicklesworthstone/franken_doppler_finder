@@ -893,7 +893,7 @@ output directory is `fdop_runs/detect`.
 
 The default output prints one line per event. The progress output on stderr identifies the independent aircraft passes after applying the same aircraft checks and duplicate/harmonic grouping as `locate`. Several successful fits can describe one pass.
 
-Use `fdop detect clip.mov --json` for a machine-readable audit. Its stdout includes the selected stream and channel, decoded duration, a flag for a readable location tag, independent pass count and event IDs, measured events and warnings. The tag flag reports presence without copying tagged coordinates. The count applies to the selected audio. A count of zero cannot establish that a recording is safe to publish.
+Use `fdop detect clip.mov --json` for a machine-readable audit. Its stdout includes the selected stream and channel, decoded duration, a flag for a nonblank recognized location tag, independent pass count and event IDs, measured events and warnings. The tag flag covers the container and all streams. Coordinates and text in recognized location tags, such as a QuickTime place name, both trigger it. The audit omits the tag values. The count applies to the selected audio. A count of zero cannot establish that a recording is safe to publish.
 
 
 ```text
