@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover from unreadable ADS-B trace archives
+
+- Reject feeds whose trace members all failed to parse, including files missing the trace array. Reuse other available feeds and covering catalogues through the existing recovery path. Report the count of skipped members when a partially readable archive still supplies a usable day.
+- Check saved parse counts before reusing a raw checkpoint or a processed day. Empty archives and valid traces outside the requested coverage remain usable.
+
 ### Count complete comparisons in the decoy-clock gate
 
 - Controls that lose part of their start window to archive publication or hit a recorded trace-search comparison cut are skipped. The gate reports the skipped shifts and tries the remaining eligible clocks. A completed search without a candidate still counts. Explicit and metadata clocks use the width actually searched, including fractional-second starts. The four-control requirement and 3-nat lead are unchanged.

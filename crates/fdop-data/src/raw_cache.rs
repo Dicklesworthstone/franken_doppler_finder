@@ -84,8 +84,7 @@ pub(crate) fn recovery_releases(
         identity: Identity,
         #[serde(rename = "aircraft")]
         _aircraft: Vec<serde::de::IgnoredAny>,
-        #[serde(rename = "stats")]
-        _stats: IngestStats,
+        stats: IngestStats,
     }
 
     let day = fdop_types::time::civil_from_days((context.day_start / 86_400.0).floor() as i64);
@@ -142,7 +141,8 @@ pub(crate) fn recovery_releases(
             continue;
         };
         let id = header.identity;
-        if id.version == VERSION
+        if crate::ingest::validate_trace_counts(header.stats.members, header.stats.parse_errors).is_ok()
+            && id.version == VERSION
             && id.release.feed == feed
             && id.include_jets == jets
             && id.keep_unknown
@@ -387,6 +387,7 @@ fn load_path(
             }
         }
     }
+    crate::ingest::validate_trace_counts(cached.stats.members, cached.stats.parse_errors)?;
     Ok(Some((cached.aircraft, cached.stats)))
 }
 
@@ -397,6 +398,7 @@ pub(crate) fn save(
     context: DayContext,
     part: &(Vec<RawAircraft>, IngestStats),
 ) -> Result<(), DataError> {
+    crate::ingest::validate_trace_counts(part.1.members, part.1.parse_errors)?;
     let path = path(dir, rel, spec);
     std::fs::create_dir_all(path.parent().expect("raw checkpoint has a parent"))?;
     // A unique sibling prevents concurrent ingests from sharing a temporary file.
@@ -1050,6 +1052,7 @@ pub(crate) mod tests {
             "missing stats",
             "aircraft shape",
             "stats shape",
+            "all traces unreadable",
             "truncated",
             "trailing",
             "temporary",
@@ -1092,6 +1095,10 @@ pub(crate) mod tests {
                 }
                 "aircraft shape" => payload["aircraft"] = serde_json::json!({}),
                 "stats shape" => payload["stats"] = serde_json::json!([]),
+                "all traces unreadable" => {
+                    payload["aircraft"] = serde_json::json!([]);
+                    payload["stats"]["parse_errors"] = payload["stats"]["members"].clone();
+                }
                 _ => {}
             }
             let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -1114,6 +1121,9 @@ pub(crate) mod tests {
                     final_path
                 };
                 std::fs::write(path, bytes).unwrap();
+            }
+            if problem == "all traces unreadable" {
+                assert!(load(&f.dir, &f.releases[0], &f.spec, f.context).is_err());
             }
             let recovered = recovery_releases(&f.dir, &[], f.context, true);
             if problem == "none" {

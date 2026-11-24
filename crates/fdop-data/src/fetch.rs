@@ -249,6 +249,12 @@ impl CachedDay {
             leg_count += 1;
             include_leg_bounds(&mut bounds, &leg);
         })?;
+        if let (Some(files), Some(errors)) = (
+            meta.stats["files"].as_u64(), meta.stats["parse_errors"].as_u64(),
+        ) {
+            crate::ingest::validate_trace_counts(files, errors)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        }
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -612,6 +618,7 @@ fn ingest_cached_release(
         )),
     }
     let part = ingest()?;
+    crate::ingest::validate_trace_counts(part.1.members, part.1.parse_errors)?;
     if let Err(e) = crate::raw_cache::save(dir, release, spec, context, &part) {
         // Checkpointing saves work on a retry; it must not discard a successfully
         // ingested feed. Final day-store publication retains its existing policy.
@@ -1442,6 +1449,18 @@ fn fetch_window_with_sources(
     failed.report(opts, &mut notes)?;
 
     // ---- combine ----
+    for (day, store) in days.iter().zip(&day_stores) {
+        if let Some(store) = store
+            && let Some(errors) = store.meta.stats["parse_errors"].as_u64().filter(|n| *n > 0)
+        {
+            let note = format!(
+                "{:04}-{:02}-{:02}: {errors} ADS-B trace members could not be parsed; aircraft from those traces may be missing",
+                day.0, day.1, day.2
+            );
+            opts.say(&format!("[adsb] WARNING {note}"));
+            notes.push(note);
+        }
+    }
     let stores: Vec<CachedDay> = day_stores.into_iter().flatten().collect();
     if stores.is_empty() {
         return Err(DataError(
@@ -6252,6 +6271,42 @@ mod tests {
             assert!(log.contains(&format!("cached {}", good_path.display())));
             assert!(!log.contains("refetching"));
         }
+    }
+
+    #[test]
+    fn cached_parse_failures_never_turn_a_wholly_unreadable_archive_into_a_no_match() {
+        let sp = crate::ingest::tests::spec();
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_nanos();
+        let cache = std::env::temp_dir().join(format!("fdop-unreadable-traces-{}-{nonce}", std::process::id()));
+        let dir = day_dir(&cache, (2026, 9, 8));
+        let (_, key) = bbox_key(&sp.bbox);
+        let mut store = synthetic_store(&sp);
+        store.legs.clear();
+        store.meta.stats["parse_errors"] = serde_json::json!(1);
+        store.save(&dir.join(format!("prod_{key}.fdtrk"))).unwrap();
+        let opts = FetchOptions { offline: true, include_mlat: false, ..Default::default() };
+        assert!(fetch_window(&sp, &cache, &opts).unwrap_err().to_string().contains("offline, not cached"));
+
+        let larger = IngestSpec { bbox: BBox::new(39.0, -75.0, 42.0, -72.0), ..sp };
+        let (_, wider_key) = bbox_key(&larger.bbox);
+        let mut good = synthetic_store(&larger);
+        good.meta.stats["files"] = serde_json::json!(2);
+        good.meta.stats["parse_errors"] = serde_json::json!(1);
+        good.save(&dir.join(format!("prod_{wider_key}.fdtrk"))).unwrap();
+        let recovered = fetch_window(&sp, &cache, &opts).unwrap();
+        assert_eq!(recovered.legs.len(), 1);
+        assert!(recovered.meta.stats["notes"].as_array().unwrap().iter()
+            .any(|note| note.as_str().is_some_and(|s| s.contains("trace members could not be parsed"))));
+
+        // Earlier catalogues may have no ingest counters; absence is not a parse failure.
+        let legacy = good.meta.stats.as_object_mut().unwrap();
+        legacy.remove("files");
+        legacy.remove("parse_errors");
+        good.save(&dir.join(format!("prod_{wider_key}.fdtrk"))).unwrap();
+        let recovered = fetch_window(&sp, &cache, &opts).unwrap();
+        assert_eq!(recovered.legs.len(), 1);
+        assert!(recovered.meta.stats["notes"].as_array().unwrap().is_empty());
     }
 
     #[test]

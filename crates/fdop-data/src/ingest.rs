@@ -199,6 +199,17 @@ pub struct IngestStats {
     pub points_kept: u64,
 }
 
+/// A readable trace can lie entirely outside the requested window. A feed whose
+/// every trace failed parsing supplies no evidence about aircraft in that window.
+pub(crate) fn validate_trace_counts(members: u64, parse_errors: u64) -> Result<(), DataError> {
+    if parse_errors > 0 && parse_errors >= members {
+        return Err(DataError(format!(
+            "unreadable ADS-B trace archive: {parse_errors} parse errors for {members} trace members"
+        )));
+    }
+    Ok(())
+}
+
 impl IngestStats {
     pub fn add(&mut self, o: &IngestStats) {
         self.bytes += o.bytes;
@@ -533,7 +544,6 @@ struct TraceFile {
     t: LStr,
     #[serde(default)]
     timestamp: LNum,
-    #[serde(default)]
     trace: Vec<Row>,
 }
 
@@ -941,6 +951,7 @@ fn ingest_reader_inner<R: Read + Send>(
             .map_err(|_| DataError("tar reader thread panicked".into()))?
     });
     walk?;
+    validate_trace_counts(st.members, st.parse_errors)?;
     st.bytes = count.load(Ordering::Relaxed);
     progress(&IngestProgress {
         label: feed.to_string(),
@@ -991,6 +1002,7 @@ pub fn ingest_path(
             kept_aircraft: st.kept_aircraft,
             elapsed_s: 0.0,
         });
+        validate_trace_counts(st.members, st.parse_errors)?;
         return Ok((out, st));
     }
     let mut f =
@@ -1020,6 +1032,7 @@ pub fn ingest_path(
             &mut out,
             &mut st,
         );
+        validate_trace_counts(st.members, st.parse_errors)?;
         Ok((out, st))
     }
 }
@@ -1135,6 +1148,36 @@ pub(crate) mod tests {
         let (aircraft, stats) = ingest_reader(empty.as_slice(), "prod", &spec(), &|_| {}).unwrap();
         assert!(aircraft.is_empty());
         assert_eq!(stats.bytes, empty.len() as u64);
+    }
+
+    #[test]
+    fn unreadable_trace_files_cannot_establish_an_empty_feed() {
+        let broken = gz(r#"{"error":"not a trace"}"#);
+        let mut interrupted = gz(&pc12_json());
+        interrupted.truncate(interrupted.len() - 5);
+        let bad = [
+            ("trace_full_a.json", broken.clone()),
+            ("trace_full_b.json", interrupted),
+        ];
+        let error = ingest_reader(tar_of(&bad).as_slice(), "prod", &spec(), &|_| {}).unwrap_err();
+        assert!(error.to_string().contains("2 parse errors for 2 trace members"));
+
+        // Explicitly empty readsb traces and non-ICAO aircraft still parse without
+        // coordinates, registration, type or timestamp. Neither implies a corrupt feed.
+        let empty_trace = tar_of(&[("trace_full_~123456.json", gz(r#"{"trace":[]}"#))]);
+        let (aircraft, stats) = ingest_reader(empty_trace.as_slice(), "prod", &spec(), &|_| {}).unwrap();
+        assert!(aircraft.is_empty());
+        assert_eq!((stats.members, stats.parse_errors), (1, 0));
+
+        // One readable trace outside the time window still establishes a valid empty result.
+        let outside = IngestSpec { t_start: T0 - 100.0, t_end: T0 - 1.0, ..spec() };
+        let mixed = tar_of(&[
+            ("trace_full_a.json", broken),
+            ("trace_full_b.json", gz(&pc12_json())),
+        ]);
+        let (aircraft, stats) = ingest_reader(mixed.as_slice(), "prod", &outside, &|_| {}).unwrap();
+        assert!(aircraft.is_empty());
+        assert_eq!((stats.members, stats.parse_errors), (2, 1));
     }
 
     #[test]
