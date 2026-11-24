@@ -1695,15 +1695,23 @@ Design notes:
   25 m/s allowance. Reports must be fresh, subsonic, and less than 30 s apart. This keeps a
   long slow segment from deleting a later supported acceleration or deceleration merely
   because its heading telemetry is missing.
-  If speed reports also disappear, a final position-based acceleration check can preserve
+  If speed reports also disappear, a position-based acceleration check can preserve
   the same supported motion. Four fresh positions are required; the first three predict the
   fourth. At a missing speed report, the fitted velocity must agree with both adjacent
   observed chord vectors within the existing 25 m/s allowance. Available speed and heading
   reports still constrain the recovery. Mixed-report tracks require independently supported
   fresh reported motion in the preceding winning chain; wholly missing-speed tracks rely on
-  the four-position check. This last attempt preserves every earlier winning report and
+  the four-position check. This acceleration retry preserves every earlier winning report and
   separately supported part, grants only local missing-velocity edges, and keeps the existing
   gap, vertical-motion, subsonic, interpolation and reported-velocity-credit rules.
+  A final steady-turn retry can retain missing-speed arcs that the secant and acceleration
+  checks cannot support. Three fresh positions determine a circle and its angular rate;
+  the fourth must independently follow that motion, and every available speed and heading
+  remains a constraint. Both endpoint secants and central finite-difference derivatives
+  must resolve the inferred arc within the existing 25 m/s allowance. Only locally supported
+  adjacent edges gain permission; earlier winning reports and separately supported parts
+  retain their protection. Recovered positions keep the existing interpolation and do not
+  gain reported-velocity credit.
 - **Close passes can seed the search between grid lines.** A measured distance interval can fit wholly
   between the default 350 m cross-track samples. When a side has no accepted grid point, the search tries
   an interior point using the terrain height at every probe. A rejected point outside the requested
@@ -2289,6 +2297,24 @@ second weather wait; a larger footprint can require another archive download.
 ---
 
 ## Testing
+
+### Recover resolved turns through missing speed telemetry
+
+Three new track regressions exercise turns after a slow reported segment, wholly
+position-only turns above the default 200 m/s envelope, and invalid or insufficient
+four-position support. The fixtures vary turn direction, time reversal, clock epoch,
+available speed/heading reports and sample density. They require retention of the
+supported positions, the existing spline and Doppler predictions, and unchanged
+reported-velocity credit. The sparse positive fixtures also assert that the preceding
+secant and acceleration checks reject their geometry.
+
+The pinned native core build was attempted with one compiler job and disk-backed
+artifacts, but rustc was killed by SIGKILL in the unchanged `fsci-stats` dependency
+before the track tests ran. Changed-line formatting and whitespace checks pass;
+the whole workspace's formatting check still reports pre-existing drift. Native
+tests, Clippy, the release selftest and reference/field replays remain unverified.
+Independent mathematical checks informed the fixture design; they are not native
+test or real-recording evidence.
 
 ### Retain physical flight support under the selected weather
 

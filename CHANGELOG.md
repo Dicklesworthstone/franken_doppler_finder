@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain resolved turning tracks when speed telemetry disappears
+
+- Add a final local recovery for coherent turning arcs with missing groundspeeds,
+  including wholly position-only fast turns. Three fresh positions predict a fourth;
+  available speed and heading reports and the existing motion/gap limits still apply.
+- Require the existing 25 m/s consistency allowance at endpoint secants as well as
+  central derivatives. Preserve earlier winning reports and supported separate parts,
+  and retain the original interpolation and reported-velocity accounting.
+- Add three synthetic regressions covering mixed telemetry, time reversal, clock
+  epochs, sampling density, Doppler support and invalid/under-resolved turns.
+  Changed-line formatting and whitespace checks pass. The pinned native build was
+  killed by SIGKILL in unchanged `fsci-stats` before tests ran; native tests, Clippy,
+  release selftest and reference/field checks remain unverified. Independent
+  mathematical review establishes no real-recording accuracy improvement.
+
 ### Keep each location answer with the artifacts from its own run
 
 - Claim a new or empty run directory exclusively. Concurrent default runs choose
