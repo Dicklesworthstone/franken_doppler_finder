@@ -19,6 +19,18 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover shared clocks beside unsupported CPA timing seeds
+
+- When every existing clock recovery fails, search the original scan-cell neighborhood
+  of a finite physical timing seed whose joint trace loss is positive infinity.
+  Preserve earlier accepted clocks, finite-loss recovery priority and all acceptance gates.
+- Add direct-profile regressions for supported neighboring clocks, earlier-path preservation,
+  invalid objectives and bounded failed retries with restored trace state.
+- All 16 selected native clock-profiler tests pass on the pinned nightly; the new recovery
+  regression fails against the preceding profiler. Changed-line formatting and whitespace
+  checks pass. This is component evidence only; full search/workspace tests, release selftest and reference/field replays
+  remain incomplete after the execution host filled and disconnected.
+
 ### Rebuild wider searches from completed regional raw checkpoints
 
 - Combine at least two compatible completed regional views when no existing exact

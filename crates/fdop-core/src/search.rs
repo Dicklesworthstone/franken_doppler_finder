@@ -2619,6 +2619,8 @@ fn profile_valid_clock(
 /// recording clocks implied by its assigned physical CPAs. Preserve successful
 /// exact-seed recovery before searching a finite rejected seed's scan-cell neighborhood:
 /// uncertain fitted CPA centres need not individually explain the other events.
+/// After those paths fail, an infinite-cost seed gets the same bounded retry: its
+/// own clock may lack joint archive support while a neighboring clock retains it.
 fn profile_valid_clock_seeded(
     lo: f64,
     hi: f64,
@@ -2642,6 +2644,7 @@ fn profile_valid_clock_seeded(
     let mut tried = false;
     let mut best: Option<(f64, f64)> = None;
     let mut rejected = Vec::new();
+    let mut unscorable = Vec::new();
     for (i, &seed) in seeds.iter().enumerate() {
         if !seed.is_finite() || seed < lo || seed > hi || seeds[..i].contains(&seed) {
             continue;
@@ -2651,6 +2654,8 @@ fn profile_valid_clock_seeded(
         if !valid || !value.is_finite() {
             if value.is_finite() {
                 rejected.push(seed);
+            } else if value == f64::INFINITY {
+                unscorable.push(seed);
             }
             continue;
         }
@@ -2667,11 +2672,15 @@ fn profile_valid_clock_seeded(
             best = Some(candidate);
         }
     }
-    if best.is_none() {
+    for pending in [&rejected, &unscorable] {
+        if best.is_some() {
+            break;
+        }
         // An admitted CPA-time interval can put its fitted centre beside the joint
-        // trace minimum. Retry only that seed's original scan-cell neighborhood,
-        // after every old recovery has failed; all accepted clocks keep the gates.
-        for seed in rejected {
+        // trace minimum. Missing support at the seed also cannot reject its whole
+        // neighborhood. Preserve every finite-cost recovery before trying those
+        // unscorable seeds, with the same scan-cell bounds and acceptance gates.
+        for &seed in pending {
             if let Some(candidate) =
                 profile_valid_clock((seed - half).max(lo), (seed + half).min(hi), &mut cost)
                 && best.is_none_or(|old| candidate.1 < old.1)
@@ -7127,18 +7136,15 @@ mod tests {
                 assert_eq!(&calls[..original_calls.len()], &original_calls);
                 let extra = &calls[original_calls.len()..calls.len() - 1];
                 assert_eq!(extra[0], 1.173);
-                if finite {
-                    // Only the distinct, finite rejected seed earns a bounded retry.
-                    // Invalid clocks can never pass; its final fits must still be restored.
-                    assert!(extra.len() > 1 && extra.len() < 50);
-                    assert!(
-                        extra
-                            .iter()
-                            .all(|&t| (1.173 - half..=1.173 + half).contains(&t))
-                    );
-                } else {
-                    assert_eq!(extra, &[1.173]);
-                }
+                // The distinct finite clock earns only its bounded neighborhood,
+                // including when its objective lacks support everywhere. Invalid
+                // clocks cannot pass, and the original final fits must be restored.
+                assert!(extra.len() > 1 && extra.len() < 50);
+                assert!(
+                    extra
+                        .iter()
+                        .all(|&t| (1.173 - half..=1.173 + half).contains(&t))
+                );
                 assert_eq!(calls.last(), original_calls.last());
                 calls.clear();
                 assert!(
@@ -7227,6 +7233,105 @@ mod tests {
                 .all(|&t| (400.39 - 2.0..=400.39 + 2.0).contains(&t))
         );
         assert_eq!(calls.last().copied(), Some(kept.0));
+    }
+
+    #[test]
+    fn unscorable_clock_seeds_recover_supported_neighboring_clocks() {
+        for base in [0.0, 1_788_895_000.0] {
+            let score = |t: f64| {
+                let t = t - base;
+                if (t - 100.1).abs() < 0.08 {
+                    ((t - 100.1).powi(2) + 1.0, true)
+                } else if (t - 400.1).abs() < 0.08 {
+                    ((t - 400.1).powi(2) + 2.0, true)
+                } else if t >= 300.0 {
+                    ((t - 600.0).powi(2) + 10.0, false)
+                } else {
+                    (f64::INFINITY, false)
+                }
+            };
+            let (lo, hi, seed) = (base, base + 800.0, base + 100.39);
+            assert_eq!(score(seed), (f64::INFINITY, false));
+            let mut original_calls = Vec::new();
+            assert!(
+                profile_valid_clock(lo, hi, |t| {
+                    original_calls.push(t);
+                    score(t)
+                })
+                .is_none()
+            );
+            let mut calls = Vec::new();
+            let recovered = profile_valid_clock_seeded(lo, hi, &[seed], |t| {
+                calls.push(t);
+                score(t)
+            })
+            .expect("missing support at a fitted centre does not exclude its neighborhood");
+            assert_eq!(&calls[..original_calls.len()], &original_calls);
+            assert!(
+                calls[original_calls.len()..]
+                    .iter()
+                    .all(|&t| (seed - 2.0..=seed + 2.0).contains(&t))
+            );
+            assert!(calls.len() < original_calls.len() + 100);
+            assert!((recovered.0 - base - 100.1).abs() < 0.01);
+            assert_eq!(recovered.1, score(recovered.0).0);
+            assert_eq!(calls.last().copied(), Some(recovered.0));
+
+            // Existing exact-seed and finite rejected-seed recoveries retain their
+            // original results and call sequence, even though the unsupported seed's
+            // unvisited neighborhood contains a lower accepted objective.
+            for legacy_seed in [base + 400.1, base + 400.39] {
+                let mut legacy_calls = Vec::new();
+                let legacy = profile_valid_clock_seeded(lo, hi, &[legacy_seed], |t| {
+                    legacy_calls.push(t);
+                    score(t)
+                })
+                .unwrap();
+                calls.clear();
+                let kept = profile_valid_clock_seeded(lo, hi, &[seed, legacy_seed], |t| {
+                    calls.push(t);
+                    score(t)
+                })
+                .unwrap();
+                assert_eq!(kept, legacy);
+                assert!((kept.0 - base - 400.1).abs() < 0.01);
+                let mut expected = original_calls.clone();
+                expected.push(seed);
+                expected.extend_from_slice(&legacy_calls[original_calls.len()..]);
+                assert_eq!(calls, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn unscorable_clock_recovery_does_not_retry_invalid_objectives() {
+        for invalid in [f64::NAN, f64::NEG_INFINITY] {
+            let mut original_calls = Vec::new();
+            assert!(
+                profile_valid_clock(-400.0, 400.0, |t| {
+                    original_calls.push(t);
+                    (invalid, false)
+                })
+                .is_none()
+            );
+            let mut calls = Vec::new();
+            assert!(
+                profile_valid_clock_seeded(
+                    -400.0,
+                    400.0,
+                    &[f64::NAN, f64::INFINITY, -401.0, 1.173, 1.173, 401.0],
+                    |t| {
+                        calls.push(t);
+                        (invalid, false)
+                    },
+                )
+                .is_none()
+            );
+            let mut expected = original_calls.clone();
+            expected.push(1.173);
+            expected.push(*original_calls.last().unwrap());
+            assert_eq!(calls, expected);
+        }
     }
 
     #[test]

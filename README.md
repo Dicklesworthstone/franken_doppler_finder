@@ -2349,6 +2349,24 @@ second weather wait; a larger footprint can require another archive download.
 
 ## Testing
 
+### Recover clocks beside unsupported timing seeds
+
+After the normal clock scan, exact CPA seeds and finite-loss seed neighborhoods all fail,
+the search also checks the original scan-cell neighborhood of a finite seed whose joint
+trace loss is positive infinity. Missing archive support at that one clock cannot rule out
+nearby supported clocks. Earlier successful paths, geometry and trace gates retain priority;
+NaN and negative-infinity losses do not request this retry, and failed retries restore the
+original final trace state.
+
+All 16 tests in a native, dependency-free component containing the exact production clock
+profilers and selected direct-profile tests pass on the pinned nightly. The new recovery
+regression fails against the preceding profiler. Changed lines pass pinned formatting and
+whitespace checks. The tests cover recovery
+at relative and Unix times, preservation of earlier successes, duplicate/invalid seeds,
+bounded all-infinite retries and callback state. This validates the clock helper, not a full
+physical pair search or location. Workspace checks, release selftest and reference/field
+replays remain incomplete after the build host filled and disconnected.
+
 ### Skip impossible detector coverage without changing scores
 
 The matched-filter bank computes each template's time-only coverage bounds once,
