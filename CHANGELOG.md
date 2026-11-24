@@ -19,6 +19,22 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover staging during a prod release lookup outage
+
+- Permit a validated staging release when prod metadata cannot be retrieved, after
+  compatible processed and completed raw main-feed data have had their existing priority.
+  Preserve the original error and actual feed provenance. Cache the alternative separately
+  so an outage never certifies prod absence or prevents a later preferred-feed upgrade.
+- Preserve local MLAT recovery when both metadata lookups fail, including joining a
+  completed optional checkpoint with a newly ingested staging archive. Failed staging
+  streams retain both the archive error and the original prod lookup cause.
+- Add discovery/cache and real synthetic archive regressions for invalid alternatives,
+  interrupted ingestion, retry, offline reuse and later prod upgrades. Extend local-cache
+  and fresh-main MLAT coverage for simultaneous outages and both aircraft policies.
+  Source review, pinned changed-line formatting and whitespace checks pass. The native
+  test build was killed by SIGKILL in unchanged `zerocopy` before reaching this crate;
+  native tests, Clippy, release selftest and reference/field validation remain unverified.
+
 ### Audit every audio source in a recording
 
 - `fdop detect --all-audio` now measures all audio tracks, including both the downmix and individual channels of multichannel tracks. Each source has separate events and artifacts. Text and JSON report per-source counts after all measurements complete. The single-source CLI and JSON fields retain their existing meanings.

@@ -823,6 +823,7 @@ fn fetch_window_with_sources(
     let days = utc_days(spec.t_start, spec.t_end);
     let mut day_stores: Vec<Option<CachedDay>> = (0..days.len()).map(|_| None).collect();
     let mut day_releases = vec![Vec::new(); days.len()];
+    let mut prod_lookup_failures = vec![None; days.len()];
     let mut mlat_discovery_outages = vec![false; days.len()];
     let mut notes: Vec<String> = Vec::new();
     let mut cache_hits = 0usize;
@@ -876,6 +877,13 @@ fn fetch_window_with_sources(
                 opts.include_mlat,
             ) {
                 Ok(found) => {
+                    if let Some(error) = found.prod_error {
+                        prod_lookup_failures[i] = Some(error.to_string());
+                        notes.push(format!(
+                            "{label}: prod release lookup failed; staging remains available; online runs will retry prod: {error}"
+                        ));
+                        discovery_error = Some(error);
+                    }
                     if let Some(error) = found.mlat_error {
                         mlat_discovery_failed = true;
                         mlat_discovery_outages[i] = true;
@@ -897,6 +905,7 @@ fn fetch_window_with_sources(
         for fs in partial_feedsets(feedset) {
             if partial.is_none()
                 && (opts.offline
+                    || discovery_error.is_some()
                     || available.as_ref().is_none_or(|a| {
                         a.as_str() == *fs
                             || (mlat_discovery_failed
@@ -937,7 +946,7 @@ fn fetch_window_with_sources(
             // only from the same main feed without losing any existing MLAT coverage.
             // Cached release identities cannot trigger another network request. Use
             // the same padded spec as online, never the clipped want.
-            let mut rels = if mlat_discovery_failed {
+            let mut rels = if mlat_discovery_failed && !local_recovery {
                 // The main lookup succeeded. Keep that live identity authoritative:
                 // local metadata can supply missing MLAT, never substitute staging
                 // for advertised prod or authorize another archive download.
@@ -1036,7 +1045,7 @@ fn fetch_window_with_sources(
             }
             continue;
         }
-        if local_recovery {
+        if local_recovery && !rels.iter().any(|rel| rel.feed == Feed::Staging) {
             if let Some(error) = discovery_error {
                 // No verified main feed means the online request still failed. Do
                 // not replace its cause with an offline-cache or missing-day error.
@@ -1046,6 +1055,9 @@ fn fetch_window_with_sources(
             }
             continue;
         }
+        // Validated staging metadata can still supply an online day after every
+        // compatible local main catalogue/checkpoint was tried. Offline and failed
+        // discovery without an alternative retain their previous refusal above.
         let main = rels
             .iter()
             .find(|r| r.feed == Feed::Prod)
@@ -1060,7 +1072,7 @@ fn fetch_window_with_sources(
         };
         if main.feed == Feed::Staging {
             notes.push(format!(
-                "{label}: prod release missing, using staging {}",
+                "{label}: prod release unavailable, using staging {}",
                 main.tag
             ));
         }
@@ -1210,6 +1222,14 @@ fn fetch_window_with_sources(
                 Ok(())
             })
         });
+    }
+
+    // If the recovered staging stream also fails, retain both causes in the final
+    // error. A failed metadata lookup must not disappear behind a truncated archive.
+    for (di, error) in &mut failed.feeds {
+        if let Some(prod_error) = &prod_lookup_failures[*di] {
+            error.push_str(&format!("; prod release lookup failed: {prod_error}"));
+        }
     }
 
     // A successful lookup can advertise an upgrade over a usable local catalogue.
@@ -2461,6 +2481,175 @@ mod tests {
     }
 
     #[test]
+    fn prod_lookup_outage_builds_staging_and_retries_preferred_feed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for include_jets in [false, true] {
+            let f = offline_raw_fixture(Feed::Staging, include_jets);
+            let prod = checkpoint_release(Feed::Prod, &f.archives[0]);
+            let calls = std::array::from_fn::<_, 3, _>(|_| AtomicUsize::new(0));
+            let run = |prod_unavailable: bool, truncate_staging: bool| {
+                fetch_window_with_sources(
+                    &f.want,
+                    &f.cache,
+                    &FetchOptions::default(),
+                    |_, y, m, d, _, offline, include_mlat| {
+                        assert_eq!((y, m, d), (2026, 9, 8));
+                        assert!(include_mlat);
+                        if offline {
+                            return Ok(crate::adsblol::ReleaseDiscovery {
+                                releases: f.releases.to_vec(),
+                                prod_error: None,
+                                mlat_error: None,
+                            });
+                        }
+                        Ok(crate::adsblol::ReleaseDiscovery {
+                            releases: vec![
+                                if prod_unavailable {
+                                    f.releases[0].clone()
+                                } else {
+                                    prod.clone()
+                                },
+                                f.releases[1].clone(),
+                            ],
+                            prod_error: prod_unavailable
+                                .then(|| DataError("synthetic prod metadata outage".into())),
+                            mlat_error: None,
+                        })
+                    },
+                    |rel, spec, context, progress| {
+                        let index = match rel.feed {
+                            Feed::Prod => 0,
+                            Feed::Staging => 1,
+                            Feed::Mlatonly => 2,
+                        };
+                        calls[index].fetch_add(1, Ordering::Relaxed);
+                        let bytes = &f.archives[usize::from(rel.feed == Feed::Mlatonly)];
+                        let end = if truncate_staging && rel.feed == Feed::Staging {
+                            128
+                        } else {
+                            bytes.len()
+                        };
+                        ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
+                    },
+                    |_, _, _, _, _| panic!("successful staging ingestion needs no recovery lookup"),
+                )
+            };
+            let expected = |main: Feed| {
+                let mut tags = vec![
+                    checkpoint_release(main, &f.archives[0]).tag,
+                    f.releases[1].tag.clone(),
+                ];
+                tags.sort();
+                let parts = [main, Feed::Mlatonly]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, feed)| {
+                        ingest_day_reader(
+                            f.archives[i].as_slice(),
+                            feed.label(),
+                            &f.spec,
+                            &|_| {},
+                            day_context((2026, 9, 8)),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let store = build_day_store(parts, &f.spec, tags, day_context((2026, 9, 8)));
+                merge_stores(vec![store], DAY_JOIN_GAP_S).filtered(
+                    &f.want.bbox,
+                    f.want.t_start,
+                    f.want.t_end,
+                )
+            };
+
+            let error = run(true, true).unwrap_err().to_string();
+            assert!(error.contains("synthetic prod metadata outage"), "{error}");
+            assert!(error.contains(&f.releases[0].tag), "{error}");
+            let staging_path = f.dir.join(format!(
+                "{}_{}.fdtrk",
+                cache_feedset("staging+mlatonly", include_jets),
+                bbox_key(&f.spec.bbox).1
+            ));
+            assert!(
+                !staging_path.exists(),
+                "an incomplete staging stream cannot publish a day"
+            );
+            let got = run(true, false)
+                .expect("staging must supply the day during a prod metadata outage");
+            assert!(!got.legs.is_empty());
+            assert_same_legs(&got.legs, &expected(Feed::Staging).legs);
+            assert_eq!(got.meta.sources, expected(Feed::Staging).meta.sources);
+            assert_eq!(
+                calls.each_ref().map(|n| n.load(Ordering::Relaxed)),
+                [0, 2, 1]
+            );
+            let notes = got.meta.stats["notes"].as_array().unwrap();
+            assert!(notes.iter().any(|n| {
+                let n = n.as_str().unwrap();
+                n.contains("synthetic prod metadata outage") && n.contains("retry prod")
+            }));
+            assert!(notes.iter().any(|n| {
+                n.as_str()
+                    .unwrap()
+                    .contains("prod release unavailable, using staging")
+            }));
+            assert!(
+                !notes
+                    .iter()
+                    .any(|n| n.as_str().unwrap().contains(NO_MLATONLY))
+            );
+            let offline = fetch_window(
+                &f.want,
+                &f.cache,
+                &FetchOptions {
+                    offline: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_same_legs(&offline.legs, &got.legs);
+            assert_eq!(offline.meta.sources, got.meta.sources);
+
+            let cached = run(true, false).unwrap();
+            assert_same_legs(&cached.legs, &got.legs);
+            assert_eq!(
+                calls.each_ref().map(|n| n.load(Ordering::Relaxed)),
+                [0, 2, 1]
+            );
+            assert!(
+                cached.meta.stats["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| {
+                        n.as_str()
+                            .unwrap()
+                            .contains("synthetic prod metadata outage")
+                    })
+            );
+            let upgraded = run(false, false).unwrap();
+            assert_same_legs(&upgraded.legs, &expected(Feed::Prod).legs);
+            assert_eq!(upgraded.meta.sources, expected(Feed::Prod).meta.sources);
+            assert_eq!(
+                calls.each_ref().map(|n| n.load(Ordering::Relaxed)),
+                [1, 2, 1]
+            );
+            assert!(
+                !upgraded.meta.stats["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| {
+                        n.as_str()
+                            .unwrap()
+                            .contains("synthetic prod metadata outage")
+                    })
+            );
+        }
+    }
+
+    #[test]
     fn failed_prod_archive_fetches_uncached_staging_then_retries_prod() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2480,6 +2669,7 @@ mod tests {
                         assert!(!offline && include_mlat);
                         Ok(crate::adsblol::ReleaseDiscovery {
                             releases: releases.to_vec(),
+                            prod_error: None,
                             mlat_error: None,
                         })
                     },
@@ -2670,6 +2860,7 @@ mod tests {
                     }
                     Ok(crate::adsblol::ReleaseDiscovery {
                         releases,
+                        prod_error: None,
                         mlat_error: None,
                     })
                 },
@@ -2838,6 +3029,7 @@ mod tests {
                         assert!(!offline && include_mlat);
                         Ok(crate::adsblol::ReleaseDiscovery {
                             releases: releases.to_vec(),
+                            prod_error: None,
                             mlat_error: None,
                         })
                     },
@@ -2982,6 +3174,7 @@ mod tests {
                     assert!(!offline && include_mlat);
                     Ok(crate::adsblol::ReleaseDiscovery {
                         releases: f.releases.to_vec(),
+                        prod_error: None,
                         mlat_error: None,
                     })
                 },
@@ -3050,6 +3243,7 @@ mod tests {
                         .unwrap();
                         Ok(crate::adsblol::ReleaseDiscovery {
                             releases: listed,
+                            prod_error: None,
                             mlat_error: mlat_failed
                                 .then(|| DataError("synthetic optional lookup outage".into())),
                         })
@@ -3213,6 +3407,7 @@ mod tests {
                     .unwrap();
                     Ok(crate::adsblol::ReleaseDiscovery {
                         releases: releases.to_vec(),
+                        prod_error: None,
                         mlat_error: None,
                     })
                 },
@@ -3265,6 +3460,7 @@ mod tests {
                             assert!(!offline && include_mlat);
                             Ok(crate::adsblol::ReleaseDiscovery {
                                 releases: f.releases.to_vec(),
+                                prod_error: None,
                                 mlat_error: None,
                             })
                         },
@@ -3407,6 +3603,7 @@ mod tests {
                         }
                         Ok(crate::adsblol::ReleaseDiscovery {
                             releases,
+                            prod_error: None,
                             mlat_error: None,
                         })
                     },
@@ -4368,6 +4565,7 @@ mod tests {
                     assert!(!offline && include_mlat);
                     Ok(crate::adsblol::ReleaseDiscovery {
                         releases: vec![f.releases[0].clone()],
+                        prod_error: None,
                         mlat_error: Some(DataError("synthetic optional lookup outage".into())),
                     })
                 },
@@ -4446,6 +4644,7 @@ mod tests {
                             assert_eq!((y, m, d), (2026, 9, 8));
                             Ok(crate::adsblol::ReleaseDiscovery {
                                 releases: vec![f.releases[0].clone()],
+                                prod_error: None,
                                 mlat_error: outage.then(|| {
                                     DataError("synthetic optional lookup outage".into())
                                 }),
@@ -4506,7 +4705,11 @@ mod tests {
     fn optional_discovery_outage_joins_cached_mlat_to_a_fresh_main_feed() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        for main in [Feed::Prod, Feed::Staging] {
+        for (main, prod_unavailable) in [
+            (Feed::Prod, false),
+            (Feed::Staging, false),
+            (Feed::Staging, true),
+        ] {
             for include_jets in [false, true] {
                 let f = offline_raw_fixture_with_listing(main, include_jets, true);
                 let context = day_context((2026, 9, 8));
@@ -4520,12 +4723,27 @@ mod tests {
                     &f.want,
                     &f.cache,
                     &FetchOptions::default(),
-                    |net, y, m, d, _, offline, include_mlat| {
+                    |net, y, m, d, dir, offline, include_mlat| {
                         lookups += 1;
-                        assert!(net.is_some() && !offline && include_mlat);
+                        assert!(include_mlat);
                         assert_eq!((y, m, d), (2026, 9, 8));
+                        if offline {
+                            assert!(prod_unavailable && net.is_none());
+                            return find_day_releases_for_fetch_cached(
+                                None,
+                                y,
+                                m,
+                                d,
+                                dir,
+                                true,
+                                include_mlat,
+                            );
+                        }
+                        assert!(net.is_some());
                         Ok(crate::adsblol::ReleaseDiscovery {
                             releases: vec![f.releases[0].clone()],
+                            prod_error: prod_unavailable
+                                .then(|| DataError("synthetic prod metadata outage".into())),
                             mlat_error: Some(DataError("synthetic optional lookup outage".into())),
                         })
                     },
@@ -4546,7 +4764,7 @@ mod tests {
                     |_, _, _, _, _| panic!("a completed main feed needs no staging lookup"),
                 )
                 .unwrap();
-                assert_eq!(lookups, 1);
+                assert_eq!(lookups, 1 + usize::from(prod_unavailable));
                 assert_eq!(downloads.load(Ordering::Relaxed), 1);
                 let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
                 tags.sort();
@@ -4567,6 +4785,14 @@ mod tests {
                 assert!(notes.iter().any(|n| {
                     n.as_str().unwrap().contains("synthetic optional lookup outage")
                 }));
+                assert_eq!(
+                    notes.iter().any(|n| {
+                        n.as_str()
+                            .unwrap()
+                            .contains("synthetic prod metadata outage")
+                    }),
+                    prod_unavailable
+                );
                 assert!(notes.iter().any(|n| {
                     n.as_str().unwrap().contains("combined the completed main feed")
                 }));
@@ -4625,6 +4851,7 @@ mod tests {
                     assert!(net.is_some() && !offline && include_mlat);
                     Ok(crate::adsblol::ReleaseDiscovery {
                         releases: vec![f.releases[0].clone()],
+                        prod_error: None,
                         mlat_error: outage
                             .then(|| DataError("synthetic optional lookup outage".into())),
                     })
@@ -4707,6 +4934,7 @@ mod tests {
                     assert!(net.is_some() && !offline && include_mlat);
                     Ok(crate::adsblol::ReleaseDiscovery {
                         releases: vec![live.clone()],
+                        prod_error: None,
                         mlat_error: Some(DataError("synthetic optional lookup outage".into())),
                     })
                 },
@@ -4767,11 +4995,15 @@ mod tests {
 
     #[test]
     fn main_discovery_outage_recovers_verified_partial_day_caches() {
-        for (main, cached_mlat, include_mlat) in [
-            (Feed::Prod, false, true),
-            (Feed::Staging, false, true),
-            (Feed::Staging, true, true),
-            (Feed::Staging, false, false),
+        for (main, cached_mlat, include_mlat, staging_recovered, mlat_failed) in [
+            (Feed::Prod, false, true, false, false),
+            (Feed::Staging, false, true, false, false),
+            (Feed::Staging, true, true, false, false),
+            (Feed::Staging, false, false, false, false),
+            (Feed::Prod, false, true, true, false),
+            (Feed::Staging, true, true, true, false),
+            (Feed::Prod, false, true, true, true),
+            (Feed::Staging, true, true, true, true),
         ] {
             for include_jets in [false, true] {
                 let f = offline_raw_fixture(main, include_jets);
@@ -4825,7 +5057,7 @@ mod tests {
                     (want.t_end, Vec::new())
                 );
                 let mut calls = 0;
-                let got = fetch_window_with_discovery(
+                let got = fetch_window_with_sources(
                     &want,
                     &f.cache,
                     &opts,
@@ -4844,9 +5076,26 @@ mod tests {
                             )
                         } else {
                             calls += 1;
-                            Err(DataError("synthetic main release lookup outage".into()))
+                            let error = DataError("synthetic main release lookup outage".into());
+                            if staging_recovered {
+                                let mut releases =
+                                    vec![checkpoint_release(Feed::Staging, &f.archives[0])];
+                                if !mlat_failed {
+                                    releases.push(f.releases[1].clone());
+                                }
+                                Ok(crate::adsblol::ReleaseDiscovery {
+                                    releases,
+                                    prod_error: Some(error),
+                                    mlat_error: mlat_failed.then(|| {
+                                        DataError("synthetic optional lookup outage".into())
+                                    }),
+                                })
+                            } else {
+                                Err(error)
+                            }
                         }
                     },
+                    |_, _, _, _| panic!("a verified local cache must precede staging downloads"),
                     |_, _, _, _, _| panic!("a failed release lookup cannot try a staging archive"),
                 )
                 .unwrap();
@@ -4880,9 +5129,16 @@ mod tests {
     fn main_discovery_outage_rebuilds_completed_raw_feeds() {
         for main in [Feed::Prod, Feed::Staging] {
             for include_jets in [false, true] {
-                for (cached_mlat, include_mlat) in
-                    [(false, false), (false, true), (true, false), (true, true)]
-                {
+                for (cached_mlat, include_mlat, staging_recovered, mlat_failed) in [
+                    (false, false, false, false),
+                    (false, true, false, false),
+                    (true, false, false, false),
+                    (true, true, false, false),
+                    (false, true, true, false),
+                    (true, true, true, false),
+                    (false, true, true, true),
+                    (true, true, true, true),
+                ] {
                     let f = offline_raw_fixture(main, include_jets);
                     f.checkpoint(0);
                     if cached_mlat {
@@ -4939,7 +5195,7 @@ mod tests {
                         ..Default::default()
                     };
                     let mut calls = 0;
-                    let got = fetch_window_with_discovery(
+                    let got = fetch_window_with_sources(
                         &want,
                         &f.cache,
                         &opts,
@@ -4958,8 +5214,28 @@ mod tests {
                                     requested_mlat,
                                 )
                             } else {
-                                Err(DataError("synthetic main release lookup outage".into()))
+                                let error =
+                                    DataError("synthetic main release lookup outage".into());
+                                if staging_recovered {
+                                    let mut releases =
+                                        vec![checkpoint_release(Feed::Staging, &f.archives[0])];
+                                    if !mlat_failed {
+                                        releases.push(f.releases[1].clone());
+                                    }
+                                    Ok(crate::adsblol::ReleaseDiscovery {
+                                        releases,
+                                        prod_error: Some(error),
+                                        mlat_error: mlat_failed.then(|| {
+                                            DataError("synthetic optional lookup outage".into())
+                                        }),
+                                    })
+                                } else {
+                                    Err(error)
+                                }
                             }
+                        },
+                        |_, _, _, _| {
+                            panic!("completed raw recovery must precede staging downloads")
                         },
                         |_, _, _, _, _| panic!("completed raw recovery cannot look up staging"),
                     )

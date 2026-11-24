@@ -1074,7 +1074,8 @@ Expanded jet-inclusive stores append `+jets` to the feedset, for example
 store cannot restore jets discarded during its ingestion. This coverage requirement
 also applies to offline legacy caches and to partial-feed fallback.
 
-Availability checks look up only the main feed (prod, or staging when prod is absent).
+Availability checks look up only the main feed (prod, or validated staging when prod is
+absent or its release lookup fails).
 Fetches with MLAT disabled also skip its release lookup. With MLAT enabled, an optional
 MLAT lookup failure keeps the successfully discovered main feed and records the error in
 progress and final notes. It can retain a complete processed catalogue for that same main
@@ -1092,8 +1093,13 @@ or rebuild one from completed raw feeds and release metadata retained in sidecar
 fallback can be upgraded when verified local checkpoints contain that same main feed plus MLAT.
 The report retains its existing missing-feed warnings and adds that newer or additional feeds
 could not be checked. Feed preference, aircraft policy, certified jet coverage and midnight
-coverage checks still apply. Without verified local main-feed data, the original lookup error
-remains fatal, including when missing days would otherwise be allowed.
+coverage checks still apply. If the prod lookup fails, a separately validated staging release
+can supply an online day after compatible processed and raw main-feed caches have been tried.
+The report retains the prod error, and staging metadata goes only into `releases-staging.json`;
+the outage cannot certify that prod is absent or prevent a later online retry from finding it.
+Completed local MLAT remains eligible even when both metadata lookups fail. Without verified
+local main-feed data or a valid staging alternative, the original lookup failure remains
+fatal, including when missing days would otherwise be allowed.
 
 If discovery succeeds but an advertised fuller or preferred main archive fails during download
 or ingestion, a verified processed main-feed catalogue can still supply the day. It must cover
@@ -1225,9 +1231,10 @@ MLAT-disabled requests retain their main-only cache path.
 
 If no processed day cache is usable, `--offline` can also rebuild one from completed raw
 checkpoints and cached `releases.json` or `releases-main.json` metadata.
-An online request whose main release lookup fails tries the same local reconstruction,
-without retrying a network request or opening an archive stream. A successful recovery
-reports the lookup failure and that newer or additional feeds could not be checked.
+An online request whose main release lookup fails tries the same local reconstruction before
+using an available staging alternative. Local reconstruction opens no network request or
+archive stream. A successful recovery reports the lookup failure and that newer or additional
+feeds could not be checked.
 It validates that each release belongs to the requested day and feed, then applies the same
 raw identity checks and geoid conversion as an online retry. A usable prod checkpoint takes priority over staging. Available requested
 MLAT is reconciled with the main feed; if requested MLAT is unavailable, a main-only result
@@ -1487,7 +1494,7 @@ wind-only levels outside thermal support remain excluded.
 
 | Data | Source | Notes |
 |---|---|---|
-| ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing, or when its archive fails and no usable local main catalogue remains |
+| ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing, or when its release lookup or archive fails and no usable local main catalogue remains |
 | Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Known jets are dropped by default and retained with `--include-jets`; unknown types are kept |
 | Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. A slow service does not discard a usable profile from the other source. Radiosonde stations are selected by archive dates covering the requested sounding brackets, so a station closed today can still serve historical recordings. US country metadata includes Alaska and Hawaii stations; their full identifiers are preserved when requesting soundings, while continental stations retain their existing cache keys. The 15 °C standard atmosphere is used only if no usable profile arrives, with a warning |
 | Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search. When a requested tile cannot be loaded, use the finest cached parent down to z10, including coarse tiles prefetched for this search. If neither is usable, check the queried position's finer cached tiles through z13, finest first. Recovery never downloads another resolution, and a finer tile supplies only its own footprint inside a missing tile. Warnings distinguish parent resolution loss, distinct finer tiles used and queried positions that actually fell back to 0 m. A prefetch miss alone does not imply a zero-height observer. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
@@ -2308,6 +2315,27 @@ second weather wait; a larger footprint can require another archive download.
 ---
 
 ## Testing
+
+### Recover staging when the prod release lookup fails
+
+A prod metadata outage now permits a separately validated staging alternative after usable
+local main-feed data has been tried. Discovery regressions cover requested optional feeds,
+invalid or unavailable alternatives, unchanged full/main manifest bytes and timestamps,
+repeat prod attempts, reuse of the separate staging listing and later prod recovery.
+
+A synthetic archive regression follows truncated staging through refusal and retry, retaining
+completed MLAT bytes, then compares the published catalogue with a fresh joint build. It also
+checks offline reuse and later prod upgrades for ordinary and jet-inclusive requests.
+Existing processed/raw recovery and fresh-main MLAT regressions now cover simultaneous prod
+and MLAT metadata failures: compatible local prod retains priority, while cached MLAT can
+still join a newly downloaded staging archive.
+
+Source review, pinned changed-line formatting and whitespace checks pass. The native
+`fdop-data` test build was attempted with one compiler job, but rustc was killed by
+SIGKILL in the unchanged `zerocopy` dependency before the crate or its tests compiled.
+The workspace formatting check reports pre-existing drift. Native tests, Clippy, the
+release selftest and reference/field replays remain unverified for this change; no
+field-accuracy or performance improvement is claimed.
 
 ### Recover resolved turns through missing speed telemetry
 
@@ -5457,7 +5485,7 @@ audio or video recorded somewhere sensitive:
 | An event reads `trace follows only N % of the central frequency drop: no ridge through the CPA` | The fit joins two steady tones with nothing between them, or the pass is too faint to trace through its steepest part | Nothing to change: the event can neither drive nor confirm an answer, though it still counts as heard |
 | A search runs for an hour or more | A busy recording and a wide region: every rival is compared, at 50–70 ms of CPU per fine cell, and `fine grid N/M` on stderr shows how far it has got | Narrow `--near` to a county, a point or a box |
 | Warning `joined N of M event pairs before the quick-check budget (...)`, `N quick-check survivors > 2000000; scoring the best 2000000` or `confirmation budget: checking 2000000 of N fine candidates; rival comparison is incomplete` | The search outgrew a comparison budget | The margin gate fails and the answer grades **low**; a numerical margin is labelled provisional. Narrow the region or the dates and rerun |
-| Warning `ADS-B <day>: no mlatonly data in this catalogue, so aircraft located only by multilateration ... are missing` (or `prod release missing, using staging`) | The cache lacks a feed because its release was unavailable or its download failed | Rerun online to obtain any now-available feeds. Aircraft missing from the data can neither match nor count as unheard passes |
+| Warning `ADS-B <day>: no mlatonly data in this catalogue, so aircraft located only by multilateration ... are missing` (or `prod release unavailable, using staging`) | The cache lacks a feed because its release was unavailable or its download failed | Rerun online to obtain any now-available feeds. Aircraft missing from the data can neither match nor count as unheard passes |
 | Disk filling up | Many cached regions and days | Delete old `adsb/<date>/` folders under the cache root |
 
 ---

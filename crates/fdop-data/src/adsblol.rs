@@ -200,17 +200,18 @@ pub fn find_release(
     Ok(None)
 }
 
-/// A completed main lookup, optionally with an independently failed MLAT lookup.
-/// An optional failure must never certify a complete release listing.
+/// An available main release, optionally with failed preferred/MLAT lookups.
+/// Outages must never certify that the preferred or optional feed is absent.
 #[derive(Debug)]
 pub(crate) struct ReleaseDiscovery {
     pub releases: Vec<DayRelease>,
+    pub prod_error: Option<DataError>,
     pub mlat_error: Option<DataError>,
 }
 
 impl ReleaseDiscovery {
     fn strict(self) -> Result<Vec<DayRelease>, DataError> {
-        match self.mlat_error {
+        match self.prod_error.or(self.mlat_error) {
             Some(error) => Err(error),
             None => Ok(self.releases),
         }
@@ -220,15 +221,34 @@ impl ReleaseDiscovery {
 fn discover_day_releases(
     mut lookup: impl FnMut(Feed) -> Result<Option<DayRelease>, DataError>,
     include_mlat: bool,
+    recover_prod: bool,
 ) -> Result<ReleaseDiscovery, DataError> {
     let mut out = Vec::new();
-    match lookup(Feed::Prod)? {
-        Some(r) => out.push(r),
-        None => {
+    let mut prod_error = None;
+    match lookup(Feed::Prod) {
+        Ok(Some(r)) => out.push(r),
+        Ok(None) => {
             if let Some(r) = lookup(Feed::Staging)? {
                 out.push(r);
             }
         }
+        Err(error) if recover_prod => match lookup(Feed::Staging) {
+            Ok(Some(r)) => {
+                out.push(r);
+                prod_error = Some(error);
+            }
+            Ok(None) => {
+                return Err(DataError(format!(
+                    "{error}; no staging release available after the prod lookup failed"
+                )));
+            }
+            Err(staging_error) => {
+                return Err(DataError(format!(
+                    "{error}; staging release lookup also failed: {staging_error}"
+                )));
+            }
+        },
+        Err(error) => return Err(error),
     }
     let mut mlat_error = None;
     if include_mlat {
@@ -241,6 +261,7 @@ fn discover_day_releases(
     }
     Ok(ReleaseDiscovery {
         releases: out,
+        prod_error,
         mlat_error,
     })
 }
@@ -248,7 +269,7 @@ fn discover_day_releases(
 /// Prod and MLAT-only releases for a UTC day. Staging is looked up only when prod is missing.
 /// This public full-discovery API remains strict when either requested lookup fails.
 pub fn find_day_releases(net: &Net, y: i64, m: u32, d: u32) -> Result<Vec<DayRelease>, DataError> {
-    discover_day_releases(|feed| find_release(net, y, m, d, feed), true)?.strict()
+    discover_day_releases(|feed| find_release(net, y, m, d, feed), true, false)?.strict()
 }
 
 /// True when a listing has everything a day can have (prod and mlatonly).
@@ -361,7 +382,7 @@ pub(crate) fn find_day_releases_for_fetch_cached(
     })
 }
 
-/// Look up staging only after an advertised prod archive has failed. Keep this
+/// Look up staging after a prod lookup or advertised archive has failed. Keep this
 /// alternative separate from the preferred day listing so a later run retries prod.
 pub(crate) fn find_staging_release_for_fetch_cached(
     net: Option<&Net>,
@@ -426,7 +447,7 @@ fn cached_fetch_releases(
     dir: &Path,
     offline: bool,
     include_mlat: bool,
-    lookup: impl FnMut(Feed) -> Result<Option<DayRelease>, DataError>,
+    mut lookup: impl FnMut(Feed) -> Result<Option<DayRelease>, DataError>,
 ) -> Result<ReleaseDiscovery, DataError> {
     let full_path = dir.join("releases.json");
     let main_path = dir.join("releases-main.json");
@@ -448,6 +469,7 @@ fn cached_fetch_releases(
         if !releases.is_empty() || !offline {
             return Ok(ReleaseDiscovery {
                 releases,
+                prod_error: None,
                 mlat_error: None,
             });
         }
@@ -460,17 +482,36 @@ fn cached_fetch_releases(
     {
         return Ok(ReleaseDiscovery {
             releases,
+            prod_error: None,
             mlat_error: None,
         });
     }
     if offline {
         return Ok(ReleaseDiscovery {
             releases: Vec::new(),
+            prod_error: None,
             mlat_error: None,
         });
     }
-    let found = discover_day_releases(lookup, include_mlat)?;
-    if !found.releases.is_empty() {
+    let mut prod_failed = false;
+    let found = discover_day_releases(
+        |feed| {
+            if feed == Feed::Staging && prod_failed {
+                // An outage is not proof that prod is absent. Validate and cache only
+                // this alternative, reusing it when the requested day preflight and
+                // fetch repeat discovery. Never advance the full/main listing.
+                return cached_staging_release(y, m, d, dir, || lookup(feed));
+            }
+            let result = lookup(feed);
+            if feed == Feed::Prod {
+                prod_failed = result.is_err();
+            }
+            result
+        },
+        include_mlat,
+        true,
+    )?;
+    if found.prod_error.is_none() && !found.releases.is_empty() {
         let path = if include_mlat && found.mlat_error.is_none() {
             &full_path
         } else {
@@ -646,16 +687,169 @@ mod tests {
     }
 
     #[test]
-    fn main_lookup_errors_remain_fatal() {
-        let dir = cache_dir("main-error");
-        let error = cached_fetch_releases(2026, 9, 8, &dir, false, true, |feed| {
-            assert_eq!(feed, Feed::Prod);
-            Err(DataError("main API unavailable".into()))
-        })
+    fn prod_lookup_outage_recovers_staging_without_certifying_prod_absence() {
+        for (include_mlat, mlat_available) in [(false, false), (true, true), (true, false)] {
+            for existing in [false, true] {
+                let dir = cache_dir("prod-outage");
+                let full = dir.join("releases.json");
+                let main = dir.join("releases-main.json");
+                if existing {
+                    let provisional = fdop_types::time::unix_from_utc(2026, 9, 9, 1, 0, 0.0);
+                    for path in [&full, &main] {
+                        write_listing(path, &[cached_release(Feed::Prod)], provisional);
+                    }
+                }
+                let before = [&full, &main].map(|path| {
+                    (
+                        std::fs::read(path).ok(),
+                        std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+                    )
+                });
+                let staging = cached_release(Feed::Staging);
+                let mut calls = Vec::new();
+                let found = cached_fetch_releases(2026, 9, 8, &dir, false, include_mlat, |feed| {
+                    calls.push(feed);
+                    match feed {
+                        Feed::Prod => Err(DataError("main API unavailable".into())),
+                        Feed::Staging => Ok(Some(staging.clone())),
+                        Feed::Mlatonly if include_mlat && mlat_available => {
+                            Ok(Some(cached_release(feed)))
+                        }
+                        Feed::Mlatonly if include_mlat => {
+                            Err(DataError("optional API unavailable".into()))
+                        }
+                        Feed::Mlatonly => panic!("MLAT was not requested"),
+                    }
+                })
+                .expect("a usable staging release must survive the prod lookup outage");
+                let mut expected = vec![staging.clone()];
+                let mut expected_calls = vec![Feed::Prod, Feed::Staging];
+                if include_mlat {
+                    expected_calls.push(Feed::Mlatonly);
+                    if mlat_available {
+                        expected.push(cached_release(Feed::Mlatonly));
+                    }
+                }
+                assert_eq!(calls, expected_calls);
+                assert_eq!(found.releases, expected);
+                assert!(
+                    found
+                        .prod_error
+                        .as_ref()
+                        .unwrap()
+                        .to_string()
+                        .contains("main API")
+                );
+                assert_eq!(found.mlat_error.is_some(), include_mlat && !mlat_available);
+                assert!(found.strict().unwrap_err().to_string().contains("main API"));
+                for (path, (bytes, modified)) in [&full, &main].into_iter().zip(before) {
+                    assert_eq!(std::fs::read(path).ok(), bytes);
+                    assert_eq!(
+                        std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+                        modified,
+                        "an outage cannot certify that prod is absent"
+                    );
+                }
+                let alternative = dir.join("releases-staging.json");
+                assert_eq!(
+                    read_cached_listing(&alternative).unwrap(),
+                    [staging.clone()]
+                );
+                // Availability preflight and fetch can repeat discovery. Reuse the
+                // validated alternative, but keep trying prod on each online request.
+                let settled = fdop_types::time::unix_from_utc(2026, 9, 11, 1, 0, 0.0);
+                write_listing(&alternative, std::slice::from_ref(&staging), settled);
+                let mut retries = Vec::new();
+                let retried =
+                    cached_fetch_releases(2026, 9, 8, &dir, false, include_mlat, |feed| {
+                        retries.push(feed);
+                        match feed {
+                            Feed::Prod => Err(DataError("main API still unavailable".into())),
+                            Feed::Staging => panic!("the complete alternative is already cached"),
+                            Feed::Mlatonly => Ok(Some(cached_release(feed))),
+                        }
+                    })
+                    .unwrap();
+                assert!(retried.prod_error.is_some());
+                assert_eq!(
+                    retries,
+                    if include_mlat {
+                        vec![Feed::Prod, Feed::Mlatonly]
+                    } else {
+                        vec![Feed::Prod]
+                    }
+                );
+                let mut upgraded = Vec::new();
+                let preferred =
+                    cached_fetch_releases(2026, 9, 8, &dir, false, include_mlat, |feed| {
+                        upgraded.push(feed);
+                        assert_ne!(feed, Feed::Staging, "successful prod never needs staging");
+                        Ok(Some(cached_release(feed)))
+                    })
+                    .unwrap();
+                assert!(preferred.prod_error.is_none() && preferred.mlat_error.is_none());
+                assert_eq!(upgraded, retries);
+                let expected: Vec<_> = upgraded.into_iter().map(cached_release).collect();
+                assert_eq!(preferred.strict().unwrap(), expected);
+                let path = if include_mlat { &full } else { &main };
+                assert_eq!(read_cached_listing(path).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn main_lookup_errors_remain_fatal_without_valid_staging() {
+        for problem in ["absent", "outage", "feed", "repo", "day", "parts"] {
+            let dir = cache_dir("main-error");
+            let mut calls = Vec::new();
+            let error = cached_fetch_releases(2026, 9, 8, &dir, false, true, |feed| {
+                calls.push(feed);
+                if feed == Feed::Prod {
+                    return Err(DataError("main API unavailable".into()));
+                }
+                assert_eq!(feed, Feed::Staging, "no main feed means no optional lookup");
+                if problem == "absent" {
+                    return Ok(None);
+                }
+                if problem == "outage" {
+                    return Err(DataError("staging API unavailable".into()));
+                }
+                let mut invalid = cached_release(Feed::Staging);
+                match problem {
+                    "feed" => invalid = cached_release(Feed::Prod),
+                    "repo" => invalid.repo = repo_for_year(2025),
+                    "day" => {
+                        invalid.tag = tag_for(2026, 9, 7, Feed::Staging, 0);
+                        invalid.parts[0].name = format!("{}.tar", invalid.tag);
+                    }
+                    "parts" => invalid.parts[0].name.push_str(".ab"),
+                    _ => unreachable!(),
+                }
+                Ok(Some(invalid))
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("main API"), "{problem}: {error}");
+            assert!(error.to_string().contains("staging"), "{problem}: {error}");
+            assert_eq!(calls, [Feed::Prod, Feed::Staging]);
+            for name in [
+                "releases.json",
+                "releases-main.json",
+                "releases-staging.json",
+            ] {
+                assert!(!dir.join(name).exists(), "{problem}: {name}");
+            }
+        }
+        // The public full-discovery path remains strict and does not add lookups.
+        let error = discover_day_releases(
+            |feed| {
+                assert_eq!(feed, Feed::Prod);
+                Err(DataError("strict main API unavailable".into()))
+            },
+            true,
+            false,
+        )
         .unwrap_err();
-        assert!(error.to_string().contains("main API"));
-        assert!(!dir.join("releases.json").exists());
-        assert!(!dir.join("releases-main.json").exists());
+        assert_eq!(error.to_string(), "strict main API unavailable");
     }
 
     #[test]
