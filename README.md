@@ -765,7 +765,7 @@ Original tags remain in the report, including unusable timestamps.
 Decoding preserves elapsed recording time: missing packet intervals become silence, and audio delayed
 relative to video retains that delay. The container's arbitrary starting timestamp is normalized without
 collapsing internal gaps. Tones are not stretched to repair timing, so a gap does not shift later flyovers
-or change their Doppler frequencies.
+or change their Doppler frequencies. A decoder-reported corrupt packet or a nonfinite PCM sample stops the run before measurement.
 
 | Shared option | Meaning |
 |---|---|
@@ -994,7 +994,7 @@ Each `locate` run writes a directory:
 
 | File | Contents |
 |---|---|
-| `report.html` | Single-page report with a Leaflet map (USGS Topo, USGS Imagery and OSM layers), heat map, top candidates and answer circle. The map loads Leaflet and tiles from the internet |
+| `report.html` | Single-page report with local figures, candidates and the location estimate. Choose **Load online interactive map** to load Leaflet and request tiles covering the estimated area. A refusal shows its reason without offering a map |
 | `report.md` | The same report in Markdown: answer, gates, ranked candidates, events, funnel, margin, timings, warnings, data attribution |
 | `map.png`, `map.svg` | Static 1024² map on USGS Topo tiles with the radius ring and runner-up markers |
 | `result.json` | Everything: answer and gates, place, top 25 candidates, events, chance-match calibration, atmosphere, funnel, margin, warnings, heat map, figures, timings |
@@ -5411,7 +5411,7 @@ audio or video recorded somewhere sensitive:
 - **Atmosphere:** a straight-ray, height-averaged speed of sound with horizontal wind only. No refraction.
 - **Data volume:** each new UTC day costs about 4 GB of download, and adsb.lol archives cannot be fetched
   partially. adsb.lol has gaps on some days.
-- **The HTML report's map needs internet** to load Leaflet and tiles. `map.png` is self-contained.
+- **Opening the HTML report works offline.** It shows the local `map.png` when available. Activating the optional interactive map contacts unpkg and the selected tile provider.
 - **High grades at one site only.** The reference recording, and a public osprey cam at the same
   site on a different day with different flights, have both produced high grades. The reference recording's
   grade depends on the search configuration; see the archived results in [Honest status](#honest-status).
@@ -5565,7 +5565,7 @@ audio or video recorded somewhere sensitive:
 
 ## FAQ
 
-**Does it use the GPS tag in my file?** No. If the container has a location tag, `fdop` says it ignored it. It
+**Does it use the GPS tag in my file?** No. When the probe recognizes a location tag, `fdop` reports its presence and omits the tag's coordinates from the warning. It
 does use `creation_time` to narrow the clock search, unless you pass `--ignore-metadata-time`.
 
 **Why does it need two flyovers?** One curve gives a speed, a closest distance and a moment, which places the

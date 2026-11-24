@@ -19,6 +19,15 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recording audits, long recordings, cache integrity and private report viewing
+
+- [Structured audits](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/7398306c8f7f807569a12d16c6134d2662fed18f) add `fdop detect --json` and identify the independent aircraft passes on the selected audio. The audit retains individual fits, selection, duration and warnings, including the presence of a recognized location tag.
+- [Audio decoding](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/e3d20dbf102a20728acbc0c52de1520d3db96200) rejects decoder-reported corruption and nonfinite samples. In a synthetic WAV check, removing 200 whole samples let FFmpeg emit a 15,800-sample prefix with success under its previous settings. The strict decoder option reported the corrupt packet and failed.
+- [Survey normalization](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/0dfe8a5f092531beb96c99ca6865110bbaa93127) updates the frequency median incrementally and shares scratch storage between the ordinary and contrast paths. [Curve-image construction](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/fbc201a654ddbb75ceb4e59f4a55b11999b6e4fb) reuses the original row buffer for the final harmonic image and computes each visible harmonic weight norm once per frequency row. The isolated median regression passed on the pinned compiler.
+- The [day-store reader and writer](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/676f8adf05b3f5e487b10d791ce37091d5d91a72) handle at most 4,096 packed points per batch. The reader parses the declared metadata span and grows a leg from completed reads. The `FDOPTRK1` format is compatible with existing caches.
+- Opening a generated HTML report displays local content. The interactive map contacts its providers only after activation and runs in a sandboxed frame. HTML and Markdown refusals show the reason without coordinates, radius or map links. The location-tag warning in a locate report omits the input tag's coordinates.
+- Regressions cover noise and a recovered pass in the JSON audit, corrupt audio, truncated store records, the visible-harmonic sum and refusal rendering. Workspace tests, the release selftest and field replays were unavailable after the build host disconnected.
+
 ### Join cached MLAT with a freshly ingested main archive
 
 - When optional MLAT metadata is unavailable and no local main feed can complete the day,

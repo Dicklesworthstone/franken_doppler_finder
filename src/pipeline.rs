@@ -1676,10 +1676,10 @@ fn locate_with_clock(
             .map_or_else(|| "mix".into(), |c| c.to_string()),
         info.creation_time
     ));
-    if let Some((la, lo)) = info.location_latlon {
-        warnings.push(format!(
-            "the file itself carries a location tag ({la:.5},{lo:.5}); the search below ignores it and is independent"
-        ));
+    if info.location_latlon.is_some() {
+        warnings.push(
+            "the file carries a readable location tag. The acoustic search ignores it.".into(),
+        );
     }
     let ctx = RegionContext::new(a.cache.clone(), !a.offline);
     let region: Region =

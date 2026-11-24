@@ -29,6 +29,16 @@ pub struct Answer {
     pub gates: Vec<(String, bool, String)>,
 }
 
+impl Answer {
+    fn has_location(&self) -> bool {
+        self.confidence != "none"
+            && (-90.0..=90.0).contains(&self.lat)
+            && (-180.0..=180.0).contains(&self.lon)
+            && self.radius_m.is_finite()
+            && self.radius_m >= 0.0
+    }
+}
+
 /// One event explained by one ADS-B flight at a candidate place and clock.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MatchRow {
@@ -406,10 +416,12 @@ pub fn render_markdown(inp: &ReportInput) -> String {
         o.push_str(&format!("**{}**\n\n", p.headline));
     }
     o.push_str(&format!(
-        "- **Location:** {:.6}, {:.6} (±{:.0} m)\n- **Confidence:** {}\n- **Verdict:** {}\n",
-        a.lat,
-        a.lon,
-        a.radius_m,
+        "- **Location:** {}\n- **Confidence:** {}\n- **Verdict:** {}\n",
+        if a.has_location() {
+            format!("{:.6}, {:.6} (±{:.0} m)", a.lat, a.lon, a.radius_m)
+        } else {
+            "No location found".into()
+        },
         if a.confidence.is_empty() {
             "–"
         } else {
@@ -428,12 +440,16 @@ pub fn render_markdown(inp: &ReportInput) -> String {
         "- **Search:** region {}; dates {}\n- **Generated:** {} by {} {}\n",
         inp.region, inp.dates, inp.created_utc, inp.tool, inp.version
     ));
-    o.push_str(&format!(
-        "- **Maps:** [OpenStreetMap](https://www.openstreetmap.org/?mlat={lat:.6}&mlon={lon:.6}#map=16/{lat:.6}/{lon:.6}) · \
-         [USGS National Map](https://apps.nationalmap.gov/viewer/?center={lon:.6},{lat:.6}&level=15)\n\n",
-        lat = a.lat,
-        lon = a.lon
-    ));
+    if a.has_location() {
+        o.push_str(&format!(
+            "- **Maps:** [OpenStreetMap](https://www.openstreetmap.org/?mlat={lat:.6}&mlon={lon:.6}#map=16/{lat:.6}/{lon:.6}) · \
+             [USGS National Map](https://apps.nationalmap.gov/viewer/?center={lon:.6},{lat:.6}&level=15)\n\n",
+            lat = a.lat,
+            lon = a.lon
+        ));
+    } else {
+        o.push('\n');
+    }
     if let Some(p) = &inp.place {
         o.push_str("## Place\n\n");
         let row = |k: &str, v: &Option<String>| {
@@ -617,10 +633,14 @@ fn md_to_html_table(md: &str) -> String {
 pub fn render_html(inp: &ReportInput, out_dir: &Path) -> Result<PathBuf, GeoError> {
     std::fs::create_dir_all(out_dir)?;
     let a = &inp.answer;
-    let title = inp.place.as_ref().map_or_else(
-        || format!("{:.5}, {:.5}", a.lat, a.lon),
-        |p| p.headline.clone(),
-    );
+    let title = if a.has_location() {
+        inp.place.as_ref().map_or_else(
+            || format!("{:.5}, {:.5}", a.lat, a.lon),
+            |p| p.headline.clone(),
+        )
+    } else {
+        "No location found".into()
+    };
     let cands: Vec<serde_json::Value> = inp
         .candidates
         .iter()
@@ -696,15 +716,21 @@ pub fn render_html(inp: &ReportInput, out_dir: &Path) -> Result<PathBuf, GeoErro
         }
         place.push_str("</ul>");
     }
+    let mut local_map = String::new();
     let mut figs = String::new();
-    if !inp.figures.is_empty() {
-        figs.push_str("<h2>Figures</h2>");
-        for (cap, path) in &inp.figures {
-            figs.push_str(&format!(
-                "<figure><a href=\"{p}\"><img src=\"{p}\" alt=\"{c}\" loading=\"lazy\"></a><figcaption>{c}</figcaption></figure>",
-                p = esc(path),
-                c = esc(cap)
-            ));
+    for (cap, path) in &inp.figures {
+        let figure = format!(
+            "<figure><a href=\"./{p}\"><img src=\"./{p}\" alt=\"{c}\" loading=\"lazy\"></a><figcaption>{c}</figcaption></figure>",
+            p = esc(path),
+            c = esc(cap)
+        );
+        if path == "map.png" {
+            local_map = figure;
+        } else {
+            if figs.is_empty() {
+                figs.push_str("<h2>Figures</h2>");
+            }
+            figs.push_str(&figure);
         }
     }
     let mut warn = String::new();
@@ -761,56 +787,27 @@ pub fn render_html(inp: &ReportInput, out_dir: &Path) -> Result<PathBuf, GeoErro
     } else {
         format!("<h2>Atmosphere</h2><p>{}</p>", esc(&inp.atmosphere))
     };
-    // `</` inside a <script> JSON literal must not close the script element.
+    // Keep report strings out of HTML's script-tag parsing states, including comments.
     let data_js = serde_json::to_string(&data)
         .unwrap_or_else(|_| "{}".into())
-        .replace("</", "<\\/");
-    let html = format!(
-        r##"<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title_e} — Doppler geolocation</title>
+        .replace('<', "\\u003c");
+    let map = if a.has_location() {
+        format!(
+            r##"<section aria-label="Map">
+{local_map}
+<p><button type="button" id="load-map" disabled>Load online interactive map</button>
+Loading contacts unpkg for Leaflet and requests tiles covering the displayed area from the selected map provider.</p>
+<iframe id="online-map" title="Interactive map of the estimated area" sandbox="allow-scripts" referrerpolicy="no-referrer" hidden></iframe>
+</section>
+<template id="map-content">
+<meta name="referrer" content="no-referrer">
 <link rel="stylesheet" href="{css}" integrity="{css_sri}" crossorigin="">
 <script src="{js}" integrity="{js_sri}" crossorigin=""></script>
-<style>
- body {{ font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 0; color: #1b1f24; }}
- header {{ padding: 14px 20px; background: #0f2a3d; color: #fff; }}
- header h1 {{ margin: 0 0 4px; font-size: 21px; }}
- header .sub {{ opacity: .85; font-size: 14px; }}
- main {{ padding: 0 20px 30px; max-width: 1400px; }}
- #map {{ height: 560px; margin: 16px 0; border: 1px solid #c8d0d8; border-radius: 6px; }}
- table {{ border-collapse: collapse; font-size: 13px; margin: 8px 0 18px; }}
- th, td {{ border: 1px solid #d5dbe1; padding: 4px 7px; text-align: left; white-space: nowrap; }}
- th {{ background: #eef2f6; }}
- td.pass {{ color: #11723a; font-weight: 600; }} td.fail {{ color: #b3261e; font-weight: 700; }}
- .kv b {{ display: inline-block; min-width: 110px; }}
- figure {{ margin: 12px 0; }} figure img {{ max-width: 100%; border: 1px solid #d5dbe1; }}
- figcaption {{ font-size: 13px; color: #555; }}
- .warn li {{ color: #8a4b00; }}
- .scroll {{ overflow-x: auto; }}
- .note {{ font-size: 13px; color: #555; max-width: 1000px; }}
- footer {{ font-size: 12px; color: #666; padding: 12px 20px; border-top: 1px solid #e3e7eb; }}
-</style></head>
-<body>
-<header><h1>{title_e}</h1>
-<div class="sub">{lat:.6}, {lon:.6} &nbsp;±{rad:.0} m &nbsp;·&nbsp; confidence: {conf} &nbsp;·&nbsp; {verdict}</div></header>
-<main>
-<div id="map"></div>
-<div class="kv"><p><b>Recording</b> {file}<br><b>Dates</b> {dates}<br><b>Region</b> {region}<br><b>Radius basis</b> {basis}<br><b>Generated</b> {created} by {tool} {version}</p></div>
-{gates}
-{place}
-<h2>Winning matches</h2><div class="scroll">{match_html}</div>
-<h2>Ranked candidates</h2><div class="scroll">{cand_html}</div>
-<h2>Events</h2><div class="scroll">{ev_html}</div>
-{calib_html}
-{atmo_html}
-{warn}
-{figs}
-{jsonblocks}
-</main>
-<footer>Aircraft tracks © adsb.lol contributors (ODbL 1.0) · Basemaps: USGS The National Map (public domain), © OpenStreetMap contributors · Places / ZCTAs: US Census Bureau · Terrain: AWS Terrain Tiles.
-The answer is a cluster centre with an uncertainty radius, not a street address.</footer>
+<style>html, body, #map {{ height: 100%; margin: 0; }}</style>
+<div id="map">If the online map is unavailable, the estimate and radius are in the report.</div>
 <script>
+if (window.L) {{
+document.getElementById('map').textContent = '';
 const D = {data_js};
 const topo = L.tileLayer('https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{{z}}/{{y}}/{{x}}',
   {{maxZoom: 19, maxNativeZoom: 16, attribution: 'USGS The National Map'}});
@@ -829,27 +826,95 @@ if (D.heat && D.heat.length) {{
 }}
 const cg = L.layerGroup();
 for (const c of D.candidates) {{
+  const label = document.createElement('span');
+  label.textContent = '#' + c.rank + ' ' + c.flights + ' (evidence ' + c.evidence.toFixed(1) + ' nats)';
   L.circleMarker([c.lat, c.lon], {{radius: c.rank === 1 ? 6 : 4, color: '#1f4e9e', weight: 1, fillOpacity: 0.8}})
-    .bindTooltip('#' + c.rank + ' ' + c.flights + ' (evidence ' + c.evidence.toFixed(1) + ' nats)').addTo(cg);
+    .bindTooltip(label).addTo(cg);
 }}
 cg.addTo(map); overlays['Candidates'] = cg;
 const circle = L.circle([D.lat, D.lon], {{radius: D.radius, color: '#d7191c', weight: 3, fill: false}}).addTo(map);
-L.marker([D.lat, D.lon]).bindPopup('<b>' + D.title + '</b><br>' + D.lat.toFixed(6) + ', ' + D.lon.toFixed(6) + '<br>±' + Math.round(D.radius) + ' m').addTo(map);
+const popup = document.createElement('span');
+popup.textContent = D.title + ' · ' + D.lat.toFixed(6) + ', ' + D.lon.toFixed(6) + ' ±' + Math.round(D.radius) + ' m';
+L.marker([D.lat, D.lon]).bindPopup(popup).addTo(map);
 overlays['Answer radius'] = circle;
 L.control.layers({{'USGS Topo': topo, 'USGS Imagery': imagery, 'OpenStreetMap': osm}}, overlays).addTo(map);
 L.control.scale({{imperial: true, metric: true}}).addTo(map);
 map.fitBounds(circle.getBounds().pad(1.5));
+}}
 </script>
+</template>
+<script>
+const loadMap = document.getElementById('load-map');
+loadMap.disabled = false;
+loadMap.addEventListener('click', () => {{
+  const frame = document.getElementById('online-map');
+  frame.srcdoc = '<!doctype html>' + document.getElementById('map-content').innerHTML;
+  frame.hidden = false;
+  loadMap.hidden = true;
+}}, {{once: true}});
+</script>"##,
+            css = LEAFLET_CSS,
+            css_sri = LEAFLET_CSS_SRI,
+            js = LEAFLET_JS,
+            js_sri = LEAFLET_JS_SRI,
+        )
+    } else {
+        String::new()
+    };
+    let location = if a.has_location() {
+        format!(
+            "{:.6}, {:.6} &nbsp;±{:.0} m &nbsp;·&nbsp; ",
+            a.lat, a.lon, a.radius_m
+        )
+    } else {
+        String::new()
+    };
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title_e} — Doppler geolocation</title>
+<style>
+ body {{ font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 0; color: #1b1f24; }}
+ header {{ padding: 14px 20px; background: #0f2a3d; color: #fff; }}
+ header h1 {{ margin: 0 0 4px; font-size: 21px; }}
+ header .sub {{ opacity: .85; font-size: 14px; }}
+ main {{ padding: 0 20px 30px; max-width: 1400px; }}
+ #online-map {{ width: 100%; height: 560px; margin: 16px 0; border: 1px solid #c8d0d8; border-radius: 6px; }}
+ table {{ border-collapse: collapse; font-size: 13px; margin: 8px 0 18px; }}
+ th, td {{ border: 1px solid #d5dbe1; padding: 4px 7px; text-align: left; white-space: nowrap; }}
+ th {{ background: #eef2f6; }}
+ td.pass {{ color: #11723a; font-weight: 600; }} td.fail {{ color: #b3261e; font-weight: 700; }}
+ .kv b {{ display: inline-block; min-width: 110px; }}
+ figure {{ margin: 12px 0; }} figure img {{ max-width: 100%; border: 1px solid #d5dbe1; }}
+ figcaption {{ font-size: 13px; color: #555; }}
+ .warn li {{ color: #8a4b00; }}
+ .scroll {{ overflow-x: auto; }}
+ .note {{ font-size: 13px; color: #555; max-width: 1000px; }}
+ footer {{ font-size: 12px; color: #666; padding: 12px 20px; border-top: 1px solid #e3e7eb; }}
+</style></head>
+<body>
+<header><h1>{title_e}</h1>
+<div class="sub">{location}confidence: {conf} &nbsp;·&nbsp; {verdict}</div></header>
+<main>
+{map}
+<div class="kv"><p><b>Recording</b> {file}<br><b>Dates</b> {dates}<br><b>Region</b> {region}<br><b>Radius basis</b> {basis}<br><b>Generated</b> {created} by {tool} {version}</p></div>
+{gates}
+{place}
+<h2>Winning matches</h2><div class="scroll">{match_html}</div>
+<h2>Ranked candidates</h2><div class="scroll">{cand_html}</div>
+<h2>Events</h2><div class="scroll">{ev_html}</div>
+{calib_html}
+{atmo_html}
+{warn}
+{figs}
+{jsonblocks}
+</main>
+<footer>Aircraft tracks © adsb.lol contributors (ODbL 1.0) · Basemaps: USGS The National Map (public domain), © OpenStreetMap contributors · Places / ZCTAs: US Census Bureau · Terrain: AWS Terrain Tiles.
+The answer is a cluster centre with an uncertainty radius, not a street address.</footer>
 </body></html>
 "##,
         title_e = esc(&title),
-        css = LEAFLET_CSS,
-        css_sri = LEAFLET_CSS_SRI,
-        js = LEAFLET_JS,
-        js_sri = LEAFLET_JS_SRI,
-        lat = a.lat,
-        lon = a.lon,
-        rad = a.radius_m,
         conf = esc(if a.confidence.is_empty() {
             "–"
         } else {
@@ -1097,16 +1162,53 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn html_has_map_and_circle() {
+    fn html_keeps_online_map_resources_inert_until_requested() {
         let dir = std::env::temp_dir().join(format!("fdop-geo-html-{}", std::process::id()));
-        let p = render_html(&sample(), &dir).unwrap();
+        let mut input = sample();
+        input
+            .figures
+            .push(("Estimated area".into(), "map.png".into()));
+        let p = render_html(&input, &dir).unwrap();
         let h = std::fs::read_to_string(p).unwrap();
         assert!(h.contains("L.circle([D.lat, D.lon]"));
         assert!(h.contains("\"lat\":40.876466"));
         assert!(h.contains("basemap.nationalmap.gov"));
         assert!(h.contains("test warning &lt;b&gt;"));
         assert!(h.contains("<th>rank</th>"));
-        assert!(h.contains(LEAFLET_JS_SRI));
+        let (before, template) = h.split_once("<template id=\"map-content\">").unwrap();
+        let (inert, after) = template.split_once("</template>").unwrap();
+        for active in [before, after] {
+            assert!(!active.contains("https://"));
+        }
+        assert!(before.contains("src=\"./map.png\""));
+        assert!(inert.contains(LEAFLET_JS_SRI));
+        assert!(after.contains("loadMap.addEventListener('click'"));
+        assert!(after.contains("frame.srcdoc ="));
+    }
+
+    #[test]
+    fn refusal_reports_explain_why_without_offering_a_map() {
+        let mut input = sample();
+        input.place = None;
+        input.candidates.clear();
+        input.answer = Answer {
+            lat: f64::NAN,
+            lon: f64::NAN,
+            radius_m: f64::NAN,
+            confidence: "none".into(),
+            verdict: "need two usable flyovers".into(),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir().join(format!("fdop-geo-refusal-{}", std::process::id()));
+        let html = std::fs::read_to_string(render_html(&input, &dir).unwrap()).unwrap();
+        let markdown = render_markdown(&input);
+        for report in [&html, &markdown] {
+            assert!(report.contains("No location found"));
+            assert!(report.contains("need two usable flyovers"));
+            assert!(!report.contains("NaN"));
+        }
+        assert!(!html.contains("load-map"));
+        assert!(!markdown.contains("mlat="));
     }
 
     #[test]
