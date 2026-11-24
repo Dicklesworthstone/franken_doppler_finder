@@ -170,6 +170,33 @@ impl SearchEvent {
         outward.is_finite().then_some(outward)
     }
 
+    /// Physical source support for the fitted constant-velocity trace in a homogeneous
+    /// medium with subsonic wind and source motion relative to the air. `c_max` must be a
+    /// certified upper bound on every candidate's path-averaged sound speed, not an estimate
+    /// from sampled locations.
+    ///
+    /// For wind `w`, let `a = c² - |w|²`. Completing the moving-medium wavefront's
+    /// quadratic maps a physical position `r` to the fitted range
+    /// `R_fit = c_fit * sqrt((w·r)² + a*|r|²) / a` at the same received-time offset
+    /// from the fitted centre. Hence `|r| <= sqrt(a)/c_fit * R_fit <= c_max/c_fit * R_fit`;
+    /// no extra wind allowance is needed. This does not bound arbitrary curved tracks
+    /// or propagation with ray bending or spatial gradients.
+    ///
+    /// Cold air may give a smaller radius. Callers expanding an existing catalogue
+    /// footprint must retain it when it is larger, or when this returns `None`.
+    pub fn physical_catalogue_radius_m(&self, c_max: f64) -> Option<f64> {
+        if !(c_max > 0.0 && c_max.is_finite()) {
+            return None;
+        }
+        let fitted = self.catalogue_radius_m()?;
+        if c_max == self.c_fit {
+            return Some(fitted);
+        }
+        let scale = (c_max / self.c_fit).next_up();
+        let physical = (fitted * scale).next_up();
+        physical.is_finite().then_some(physical)
+    }
+
     /// Build from a quality-passing measured event. `wind_mps` retains the extra speed
     /// allowance in fitted coordinates; each candidate's propagation medium maps its motion.
     pub fn from_measured(m: &MeasuredEvent, wind_mps: f64) -> Option<Self> {
@@ -16545,6 +16572,100 @@ mod catalogue_support_tests {
             }
             assert!(ev.catalogue_radius_m().is_none(), "invalid case {bad}");
         }
+    }
+
+    #[test]
+    fn physical_catalogue_radius_preserves_fit_scale_and_checks_the_sound_speed_bound() {
+        let mut ev = event();
+        let fitted = ev.catalogue_radius_m().unwrap();
+        assert_eq!(ev.physical_catalogue_radius_m(ev.c_fit), Some(fitted));
+        let cold = ev.physical_catalogue_radius_m(300.0).unwrap();
+        assert!(cold >= fitted * (300.0 / ev.c_fit) && cold < fitted);
+        let warm = ev.physical_catalogue_radius_m(365.0).unwrap();
+        assert!(warm >= fitted * (365.0 / ev.c_fit) && warm > fitted);
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            assert!(
+                ev.physical_catalogue_radius_m(invalid).is_none(),
+                "invalid or overflowing c_max={invalid}"
+            );
+        }
+        ev.tr_t.clear();
+        assert!(ev.physical_catalogue_radius_m(365.0).is_none());
+    }
+
+    #[test]
+    fn physical_catalogue_radius_encloses_calm_and_windy_emission_positions() {
+        // Independently solve the expanding wavefront |r + w*T| = c*T, rather than
+        // using either Prop's quadratic root or the fitted-curve inverse in the bound.
+        let receive = |prop: Prop, r: V3, emitted: f64| {
+            let (mut lo, mut hi) = (0.0, norm(r) / (prop.c - norm(prop.w)));
+            for _ in 0..80 {
+                let travel = 0.5 * (lo + hi);
+                let displaced = std::array::from_fn(|i| r[i] + prop.w[i] * travel);
+                if norm(displaced) > prop.c * travel {
+                    lo = travel;
+                } else {
+                    hi = travel;
+                }
+            }
+            emitted + 0.5 * (lo + hi)
+        };
+        let (mut tested, mut tolerance_samples, mut warm_misses) = (0, 0, 0);
+        for c in [300.0, 343.0, 365.0] {
+            for w in [
+                [0.0; 3],
+                [40.0, 0.0, 0.0],
+                [-80.0, 0.0, 0.0],
+                [0.0, 60.0, 0.0],
+                [32.0, -24.0, 10.0],
+                [-32.0, 24.0, -10.0],
+            ] {
+                let prop = Prop { c, w };
+                for (rv, velocity) in [
+                    ([0.0, 15_000.0, 3000.0], [200.0, 0.0, 0.0]),
+                    ([-9125.0, 12_000.0, 1000.0], [160.0, 120.0, 20.0]),
+                ] {
+                    assert_eq!(dot(rv, velocity), 0.0);
+                    let mut ev = event();
+                    let (speed, distance) = prop.fit_geometry(rv, velocity, ev.c_fit).unwrap();
+                    ev.v_gate = [speed; 2];
+                    ev.d_gate = [distance; 2];
+                    ev.t_rec = 1000.0 + prop.fit_center_offset(rv, velocity);
+                    ev.t_tol = 5.0;
+                    ev.tr_t = vec![ev.t_rec - 240.0, ev.t_rec + 120.0];
+                    let fitted = ev.catalogue_radius_m().unwrap();
+                    let physical = ev.physical_catalogue_radius_m(c).unwrap();
+                    let mut included = 0;
+                    for k in -100..=50 {
+                        let emitted = 10.0 * f64::from(k);
+                        let r = std::array::from_fn(|i| rv[i] + velocity[i] * emitted);
+                        let offset = 1000.0 + receive(prop, r, emitted) - ev.t_rec;
+                        if !(-245.0..=125.0).contains(&offset) {
+                            continue;
+                        }
+                        let range = norm(r);
+                        assert!(
+                            range <= physical,
+                            "c={c} w={w:?} v={velocity:?} emitted={emitted} offset={offset} range={range} bound={physical}"
+                        );
+                        if !(-240.0..=120.0).contains(&offset) {
+                            tolerance_samples += 1;
+                        }
+                        if c == 365.0 && w == [0.0; 3] && range > fitted {
+                            warm_misses += 1;
+                        }
+                        included += 1;
+                    }
+                    assert!(included > 20);
+                    tested += included;
+                }
+            }
+        }
+        assert!(tested > 1000 && tolerance_samples > 0);
+        assert!(
+            warm_misses > 0,
+            "warm-air physical source positions must expose the old fitted-radius crop"
+        );
     }
 
     fn long_measurement(speed: f64) -> MeasuredEvent {

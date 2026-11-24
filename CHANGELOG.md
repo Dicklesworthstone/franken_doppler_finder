@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain weather-expanded physical flight positions before search
+
+- Select each attempt's atmosphere before choosing its ADS-B footprint. Expand fitted
+  CPA and received-trace support by the provider's certified upper sound speed divided
+  by the event's fit sound speed; preserve the previous footprint in cold or unknown
+  weather and warn when no certified bound is available. Terrain follows physical CPA
+  support, and the separate curve catalogue receives the same expanded box.
+- Poll unfinished weather once after archive loading. Adopt a late profile with the
+  existing catalogue when it covers the new footprint, otherwise after a successful
+  expanded fetch. Failed expansion keeps the earlier usable atmosphere and catalogue
+  with a warning. Metadata retries recalculate coverage from their own weather.
+- Add physical wavefront, actual store-crop, cold/unknown compatibility and late-weather
+  regressions. Independent Python calculations checked the geometry, including source
+  positions lost by the old footprint. Source review and whitespace checks passed;
+  native Rust checks, the release selftest and reference/field replays could not run
+  because this environment has no Rust toolchain, RCH or dsr. The enclosure covers the
+  existing homogeneous constant-velocity model, not arbitrary curved tracks or global
+  geodesic coverage. No field-accuracy or runtime improvement is claimed.
+
 ### Recording audits, long recordings, cache integrity and private report viewing
 
 - [Structured audits](https://github.com/Dicklesworthstone/franken_doppler_finder/commit/7398306c8f7f807569a12d16c6134d2662fed18f) add `fdop detect --json` and identify the independent aircraft passes on the selected audio. The audit retains individual fits, selection, duration and warnings, including the presence of a recognized location tag.

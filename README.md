@@ -1523,10 +1523,17 @@ Design notes:
   The bound uses the retained trace times, generous distance and CPA-time ranges, and the
   largest speed allowance of either weather outcome. It evaluates both distance endpoints:
   a smaller CPA distance can require a farther approach at the same received-time offset.
-  Short traces keep the previous footprint, and terrain prefetch still follows the CPA range.
+  Each attempt selects its atmosphere before cropping the archive. Its certified upper
+  sound speed expands fitted distances into physical source distances, including homogeneous
+  wind; cold weather never shrinks the previous footprint. Terrain prefetch follows the
+  physical CPA range. A missing weather certificate retains the previous footprint with an
+  explicit coverage warning. The curve matcher's separate real/decoy catalogue receives the
+  same weather-expanded footprint.
   Longer or weakly constrained traces can require substantially more cache and processing work;
-  no new spatial cap is imposed. This bounds constant-velocity support in fitted coordinates,
-  not arbitrary wind or curved paths. The separate 1200 s archive time padding is unchanged.
+  no new spatial cap is imposed. The physical range bound covers homogeneous constant-velocity
+  support; it does not establish complete coverage for arbitrary curved tracks, spatially
+  varying propagation or the approximate geographic box padding. The separate 1200 s archive
+  time padding is unchanged.
 - **Candidate geometry and clocks use the observer's propagation medium.** Each candidate
   ground point uses the path-averaged atmosphere at that observer for its speed, distance and
   recording-clock checks, with wind in the observer's frame. A constant local east/north wind
@@ -2258,7 +2265,7 @@ time, and keeps the original scalar normalization when every tone fits. Runtime 
 not been remeasured. Additional bank rows also change the tone-prior histogram, so field grades need
 replay even though real and decoy searches share the scorer and the acceptance thresholds are unchanged.
 
-Weather retrieval overlaps audio analysis. After audio analysis, the pipeline waits up to 190 s for weather:
+Weather retrieval overlaps audio analysis. Before choosing the ADS-B footprint, the pipeline waits up to 190 s for weather:
 the preferred source's 40 s request allowance plus the previous 150 s allowance for fallbacks. Usable hourly
 surface weather or radiosonde profiles are retained as they arrive; updates do not restart that deadline.
 Each usable radiosonde response publishes an immutable upper-air profile before requests for later
@@ -2268,10 +2275,39 @@ If both fallback sources finish, their final combined profile is used. If retrie
 the best received profile survives, with winds aloft preferred over surface-only data and warnings describing
 what is missing. The 15 °C standard atmosphere is used only when no usable profile has arrived.
 An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional profile is usable.
+After the ADS-B load, an unfinished weather job is checked once more without waiting. A later
+usable profile replaces the earlier one only when the retained catalogue covers its footprint,
+or after a successful expanded fetch. If that expansion fails, the earlier atmosphere and
+catalogue remain usable and a warning explains why the update was not adopted. This adds no
+second weather wait; a larger footprint can require another archive download.
 
 ---
 
 ## Testing
+
+### Retain physical flight support under the selected weather
+
+The archive footprint previously used fitted still-air distances before the atmosphere was
+selected. `physical_catalogue_radius_encloses_calm_and_windy_emission_positions` now checks
+physical source positions against a certified sound-speed expansion, with received times
+computed independently by bisection of the moving-medium wavefront. A separate pipeline
+regression constructs a physical warm-air flight and exercises `TrackStore::filtered`: its
+required approach and departure reports fall outside the earlier crop, beyond even its
+interpolation neighbours, and inside the expanded footprint. Controls preserve matching,
+cold and unknown-weather coverage and scale each event before selecting the largest extent.
+Adjacent channel tests cover weather arriving during archive work and preserve already
+available winds over a later surface-only update.
+
+An independent Python translation of the physical-support fixture enclosed 2,345 sampled
+emission positions, including 53 samples in the centre-tolerance fringe; six warm-air positions
+lay beyond the earlier fitted bound. A separate 3,500-case wavefront calculation checked
+31,500 emission positions with calm and oblique winds. These are synthetic geometry checks,
+not Rust test execution or evidence of improved accuracy on recordings.
+
+The Rust regressions have been source-reviewed but remain **unrun**: this session has a
+checkout and shell, but no Rust toolchain, RCH or dsr. Native formatting, Clippy, workspace
+tests, the release selftest and reference/field replays remain unavailable. No field-accuracy
+or runtime improvement is claimed.
 
 ### Recover cached MLAT aircraft during an optional release lookup outage
 

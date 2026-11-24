@@ -195,14 +195,49 @@ fn media_metadata_start_window(
 
 const MAX_WIND_GATE_ALLOWANCE_MPS: f64 = 10.0;
 
-/// Retain the full CPA distance profile plus its existing 15 km of track context. A long
-/// received trace can require farther emission positions; include its admitted fitted-curve
-/// support too, so cropping the archive cannot discard an otherwise scoreable approach.
-fn search_data_bounds(region: BBox, events: &[search::SearchEvent]) -> (f64, BBox) {
-    let d_max = events.iter().map(|e| e.d_gate[1]).fold(5000.0, f64::max);
+fn catalogue_sound_speed(atmo: &dyn fdop_types::atmo::Atmosphere) -> Option<f64> {
+    atmo.medium_bounds()
+        .filter(|b| {
+            b.c[0] > 0.0
+                && b.c[1] >= b.c[0]
+                && b.c.iter().all(|c| c.is_finite())
+                && b.wind_max >= 0.0
+                && b.wind_max.is_finite()
+        })
+        .map(|b| b.c[1])
+}
+
+/// Retain the full CPA distance profile plus its existing 15 km of track context, and the
+/// farther emission positions needed by long received traces. Expand both from fitted to
+/// physical distances using the atmosphere's certified sound-speed bound. Never shrink the
+/// original footprint: cold or unknown weather must not discard previously retained tracks.
+fn search_data_bounds(region: BBox, events: &[search::SearchEvent], c_max: Option<f64>) -> (f64, BBox) {
+    let c_max = c_max.filter(|c| *c > 0.0 && c.is_finite());
+    let d_max = events
+        .iter()
+        .map(|e| {
+            if let Some(c) = c_max
+                && e.c_fit > 0.0
+                && e.c_fit.is_finite()
+                && c > e.c_fit
+            {
+                (e.d_gate[1] * (c / e.c_fit).next_up()).next_up()
+            } else {
+                e.d_gate[1]
+            }
+        })
+        .fold(5000.0, f64::max);
     let support_km = events
         .iter()
-        .filter_map(search::SearchEvent::catalogue_radius_m)
+        .filter_map(|e| {
+            let fitted = e.catalogue_radius_m()?;
+            Some(
+                c_max
+                    .filter(|c| *c > e.c_fit)
+                    .and_then(|c| e.physical_catalogue_radius_m(c))
+                    .map_or(fitted, |physical| fitted.max(physical)),
+            )
+        })
         .map(|radius| radius / 1000.0)
         .fold(d_max / 1000.0 + 15.0, f64::max);
     (d_max, region.padded_km(support_km))
@@ -375,8 +410,47 @@ fn wait_for_weather(
 
 type WeatherReceiver = std::sync::mpsc::Receiver<WeatherUpdate>;
 
-/// Weather and audio/track preparation are independent. Each attempted clock gets its own
-/// profiles; a wider retry must not extrapolate the metadata window's weather across days.
+/// Use profiles that finished during archive retrieval without waiting a second time.
+/// A queued surface fallback cannot displace current winds; a final result remains
+/// authoritative, and newer fallbacks of the same quality replace older ones.
+fn queued_weather(rx: &WeatherReceiver, current_has_wind: bool) -> Option<(fdop_data::Weather, f64)> {
+    let mut fallback: Option<fdop_data::Weather> = None;
+    let stopped = loop {
+        match rx.try_recv() {
+            Ok(WeatherUpdate::Complete(weather, elapsed)) => return Some((weather, elapsed)),
+            Ok(WeatherUpdate::Fallback(weather)) => {
+                if weather.winds_aloft
+                    || !fallback
+                        .as_ref()
+                        .map_or(current_has_wind, |old| old.winds_aloft)
+                {
+                    fallback = Some(weather);
+                }
+            }
+            Err(e) => break e,
+        }
+    };
+    let mut weather = fallback?;
+    let reason = match stopped {
+        std::sync::mpsc::TryRecvError::Empty => "weather services have not all finished",
+        std::sync::mpsc::TryRecvError::Disconnected => {
+            "weather fetch ended before a final result was available"
+        }
+    };
+    weather.warnings.push(format!(
+        "{reason}; using the best available profile{}",
+        if stopped == std::sync::mpsc::TryRecvError::Empty {
+            " (rerun to use any additional cached profiles once they arrive)"
+        } else {
+            ""
+        },
+    ));
+    Some((weather, f64::NAN))
+}
+
+/// Weather runs alongside audio preparation. Each attempted clock gets its own profiles;
+/// wait for that profile before choosing the archive footprint. A wider retry must not
+/// extrapolate the metadata window's weather across days.
 fn start_weather(
     a: &LocateArgs,
     bbox: BBox,
@@ -1873,7 +1947,6 @@ fn locate_with_clock(
         base_events.len()
     ));
     let heard: Vec<f64> = dets.iter().map(|d| d.t0r).collect();
-    let (d_max, fetch_box) = search_data_bounds(region.bbox, &base_events);
     let t = Instant::now();
     let (geoid_n, geoid_src) =
         fdop_data::geoid_height_with_options(&a.cache, region.center.0, region.center.1, a.offline);
@@ -1903,18 +1976,23 @@ fn locate_with_clock(
     let fine = fdop_data::TerrariumDem::new(&a.cache, 13)
         .with_offline(a.offline)
         .with_fallback(0.0);
-    match coarse.prefetch_bbox(&region.bbox.padded_km(d_max / 1000.0 + 2.0), 4000) {
-        Ok(n) => log.say(&format!("terrain: {n} coarse tiles ready (z10)")),
-        Err(e) => warnings.push(format!(
-            "terrain prefetch: {e}; queried positions use cached terrain when available and otherwise fall back to 0 m"
-        )),
-    }
+    let mut terrain_range_m = 0.0;
     let mut tracks_terrain_s = t.elapsed().as_secs_f64();
     let (mut weather_fetch_s, mut weather_wait_s, mut search_s) = (0.0, 0.0, 0.0);
     let mut curve_match_s = curve_image_s;
     let mut curve = None;
     let mut curve_check = None;
     let (tracks, atmo, has_wind, sevs, res, assessment) = loop {
+        // ---- atmosphere and physical catalogue coverage for this attempt ----------------
+        let t = Instant::now();
+        let (mut wx, mut fetch_s) =
+            wait_for_weather(&weather_rx, fdop_data::weather::FETCH_WAIT_TIMEOUT);
+        weather_wait_s += t.elapsed().as_secs_f64();
+        let (mut d_max, mut fetch_box) = search_data_bounds(
+            region.bbox,
+            &base_events,
+            catalogue_sound_speed(&*wx.atmo),
+        );
         // ---- ADS-B for this attempt ------------------------------------------------------
         let spec = archive.track_spec(fetch_box, dur, geoid_n, a.include_jets);
         log.say(&format!(
@@ -1929,7 +2007,7 @@ fn locate_with_clock(
         let t = Instant::now();
         let fetched = fdop_data::fetch_window(&spec, &a.cache, &opts);
         adsb_s += t.elapsed().as_secs_f64();
-        let store = match fetched {
+        let mut store = match fetched {
             Ok(s) => s,
             Err(e) if meta_window => {
                 let why = format!(
@@ -1946,6 +2024,77 @@ fn locate_with_clock(
             }
             Err(e) => return Err(format!("ADS-B fetch: {e}")),
         };
+        // A timed-out weather job can finish during the archive download. Poll once,
+        // without another wait budget, and never score its profile against a smaller
+        // catalogue. A failed expansion keeps the usable original profile and tracks.
+        if !fetch_s.is_finite()
+            && let Some((late, elapsed)) = queued_weather(&weather_rx, wx.winds_aloft)
+        {
+            let (late_d, late_box) = search_data_bounds(
+                region.bbox,
+                &base_events,
+                catalogue_sound_speed(&*late.atmo),
+            );
+            let covered = fetch_box.contains(late_box.south, late_box.west)
+                && fetch_box.contains(late_box.north, late_box.east);
+            let expanded = if covered {
+                Ok(None)
+            } else {
+                log.say("weather arrived during ADS-B loading; expanding the flight catalogue");
+                let t = Instant::now();
+                let spec = archive.track_spec(late_box, dur, geoid_n, a.include_jets);
+                let expanded = fdop_data::fetch_window(&spec, &a.cache, &opts).map(Some);
+                adsb_s += t.elapsed().as_secs_f64();
+                expanded
+            };
+            match expanded {
+                Ok(expanded) => {
+                    if let Some(expanded) = expanded {
+                        store = expanded;
+                        fetch_box = late_box;
+                    }
+                    d_max = d_max.max(late_d);
+                    wx = late;
+                    fetch_s = elapsed;
+                }
+                Err(e) => warnings.push(format!(
+                    "late weather required a wider ADS-B catalogue, but loading it failed ({e}); retaining the earlier atmosphere and its existing catalogue"
+                )),
+            }
+        }
+        weather_fetch_s += fetch_s;
+        let fdop_data::Weather {
+            atmo,
+            warnings: wwarn,
+            winds_aloft: has_wind,
+        } = wx;
+        for w in &wwarn {
+            log.say(&format!("weather: {w}"));
+        }
+        warnings.extend(wwarn);
+        if catalogue_sound_speed(&*atmo).is_none() {
+            let warning = "atmosphere has no certified sound-speed bound; ADS-B selection retains its fitted-coordinate footprint and may omit physical track support";
+            log.say(warning);
+            warnings.push(warning.into());
+        }
+        if d_max > terrain_range_m {
+            let t = Instant::now();
+            match coarse.prefetch_bbox(&region.bbox.padded_km(d_max / 1000.0 + 2.0), 4000) {
+                Ok(n) => log.say(&format!("terrain: {n} coarse tiles ready (z10)")),
+                Err(e) => warnings.push(format!(
+                    "terrain prefetch: {e}; queried positions use cached terrain when available and otherwise fall back to 0 m"
+                )),
+            }
+            terrain_range_m = d_max;
+            tracks_terrain_s += t.elapsed().as_secs_f64();
+        }
+        let wind = if has_wind {
+            3.0
+        } else {
+            MAX_WIND_GATE_ALLOWANCE_MPS
+        };
+        let mut sevs = search::independent_measured_events(events, wind);
+        sevs.truncate(max_measured);
         log.say(&format!(
             "ADS-B: {} legs, {} points",
             store.legs.len(),
@@ -1975,27 +2124,6 @@ fn locate_with_clock(
         ));
         drop(store);
         tracks_terrain_s += t.elapsed().as_secs_f64();
-        // ---- atmosphere for this attempt ------------------------------------------------
-        let t = Instant::now();
-        let (wx, fetch_s) = wait_for_weather(&weather_rx, fdop_data::weather::FETCH_WAIT_TIMEOUT);
-        weather_wait_s += t.elapsed().as_secs_f64();
-        weather_fetch_s += fetch_s;
-        let fdop_data::Weather {
-            atmo,
-            warnings: wwarn,
-            winds_aloft: has_wind,
-        } = wx;
-        for w in &wwarn {
-            log.say(&format!("weather: {w}"));
-        }
-        warnings.extend(wwarn);
-        let wind = if has_wind {
-            3.0
-        } else {
-            MAX_WIND_GATE_ALLOWANCE_MPS
-        };
-        let mut sevs = search::independent_measured_events(events, wind);
-        sevs.truncate(max_measured);
         // ---- search ---------------------------------------------------------------------
         let t = Instant::now();
         let mut sp = SearchParams::new(archive.clock.0, archive.clock.1, dur, region.bbox);
@@ -3884,6 +4012,115 @@ mod tests {
     }
 
     #[test]
+    fn queued_weather_promotes_late_winds_and_keeps_the_newest_sounding() {
+        for disconnected in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            assert!(
+                tx.send(WeatherUpdate::Fallback(test_weather("surface", -10.0, false)))
+                    .is_ok()
+            );
+            let (initial, elapsed) = wait_for_weather(&rx, Duration::ZERO);
+            assert!(!initial.winds_aloft && elapsed.is_nan());
+
+            // These profiles arrive while the caller retrieves its first archive.
+            // A later surface fallback must not hide either sounding, and the
+            // newest sounding must replace the earlier one at the same quality.
+            for update in [
+                test_weather("first sounding", 18.0, true),
+                test_weather("later surface", -8.0, false),
+                test_weather("latest sounding", 8.0, true),
+                test_weather("last surface", -6.0, false),
+            ] {
+                assert!(tx.send(WeatherUpdate::Fallback(update)).is_ok());
+            }
+            let tx = (!disconnected).then_some(tx);
+            let (weather, elapsed) = queued_weather(&rx, initial.winds_aloft).unwrap();
+            drop(tx);
+            let expected = test_weather("latest sounding", 8.0, true);
+            assert_eq!(weather.atmo.describe(), expected.atmo.describe());
+            assert_eq!(
+                weather.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0),
+                expected.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0)
+            );
+            assert!(weather.winds_aloft && elapsed.is_nan());
+            assert_eq!(weather.warnings.len(), 2);
+            assert_eq!(weather.warnings[0], "latest sounding");
+            if disconnected {
+                assert!(weather.warnings[1].contains("ended before a final result"));
+                assert!(!weather.warnings[1].contains("rerun"));
+            } else {
+                assert!(weather.warnings[1].contains("have not all finished"));
+            }
+        }
+    }
+
+    #[test]
+    fn queued_surface_weather_cannot_displace_existing_winds() {
+        for current_has_wind in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for weather in [
+                test_weather("first surface", -10.0, false),
+                test_weather("latest surface", -8.0, false),
+            ] {
+                assert!(tx.send(WeatherUpdate::Fallback(weather)).is_ok());
+            }
+            let update = queued_weather(&rx, current_has_wind);
+            drop(tx);
+            if current_has_wind {
+                assert!(update.is_none());
+            } else {
+                let (weather, elapsed) = update.unwrap();
+                let expected = test_weather("latest surface", -8.0, false);
+                assert_eq!(weather.atmo.describe(), expected.atmo.describe());
+                assert_eq!(
+                    weather.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0),
+                    expected.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0)
+                );
+                assert!(!weather.winds_aloft && elapsed.is_nan());
+                assert_eq!(weather.warnings[0], "latest surface");
+            }
+        }
+    }
+
+    #[test]
+    fn queued_weather_completion_replaces_provisional_profiles() {
+        for winds_aloft in [false, true] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for update in [
+                WeatherUpdate::Fallback(test_weather("soundings", 18.0, true)),
+                WeatherUpdate::Complete(test_weather("combined", 8.0, winds_aloft), 42.0),
+            ] {
+                assert!(tx.send(update).is_ok());
+            }
+            let (weather, elapsed) = queued_weather(&rx, true).unwrap();
+            let expected = test_weather("combined", 8.0, winds_aloft);
+            assert_eq!(weather.atmo.describe(), expected.atmo.describe());
+            assert_eq!(
+                weather.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0),
+                expected.atmo.medium(0.0, 0.0, 0.0, 0.0, 2000.0)
+            );
+            assert_eq!(weather.warnings, ["combined"]);
+            assert_eq!(weather.winds_aloft, winds_aloft);
+            assert_eq!(elapsed, 42.0);
+        }
+    }
+
+    #[test]
+    fn queued_weather_without_update_leaves_the_current_profile_available() {
+        for disconnected in [false, true] {
+            for winds_aloft in [false, true] {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let tx = (!disconnected).then_some(tx);
+                let current = test_weather("current", 8.0, winds_aloft);
+                assert!(queued_weather(&rx, current.winds_aloft).is_none());
+                drop(tx);
+                assert_eq!(current.warnings, ["current"]);
+                assert_eq!(current.winds_aloft, winds_aloft);
+            }
+        }
+    }
+
+    #[test]
     fn decoy_gate_reads_rows_from_real_runs() {
         // c2c7578 on the Mac, xdet/dclock_c2c7578 (LOG 2026-11-08T15:48Z): the wrong date
         // nd_o02_1031 graded high, and right answers with their own four decoy clocks.
@@ -4123,22 +4360,199 @@ mod tests {
         };
         let old = region.padded_km(33.75);
         assert_eq!(
-            search_data_bounds(region, std::slice::from_ref(&event)),
+            search_data_bounds(region, std::slice::from_ref(&event), Some(343.0)),
             (18_750.0, old)
         );
         event.tr_t = vec![100.0, 700.0];
         let radius = event.catalogue_radius_m().unwrap();
-        let (distance, bbox) = search_data_bounds(region, std::slice::from_ref(&event));
+        let (distance, bbox) =
+            search_data_bounds(region, std::slice::from_ref(&event), Some(343.0));
         assert_eq!(distance, 18_750.0, "terrain keeps its CPA footprint");
         assert_eq!(bbox, region.padded_km(radius / 1000.0));
         assert!(radius > 100_000.0 && bbox.south < old.south && bbox.east > old.east);
+        // A synthetic origin keeps one-ULP padding changes observable. Outward
+        // rounding of an immediately colder certificate must not enlarge the
+        // nonempty trace's existing catalogue or alter its cache footprint.
+        let origin = BBox::new(-0.001, -0.001, 0.001, 0.001);
+        let original = (distance, origin.padded_km(radius / 1000.0));
+        for c_max in [None, Some(300.0), Some(343.0_f64.next_down()), Some(343.0)] {
+            assert_eq!(
+                search_data_bounds(origin, std::slice::from_ref(&event), c_max),
+                original
+            );
+        }
         event.v_gate[1] -= MAX_WIND_GATE_ALLOWANCE_MPS;
         assert!(radius > event.catalogue_radius_m().unwrap());
         event.tr_t.push(f64::NAN);
         assert_eq!(
-            search_data_bounds(region, std::slice::from_ref(&event)),
+            search_data_bounds(region, std::slice::from_ref(&event), Some(343.0)),
             (18_750.0, old)
         );
+    }
+
+    #[test]
+    fn archive_catalogue_scales_each_fit_without_shrinking_existing_coverage() {
+        let region = BBox::new(40.875466, -73.525951, 40.877466, -73.523951);
+        let event = search::SearchEvent {
+            id: "catalogue-medium".into(),
+            t_rec: 180.0,
+            t_tol: 3.0,
+            v_gate: [90.0, 110.0],
+            d_gate: [200.0, 6000.0],
+            f0: 112.0,
+            f0_tol: 4.5,
+            sigma_hz: 0.25,
+            n_eff: 20.0,
+            quality: 10.0,
+            misfit: false,
+            c_fit: 343.0,
+            tr_t: Vec::new(),
+            tr_f: Vec::new(),
+            q_t: Vec::new(),
+            q_f: Vec::new(),
+        };
+        let original = (6000.0, region.padded_km(21.0));
+        for c_max in [
+            None,
+            Some(300.0),
+            Some(343.0),
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            assert_eq!(
+                search_data_bounds(region, std::slice::from_ref(&event), c_max),
+                original
+            );
+        }
+        for c_fit in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut invalid = event.clone();
+            invalid.c_fit = c_fit;
+            assert_eq!(
+                search_data_bounds(region, std::slice::from_ref(&invalid), Some(365.0)),
+                original
+            );
+        }
+        assert_eq!(
+            search_data_bounds(region, &[], Some(365.0)),
+            (5000.0, region.padded_km(20.0))
+        );
+
+        // A smaller fitted range can require the larger physical footprint when
+        // the events were fitted at different sound speeds. Scale before taking maxima.
+        let mut colder_fit = event.clone();
+        colder_fit.c_fit = 300.0;
+        colder_fit.d_gate[1] = 5500.0;
+        let events = [event, colder_fit];
+        let (distance, bbox) = search_data_bounds(region, &events, Some(365.0));
+        let expected = 5500.0 * 365.0 / 300.0;
+        assert!((distance - expected).abs() < 1e-8);
+        assert!(distance > 6000.0 * 365.0 / 343.0);
+        assert_eq!(bbox, region.padded_km(distance / 1000.0 + 15.0));
+        assert_eq!(search_data_bounds(region, &events, Some(300.0)), original);
+    }
+
+    #[test]
+    fn archive_catalogue_retains_physical_sources_in_a_warmer_medium() {
+        use fdop_types::geo::Enu;
+        use fdop_types::store::{FlightLeg, StoreMeta, TrackPoint, TrackStore, alt_src};
+
+        let (lat, lon) = (40.876466, -73.524951);
+        let region = BBox::new(lat - 0.001, lon - 0.001, lat + 0.001, lon + 0.001);
+        let enu = Enu::new(lat, lon, fdop_types::MIC_HEIGHT_M);
+        let (c, c_fit, speed, distance, height) =
+            (365.0_f64, 343.0, 200.0, 15_000.0_f64, 1000.0_f64);
+        let cross_track = (distance * distance - height * height).sqrt();
+        let emission_offsets = [-600.0, -300.0, -80.0, 0.0, 80.0, 300.0, 600.0];
+        let mut event = search::SearchEvent {
+            id: "warm-catalogue".into(),
+            t_rec: 1000.0 + distance / c,
+            t_tol: 0.0,
+            v_gate: [speed * c_fit / c; 2],
+            d_gate: [distance * c_fit / c; 2],
+            f0: 112.0,
+            f0_tol: 4.5,
+            sigma_hz: 0.25,
+            n_eff: 20.0,
+            quality: 10.0,
+            misfit: false,
+            c_fit,
+            tr_t: Vec::new(),
+            tr_f: Vec::new(),
+            q_t: Vec::new(),
+            q_f: Vec::new(),
+        };
+        // Emit from physical positions, then propagate to the observer. Uniform
+        // still-air scaling gives an exact fit at c_fit without using a fitted
+        // inverse-time root to manufacture the required archive positions.
+        for tau in emission_offsets {
+            let range = distance.hypot(speed * tau);
+            event.tr_t.push(1000.0 + tau + range / c);
+            event
+                .tr_f
+                .push(112.0 / (1.0 + speed * speed * tau / (c * range)));
+        }
+        let (_, old_box) =
+            search_data_bounds(region, std::slice::from_ref(&event), Some(c_fit));
+        let (physical_cpa, warm_box) =
+            search_data_bounds(region, std::slice::from_ref(&event), Some(c));
+        assert!((physical_cpa - distance).abs() < 1e-8);
+
+        let full = TrackStore {
+            meta: StoreMeta {
+                version: 1,
+                bbox: region.padded_km(250.0),
+                t_start: 0.0,
+                t_end: 2000.0,
+                geoid_n_m: 0.0,
+                sources: vec!["synthetic".into()],
+                stats: json!({}),
+                created_unix: 0.0,
+            },
+            legs: vec![FlightLeg {
+                key: "warm-catalogue".into(),
+                icao: "000001".into(),
+                reg: String::new(),
+                typ: "C172".into(),
+                source: "synthetic".into(),
+                engine: fdop_types::engine::EngineClass::Piston,
+                points: (0..=700)
+                    .map(|i| {
+                        let tau = -700.0 + 2.0 * f64::from(i);
+                        let (lat, lon, altitude) =
+                            enu.to_geodetic([speed * tau, cross_track, height]);
+                        TrackPoint {
+                            t: 1000.0 + tau,
+                            lat,
+                            lon,
+                            alt_m: altitude as f32,
+                            gs_mps: f32::NAN,
+                            track_deg: f32::NAN,
+                            vrate_mps: f32::NAN,
+                            alt_src: alt_src::GEOM,
+                            flags: 0,
+                        }
+                    })
+                    .collect(),
+            }],
+        };
+        let old = full.filtered(&old_box, 0.0, 2000.0);
+        let retained = full.filtered(&warm_box, 0.0, 2000.0);
+        assert_eq!(old.legs.len(), 1);
+        assert_eq!(retained.legs.len(), 1);
+        for tau in emission_offsets {
+            let (lat, lon, _) = enu.to_geodetic([speed * tau, cross_track, height]);
+            assert!(warm_box.contains(lat, lon));
+            assert!(retained.legs[0].points.iter().any(|p| p.t == 1000.0 + tau));
+            if tau.abs() == 600.0 {
+                assert!(!old_box.contains(lat, lon));
+                assert!(
+                    !old.legs[0].points.iter().any(|p| p.t == 1000.0 + tau),
+                    "even interpolation neighbours cannot restore the cropped source"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4167,7 +4581,7 @@ mod tests {
             q_f: Vec::new(),
         };
         assert_eq!(
-            search_data_bounds(region, &[]),
+            search_data_bounds(region, &[], Some(343.0)),
             (5000.0, region.padded_km(20.0))
         );
         // Ordinary requests retain the previous minimum range and padding exactly.
@@ -4175,7 +4589,7 @@ mod tests {
             event.d_gate[1] = upper;
             let distance = upper.max(5000.0);
             assert_eq!(
-                search_data_bounds(region, std::slice::from_ref(&event)),
+                search_data_bounds(region, std::slice::from_ref(&event), Some(343.0)),
                 (distance, region.padded_km(distance / 1000.0 + 15.0))
             );
         }
@@ -4184,7 +4598,8 @@ mod tests {
         // severe model warning raises that floor to 43.75 km. Neither is a 30 km gate.
         for upper in [31_250.0, 43_750.0] {
             event.d_gate[1] = upper;
-            let (distance, fetch_box) = search_data_bounds(region, std::slice::from_ref(&event));
+            let (distance, fetch_box) =
+                search_data_bounds(region, std::slice::from_ref(&event), Some(343.0));
             assert_eq!(distance, upper);
             assert_eq!(fetch_box, region.padded_km(upper / 1000.0 + 15.0));
             let a = offline_test_args("wide-distance-catalogue");
