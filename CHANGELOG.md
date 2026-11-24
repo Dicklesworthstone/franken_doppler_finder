@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain valid locations beside rejected fine-grid range intersections
+
+- Let the existing quick-geometry spatial recovery run after both the ordinary fine
+  grid and exact-gated polishing fail. A finite rejected fit in a separate range
+  intersection must not suppress recovery from the original joined location.
+- Preserve every successful original grid or exact-polish result. The retry retains
+  the same grid extent, region, physical intervals, common clock, coverage and trace
+  gates, and consumes the same fine-seed allowance. Previously failed grids may incur
+  one additional bounded polish; no runtime improvement is claimed.
+- The physical `rejected_range_island_cannot_hide_a_valid_subcell_pair` regression
+  fails on the preceding code after proving that the same seed works in a smaller
+  region and that the true observer still passes every gate. The repair recovers both
+  intended aircraft with 0.001077 m synthetic position error in relative-clock and
+  reflected Unix-clock cases. This checks search coverage, not field accuracy.
+- All 17 focused native search tests pass in the complete core test executable built
+  through RCH with the pinned compiler and locked production dependencies, including unchanged-success, physical-limit, terrain,
+  fine-budget and complete compact-pair search controls. Full-workspace checks,
+  release selftest and reference/field replays are not established by these tests.
+
 ### Carry broad-clock recovery through weighted position refinement
 
 - Let nonquick, ungated clock profiles consider finite, distinct closest-approach timing

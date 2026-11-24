@@ -2115,12 +2115,14 @@ keeps its original result exactly and skips this fallback. Each attempted grid s
 the same `max_fine` allowance. Failed grids can require up to 64 eight-direction polishing
 iterations, so this recovery can add runtime; no real-recording timing improvement is claimed.
 
-If every fine node also fails the exact fitted speed/range intervals, a final fallback
+If the grid and rejected-fit polishing still find no valid location, a final fallback
 can instead start at the original joined location inside the existing 12% quick-check
 geometry envelope. The bounded polisher keeps that envelope during exploration and applies
 the original zero-slack intervals before retaining any candidate. Interior CPA, track-gap,
 shared-clock, coverage, trace, region and grid-extent checks remain in force. Original grid
-successes and the earlier trace-fit recovery retain their behavior. This adds at most one
+successes and successful trace-fit recovery retain their behavior. A rejected fit in a
+separate range intersection cannot suppress this retry toward a valid location nearer the
+joined seed. This adds at most one
 bounded polish per failed grid, under the same fine-seed budget.
 
 If the fine terrain also rejects the joined centre's relaxed geometry, the same recovery
@@ -2223,6 +2225,17 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### A wider region retains a recoverable fine-grid location
+
+`rejected_range_island_cannot_hide_a_valid_subcell_pair` starts with physical traces
+from two aircraft and a seed that already succeeds in a small region. Widening the
+region adds a separate range intersection that fails the traces; on the preceding
+code, that rejected alternative erases the valid answer. The repaired fine stage
+recovers both intended flights within 0.001077 m in relative-clock and reflected
+Unix-clock cases. All 17 focused native search tests pass, including original-success
+equality and the physical, coverage, clock, terrain and budget controls. These are
+synthetic search checks; they do not establish field accuracy or confidence calibration.
 
 ### Recover a location after flight velocity reports disappear
 

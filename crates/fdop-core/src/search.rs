@@ -3605,11 +3605,12 @@ fn fine_candidate(
             Some(total)
         });
     }
-    if best.is_none() && rejected.is_none() {
+    if best.is_none() {
         // The joined seed passed the quick geometry check, but the exact distance
-        // intervals can intersect only between fine nodes. Reuse that existing 12%
-        // envelope to start bounded refinement when no node supplied an objective.
-        // Every accepted point must still pass the original exact geometry gates.
+        // intervals can intersect only between fine nodes. A rejected node in another
+        // range intersection can also trap exact-gated polishing away from that seed.
+        // Reuse the existing 12% envelope after both exact attempts fail; every accepted
+        // point must still pass the original exact geometry gates.
         let local = Enu::new(la, lo, 0.0);
         let mut score = |e, n| {
             let (lat, lon, _) = local.to_geodetic([e, n, 0.0]);
@@ -9040,6 +9041,111 @@ mod tests {
                 "geometry subcell start={start} reflected={reflected}: error={error:.6}, clock={:.6}",
                 answer.t_start_utc - start
             );
+            assert!(error < 2.0);
+            assert!((answer.t_start_utc - start).abs() < 0.05);
+            for key in ["A", "B"] {
+                assert!(answer.events.iter().any(|matched| matched.event == key
+                    && matched.flight == key
+                    && matched.chi < 0.1
+                    && matched.coverage == 1.0));
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_range_island_cannot_hide_a_valid_subcell_pair() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        for (start, reflected) in [(0.0, false), (1_788_895_000.0, true)] {
+            let mut case = compact_fine_grid_case(start, reflected);
+            let sign = if reflected { -1.0 } else { 1.0 };
+            let original_region = case.p.region;
+            let local = Enu::new(case.obs.0, case.obs.1, 0.0);
+            let (mlat, mlon) = fdop_types::geo::m_per_deg(case.obs.0);
+            let (low, high) = if reflected {
+                (-510.0, 10.0)
+            } else {
+                (-10.0, 510.0)
+            };
+            case.p.region = BBox::new(
+                case.obs.0 + low / mlat,
+                case.obs.1 + low / mlon,
+                case.obs.0 + high / mlat,
+                case.obs.1 + high / mlon,
+            );
+            for event in &mut case.events {
+                event.t_tol = 20.0;
+            }
+            let frame = Frame::new(&case.p.region);
+            let (lat, lon, _) = local.to_geodetic([sign * 75.0, sign * 75.0, 0.0]);
+            let (e, n) = frame.en(lat, lon);
+            let seed = Joined {
+                ei: 0,
+                ej: 1,
+                ti: 0,
+                tj: 1,
+                te_i: start + 120.0,
+                te_j: start + 360.0,
+                e,
+                n,
+                t_s: start,
+            };
+            let assign = [(0, 0, seed.te_i), (1, 1, seed.te_j)];
+            let evaluate = |lat, lon, quick| {
+                eval_point_weighted(
+                    &observer(lat, lon, &dem),
+                    &assign,
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &atmo,
+                    case.p.region.contains(lat, lon),
+                    PointGates::All,
+                    quick,
+                    None,
+                    true,
+                )
+            };
+            let quick = evaluate(lat, lon, true).expect("the joined seed reaches the fine stage");
+            assert!(quick.chis.iter().all(|fit| fit.chi <= case.p.quick_chi));
+            let truth = evaluate(case.obs.0, case.obs.1, false)
+                .expect("the actual observer retains both complete physical traces");
+            assert!(truth.chis.iter().all(|fit| fit.chi < 0.1 && fit.cov == 1.0));
+            // Both distance annuli also intersect on the far side of the aircraft.
+            // That island passes geometry but fails the observed traces at the fixed
+            // clock. It must not suppress recovery from the original joined seed.
+            let mut rejected = 0;
+            for (lat, lon, _, _) in local_grid(lat, lon, case.p.fine_half_m, case.p.fine_step_m) {
+                if let Some(point) = evaluate(lat, lon, false) {
+                    assert!(point.total.is_finite());
+                    assert!(!fine_trace_fits(&point.chis, case.p.kappa));
+                    rejected += 1;
+                }
+            }
+            assert!(
+                rejected > 0,
+                "the ordinary grid must retain a rejected range island"
+            );
+            let inp = SearchInputs {
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                heard_times: vec![],
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            let narrow = SearchParams {
+                region: original_region,
+                ..case.p.clone()
+            };
+            assert!(
+                fine_candidate(&seed, &frame, &case.events, &inp, &narrow, &[]).is_some(),
+                "the same joined seed must already work before the range island enters the region"
+            );
+            let answer = fine_candidate(&seed, &frame, &case.events, &inp, &case.p, &[])
+                .expect("a rejected range island cannot hide a valid two-aircraft location");
+            let error = haversine_m(case.obs.0, case.obs.1, answer.lat, answer.lon);
+            eprintln!("range island start={start} reflected={reflected}: error={error:.6} m");
             assert!(error < 2.0);
             assert!((answer.t_start_utc - start).abs() < 0.05);
             for key in ["A", "B"] {
