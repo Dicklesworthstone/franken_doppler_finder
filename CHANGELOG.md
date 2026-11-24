@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Join cached MLAT with a freshly ingested main archive
+
+- When optional MLAT metadata is unavailable and no local main feed can complete the day,
+  let a verified completed MLAT checkpoint join the newly ingested main feed before the
+  ordinary joint altitude/type reconciliation. Only the advertised main archive is downloaded.
+- Publish the actual combined feedset and provenance. Defer the missing-MLAT warning until
+  assembly; missing, corrupt or incompatible optional data retains the main-only fallback.
+  Existing main-feed failures and final cache-publication errors retain their behavior.
+- Add two regressions for prod/staging and ordinary/jet-inclusive requests, exact fresh-joint
+  equivalence, one authorized main download, checkpoint preservation and offline reuse,
+  plus missing/corrupt/no-outage controls. Independent source reviews found no blocker.
+  Native formatting, Clippy, tests, release selftest and reference/field replays remain
+  unrun because no build computer is attached; no native or field pass is claimed.
+
 ### Recover cached MLAT aircraft when its release lookup is unavailable
 
 - Treat an optional MLAT metadata outage as an opportunity for verified local recovery.

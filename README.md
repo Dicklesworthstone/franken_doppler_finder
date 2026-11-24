@@ -1063,6 +1063,11 @@ feed or rebuild the day from verified completed main and MLAT raw checkpoints, i
 a main-only processed fallback whose MLAT upgrade was interrupted. The live main identity
 remains authoritative, and checkpoint metadata never authorizes a download. If no local
 rebuild succeeds, a usable main cache or the advertised main archive still supplies the day.
+When the main feed needs downloading, a verified completed MLAT checkpoint can join that
+fresh ingest before joint aircraft-type and altitude reconciliation. This optional feed is
+loaded locally; a lookup outage never authorizes downloading an archive from checkpoint
+metadata. Missing, corrupt or incompatible checkpoints retain the main-only result and
+its missing-MLAT warning.
 A failed main-feed lookup can also reuse a readable, covering processed main-feed catalogue,
 or rebuild one from completed raw feeds and release metadata retained in sidecars or checkpoints. A main-only processed
 fallback can be upgraded when verified local checkpoints contain that same main feed plus MLAT.
@@ -2271,12 +2276,15 @@ An online fetch previously returned its main-only processed fallback when the op
 MLAT release lookup failed, even if completed raw main and MLAT feeds could rebuild the
 full catalogue. The same local data was recoverable offline. The optional-outage path now
 attempts that existing joint reconstruction and can also retain a complete same-main
-staging catalogue. A successful live prod lookup still takes priority over cached staging.
+staging catalogue. If the main feed must be downloaded first, the completed MLAT checkpoint
+can join it before the normal joint build. A successful live prod lookup still takes
+priority over cached staging, and only advertised archive identities can be downloaded.
 
-Two adjacent regressions exercise the real synthetic archive parser, raw checkpoints,
+Four adjacent regressions exercise the real synthetic archive parser, raw checkpoints,
 joint altitude/type reconciliation, publication and offline reuse. They cover prod and
 staging, ordinary and jet-inclusive policies, unchanged behavior when discovery succeeds
-without MLAT, unavailable raw data, and fresh prod ingestion when only staging is cached.
+without MLAT, missing or corrupt raw data, fresh-main assembly with exactly one advertised
+main download, and fresh prod ingestion when only staging is cached.
 The assertions compare recovered tracks, provenance and persisted statistics with a fresh
 joint build; source checkpoints and partial catalogues must remain unchanged.
 

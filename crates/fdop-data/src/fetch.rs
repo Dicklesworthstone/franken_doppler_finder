@@ -823,6 +823,7 @@ fn fetch_window_with_sources(
     let days = utc_days(spec.t_start, spec.t_end);
     let mut day_stores: Vec<Option<CachedDay>> = (0..days.len()).map(|_| None).collect();
     let mut day_releases = vec![Vec::new(); days.len()];
+    let mut mlat_discovery_outages = vec![false; days.len()];
     let mut notes: Vec<String> = Vec::new();
     let mut cache_hits = 0usize;
     let mut jobs: Vec<Job> = Vec::new();
@@ -877,6 +878,7 @@ fn fetch_window_with_sources(
                 Ok(found) => {
                     if let Some(error) = found.mlat_error {
                         mlat_discovery_failed = true;
+                        mlat_discovery_outages[i] = true;
                         notes.push(format!(
                             "{label}: MLAT-only release lookup failed; newer MLAT releases could not be checked: {error}"
                         ));
@@ -1074,6 +1076,9 @@ fn fetch_window_with_sources(
                     day,
                     rel: r.clone(),
                 }),
+                // A completed local MLAT part may still join a newly streamed main
+                // feed. Report missing coverage after that actual assembly finishes.
+                None if mlat_discovery_failed => {}
                 None => notes.push(format!("{label}: {NO_MLATONLY}")),
             }
         }
@@ -1152,26 +1157,55 @@ fn fetch_window_with_sources(
                 });
             }
             drop(tx);
-            collect_streamed_days(rx, remaining, |di, parts, tags, fs| {
+            collect_streamed_days(rx, remaining, |di, mut parts, mut tags, mut fs| {
                 let day = days[di];
+                let dir = day_dir(cache_dir, day);
+                let label = format!("{:04}-{:02}-{:02}", day.0, day.1, day.2);
+                let sp = day_spec(day);
+                let context = day_context(day);
+                if mlat_discovery_outages[di] && opts.include_mlat && !fs.contains("mlatonly") {
+                    // Before the main download there may have been no complete raw pair.
+                    // Join any now-usable MLAT checkpoint before altitude/type reconciliation.
+                    // Live identities stay authoritative, and recovered identities only load
+                    // local bytes: they must never schedule or retry an archive download.
+                    let recovered =
+                        crate::raw_cache::recovery_releases(&dir, &day_releases[di], context, true);
+                    for rel in recovered.into_iter().filter(|rel| rel.feed == Feed::Mlatonly) {
+                        match crate::raw_cache::load(&dir, &rel, &sp, context) {
+                            Ok(Some(part)) => {
+                                parts.push(part);
+                                tags.push(rel.tag.clone());
+                                tags.sort();
+                                fs.push_str("+mlatonly");
+                                notes.push(format!(
+                                    "{label}: combined the completed main feed with local MLAT-only checkpoint {}; newer MLAT releases could not be checked",
+                                    rel.tag
+                                ));
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(error) => notes.push(format!(
+                                "{label}: MLAT-only checkpoint {} unreadable ({error}); unavailable during main-feed assembly",
+                                rel.tag
+                            )),
+                        }
+                    }
+                }
                 // Only completely ingested feeds reach this cache. Its actual feedset
                 // lets searches use a surviving main feed with the existing warning;
                 // an online retry reuses completed raw feeds and rebuilds them together
                 // with new ingests for the same altitude/type reconciliation.
                 if opts.include_mlat && !fs.contains("mlatonly") {
-                    let label = format!("{:04}-{:02}-{:02}", day.0, day.1, day.2);
                     let note = format!("{label}: {NO_MLATONLY}");
                     if !notes.contains(&note) {
                         notes.push(note);
                     }
                 }
-                let store = build_day_store(parts, &day_spec(day), tags, day_context(day));
-                let dir = day_dir(cache_dir, day);
+                let store = build_day_store(parts, &sp, tags, context);
                 let path = dir.join(format!(
                     "{}_{key}.fdtrk",
                     cache_feedset(&fs, spec.include_jets)
                 ));
-                let label = format!("{:04}-{:02}-{:02}", day.0, day.1, day.2);
                 day_stores[di] = Some(publish_day(store, &path, &label, opts)?);
                 Ok(())
             })
@@ -4465,6 +4499,178 @@ mod tests {
                 assert_same_legs(&reused.legs, &got.legs);
                 assert_eq!(reused.meta.stats["cache_hits"], 1);
             }
+        }
+    }
+
+    #[test]
+    fn optional_discovery_outage_joins_cached_mlat_to_a_fresh_main_feed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                let f = offline_raw_fixture_with_listing(main, include_jets, true);
+                let context = day_context((2026, 9, 8));
+                f.checkpoint(1);
+                let raw_mlat = crate::raw_cache::path(&f.dir, &f.releases[1], &f.spec);
+                let original_mlat = std::fs::read(&raw_mlat).unwrap();
+                assert!(!crate::raw_cache::path(&f.dir, &f.releases[0], &f.spec).exists());
+                let downloads = AtomicUsize::new(0);
+                let mut lookups = 0;
+                let got = fetch_window_with_sources(
+                    &f.want,
+                    &f.cache,
+                    &FetchOptions::default(),
+                    |net, y, m, d, _, offline, include_mlat| {
+                        lookups += 1;
+                        assert!(net.is_some() && !offline && include_mlat);
+                        assert_eq!((y, m, d), (2026, 9, 8));
+                        Ok(crate::adsblol::ReleaseDiscovery {
+                            releases: vec![f.releases[0].clone()],
+                            mlat_error: Some(DataError("synthetic optional lookup outage".into())),
+                        })
+                    },
+                    |rel, spec, context, progress| {
+                        assert_eq!(
+                            rel, &f.releases[0],
+                            "only the live main identity may download"
+                        );
+                        downloads.fetch_add(1, Ordering::Relaxed);
+                        ingest_day_reader(
+                            f.archives[0].as_slice(),
+                            rel.feed.label(),
+                            spec,
+                            progress,
+                            context,
+                        )
+                    },
+                    |_, _, _, _, _| panic!("a completed main feed needs no staging lookup"),
+                )
+                .unwrap();
+                assert_eq!(lookups, 1);
+                assert_eq!(downloads.load(Ordering::Relaxed), 1);
+                let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
+                tags.sort();
+                let fresh = build_day_store(f.parts.to_vec(), &f.spec, tags.clone(), context);
+                let expected = merge_stores(vec![fresh.clone()], DAY_JOIN_GAP_S).filtered(
+                    &f.want.bbox,
+                    f.want.t_start,
+                    f.want.t_end,
+                );
+                assert!(
+                    !got.legs.is_empty(),
+                    "MLAT identifies the main feed's unknown aircraft"
+                );
+                assert_same_legs(&got.legs, &expected.legs);
+                assert_eq!(got.meta.sources, tags);
+                assert_eq!(got.meta.stats["cache_hits"], 0);
+                let notes = got.meta.stats["notes"].as_array().unwrap();
+                assert!(notes.iter().any(|n| {
+                    n.as_str().unwrap().contains("synthetic optional lookup outage")
+                }));
+                assert!(notes.iter().any(|n| {
+                    n.as_str().unwrap().contains("combined the completed main feed")
+                }));
+                assert!(!notes.iter().any(|n| n.as_str().unwrap().contains(NO_MLATONLY)));
+                assert_eq!(std::fs::read(raw_mlat).unwrap(), original_mlat);
+                let saved = TrackStore::load(&f.dir.join(format!(
+                    "{}_{}.fdtrk",
+                    cache_feedset(&feedset_name(main, true), include_jets),
+                    bbox_key(&f.spec.bbox).1
+                )))
+                .unwrap();
+                assert_same_legs(&saved.legs, &fresh.legs);
+                assert_eq!(saved.meta.sources, fresh.meta.sources);
+                assert_eq!(saved.meta.stats, fresh.meta.stats);
+                let reused = fetch_window(
+                    &f.want,
+                    &f.cache,
+                    &FetchOptions {
+                        offline: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_same_legs(&reused.legs, &got.legs);
+                assert_eq!(reused.meta.stats["cache_hits"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_main_mlat_recovery_requires_an_outage_and_a_complete_checkpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for (checkpoint, outage) in [("missing", true), ("corrupt", true), ("complete", false)] {
+            let f = offline_raw_fixture_with_listing(Feed::Prod, false, true);
+            if checkpoint != "missing" {
+                f.checkpoint(1);
+                if checkpoint == "corrupt" {
+                    std::fs::write(
+                        crate::raw_cache::path(&f.dir, &f.releases[1], &f.spec),
+                        b"unfinished raw MLAT checkpoint",
+                    )
+                    .unwrap();
+                }
+            }
+            let want = IngestSpec {
+                keep_unknown: true,
+                ..f.want
+            };
+            let downloads = AtomicUsize::new(0);
+            let got = fetch_window_with_sources(
+                &want,
+                &f.cache,
+                &FetchOptions::default(),
+                |net, _, _, _, _, offline, include_mlat| {
+                    assert!(net.is_some() && !offline && include_mlat);
+                    Ok(crate::adsblol::ReleaseDiscovery {
+                        releases: vec![f.releases[0].clone()],
+                        mlat_error: outage
+                            .then(|| DataError("synthetic optional lookup outage".into())),
+                    })
+                },
+                |rel, spec, context, progress| {
+                    assert_eq!(
+                        rel, &f.releases[0],
+                        "local metadata cannot authorize a download"
+                    );
+                    downloads.fetch_add(1, Ordering::Relaxed);
+                    ingest_day_reader(
+                        f.archives[0].as_slice(),
+                        rel.feed.label(),
+                        spec,
+                        progress,
+                        context,
+                    )
+                },
+                |_, _, _, _, _| panic!("the completed main feed stays authoritative"),
+            )
+            .unwrap();
+            assert_eq!(downloads.load(Ordering::Relaxed), 1);
+            let main = build_day_store(
+                vec![f.parts[0].clone()],
+                &f.spec,
+                vec![f.releases[0].tag.clone()],
+                day_context((2026, 9, 8)),
+            );
+            let expected = merge_stores(vec![main], DAY_JOIN_GAP_S).filtered(
+                &want.bbox,
+                want.t_start,
+                want.t_end,
+            );
+            assert!(!got.legs.is_empty());
+            assert_same_legs(&got.legs, &expected.legs);
+            assert_eq!(got.meta.sources, [f.releases[0].tag.clone()]);
+            let notes = got.meta.stats["notes"].as_array().unwrap();
+            assert!(notes.iter().any(|n| n.as_str().unwrap().contains(NO_MLATONLY)));
+            assert!(notes.iter().all(|n| {
+                !n.as_str().unwrap().contains("combined the completed main feed")
+            }));
+            assert!(
+                !f.dir
+                    .join(format!("prod+mlatonly_{}.fdtrk", bbox_key(&f.spec.bbox).1))
+                    .exists()
+            );
         }
     }
 
