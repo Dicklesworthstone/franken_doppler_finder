@@ -19,6 +19,26 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover steep-pass ridge points before applying the final frequency bound
+
+- Let both short-window guided tracing paths qualify normalized peaks across the full
+  spectral lobe before restoring their local three-bin raw vertices. Apply the original
+  narrower timing/frequency bound afterward, matching the ordinary-window path.
+- Recover qualified peaks whose raw correction moves inside that bound; reject or replace
+  peaks whose correction moves outside it. Preserve previously accepted raw-calibrated
+  vertices and retain the original SNR, robust-z, valley-clearance and position thresholds.
+  Uncorrected discovery peaks can now be rejected when their raw vertex is out of bounds.
+- The preceding code loses all 41 admissible points in the first analytic regression case
+  and a valid vertex in the physical PCM regression. Both pass after the repair. The PCM
+  fixture independently solves emission time, includes geometric spreading and fixed-seed
+  noise, and exercises the production STFT and tracing with both clock-offset directions.
+  Recovered vertices stay within one spectral bin of the known physical curve.
+- All 17 focused native measurement/trace tests pass in the complete core test executable
+  built through RCH with the pinned compiler and locked dependencies. The analytic controls
+  cover both frequency directions, outward corrections and insufficient signal. No field
+  accuracy or end-to-end performance improvement is established; reference/field replays
+  and the full-workspace/release-selftest gates remain separate validation requirements.
+
 ### Retain valid locations beside rejected fine-grid range intersections
 
 - Let the existing quick-geometry spatial recovery run after both the ordinary fine

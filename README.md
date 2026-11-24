@@ -1816,6 +1816,10 @@ Design notes:
   calibration also tries those alternatives when the original peak has no local raw vertex,
   even if its normalized frequency stays in the tolerance. Every calibration alternative
   must supply a valid local raw vertex before it can be ranked.
+  Short windows use the same separation between spectral-lobe selection and final position
+  tolerance: a qualified normalized peak outside the latter can still supply a corrected
+  vertex inside it. Conversely, an in-band normalized peak whose corrected vertex lies
+  outside the tolerance is rejected or replaced by another qualified peak.
   An eligible original winner keeps its exact selection and interpolation.
   There is no climb toward a raw maximum several bins away: tried,
   it made Livermore distances worse and raised the evidence of wrong-date runs. No extra full
@@ -2225,6 +2229,19 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Keep admissible steep-pass frequencies after raw correction
+
+`steep_measurement_checks_position_after_local_raw_frequency_correction` checks analytic
+short-window lobes in both frequency directions, including inward and outward raw-vertex
+corrections, insufficient signal and the unchanged timing bound. The preceding code loses
+all 41 admissible points in its first case; the repaired path keeps them.
+`steep_raw_calibration_keeps_admissible_physical_pcm_frames` synthesizes received audio
+from independent emission-time physics, geometric spreading and fixed-seed noise, then
+uses the real STFT, row normalization and guided tracing. It recovers previously lost
+vertices within one spectral bin of the physical curve and preserves accepted raw-calibrated
+vertices exactly. Both regressions and 15 related tracing/measurement tests pass in the
+complete native core test executable. These checks do not establish field accuracy.
 
 ### A wider region retains a recoverable fine-grid location
 

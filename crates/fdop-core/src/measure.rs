@@ -348,9 +348,13 @@ fn guided_trace_with_background(
                         let reference = (4.0 * band).max(noise_band).max(4.0 * half_width);
                         let along = |tk: f64| model(tk) - fp;
                         let j = short.frame_index(t);
+                        // As in the main window, select the normalized peak across
+                        // the lobe before restoring its local raw vertex. That
+                        // correction can cross the narrower timing boundary in
+                        // either direction; only the corrected position decides.
                         let peak = match (short_background, raw_only) {
                             (Some(background), true) => guided_raw_ridge_peak(
-                                short, j, fp, along, band, peak_band, reference, half, min_snr,
+                                short, j, fp, along, peak_band, peak_band, reference, half, min_snr,
                                 min_z, background, band,
                             ),
                             _ => guided_ridge_peak_with_exclusion(
@@ -358,7 +362,7 @@ fn guided_trace_with_background(
                                 j,
                                 fp,
                                 along,
-                                band,
+                                peak_band,
                                 peak_band,
                                 reference,
                                 half,
@@ -1288,6 +1292,195 @@ mod tests {
                 let expected = 100.0 + direction * (-1.0 + 8.0 / 60.0);
                 assert!(trace.f.iter().all(|&f| (f - expected).abs() < 2e-5));
             }
+        }
+    }
+
+    #[test]
+    fn steep_measurement_checks_position_after_local_raw_frequency_correction() {
+        // Analytic short-window spectral lobes following an eight-Hz/s chirp.
+        // The timing tolerance is two Hz, while the short Hann lobe's half-width
+        // is nine Hz. Row normalization can put the local peak just outside the
+        // former even though restoring its raw vertex puts it inside.
+        let guide = |t: f64| 160.0 - 8.0 * t;
+        for direction in [-1.0, 1.0] {
+            for (normal_offset, raw_shift, height, inside) in [
+                (2.1, -0.15, 12.0, true),
+                (2.3, -0.15, 12.0, false),
+                (1.5, -0.15, 12.0, true),
+                (2.1, -0.15, 2.0, false),
+                // An in-band normalized vertex cannot stand in for its observed
+                // raw vertex when the correction moves the latter outside.
+                (1.95, 0.15, 12.0, false),
+            ] {
+                let t: Vec<_> = (0..=40).map(|i| i as f64 * 0.25).collect();
+                let f: Vec<_> = (0..=800).map(|i| 20.0 + i as f64 * 0.25).collect();
+                let background: Vec<_> = f
+                    .iter()
+                    .map(|&frequency| (direction * 0.6 * raw_shift * (frequency - 100.0)) as f32)
+                    .collect();
+                let db = f
+                    .iter()
+                    .flat_map(|&frequency| {
+                        t.iter().map(move |&time| {
+                            let offset = frequency - guide(time) - direction * normal_offset;
+                            (height - 0.3 * offset * offset).max(0.0) as f32
+                        })
+                    })
+                    .collect();
+                let short = Spec {
+                    t,
+                    f,
+                    db,
+                    meta: crate::spectro::SpecMeta {
+                        sr: 1000,
+                        win_s: 0.25,
+                        hop_s: 0.25,
+                        nfft: 4000,
+                        df: 0.25,
+                        fmin: 20.0,
+                        fmax: 220.0,
+                        norm: "analytic short-window chirp with removed row background".into(),
+                    },
+                };
+                let mut main = short.clone();
+                main.meta.win_s = 0.5;
+                main.db.fill(0.0);
+                for raw_only in [false, true] {
+                    let trace = guided_trace_with_background(
+                        &main,
+                        None,
+                        Some((&short, Some(&background))),
+                        &guide,
+                        0.0,
+                        10.0,
+                        1.0,
+                        3.0,
+                        4.0,
+                        raw_only,
+                    );
+                    if !inside {
+                        assert!(
+                            trace.is_empty(),
+                            "outside/unqualified: offset={normal_offset}, raw shift={raw_shift}, height={height}, direction={direction}, raw_only={raw_only}"
+                        );
+                        continue;
+                    }
+                    assert_eq!(
+                        trace.len(),
+                        short.nt(),
+                        "offset={normal_offset}, direction={direction}, raw_only={raw_only}"
+                    );
+                    for (&time, &frequency) in trace.t.iter().zip(&trace.f) {
+                        // The raw parabola's independently known vertex moves by
+                        // background_slope / (2 * curvature).
+                        let expected = guide(time) + direction * (normal_offset + raw_shift);
+                        assert!(
+                            (frequency - expected).abs() < 0.002,
+                            "{frequency} vs {expected}"
+                        );
+                        assert!((frequency - guide(time)).abs() <= 2.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn steep_raw_calibration_keeps_admissible_physical_pcm_frames() {
+        let (sr, c, f0, v, d, t0r) = (4000u32, 343.0, 250.0, 110.0, 900.0, 30.0);
+        let t0e = t0r - d / c;
+        let mut seed = 4242u64;
+        // Synthesize emission phase and geometric spreading by independently solving
+        // arrival = emission + range/c, then use the production STFT and normalization.
+        let x: Vec<f32> = (0..sr as usize * 60)
+            .map(|i| {
+                let received = i as f64 / sr as f64 - t0e;
+                let mut emitted = received - d / c;
+                for _ in 0..10 {
+                    let range = d.hypot(v * emitted);
+                    emitted -=
+                        (emitted + range / c - received) / (1.0 + v * v * emitted / (c * range));
+                }
+                let range = d.hypot(v * emitted);
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (0.3 * d / range * (std::f64::consts::TAU * f0 * emitted).sin()
+                    + 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0)) as f32
+            })
+            .collect();
+        let truth = model_fn(f0, v, d, t0r, c);
+        let mut main = stft_band_db(&x, sr, 0.5, 0.1, 150.0, 400.0, 0.25, 0.0).unwrap();
+        let main_background = main.normalize_rows_with_offsets(None);
+        let win = window_for_roc(peak_received_chirp(f0, v, d, c));
+        assert!(win < MIN_MAIN_WIN_S);
+        let mut short = stft_band_db(&x, sr, win, 0.1, 150.0, 400.0, 0.25, 0.0).unwrap();
+        let background = short.normalize_rows_with_offsets(None);
+        for clock_offset in [-0.25, 0.25] {
+            let guide = |t: f64| truth(t + clock_offset);
+            let trace = guided_trace_with_background(
+                &main,
+                Some(&main_background),
+                Some((&short, Some(&background))),
+                &guide,
+                21.0,
+                34.0,
+                1.0,
+                3.0,
+                4.0,
+                true,
+            );
+            let mut recovered = 0;
+            for &time in main.t.iter().filter(|&&t| (21.0..=34.0).contains(&t)) {
+                let fp = guide(time);
+                let chirp = (guide(time + 0.125) - guide(time - 0.125)).abs() / 0.25;
+                assert!(chirp > 4.0);
+                let band = (STEEP_TIME_ERROR_S * chirp).max(1.0);
+                let half_width = 2.0 / short.meta.win_s + 0.5 * chirp * short.meta.win_s;
+                let peak_band = band.max(half_width);
+                let reference = (4.0 * band).max(8.0).max(4.0 * half_width);
+                let peak = |selection_band| {
+                    guided_raw_ridge_peak(
+                        &short,
+                        short.frame_index(time),
+                        fp,
+                        |t| guide(t) - fp,
+                        selection_band,
+                        peak_band,
+                        reference,
+                        (1.5 / main.dt()).round() as usize,
+                        3.0,
+                        4.0,
+                        &background,
+                        band,
+                    )
+                };
+                let old = peak(band);
+                let wide = peak(peak_band);
+                if let Some(old) = old {
+                    assert_eq!(
+                        Some(old),
+                        wide,
+                        "an accepted raw vertex must stay unchanged"
+                    );
+                }
+                if let Some((frequency, snr, _)) = wide {
+                    let index = trace
+                        .t
+                        .iter()
+                        .position(|&t| t == time)
+                        .expect("an admissible measured short-window vertex was lost");
+                    assert_eq!(trace.f[index], frequency);
+                    assert_eq!(trace.snr[index], snr);
+                    assert!((frequency - guide(time)).abs() <= band);
+                    assert!((frequency - truth(time)).abs() <= short.df());
+                    recovered += usize::from(old.is_none());
+                }
+            }
+            assert!(
+                recovered > 0,
+                "fixture must reach raw vertices hidden by the old normalized band: clock offset {clock_offset}"
+            );
         }
     }
 
