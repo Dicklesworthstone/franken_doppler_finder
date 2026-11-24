@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Avoid detector scoring where temporal coverage cannot qualify
+
+- Compute conservative time-only coverage bounds once per template and intersect
+  each scoring window with them. Skip unused evidence sums for edge-coverage guards.
+  Preserve actual counts, floating-point sample order, residual-mask handling,
+  earliest-template ties, thresholds and detection budgets.
+- Extend the existing scalar-oracle tests for short/long clips, full row coverage
+  and overlapping/clamped windows. Both pass in the exact-source native component
+  runner with real Rayon, including the existing one-/three-thread checks; all
+  eight native old/new kernel comparisons retain bitwise scores and template indices.
+- A single-thread synthetic kernel benchmark on a shared Intel Xeon Platinum 8573C,
+  median of three alternating runs, measured the 3,600-frame primary bank at
+  6.168426 s before and 4.539564 s after (1.359x). The 120-/300-frame primary and
+  four edge-bank cases also improved. This is not an end-to-end or field result.
+  Changed lines pass pinned formatting and whitespace checks; full core/workspace
+  tests, release selftest and reference/field replays remain unverified.
+
 ### Recover staging during a prod release lookup outage
 
 - Permit a validated staging release when prod metadata cannot be retrieved, after
@@ -49,10 +66,13 @@ at that commit, not per-change commits.
   and retain the original interpolation and reported-velocity accounting.
 - Add three synthetic regressions covering mixed telemetry, time reversal, clock
   epochs, sampling density, Doppler support and invalid/under-resolved turns.
-  Changed-line formatting and whitespace checks pass. The pinned native build was
-  killed by SIGKILL in unchanged `fsci-stats` before tests ran; native tests, Clippy,
-  release selftest and reference/field checks remain unverified. Independent
-  mathematical review establishes no real-recording accuracy improvement.
+  All three pass in the native exact-module track/physics runner with genuine
+  dependencies: 95 tests passed, none failed, one existing timing benchmark ignored.
+  Only the existing search integration test is excluded from that external runner.
+  Changed-line formatting and whitespace checks pass. The full core build was
+  killed twice by SIGKILL in unchanged `fsci-stats`; full core/workspace tests,
+  Clippy, release selftest and reference/field checks remain unverified. These
+  synthetic component results establish no real-recording accuracy improvement.
 
 ### Keep each location answer with the artifacts from its own run
 

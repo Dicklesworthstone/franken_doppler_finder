@@ -347,6 +347,39 @@ fn score_bank(
     let mut indices = vec![0u16; nr * nt];
     let max_count = tmpls.iter().map(|t| t.n_a.max(t.n_r)).max().unwrap_or(0);
     let roots: Vec<f32> = (0..=max_count).map(|n| (n as f32).sqrt()).collect();
+    // Frequency clipping can only reduce coverage. Find the time-only bounds
+    // once per template, then avoid evidence sums at centres that cannot meet
+    // both halves' coverage requirement in any row.
+    let mut count_a = vec![0i32; nt + 1];
+    let mut count_r = vec![0i32; nt + 1];
+    let bounds: Vec<_> = tmpls
+        .iter()
+        .map(|tm| {
+            count_a.fill(0);
+            count_r.fill(0);
+            for &(dt, _, app) in &tm.path {
+                let a = (-(dt as i64)).clamp(0, nt as i64) as usize;
+                let b = (nt as i64 - dt as i64).clamp(0, nt as i64) as usize;
+                if a < b {
+                    let counts = if app { &mut count_a } else { &mut count_r };
+                    counts[a] += 1;
+                    counts[b] -= 1;
+                }
+            }
+            let (mut na, mut nrr) = (0i32, 0i32);
+            let (mut first, mut end) = (nt, 0);
+            for k in 0..nt {
+                na += count_a[k];
+                nrr += count_r[k];
+                if (na as f32) < 0.6 * tm.n_a as f32 || (nrr as f32) < 0.6 * tm.n_r as f32 {
+                    continue;
+                }
+                first = first.min(k);
+                end = k + 1;
+            }
+            (first, end)
+        })
+        .collect();
     best.par_chunks_mut(nt)
         .zip(indices.par_chunks_mut(nt))
         .enumerate()
@@ -367,8 +400,21 @@ fn score_bank(
                         continue;
                     }
                     for (ti, tm) in tmpls.iter().enumerate() {
-                        sa[c0..c1].fill(0.0);
-                        sr[c0..c1].fill(0.0);
+                        let base = tm.edge == EdgeRole::Base;
+                        if base {
+                            // The following edge template still needs the uncovered guard
+                            // outside the base's possible time-coverage bounds.
+                            base_covered[c0..c1].fill(false);
+                        }
+                        let (lo, hi) = bounds[ti];
+                        let (c0, c1) = (c0.max(lo), c1.min(hi));
+                        if c0 >= c1 {
+                            continue;
+                        }
+                        if !base {
+                            sa[c0..c1].fill(0.0);
+                            sr[c0..c1].fill(0.0);
+                        }
                         ca[c0..=c1].fill(0);
                         cr[c0..=c1].fill(0);
                         for &(dt, dr, app) in &tm.path {
@@ -386,9 +432,13 @@ fn score_bank(
                             } else {
                                 (&mut *sr, &mut *cr)
                             };
-                            let src = source_row as usize * nt + (a as i64 + dt as i64) as usize;
-                            for (sum, &z) in s[a..b].iter_mut().zip(&evidence[src..src + b - a]) {
-                                *sum += z;
+                            if !base {
+                                let src =
+                                    source_row as usize * nt + (a as i64 + dt as i64) as usize;
+                                for (sum, &z) in s[a..b].iter_mut().zip(&evidence[src..src + b - a])
+                                {
+                                    *sum += z;
+                                }
                             }
                             counts[a] += 1;
                             counts[b] -= 1;
@@ -4606,8 +4656,7 @@ mod tests {
             d_grid: vec![250.0, 1000.0, 12_000.0],
             ..DetectParams::default()
         };
-        for nt in [8, 61, 251] {
-            let nr = 37;
+        for (nt, nr) in [(8, 37), (29, 37), (61, 37), (251, 37), (601, 37), (61, 239)] {
             let ls = LogSpec {
                 t: (0..nt).map(|i| i as f64).collect(),
                 freqs: (0..nr).map(|r| 35.0 * 2f64.powf(r as f64 / 48.0)).collect(),
@@ -4686,7 +4735,12 @@ mod tests {
                     }
                     // Windows score their cells exactly as the full window does and leave every
                     // other cell at -inf.
-                    for windows in [vec![(0, nt / 3), (nt - nt / 4, nt)], vec![(nt / 2, nt / 2)]] {
+                    for windows in [
+                        vec![(0, nt / 3), (nt - nt / 4, nt)],
+                        vec![(nt / 2, nt / 2)],
+                        vec![(0, nt / 2), (nt / 3, nt), (nt / 4, nt / 2)],
+                        vec![(nt - 3, nt + 5), (0, 2), (nt + 2, nt + 10)],
+                    ] {
                         let part = pool.install(|| score_bank(&ls, &tmpls, &evidence, &windows));
                         for k in 0..nr * nt {
                             let i = k % nt;
@@ -4718,7 +4772,7 @@ mod tests {
             ..p.clone()
         };
         assert!(build_edge_templates(&off, 1.0).is_empty());
-        for nt in [8, 61, 251] {
+        for nt in [8, 29, 30, 61, 251] {
             let nr = 37;
             let ls = LogSpec {
                 t: (0..nt).map(|i| i as f64).collect(),
@@ -4802,7 +4856,11 @@ mod tests {
             }
             let head = (p.min_half_s as usize).min(nt);
             let tail = nt.saturating_sub(p.min_half_s as usize).max(head);
-            for windows in [vec![(0, nt)], vec![(0, head), (tail, nt)]] {
+            for windows in [
+                vec![(0, nt)],
+                vec![(0, head), (tail, nt)],
+                vec![(0, nt), (0, nt / 2), (nt / 3, nt + 5)],
+            ] {
                 let actual = score_bank(&ls, &edge, &ls.data, &windows);
                 for k in 0..nr * nt {
                     assert_eq!(actual.1[k], expected.1[k], "nt={nt} cell={k} {windows:?}");

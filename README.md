@@ -2316,6 +2316,33 @@ second weather wait; a larger footprint can require another archive download.
 
 ## Testing
 
+### Skip impossible detector coverage without changing scores
+
+The matched-filter bank computes each template's time-only coverage bounds once,
+then skips centres that cannot meet the existing approach/recede coverage rules
+in any frequency row. Templates used only to guard the edge fallback no longer
+sum unused evidence. Eligible cells retain the original sample addition order,
+actual frequency-clipped counts, residual-mask accounting and earliest-template ties.
+
+The expanded `template_bank_matches_scalar_with_edges_and_residuals` and
+`edge_bank_matches_scalar` tests pass in a native component runner using the exact
+production items, unchanged oracle calculations and genuine Rayon dependencies.
+They cover short and long clips, all 239 frequency rows, residual masks, ties,
+overlapping/clamped windows and the existing one-/three-thread comparisons.
+Eight separate native old/new kernel comparisons also match every score bit and
+winning template index.
+
+On an Intel Xeon Platinum 8573C under shared load, a single-thread component
+benchmark using 239 rows, the default 326-template primary bank, in-memory
+synthetic evidence and the median of three alternating runs measured 0.306074 s
+to 0.099591 s for 120 frames, 0.659314 s to 0.534350 s for 300 frames, and
+6.168426 s to 4.539564 s for 3,600 frames. Each frame represents one second.
+The four corresponding 156-template edge-bank cases also improved. The 30-frame
+primary case has no eligible centre and is skipped entirely. These are component
+timings, not end-to-end `locate` measurements. Full core/workspace tests, release
+selftest and reference/field replays remain unverified; no accuracy improvement
+or change to detection thresholds, caps or confidence gates is claimed.
+
 ### Recover staging when the prod release lookup fails
 
 A prod metadata outage now permits a separately validated staging alternative after usable
@@ -2347,13 +2374,16 @@ supported positions, the existing spline and Doppler predictions, and unchanged
 reported-velocity credit. The sparse positive fixtures also assert that the preceding
 secant and acceleration checks reject their geometry.
 
-The pinned native core build was attempted with one compiler job and disk-backed
-artifacts, but rustc was killed by SIGKILL in the unchanged `fsci-stats` dependency
-before the track tests ran. Changed-line formatting and whitespace checks pass;
-the whole workspace's formatting check still reports pre-existing drift. Native
-tests, Clippy, the release selftest and reference/field replays remain unverified.
-Independent mathematical checks informed the fixture design; they are not native
-test or real-recording evidence.
+All three new regressions pass in a native component run of the production track
+and physics modules: 95 tests passed, none failed, and the existing timing benchmark
+was ignored. The external runner uses the pinned compiler and genuine Cargo-built
+dependencies. It excludes only `missing_speed_acceleration_restores_two_aircraft_location`,
+an existing search integration test; all remaining assertions and production code are
+unchanged. The full core build was killed twice by SIGKILL in the unchanged
+`fsci-stats` dependency. Changed-line formatting and whitespace checks pass; the
+workspace formatting check reports pre-existing drift. Full core/workspace tests,
+Clippy, the release selftest and reference/field replays remain unverified. These
+synthetic component results do not establish real-recording accuracy.
 
 ### Retain physical flight support under the selected weather
 
