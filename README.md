@@ -305,7 +305,8 @@ propagation model; this numerical consistency does not calibrate the search-wide
 When broad fitted timing intervals reach the shared clock scan's 400-cell limit, continuous
 refinement covers the actual spacing between those cells. It no longer confines the optimum to
 the nominal 0.25 s neighbourhood of a sample when the samples are farther apart. Narrow timing
-windows retain their original evaluation sequence; the scan budget and confidence gates are unchanged.
+windows keep that original scan first; a successful fit retains its evaluation sequence.
+The scan budget and confidence gates are unchanged.
 
 Trace scoring retains the original least-squares tone fit and also tries a robust emitted-tone estimate
 from the median of observed frequency divided by predicted Doppler ratio. The alternative is used only
@@ -2178,9 +2179,11 @@ At each fine-grid point, the original shared-clock fit is retained exactly when 
 aircraft pass those same gates. If that minimum fails an event, the fitter keeps the
 best eligible clock it already examined and polishes only its neighboring scan interval.
 A failed local polish cannot erase that retained clock, and the returned trace fits are
-recomputed at the returned clock. A window with no eligible sampled clock is rejected
-without another scan unless the 400-cell cap widened its sampling interval. In that case,
+recomputed at the returned clock. If no sampled clock qualifies in a positive-width window,
 the fitter also tries the recording start implied by each aircraft's exact closest approach.
+This includes narrow windows: the overlap in two partially covered tracks can lie between
+nominal 0.25 s samples even when both tracks meet the existing coverage gate at one clock.
+Zero-width and invalid intervals retain their original behavior.
 Each seed must lie inside the original joint clock window. Seeds that already explain both
 aircraft retain priority, including the seed itself when local polishing misses it. If every
 original scan and eligible-seed recovery fails, the fitter also searches the original scan-cell
@@ -2546,6 +2549,25 @@ regression also gains a saturated-air invariant, but that full data-pipeline tes
 run. Workspace checks, release selftest and field replays remain incomplete after the
 shared build host exhausted resources and disconnected; these results establish the
 synthetic propagation invariant, not improved recording accuracy.
+
+### Retain a shared clock through partial aircraft coverage
+
+`narrow_clock_seeds_retain_partially_covered_physical_flyovers` observes two complete
+physical ridges, then clips the first aircraft's archived track after closest approach
+and the second before it. Their shared coverage interval falls between the regular
+clock samples. The original profile rejects the pair; the physical-seed retry recovers
+both matches at the known observer, each covering 49 of 81 observations, within 0.05 s
+of the recording clock in both relative and Unix time. The existing coverage, geometry
+and trace-fit gates remain unchanged.
+
+All 20 tests in the focused native component pass: 15 actual clock/point-evaluation
+tests and five existing physics tests, using exact production helpers, complete
+track/propagation code and genuine dependencies under the pinned compiler. Controls
+retain the exact evaluation sequence of successful scans and zero-width failures,
+filter unusable seeds, and restore failed narrow retries' original callback state.
+Changed-line formatting and whitespace checks pass. Full search/workspace tests,
+CLI selftest and reference/field replays remain unverified; this is not an end-to-end
+location or field-accuracy result.
 
 ### Recover a shared clock between uncertain closest-approach estimates
 

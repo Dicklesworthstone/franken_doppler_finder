@@ -2613,8 +2613,8 @@ fn profile_valid_clock(
     valid.then_some((best.0, value))
 }
 
-/// A wide uncertainty window can put every regular sample outside a compact pass's
-/// accepted clock basin. Capped residuals may then favor a distant, invalid plateau.
+/// Regular samples can miss a compact pass's accepted clock basin or a narrow
+/// overlap in two tracks' coverage. Capped residuals may favor an invalid plateau.
 /// Preserve every original success; only a failed coarse scan tries the exact
 /// recording clocks implied by its assigned physical CPAs. Preserve successful
 /// exact-seed recovery before searching a finite rejected seed's scan-cell neighborhood:
@@ -2635,7 +2635,7 @@ fn profile_valid_clock_seeded(
     }
     let n = (((hi - lo) / 0.25).ceil() as usize).clamp(1, 400);
     let half = (hi - lo) / n as f64;
-    if !half.is_finite() || half <= 0.25 {
+    if !half.is_finite() || half <= 0.0 {
         return None;
     }
     let restore = last?;
@@ -7051,15 +7051,15 @@ mod tests {
     }
 
     #[test]
-    fn seeded_clock_preserves_successes_and_narrow_failures_exactly() {
-        for (lo, hi, valid) in [(-400.0, 400.0, true), (0.0, 80.0, false)] {
+    fn seeded_clock_preserves_successes_and_zero_width_failures_exactly() {
+        for (lo, hi, valid) in [(-400.0, 400.0, true), (0.0, 80.0, true), (1.0, 1.0, false)] {
             let mut original_calls = Vec::new();
             let original = profile_valid_clock(lo, hi, |t| {
                 original_calls.push(t);
                 (t * t, valid)
             });
             let mut calls = Vec::new();
-            let recovered = profile_valid_clock_seeded(lo, hi, &[1.173, 20.31], |t| {
+            let recovered = profile_valid_clock_seeded(lo, hi, &[1.0, 1.173, 20.31], |t| {
                 calls.push(t);
                 (t * t, valid)
             });
@@ -7104,46 +7104,52 @@ mod tests {
 
     #[test]
     fn seeded_clock_restores_rejected_fits_and_filters_unused_seeds() {
-        for finite in [true, false] {
-            let score = |t: f64| (if finite { t * t } else { f64::INFINITY }, false);
-            let mut original_calls = Vec::new();
-            assert!(
-                profile_valid_clock(-400.0, 400.0, |t| {
-                    original_calls.push(t);
-                    score(t)
-                })
-                .is_none()
-            );
-            let mut calls = Vec::new();
-            let seeds = [f64::NAN, f64::INFINITY, -401.0, 1.173, 1.173, 401.0];
-            assert!(
-                profile_valid_clock_seeded(-400.0, 400.0, &seeds, |t| {
-                    calls.push(t);
-                    score(t)
-                })
-                .is_none()
-            );
-            assert_eq!(&calls[..original_calls.len()], &original_calls);
-            let extra = &calls[original_calls.len()..calls.len() - 1];
-            assert_eq!(extra[0], 1.173);
-            if finite {
-                // Only the distinct, finite rejected seed earns a bounded retry.
-                // Invalid clocks can never pass; its final fits must still be restored.
-                assert!(extra.len() > 1 && extra.len() < 50);
-                assert!(extra.iter().all(|&t| (1.173 - 2.0..=1.173 + 2.0).contains(&t)));
-            } else {
-                assert_eq!(extra, &[1.173]);
+        for (lo, hi, half) in [(-400.0, 400.0, 2.0), (0.0, 80.0, 0.25)] {
+            for finite in [true, false] {
+                let score = |t: f64| (if finite { t * t } else { f64::INFINITY }, false);
+                let mut original_calls = Vec::new();
+                assert!(
+                    profile_valid_clock(lo, hi, |t| {
+                        original_calls.push(t);
+                        score(t)
+                    })
+                    .is_none()
+                );
+                let mut calls = Vec::new();
+                let seeds = [f64::NAN, f64::INFINITY, lo - 1.0, 1.173, 1.173, hi + 1.0];
+                assert!(
+                    profile_valid_clock_seeded(lo, hi, &seeds, |t| {
+                        calls.push(t);
+                        score(t)
+                    })
+                    .is_none()
+                );
+                assert_eq!(&calls[..original_calls.len()], &original_calls);
+                let extra = &calls[original_calls.len()..calls.len() - 1];
+                assert_eq!(extra[0], 1.173);
+                if finite {
+                    // Only the distinct, finite rejected seed earns a bounded retry.
+                    // Invalid clocks can never pass; its final fits must still be restored.
+                    assert!(extra.len() > 1 && extra.len() < 50);
+                    assert!(
+                        extra
+                            .iter()
+                            .all(|&t| (1.173 - half..=1.173 + half).contains(&t))
+                    );
+                } else {
+                    assert_eq!(extra, &[1.173]);
+                }
+                assert_eq!(calls.last(), original_calls.last());
+                calls.clear();
+                assert!(
+                    profile_valid_clock_seeded(lo, hi, &seeds[..3], |t| {
+                        calls.push(t);
+                        score(t)
+                    })
+                    .is_none()
+                );
+                assert_eq!(calls, original_calls);
             }
-            assert_eq!(calls.last(), original_calls.last());
-            calls.clear();
-            assert!(
-                profile_valid_clock_seeded(-400.0, 400.0, &seeds[..3], |t| {
-                    calls.push(t);
-                    score(t)
-                })
-                .is_none()
-            );
-            assert_eq!(calls, original_calls);
         }
     }
 
@@ -7414,6 +7420,155 @@ mod tests {
                 );
                 assert!(fitted.chis.iter().all(|fit| fit.chi < 0.1));
             }
+        }
+    }
+
+    #[test]
+    fn narrow_clock_seeds_retain_partially_covered_physical_flyovers() {
+        let (lat, lon) = (40.876466, -73.524951);
+        let dem = FlatElevation(0.0);
+        let enu = Enu::new(lat, lon, 0.0);
+        let o = observer(lat, lon, &dem);
+        let prop = Prop::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(prop.c));
+        let cross = (2000.0_f64.powi(2) - (150.0 - MIC_HEIGHT_M).powi(2)).sqrt();
+        for start in [0.0, 1_788_895_000.0] {
+            let mut tracks = Vec::new();
+            let mut events = Vec::new();
+            for (key, position, velocity, when, tone, n_eff) in [
+                (
+                    "A",
+                    [0.0, cross, 150.0],
+                    [88.0, 0.0, 0.0],
+                    120.0,
+                    112.7,
+                    20.0,
+                ),
+                (
+                    "B",
+                    [cross, 0.0, 150.0],
+                    [0.0, 95.0, 0.0],
+                    360.0,
+                    149.3,
+                    10.0,
+                ),
+            ] {
+                let full = straight_track(
+                    &enu,
+                    position,
+                    velocity,
+                    start + when,
+                    start + when - 200.0,
+                    start + when + 200.0,
+                    5.0,
+                );
+                let mut event =
+                    synth_event(key, &full, o.x, start, tone, prop.c, start + when, &prop);
+                event.tr_t.clear();
+                event.tr_f.clear();
+                // Observe both complete physical ridges before cropping archive coverage.
+                // The 19.2-second ridge exceeds eighty points and eight seconds on each side.
+                for k in 0..=80 {
+                    let tu = start + event.t_rec + (k as f64 - 40.0) * 0.24;
+                    let (_, _, ratio) = full.solve_emission_p(tu, o.x, &prop, None).unwrap();
+                    event.tr_t.push(tu - start);
+                    event
+                        .tr_f
+                        .push(tone * ratio + 0.05 * (((k * 7919) % 13) as f64 / 6.0 - 1.0));
+                }
+                (event.q_t, event.q_f) = subsample(&event.tr_t, &event.tr_f, 40);
+                event.sigma_hz = 0.002 * event.f0;
+                event.n_eff = n_eff;
+                let cutoff = start + event.t_rec + if key == "A" { 2.01 } else { -2.01 };
+                let (edge, _, _) = full.solve_emission_p(cutoff, o.x, &prop, None).unwrap();
+                let (from, to) = if key == "A" {
+                    (edge - 200.0, edge)
+                } else {
+                    (edge, edge + 200.0)
+                };
+                let mut track =
+                    straight_track(&enu, position, velocity, start + when, from, to, 5.0);
+                track.key = key.into();
+                let cpa = track.cpa_nearest_time(o.x, start + when, 150.0).unwrap();
+                assert!(gates_ok(&event, &cpa, &prop, 0.0));
+                tracks.push(track);
+                events.push(event);
+            }
+            let p = SearchParams::new(
+                start - 1.4,
+                start + 1.1,
+                600.0,
+                BBox::new(lat - 0.01, lon - 0.01, lat + 0.01, lon + 0.01),
+            );
+            let (lo, hi) = (p.start_lo - 1.0, p.start_hi + 1.0);
+            let grids: Vec<_> = tracks
+                .iter()
+                .zip(&events)
+                .map(|(track, event)| {
+                    RatioGrid::build(
+                        track,
+                        o.x,
+                        &prop,
+                        lo + event.tr_t[0] - 1.0,
+                        hi + event.tr_t.last().unwrap() + 1.0,
+                        0.2,
+                        p.max_gap_s,
+                    )
+                })
+                .collect();
+            let mut scratch = TraceScratch::default();
+            // The valid coverage overlap lies between the regular -0.15/+0.10 s
+            // samples. Its lower weighted plateau sacrifices the second aircraft.
+            let original = profile_valid_clock(lo, hi, |clock| {
+                let fits: Vec<_> = events
+                    .iter()
+                    .zip(&grids)
+                    .map(|(event, grid)| {
+                        trace_chi(
+                            &event.tr_t,
+                            &event.tr_f,
+                            &|tu| grid.at(tu),
+                            clock,
+                            event,
+                            1.0,
+                            event.sigma_hz,
+                            p.cap_sigma,
+                            true,
+                            &mut scratch,
+                        )
+                    })
+                    .collect();
+                let total = fits
+                    .iter()
+                    .zip(&events)
+                    .map(|(fit, event)| event.n_eff * fit.chi)
+                    .sum();
+                (total, fine_trace_fits(&fits, p.kappa))
+            });
+            assert!(original.is_none(), "start={start}: {original:?}");
+            let fitted = eval_point(
+                &o,
+                &[(0, 0, start + 120.0), (1, 1, start + 360.0)],
+                &events,
+                &tracks,
+                &p,
+                &atmo,
+                true,
+                true,
+                false,
+            )
+            .expect("physical CPA clocks must recover the accepted coverage overlap");
+            assert!(
+                (fitted.t_s - start).abs() < 0.05,
+                "start={start}: {}",
+                fitted.t_s
+            );
+            assert!(
+                fitted
+                    .chis
+                    .iter()
+                    .all(|fit| fit.chi < 10.0 && fit.cov == 49.0 / 81.0)
+            );
         }
     }
 

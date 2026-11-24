@@ -19,6 +19,19 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover valid aircraft pairs between narrow clock samples
+
+- After a failed shared-clock scan, permit the existing physical closest-approach
+  seeds in narrow positive-width windows too. Partly covered aircraft can have a
+  valid common clock between nominal 0.25 s samples. Preserve every original
+  success, the zero-width failure path, all acceptance gates and the unconstrained
+  contour's behavior.
+- Add a physical two-flight regression in relative and Unix time and extend the
+  bounded-retry, duplicate/nonfinite-seed and callback-state controls. All 20 tests
+  in the pinned native clock/point-evaluation component pass with genuine
+  dependencies. Changed-line formatting and whitespace checks pass; full
+  workspace, CLI selftest and reference/field validation remain incomplete.
+
 ### Recover fast ridges that leave neighboring seed bands
 
 - After the existing seed scan and observed-motion recovery fail, retry neighboring
