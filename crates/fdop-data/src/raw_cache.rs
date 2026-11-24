@@ -6,6 +6,8 @@
 //! After an exact miss, a covering spatial checkpoint can supply a narrower retry. An
 //! ordinary request may also remove known jets from a certified jet-inclusive raw feed;
 //! every ordinary checkpoint keeps priority, and all other identity fields still match.
+//! When no one checkpoint covers a retry, compatible regional views may jointly supply it:
+//! their certified rectangle union must cover every requested location before reconciliation.
 
 use crate::DataError;
 use crate::adsblol::{DayRelease, Feed};
@@ -175,8 +177,8 @@ pub(crate) fn load(
     context: DayContext,
 ) -> Result<Option<(Vec<RawAircraft>, IngestStats)>, DataError> {
     let exact = path(dir, rel, spec);
-    let mut first_error = match load_path(&exact, rel, spec, context, false) {
-        Ok(Some(part)) => return Ok(Some(part)),
+    let mut first_error = match load_path(&exact, rel, spec, context, Coverage::Exact) {
+        Ok(Some((_, aircraft, stats))) => return Ok(Some((aircraft, stats))),
         Ok(None) => None,
         Err(e) => Some(e),
     };
@@ -196,16 +198,16 @@ pub(crate) fn load(
     let mut candidates = Vec::new();
     for entry in entries.flatten() {
         let candidate = entry.path();
-        if candidate == exact || !candidate.is_file() {
+        if !candidate.is_file() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Some(stem) = name.strip_suffix(".fdopraw.gz")
             && let Some((label, bbox)) = crate::fetch::parse_cache_name(&format!("{stem}.fdtrk"))
             && (label == feed || (!spec.include_jets && label == expanded_feed))
-            && covers_bbox(bbox, spec.bbox)
+            && overlaps_bbox(bbox, spec.bbox)
         {
-            candidates.push((label != feed, bbox.area_km2(), candidate));
+            candidates.push((label != feed, bbox.area_km2(), candidate, bbox));
         }
     }
     // Preserve the existing exact/covering ordinary preference before trying the
@@ -215,22 +217,18 @@ pub(crate) fn load(
             .then_with(|| a.1.total_cmp(&b.1))
             .then_with(|| a.2.cmp(&b.2))
     });
-    for (from_expanded, _, candidate) in candidates {
+    for &(from_expanded, _, ref candidate, bbox) in &candidates {
+        if candidate == &exact || !covers_bbox(bbox, spec.bbox) {
+            continue;
+        }
         let cached_spec = IngestSpec {
             include_jets: spec.include_jets || from_expanded,
             ..*spec
         };
-        match load_path(&candidate, rel, &cached_spec, context, true) {
-            Ok(Some((mut aircraft, mut stats))) => {
+        match load_path(candidate, rel, &cached_spec, context, Coverage::Covering) {
+            Ok(Some((_, mut aircraft, mut stats))) => {
                 if from_expanded {
-                    // The embedded identity must certify the expanded ingest. Drop
-                    // jets before normal feed/type reconciliation and regional height
-                    // correction, exactly as an ordinary fresh ingest would do.
-                    let before = aircraft.len();
-                    aircraft.retain(|a| a.engine != fdop_types::engine::EngineClass::Jet);
-                    stats.jets_dropped += (before - aircraft.len()) as u64;
-                    stats.kept_aircraft = aircraft.len() as u64;
-                    stats.points_kept = aircraft.iter().map(|a| a.points.len() as u64).sum();
+                    remove_known_jets(&mut aircraft, &mut stats);
                 }
                 return Ok(Some((aircraft, stats)));
             }
@@ -241,7 +239,62 @@ pub(crate) fn load(
             }
         }
     }
+    // Several completed regional views of the same release can cover a wider retry.
+    // Keep all their original reports for the ordinary builder's duplicate, boundary
+    // and altitude reconciliation. A bounding hull would hide gaps: prove the union
+    // from the embedded, fully validated identities before publishing any combined part.
+    let mut covered = Vec::new();
+    let mut aircraft = Vec::new();
+    let mut stats = IngestStats::default();
+    for (from_expanded, _, candidate, _) in candidates {
+        let cached_spec = IngestSpec {
+            include_jets: spec.include_jets || from_expanded,
+            ..*spec
+        };
+        match load_path(
+            &candidate,
+            rel,
+            &cached_spec,
+            context,
+            Coverage::Intersecting,
+        ) {
+            Ok(Some((bbox, mut retained, mut selection))) => {
+                if from_expanded {
+                    remove_known_jets(&mut retained, &mut selection);
+                }
+                covered.push(bbox);
+                aircraft.extend(retained);
+                // Every view counted the same complete archive. Do not multiply its
+                // bytes or parse diagnostics; selection counters still describe the
+                // retained inputs, as with the builder's other overlapping raw parts.
+                stats.bytes = stats.bytes.max(selection.bytes);
+                stats.members = stats.members.max(selection.members);
+                stats.parse_errors = stats.parse_errors.max(selection.parse_errors);
+                (selection.bytes, selection.members, selection.parse_errors) = (0, 0, 0);
+                stats.add(&selection);
+                // A lone exact-filename identity mismatch keeps its previous miss.
+                if covered.len() > 1 && covers_union(&covered, spec.bbox) {
+                    return Ok(Some((aircraft, stats)));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                first_error
+                    .get_or_insert_with(|| DataError(format!("{}: {e}", candidate.display())));
+            }
+        }
+    }
     first_error.map_or(Ok(None), Err)
+}
+
+fn remove_known_jets(aircraft: &mut Vec<RawAircraft>, stats: &mut IngestStats) {
+    // The embedded identity certifies the expanded ingest. Remove jets before feed
+    // reconciliation and regional height correction, as an ordinary fresh ingest does.
+    let before = aircraft.len();
+    aircraft.retain(|a| a.engine != fdop_types::engine::EngineClass::Jet);
+    stats.jets_dropped += (before - aircraft.len()) as u64;
+    stats.kept_aircraft = aircraft.len() as u64;
+    stats.points_kept = aircraft.iter().map(|a| a.points.len() as u64).sum();
 }
 
 /// Reconcile complete local feeds with the ordinary day builder. When a processed
@@ -322,13 +375,65 @@ fn covers_bbox(outer: BBox, inner: BBox) -> bool {
         && outer.east >= inner.east
 }
 
+fn overlaps_bbox(a: BBox, b: BBox) -> bool {
+    covers_bbox(a, a)
+        && covers_bbox(b, b)
+        && a.south <= b.north
+        && a.north >= b.south
+        && a.west <= b.east
+        && a.east >= b.west
+}
+
+/// Sweep every latitude strip where the set of covering rectangles can change.
+/// Each strip must cover the complete longitude interval with no tolerance for gaps.
+fn covers_union(boxes: &[BBox], want: BBox) -> bool {
+    if !covers_bbox(want, want) {
+        return false;
+    }
+    let mut latitudes = vec![want.south, want.north];
+    for b in boxes.iter().filter(|&&b| overlaps_bbox(b, want)) {
+        latitudes.extend([b.south.max(want.south), b.north.min(want.north)]);
+    }
+    latitudes.sort_by(f64::total_cmp);
+    latitudes.dedup();
+    // Duplicated endpoints also check a zero-height request without a midpoint.
+    if latitudes.len() == 1 {
+        latitudes.push(want.north);
+    }
+    latitudes.windows(2).all(|strip| {
+        let mut intervals: Vec<_> = boxes
+            .iter()
+            .filter(|&&b| overlaps_bbox(b, want) && b.south <= strip[0] && b.north >= strip[1])
+            .map(|b| (b.west, b.east))
+            .collect();
+        intervals.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        let mut reached = want.west;
+        for (west, east) in intervals {
+            if west > reached {
+                return false;
+            }
+            reached = reached.max(east);
+            if reached >= want.east {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+enum Coverage {
+    Exact,
+    Covering,
+    Intersecting,
+}
+
 fn load_path(
     path: &Path,
     rel: &DayRelease,
     spec: &IngestSpec,
     context: DayContext,
-    covering: bool,
-) -> Result<Option<(Vec<RawAircraft>, IngestStats)>, DataError> {
+    coverage: Coverage,
+) -> Result<Option<(BBox, Vec<RawAircraft>, IngestStats)>, DataError> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -343,17 +448,22 @@ fn load_path(
         return Ok(None);
     }
     let mut required = Identity::new(rel, spec, context);
-    if covering {
-        let bits = &cached.identity.filter_bits;
-        let bbox = BBox::new(
-            f64::from_bits(bits[0]),
-            f64::from_bits(bits[1]),
-            f64::from_bits(bits[2]),
-            f64::from_bits(bits[3]),
-        );
-        if !covers_bbox(bbox, spec.bbox) {
-            return Ok(None);
-        }
+    let bits = &cached.identity.filter_bits;
+    let bbox = BBox::new(
+        f64::from_bits(bits[0]),
+        f64::from_bits(bits[1]),
+        f64::from_bits(bits[2]),
+        f64::from_bits(bits[3]),
+    );
+    let compatible = match coverage {
+        Coverage::Exact => true,
+        Coverage::Covering => covers_bbox(bbox, spec.bbox),
+        Coverage::Intersecting => overlaps_bbox(bbox, spec.bbox),
+    };
+    if !compatible {
+        return Ok(None);
+    }
+    if !matches!(coverage, Coverage::Exact) {
         // Retain the whole raw part: cropping before feed reconciliation could
         // discard altitude offsets or leg boundaries. Final store filtering still
         // applies the requested region; the filename alone certifies no coverage.
@@ -388,7 +498,7 @@ fn load_path(
         }
     }
     crate::ingest::validate_trace_counts(cached.stats.members, cached.stats.parse_errors)?;
-    Ok(Some((cached.aircraft, cached.stats)))
+    Ok(Some((bbox, cached.aircraft, cached.stats)))
 }
 
 pub(crate) fn save(
@@ -1427,6 +1537,331 @@ pub(crate) mod tests {
         );
         std::fs::write(path(&dir, &rel, &spec), b"damaged covering checkpoint").unwrap();
         assert!(load(&dir, &rel, &want, context).is_err());
+    }
+
+    #[test]
+    fn spatial_union_rebuilds_crossing_flight_with_raw_altitude_evidence() {
+        use crate::ingest::ingest_day_reader;
+        use crate::ingest::tests::{gz, tar_of};
+        use fdop_types::store::alt_src;
+
+        let (dir, mut rel, spec, context) = fixture();
+        let rows: Vec<_> = (0..=14)
+            .map(|i| {
+                serde_json::json!([
+                    10_000.0 + 120.0 * f64::from(i),
+                    0.5,
+                    (f64::from(i) - 2.0) / 10.0,
+                    5000,
+                    180,
+                    90,
+                    0,
+                    0,
+                    null,
+                    "adsb_icao",
+                    (i >= 10).then_some(5100),
+                    0
+                ])
+            })
+            .collect();
+        let trace = serde_json::json!({
+            "icao": "000001", "t": "PC12",
+            "timestamp": spec.t_start, "trace": rows
+        })
+        .to_string();
+        let archive = tar_of(&[
+            ("trace_full_000001.json", gz(&trace)),
+            ("trace_full_unreadable.json", b"not JSON".to_vec()),
+        ]);
+        rel.parts = vec![AssetPart {
+            name: format!("{}.tar", rel.tag),
+            url: format!("https://example.invalid/{}.tar", rel.tag),
+            size: archive.len() as u64,
+        }];
+        let ingest = |sp: &IngestSpec| {
+            ingest_day_reader(archive.as_slice(), "prod", sp, &|_| {}, context).unwrap()
+        };
+        let full = ingest(&spec);
+        let west = IngestSpec {
+            bbox: BBox::new(0.0, 0.0, 1.0, 0.5),
+            ..spec
+        };
+        let east = IngestSpec {
+            bbox: BBox::new(0.0, 0.5, 1.0, 1.0),
+            ..spec
+        };
+        let west_part = ingest(&west);
+        let east_part = ingest(&east);
+        assert!(
+            west_part.0[0]
+                .points
+                .iter()
+                .all(|p| p.alt_geom_msl.is_nan())
+        );
+        let west_only = crate::build::build_day_store(
+            vec![west_part.clone()],
+            &west,
+            vec![rel.tag.clone()],
+            context,
+        );
+        assert!(
+            west_only.legs[0]
+                .points
+                .iter()
+                .all(|p| p.alt_src == alt_src::BARO_RAW)
+        );
+        save(&dir, &rel, &west, context, &west_part).unwrap();
+        save(&dir, &rel, &east, context, &east_part).unwrap();
+        let before: Vec<_> = [west, east]
+            .iter()
+            .map(|sp| std::fs::read(path(&dir, &rel, sp)).unwrap())
+            .collect();
+        let recovered = load(&dir, &rel, &spec, context).unwrap().unwrap();
+        // Both raw aircraft views and all bracketing reports reach reconciliation.
+        assert_eq!(recovered.0.len(), 2);
+        assert_eq!(
+            recovered.1.points_kept,
+            west_part.1.points_kept + east_part.1.points_kept
+        );
+        assert_eq!(recovered.1.members, 2);
+        assert_eq!(recovered.1.parse_errors, 1);
+        assert_eq!(recovered.1.bytes, archive.len() as u64);
+        let (_, has_mlat, rebuilt) = rebuild_day(
+            &dir,
+            std::slice::from_ref(&rel),
+            &spec,
+            context,
+            false,
+            None,
+            |_, error| panic!("valid spatial union: {error}"),
+        )
+        .unwrap();
+        assert!(!has_mlat);
+        let reference =
+            crate::build::build_day_store(vec![full], &spec, vec![rel.tag.clone()], context);
+        assert_eq!(rebuilt.legs.len(), 1);
+        assert_eq!(rebuilt.legs[0].key, reference.legs[0].key);
+        assert_eq!(rebuilt.legs[0].points, reference.legs[0].points);
+        assert_eq!(rebuilt.legs[0].points.len(), 15);
+        assert_eq!(rebuilt.legs[0].points[0].alt_src, alt_src::BARO_CORRECTED);
+        assert_eq!(rebuilt.meta.stats["files"], 2);
+        assert_eq!(rebuilt.meta.stats["parse_errors"], 1);
+        for (sp, bytes) in [west, east].iter().zip(before) {
+            assert_eq!(std::fs::read(path(&dir, &rel, sp)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn spatial_union_requires_verified_coverage_and_compatible_identity() {
+        for problem in [
+            "gap",
+            "hull",
+            "time",
+            "policy",
+            "release",
+            "context",
+            "corrupt",
+            "unreadable",
+        ] {
+            let (dir, rel, spec, context) = fixture();
+            let mut west = IngestSpec {
+                bbox: BBox::new(0.0, 0.0, 1.0, 0.5),
+                ..spec
+            };
+            let mut east = IngestSpec {
+                bbox: BBox::new(0.0, 0.5, 1.0, 1.0),
+                ..spec
+            };
+            let mut east_release = rel.clone();
+            let mut east_context = context;
+            match problem {
+                // Rounded filenames claim touching coverage; embedded identities do not.
+                "gap" => east.bbox.west = 0.5_f64.next_up(),
+                "hull" => {
+                    west.bbox = BBox::new(0.0, 0.0, 0.4, 1.0);
+                    east.bbox = BBox::new(0.6, 0.0, 1.0, 1.0);
+                }
+                "time" => east.t_end += 1.0,
+                "policy" => east.keep_unknown = false,
+                "release" => east_release.parts[0].size += 1,
+                "context" => {
+                    east_context = DayContext::new(context.day_start, 301.0, 3600.0);
+                }
+                _ => {}
+            }
+            let mut retained = part();
+            save(&dir, &rel, &west, context, &retained).unwrap();
+            save(&dir, &east_release, &east, east_context, &retained).unwrap();
+            let east_path = path(&dir, &east_release, &east);
+            if problem == "corrupt" {
+                let bytes = std::fs::read(&east_path).unwrap();
+                std::fs::write(&east_path, &bytes[..bytes.len() - 1]).unwrap();
+            } else if problem == "unreadable" {
+                retained.1.parse_errors = retained.1.members;
+                let mut encoder =
+                    GzEncoder::new(File::create(&east_path).unwrap(), Compression::fast());
+                serde_json::to_writer(
+                    &mut encoder,
+                    &CheckpointRef {
+                        identity: &Identity::new(&east_release, &east, east_context),
+                        aircraft: &retained.0,
+                        stats: &retained.1,
+                    },
+                )
+                .unwrap();
+                encoder.finish().unwrap();
+            }
+            let result = load(&dir, &rel, &spec, context);
+            if matches!(problem, "corrupt" | "unreadable") {
+                assert!(result.is_err(), "{problem}");
+            } else {
+                assert!(result.unwrap().is_none(), "{problem}");
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_union_keeps_jet_policy_and_single_checkpoint_precedence() {
+        let (dir, rel, spec, context) = fixture();
+        let west = IngestSpec {
+            bbox: BBox::new(0.0, 0.0, 1.0, 0.5),
+            ..spec
+        };
+        let east = IngestSpec {
+            bbox: BBox::new(0.0, 0.5, 1.0, 1.0),
+            include_jets: true,
+            ..spec
+        };
+        let ordinary = part();
+        let mut expanded = ordinary.clone();
+        let mut jet = ordinary.0[0].clone();
+        jet.icao = "000002".into();
+        jet.typ = "B738".into();
+        jet.engine = EngineClass::Jet;
+        expanded.0.push(jet);
+        expanded.1.members += 1;
+        expanded.1.kept_aircraft += 1;
+        expanded.1.points_kept += 1;
+        save(&dir, &rel, &west, context, &ordinary).unwrap();
+        save(&dir, &rel, &east, context, &expanded).unwrap();
+        let recovered = load(&dir, &rel, &spec, context).unwrap().unwrap();
+        assert_eq!(recovered.0.len(), 2);
+        assert!(
+            recovered
+                .0
+                .iter()
+                .all(|a| a.engine == EngineClass::Turboprop)
+        );
+        assert_eq!(recovered.1.jets_dropped, 1);
+        let expanded_request = IngestSpec {
+            include_jets: true,
+            ..spec
+        };
+        assert!(
+            load(&dir, &rel, &expanded_request, context)
+                .unwrap()
+                .is_none()
+        );
+        save(
+            &dir,
+            &rel,
+            &IngestSpec {
+                include_jets: true,
+                ..west
+            },
+            context,
+            &expanded,
+        )
+        .unwrap();
+        let recovered = load(&dir, &rel, &expanded_request, context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered
+                .0
+                .iter()
+                .filter(|a| a.engine == EngineClass::Jet)
+                .count(),
+            2
+        );
+
+        // An existing single covering checkpoint (including an expanded one) keeps
+        // priority over the newly available union. The exact ordinary view still wins.
+        expanded.1.bytes += 1;
+        save(&dir, &rel, &expanded_request, context, &expanded).unwrap();
+        let recovered = load(&dir, &rel, &spec, context).unwrap().unwrap();
+        assert_eq!(recovered.0.len(), 1);
+        assert_eq!(recovered.1.bytes, expanded.1.bytes);
+        let mut covering = ordinary.clone();
+        covering.1.bytes += 2;
+        save(
+            &dir,
+            &rel,
+            &IngestSpec {
+                bbox: BBox::new(-0.1, -0.1, 1.1, 1.1),
+                ..spec
+            },
+            context,
+            &covering,
+        )
+        .unwrap();
+        assert_eq!(
+            load(&dir, &rel, &spec, context).unwrap().unwrap().1,
+            covering.1
+        );
+        save(&dir, &rel, &spec, context, &ordinary).unwrap();
+        assert_eq!(
+            load(&dir, &rel, &spec, context).unwrap().unwrap().1,
+            ordinary.1
+        );
+
+        // A different embedded bbox can share the exact rounded filename. Preserve
+        // the old separate-covering-cache preference after that exact identity misses.
+        let inset = IngestSpec {
+            bbox: BBox::new(0.01, 0.01, 0.99, 0.99),
+            ..spec
+        };
+        assert_eq!(path(&dir, &rel, &inset), path(&dir, &rel, &spec));
+        assert_eq!(
+            load(&dir, &rel, &inset, context).unwrap().unwrap().1,
+            covering.1
+        );
+    }
+
+    #[test]
+    fn spatial_union_sweep_checks_every_strip_and_closed_boundary() {
+        let want = BBox::new(0.0, 0.0, 1.0, 1.0);
+        let tiles = [
+            BBox::new(0.0, 0.0, 0.5, 0.5),
+            BBox::new(0.0, 0.5, 0.5, 1.0),
+            BBox::new(0.5, 0.0, 1.0, 0.5),
+            BBox::new(0.5, 0.5, 1.0, 1.0),
+        ];
+        assert!(covers_union(&tiles, want));
+        assert!(covers_union(
+            &tiles.into_iter().rev().collect::<Vec<_>>(),
+            want
+        ));
+        for missing in 0..tiles.len() {
+            let remaining: Vec<_> = tiles
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| (i != missing).then_some(*b))
+                .collect();
+            assert!(!covers_union(&remaining, want));
+        }
+        let mut gap = tiles;
+        gap[3].south = 0.5_f64.next_up();
+        assert!(!covers_union(&gap, want));
+        for request in [
+            BBox::new(0.5, 0.0, 0.5, 1.0),
+            BBox::new(0.0, 0.5, 1.0, 0.5),
+            BBox::new(0.5, 0.5, 0.5, 0.5),
+        ] {
+            assert!(covers_union(&tiles, request));
+            assert!(!covers_union(&[], request));
+        }
+        assert!(!covers_union(&tiles, BBox::new(f64::NAN, 0.0, 1.0, 1.0)));
     }
 
     #[test]

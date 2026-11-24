@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Rebuild wider searches from completed regional raw checkpoints
+
+- Combine at least two compatible completed regional views when no existing exact
+  or single covering checkpoint can satisfy the request. Prove full coverage from
+  the embedded rectangle union, preserving release/time/context/policy checks and
+  existing cache priority. Even a one-ULP uncovered strip remains a miss.
+- Retain raw observations through ordinary flight-boundary, duplicate and altitude
+  reconciliation. Remove known jets from certified expanded views when appropriate
+  and count same-release archive parse diagnostics once.
+- All 76 native raw-cache, ingestion and build tests pass, including a real synthetic
+  tar/checkpoint/rebuild regression that recovers the same 15-point calibrated flight
+  as full-region ingestion. Existing rounded-filename identity assertions remain
+  intact. Changed-line formatting and whitespace checks pass; full workspace,
+  HTTP/fetch, CLI selftest and reference/field validation remain incomplete.
+
 ### Retain the earlier flight positions required by long received traces
 
 - Expand the archive's source-time window when the measured trace's propagation envelope extends

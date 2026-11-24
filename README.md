@@ -1216,6 +1216,17 @@ request. A processed jet-inclusive day store cannot satisfy an ordinary request 
 because its altitude corrections may already incorporate the jets. Source checkpoints
 and processed stores remain unchanged.
 
+If no exact or single covering checkpoint is usable, two or more compatible
+completed regional checkpoints can supply a wider request together. Their embedded
+coverage must jointly cover the entire requested rectangle, with no tolerance for
+uncovered strips or holes hidden by rounded filenames. Release, time, midnight
+context and aircraft-policy checks still apply to every contributing view; expanded
+views lose known jets before an ordinary build. All original observations reach the
+existing flight-boundary, duplicate and altitude reconciliation. Archive-wide bytes,
+member counts and parse errors count once across these views of the same release;
+retained-input counters still describe the combined inputs. Earlier exact and
+single-covering successes keep priority, including their rounded-name behavior.
+
 All retained raw reports still enter the ordinary altitude and boundary reconciliation
 before the final requested-region filter. This also lets an offline retry recover a
 narrower region after a larger download completed but its day-store publication was
@@ -3028,6 +3039,24 @@ and pristine preceding source: the older single-move method already reaches 106.
 there. Its actual recovery assertions pass; no assertion was weakened. These tests use
 complete production modules and real pinned dependencies in the native component.
 Full workspace checks, CLI selftest and reference/field replays remain incomplete.
+
+### Reuse completed regional archives for a wider search
+
+`spatial_union_rebuilds_crossing_flight_with_raw_altitude_evidence` ingests a real
+synthetic tar archive into two adjacent regional checkpoints. The western view has
+only barometric heights; the eastern view supplies GNSS calibration. Loading their
+verified union and rebuilding the day preserves all 15 processed flight points,
+including the corrected western altitude, exactly as full-region ingestion does.
+Archive parse diagnostics count once and source checkpoint bytes remain unchanged.
+
+The companion regressions reject uncovered strips, a one-ULP gap hidden by rounded
+filenames, incompatible identities, corrupt gzip and wholly unreadable feeds. They
+cover both jet policies, exact/single-cache priority, rounded-name identity misses,
+and zero-width or zero-height requests. All 76 tests in the complete production
+raw-cache, ingestion and build modules pass in the pinned native component with
+genuine dependencies. Changed-line formatting and whitespace checks pass. The full
+HTTP/fetch graph, workspace gates, CLI selftest and reference/field replays remain
+outside that component result.
 
 ### Reuse a completed raw feed after narrowing the search region
 
