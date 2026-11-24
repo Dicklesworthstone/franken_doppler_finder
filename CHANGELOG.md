@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover fast ridges that leave neighboring seed bands
+
+- After the existing seed scan and observed-motion recovery fail, retry neighboring
+  profiles along the scan's two endpoint directions. Keep the original frequency
+  bands, peak gates, full integration and independent endpoint checks, and preserve
+  every earlier successful direction.
+- Add a physical fast-pass regression within the ordinary survey band and mirrored
+  burst/reset controls. The recovery supplies observed points to the existing
+  free-reseed fit; it does not itself establish a measured aircraft or a location.
+- All 19 production trace tests pass in the pinned native component with exact
+  spectrogram sampling and genuine dependencies. Changed-line formatting and
+  whitespace checks pass; full workspace, CLI selftest and reference/field
+  validation remain incomplete.
+
 ### Recover from unreadable ADS-B trace archives
 
 - Reject feeds whose trace members all failed to parse, including files missing the trace array. Reuse other available feeds and covering catalogues through the existing recovery path. Report the count of skipped members when a partially readable archive still supplies a usable day.

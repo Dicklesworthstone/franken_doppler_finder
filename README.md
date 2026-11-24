@@ -1882,6 +1882,11 @@ Design notes:
   frequency motion must agree on both sides of the seed, and the selected direction must
   pass the existing full integration and peak gates, with observed peaks at the integration
   window's endpoints. Qualified original directions stay unchanged.
+  If fixed-frequency neighboring profiles also fail, two bounded retries shift their
+  centers along the original scan's -25 and +25 Hz/s directions. This can retain a
+  fast ridge that moves beyond the seed band between frames; its measured motion
+  must still pass the same full-window and endpoint checks. The original recovery
+  keeps priority, and neither the point-selection band nor its quality gates widen.
   If recovery fails, the original direction remains available only to initialize a seed,
   never as a measured point. This does not widen the detector's frequency or speed banks.
 - **Frequency estimates preserve the spectral peak's shape.** Ordinary and short windows integrate
@@ -2455,11 +2460,23 @@ original directions for stationary tones, jumps, resets, isolated bursts, blank
 input, off-target seeds and boundary seeds; a short moving packet still fails full
 integration support. Existing qualified seed choices and their gates stay intact.
 
-All 17 native trace tests pass through genuine RCH with the pinned compiler and
-genuine serde, using the complete production trace module and exact production
-spectrogram sampling code. FFT extraction, downstream fitting, the complete
-workspace/CLI selftest and reference/field replays remain unverified. This does
-not establish broader noise rejection or accuracy on recordings.
+`free_trace_recovers_a_fast_in_band_ridge_with_shifted_seed_profiles` adds a
+350 Hz, 230 m/s pass at 2,000 m with every received frequency inside the ordinary
+35–1,100 Hz survey. Its ridge moves more than 6 Hz between adjacent 0.1 s frames,
+so fixed-frequency neighboring profiles miss it. The regression requires at least
+40 observed points over four seconds with less than 1.5 Hz RMS error. This restores
+support for the existing free-reseed fit; it does not establish a complete measured
+aircraft or a location. A companion regression checks that short bursts and
+repeating resets still need full integration and independent endpoint support in
+both frequency directions.
+
+All 19 tests in the complete production trace module pass in a focused native
+component with the pinned compiler, exact production spectrogram sampling and
+median code, and genuine dependencies. FFT extraction, downstream fitting, full
+workspace checks, CLI selftest and reference/field replays remain unverified.
+The workspace formatting check still reports pre-existing differences; changed
+lines pass pinned formatting and whitespace checks. These synthetic component
+results do not establish a complete aircraft recovery or real-recording accuracy.
 
 ### Use cached fine terrain when the coarse tile is missing
 
