@@ -19,6 +19,10 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Crop merged flight archives without duplicating intact tracks
+
+- The ADS-B fetch path now consumes the merged track store when selecting the final region and time window. Wholly retained flight legs transfer their point buffers to the result, and rejected legs release their memory during the crop. Borrowed track stores and disjoint flight fragments retain the existing interpolation and clipping rules.
+
 - Whole-file publication audits now check recognized location metadata on video-only files. Removed audio produces an empty source list and a file-level tag result. Failed or incomplete probing returns an error.
 
 ### Avoid detector scoring where temporal coverage cannot qualify

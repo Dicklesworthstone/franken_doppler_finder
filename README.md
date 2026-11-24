@@ -1269,7 +1269,7 @@ UTC days; keeping the whole aircraft also preserves merge keys, feed preference 
 anchors. Original day metadata and altitude references remain available even when no aircraft from a
 day is selected. This reduces retained track data for selective requests. A cached file containing
 selected aircraft is decompressed twice, so broad requests may save little memory and pay for the extra
-scan. The binary store format is unchanged.
+scan. When the merged catalogue is cropped to the requested window, complete flight legs keep their point buffers and discarded legs release theirs as the crop proceeds. The binary store format is unchanged.
 
 Newly ingested day stores also retain the original reports needed to join a flight across UTC midnight,
 even when neither day's separate segment enters the cached region. Boundary support uses the closest

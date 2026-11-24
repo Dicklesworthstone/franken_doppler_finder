@@ -1463,7 +1463,7 @@ fn fetch_window_with_sources(
     if !spec.include_jets {
         merged.legs.retain(|l| l.engine != EngineClass::Jet);
     }
-    let mut out = merged.filtered(&spec.bbox, spec.t_start, spec.t_end);
+    let mut out = merged.into_filtered(&spec.bbox, spec.t_start, spec.t_end);
     out.meta.geoid_n_m = spec.geoid_n_m;
     out.meta.stats = serde_json::json!({
         "legs": out.legs.len(),

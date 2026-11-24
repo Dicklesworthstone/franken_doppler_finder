@@ -10,6 +10,8 @@ use flate2::Compression;
 use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -306,15 +308,56 @@ impl TrackStore {
     /// plus two neighbours on each side (so interpolation at the edges stays anchored).
     /// Existing leg boundaries are never crossed. Legs left with < 2 points go.
     pub fn filtered(&self, bbox: &BBox, t0: f64, t1: f64) -> TrackStore {
+        Self::filter_legs(
+            self.meta.clone(),
+            self.leg_keys(),
+            self.legs.iter().map(Cow::Borrowed),
+            bbox,
+            t0,
+            t1,
+        )
+    }
+
+    /// The consuming form releases rejected legs during the crop and transfers the
+    /// point buffers of wholly retained legs directly into the result.
+    pub fn into_filtered(self, bbox: &BBox, t0: f64, t1: f64) -> TrackStore {
+        let keys = self.leg_keys();
+        Self::filter_legs(
+            self.meta,
+            keys,
+            self.legs.into_iter().map(Cow::Owned),
+            bbox,
+            t0,
+            t1,
+        )
+    }
+
+    fn leg_keys(&self) -> HashSet<String> {
+        self.legs.iter().map(|leg| leg.key.clone()).collect()
+    }
+
+    fn filter_legs<'a>(
+        mut meta: StoreMeta,
+        mut used_keys: HashSet<String>,
+        input: impl Iterator<Item = Cow<'a, FlightLeg>>,
+        bbox: &BBox,
+        t0: f64,
+        t1: f64,
+    ) -> TrackStore {
         let mut legs = Vec::new();
-        let mut used_keys: std::collections::HashSet<String> =
-            self.legs.iter().map(|leg| leg.key.clone()).collect();
-        for leg in &self.legs {
+        for leg in input {
+            if leg.points.len() < 2 {
+                continue;
+            }
             let inside: Vec<bool> = leg
                 .points
                 .iter()
                 .map(|p| p.t >= t0 && p.t <= t1 && bbox.contains(p.lat, p.lon))
                 .collect();
+            if inside.iter().all(|&hit| hit) {
+                legs.push(leg.into_owned());
+                continue;
+            }
             let mut keep = inside.clone();
             for (i, pair) in leg.points.windows(2).enumerate() {
                 let (a, b) = (pair[0], pair[1]);
@@ -351,6 +394,10 @@ impl TrackStore {
                     continue;
                 }
                 let end = (start + 1..n).find(|&i| !grown[i]).unwrap_or(n);
+                if start == 0 && end == n {
+                    legs.push(leg.into_owned());
+                    break;
+                }
                 if end - start >= 2 {
                     let key = if fragment == 0 {
                         leg.key.clone()
@@ -384,7 +431,6 @@ impl TrackStore {
                 start = end;
             }
         }
-        let mut meta = self.meta.clone();
         meta.bbox = *bbox;
         meta.t_start = t0;
         meta.t_end = t1;
@@ -462,6 +508,18 @@ mod tests {
         assert_eq!(got.legs[0].points, bracket);
         assert_eq!(got.meta.bbox, bbox);
         assert_eq!((got.meta.t_start, got.meta.t_end), (145.0, 155.0));
+        // The consuming crop keeps the allocation even if the outer points are
+        // included only as interpolation neighbours.
+        for (area, lo, hi) in [
+            (store.meta.bbox, 0.0, 300.0),
+            (store.meta.bbox, 60.0, 240.0),
+        ] {
+            let owned = store.clone();
+            let buffer = owned.legs[0].points.as_ptr();
+            let result = owned.into_filtered(&area, lo, hi);
+            assert_eq!(result.legs[0].points.as_ptr(), buffer);
+            assert_eq!(result.legs[0].points, store.legs[0].points);
+        }
         // Time and space must overlap on the same portion of the segment.
         assert!(store.filtered(&bbox, 100.0, 110.0).legs.is_empty());
         // A time-only crop between knots also needs both interpolation anchors.
@@ -584,6 +642,13 @@ mod tests {
         let store = looping_store();
         let bbox = BBox::new(-0.001, -0.001, 0.001, 0.001);
         let cropped = store.filtered(&bbox, 0.0, 180.0);
+        let owned = store.clone().into_filtered(&bbox, 0.0, 180.0);
+        assert_eq!(owned.legs.len(), cropped.legs.len());
+        for (moved, borrowed) in owned.legs.iter().zip(&cropped.legs) {
+            assert_eq!(moved.key, borrowed.key);
+            assert_eq!(moved.points, borrowed.points);
+        }
+        assert_eq!(owned.meta.stats, cropped.meta.stats);
         assert_eq!(cropped.legs.len(), 2);
         assert_eq!(cropped.n_points(), 12);
         assert_eq!(cropped.legs[0].key, store.legs[0].key);
