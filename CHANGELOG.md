@@ -19,6 +19,36 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Fetch staging when an advertised prod archive cannot supply a day
+
+- After a prod archive fails and processed/raw local recovery cannot supply the day,
+  lazily discover and ingest staging through the existing complete-stream parser,
+  raw checkpoints and day-store publisher. Reuse requested completed MLAT feeds without
+  downloading them again; retain the original failures and actual missing-feed warnings.
+- Validate staging's day, repository, feed, tag and archive layout. Keep alternative
+  metadata in `releases-staging.json`, preserve preferred release metadata, and publish
+  the actual staging feed identity so later online runs still retry prod. Successful
+  main feeds, usable local recovery and offline requests do not make this extra lookup.
+  Incomplete alternatives cannot become completed days; publication errors remain fatal.
+- The real truncated-tar regression fails with the preceding fetch and passes after
+  the repair, comparing full legs/provenance with fresh staging-plus-MLAT ingestion,
+  offline reuse and a later prod upgrade for both ordinary and jet-inclusive policies.
+  All four new discovery/fetch regressions pass. The exact-module offline component
+  suite passes 133 tests with one cache-priority assertion failure reproduced identically
+  on the unchanged fetch source. No assertions or tolerances were weakened.
+- Both native data builds were killed in unchanged `asupersync 0.6.2`, including an
+  optimization-level-zero retry. The component harness uses actual production parsing,
+  build/cache code and locked dependencies, with HTTP operations unavailable; it does
+  not establish production HTTP or live-service behavior. See README Testing for scope.
+- Broader validation of the preceding core repairs passes all 149 search tests (three
+  ignored) and 48 measurement tests, with one pre-existing measurement fixture failure
+  confirmed on the original source. The unchanged repository selftest passes against
+  the complete current core: both intended aircraft, 1.520666 m position error, 75 m
+  radius and +0.014271 s clock error. This synthetic development-profile run does not
+  establish the full release CLI/workspace gates or reference/field accuracy.
+  Changed sections pass formatting and whitespace checks; remaining workspace formatter
+  replacements match the baseline and do not intersect these changes.
+
 ### Recover steep-pass ridge points before applying the final frequency bound
 
 - Let both short-window guided tracing paths qualify normalized peaks across the full

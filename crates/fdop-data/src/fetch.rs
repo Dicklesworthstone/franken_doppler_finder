@@ -12,7 +12,9 @@
 //! reconciliation, so retries download only missing releases for an identical ingest policy.
 
 use crate::DataError;
-use crate::adsblol::{DayRelease, Feed, find_day_releases_for_fetch_cached};
+use crate::adsblol::{
+    DayRelease, Feed, find_day_releases_for_fetch_cached, find_staging_release_for_fetch_cached,
+};
 use crate::build::{build_day_store, merge_stores};
 use crate::ingest::{
     DayContext, IngestProgress, IngestSpec, IngestStats, RawAircraft, ingest_day_reader,
@@ -732,7 +734,13 @@ pub fn fetch_window(
     cache_dir: &Path,
     opts: &FetchOptions,
 ) -> Result<TrackStore, DataError> {
-    fetch_window_with_discovery(spec, cache_dir, opts, find_day_releases_for_fetch_cached)
+    fetch_window_with_discovery(
+        spec,
+        cache_dir,
+        opts,
+        find_day_releases_for_fetch_cached,
+        find_staging_release_for_fetch_cached,
+    )
 }
 
 fn fetch_window_with_discovery(
@@ -748,6 +756,13 @@ fn fetch_window_with_discovery(
         bool,
         bool,
     ) -> Result<crate::adsblol::ReleaseDiscovery, DataError>,
+    staging: impl FnMut(
+        Option<&fdop_http::Net>,
+        i64,
+        u32,
+        u32,
+        &Path,
+    ) -> Result<Option<DayRelease>, DataError>,
 ) -> Result<TrackStore, DataError> {
     fetch_window_with_sources(
         spec,
@@ -758,6 +773,7 @@ fn fetch_window_with_discovery(
             let reader = crate::stream::BigStreamReader::open(rel.urls());
             ingest_day_reader(reader, rel.feed.label(), sp, progress, context)
         },
+        staging,
     )
 }
 
@@ -782,6 +798,13 @@ fn fetch_window_with_sources(
         &(dyn Fn(&IngestProgress) + Sync),
     ) -> Result<Part, DataError>
     + Sync,
+    mut staging: impl FnMut(
+        Option<&fdop_http::Net>,
+        i64,
+        u32,
+        u32,
+        &Path,
+    ) -> Result<Option<DayRelease>, DataError>,
 ) -> Result<TrackStore, DataError> {
     let feedset = if opts.include_mlat {
         "prod+mlatonly"
@@ -1234,7 +1257,114 @@ fn fetch_window_with_sources(
                 }
                 notes.extend(feedset_gaps(&label, &fs, opts.include_mlat));
                 failed.feeds.retain(|(failed_day, _)| *failed_day != di);
+                continue;
             }
+            // An advertised prod archive can be unavailable while staging is
+            // complete. Discover that alternative only after every local recovery
+            // failed; never retry the failed prod download within this request.
+            if opts.offline || !rels.iter().any(|rel| rel.feed == Feed::Prod) {
+                continue;
+            }
+            let alternative = match staging(net.as_ref(), day.0, day.1, day.2, &dir) {
+                Ok(Some(rel))
+                    if rel.feed == Feed::Staging
+                        && release_for_day(&rel, day)
+                        && crate::adsblol::valid_archive_parts(&rel.tag, &rel.parts) =>
+                {
+                    rel
+                }
+                Ok(Some(_)) => {
+                    failed.feeds.push((di, format!(
+                        "{label}: staging lookup returned an invalid release for the requested day"
+                    )));
+                    continue;
+                }
+                Ok(None) => {
+                    failed.feeds.push((
+                        di,
+                        format!(
+                            "{label}: no staging release available after the prod archive failed"
+                        ),
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    failed.feeds.push((di, format!(
+                        "{label}: staging release lookup failed after the prod archive failed: {error}"
+                    )));
+                    continue;
+                }
+            };
+            opts.say(&format!(
+                "[adsb] {label}: prod archive unavailable; trying staging {}",
+                alternative.tag
+            ));
+            let sp = day_spec(day);
+            let part = match ingest_cached_release(&dir, &alternative, &sp, context, opts, || {
+                ingest(&alternative, &sp, context, &|p| {
+                    opts.say(&format!(
+                        "[adsb] {label} staging: {:.0}/{:.0} MiB, {} members, {} kept, {:.0}s",
+                        mib(p.bytes),
+                        mib(alternative.total_bytes()),
+                        p.members,
+                        p.kept_aircraft,
+                        p.elapsed_s
+                    ));
+                })
+            }) {
+                Ok(part) => part,
+                Err(error) => {
+                    failed.feeds.push((
+                        di,
+                        format!("{label} staging ({}): {error}", alternative.tag),
+                    ));
+                    continue;
+                }
+            };
+            let mut parts = vec![part];
+            let mut tags = vec![alternative.tag.clone()];
+            // Reuse a completed requested MLAT checkpoint without downloading it
+            // again. Unadvertised identities are local-only, as in raw recovery above.
+            if opts.include_mlat {
+                for rel in rels
+                    .iter()
+                    .filter(|rel| rel.feed == Feed::Mlatonly && release_for_day(rel, day))
+                {
+                    match crate::raw_cache::load(&dir, rel, &sp, context) {
+                        Ok(Some(part)) => {
+                            parts.push(part);
+                            tags.push(rel.tag.clone());
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(error) => notes.push(format!(
+                            "{label}: completed MLAT checkpoint {} unreadable ({error}); unavailable for staging recovery",
+                            rel.tag
+                        )),
+                    }
+                }
+            }
+            let mlat = tags.len() > 1;
+            tags.sort();
+            let fs = feedset_name(Feed::Staging, mlat);
+            let store = build_day_store(parts, &sp, tags, context);
+            let path = dir.join(format!(
+                "{}_{key}.fdtrk",
+                cache_feedset(&fs, spec.include_jets)
+            ));
+            day_stores[di] = Some(publish_day(store, &path, &label, opts)?);
+            let note = format!(
+                "{label}: prod archive fetch failed; recovered the {fs} main-feed catalogue from staging {}; rerun online to retry prod: {errors}",
+                alternative.tag
+            );
+            opts.say(&format!("[adsb] WARNING {note}"));
+            notes.push(note);
+            if mlat {
+                let missing_mlat = format!("{label}: {NO_MLATONLY}");
+                notes.retain(|note| note != &missing_mlat);
+            }
+            notes.extend(feedset_gaps(&label, &fs, opts.include_mlat));
+            failed.feeds.retain(|(failed_day, _)| *failed_day != di);
         }
     }
 
@@ -1819,6 +1949,7 @@ mod tests {
                                     )
                                 },
                                 |_, _, _, _| panic!("offline recovery must never open an archive"),
+                                |_, _, _, _, _| panic!("offline recovery cannot look up staging"),
                             )
                             .unwrap();
                             assert_eq!(cached.meta.stats["cache_hits"], 2);
@@ -2279,6 +2410,298 @@ mod tests {
     }
 
     #[test]
+    fn failed_prod_archive_fetches_uncached_staging_then_retries_prod() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for include_jets in [false, true] {
+            let f = offline_raw_fixture(Feed::Staging, include_jets);
+            let prod = checkpoint_release(Feed::Prod, &f.archives[0]);
+            let releases = [prod.clone(), f.releases[1].clone()];
+            let calls = std::array::from_fn::<_, 3, _>(|_| AtomicUsize::new(0));
+            let lookups = AtomicUsize::new(0);
+            let run = |fail_prod: bool| {
+                fetch_window_with_sources(
+                    &f.want,
+                    &f.cache,
+                    &FetchOptions::default(),
+                    |_, y, m, d, _, offline, include_mlat| {
+                        assert_eq!((y, m, d), (2026, 9, 8));
+                        assert!(!offline && include_mlat);
+                        Ok(crate::adsblol::ReleaseDiscovery {
+                            releases: releases.to_vec(),
+                            mlat_error: None,
+                        })
+                    },
+                    |rel, spec, context, progress| {
+                        let index = match rel.feed {
+                            Feed::Prod => 0,
+                            Feed::Staging => 1,
+                            Feed::Mlatonly => 2,
+                        };
+                        calls[index].fetch_add(1, Ordering::Relaxed);
+                        let bytes = &f.archives[usize::from(rel.feed == Feed::Mlatonly)];
+                        let end = if fail_prod && rel.feed == Feed::Prod {
+                            128
+                        } else {
+                            bytes.len()
+                        };
+                        ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
+                    },
+                    |_, y, m, d, dir| {
+                        assert_eq!((y, m, d), (2026, 9, 8));
+                        assert_eq!(dir, f.dir.as_path());
+                        assert_eq!(calls[0].load(Ordering::Relaxed), 1);
+                        assert_eq!(calls[2].load(Ordering::Relaxed), 1);
+                        lookups.fetch_add(1, Ordering::Relaxed);
+                        Ok(Some(f.releases[0].clone()))
+                    },
+                )
+            };
+            let expected = |main: Feed| {
+                let mut tags = vec![
+                    checkpoint_release(main, &f.archives[0]).tag,
+                    f.releases[1].tag.clone(),
+                ];
+                tags.sort();
+                let parts = [main, Feed::Mlatonly]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, feed)| {
+                        ingest_day_reader(
+                            f.archives[i].as_slice(),
+                            feed.label(),
+                            &f.spec,
+                            &|_| {},
+                            day_context((2026, 9, 8)),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let store = build_day_store(parts, &f.spec, tags, day_context((2026, 9, 8)));
+                merge_stores(vec![store], DAY_JOIN_GAP_S).filtered(
+                    &f.want.bbox,
+                    f.want.t_start,
+                    f.want.t_end,
+                )
+            };
+
+            let got = run(true).expect("available staging must recover a failed prod archive");
+            assert!(!got.legs.is_empty());
+            assert_same_legs(&got.legs, &expected(Feed::Staging).legs);
+            assert_eq!(got.meta.sources, expected(Feed::Staging).meta.sources);
+            assert_eq!(
+                calls.each_ref().map(|n| n.load(Ordering::Relaxed)),
+                [1, 1, 1]
+            );
+            assert_eq!(lookups.load(Ordering::Relaxed), 1);
+            let notes = got.meta.stats["notes"].as_array().unwrap();
+            assert!(notes.iter().any(|n| {
+                let n = n.as_str().unwrap();
+                n.contains("recovered the staging+mlatonly")
+                    && n.contains(&prod.tag)
+                    && n.contains("rerun online")
+            }));
+            assert!(
+                !notes
+                    .iter()
+                    .any(|n| n.as_str().unwrap().contains(NO_MLATONLY))
+            );
+            let offline = fetch_window(
+                &f.want,
+                &f.cache,
+                &FetchOptions {
+                    offline: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_same_legs(&offline.legs, &got.legs);
+            assert_eq!(offline.meta.sources, got.meta.sources);
+            let upgraded = run(false).unwrap();
+            assert_same_legs(&upgraded.legs, &expected(Feed::Prod).legs);
+            assert_eq!(upgraded.meta.sources, expected(Feed::Prod).meta.sources);
+            assert_eq!(
+                calls.each_ref().map(|n| n.load(Ordering::Relaxed)),
+                [2, 1, 1]
+            );
+            assert_eq!(lookups.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn staging_archive_recovery_preserves_identity_offline_and_failure_rules() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for problem in [
+            "absent",
+            "lookup",
+            "feed",
+            "day",
+            "parts",
+            "incomplete",
+            "publication",
+            "mlat-failed",
+            "mlat-disabled",
+            "offline",
+            "selected-staging",
+        ] {
+            let f = offline_raw_fixture(Feed::Staging, false);
+            let selected = checkpoint_release(
+                if problem == "selected-staging" {
+                    Feed::Staging
+                } else {
+                    Feed::Prod
+                },
+                &f.archives[0],
+            );
+            let want = IngestSpec {
+                keep_unknown: true,
+                ..f.want
+            };
+            let opts = FetchOptions {
+                offline: problem == "offline",
+                include_mlat: problem != "mlat-disabled",
+                allow_missing: problem == "publication",
+                ..Default::default()
+            };
+            if problem == "mlat-disabled" {
+                // An unrequested complete MLAT checkpoint must remain unused.
+                f.checkpoint(1);
+            }
+            let path = f.dir.join(format!(
+                "staging+mlatonly_{}.fdtrk",
+                bbox_key(&f.spec.bbox).1
+            ));
+            if problem == "publication" {
+                std::fs::create_dir_all(&path).unwrap();
+            }
+            let lookups = AtomicUsize::new(0);
+            let calls = std::array::from_fn::<_, 3, _>(|_| AtomicUsize::new(0));
+            let result = fetch_window_with_sources(
+                &want,
+                &f.cache,
+                &opts,
+                |_, _, _, _, _, _, include_mlat| {
+                    let mut releases = vec![selected.clone()];
+                    if include_mlat {
+                        releases.push(f.releases[1].clone());
+                    }
+                    Ok(crate::adsblol::ReleaseDiscovery {
+                        releases,
+                        mlat_error: None,
+                    })
+                },
+                |rel, spec, context, progress| {
+                    let index = match rel.feed {
+                        Feed::Prod => 0,
+                        Feed::Staging => 1,
+                        Feed::Mlatonly => 2,
+                    };
+                    calls[index].fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(spec.bbox, f.spec.bbox);
+                    assert_eq!((spec.t_start, spec.t_end), (f.spec.t_start, f.spec.t_end));
+                    assert_eq!(
+                        context.cache_identity(),
+                        day_context((2026, 9, 8)).cache_identity()
+                    );
+                    let bytes = &f.archives[usize::from(rel.feed == Feed::Mlatonly)];
+                    let fail = rel.feed == selected.feed
+                        || (problem == "incomplete" && rel.feed == Feed::Staging)
+                        || (problem == "mlat-failed" && rel.feed == Feed::Mlatonly);
+                    let end = if fail { 128 } else { bytes.len() };
+                    ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
+                },
+                |_, _, _, _, _| {
+                    lookups.fetch_add(1, Ordering::Relaxed);
+                    match problem {
+                        "absent" => Ok(None),
+                        "lookup" => Err(DataError::new("synthetic staging lookup outage")),
+                        _ => {
+                            let mut rel = f.releases[0].clone();
+                            match problem {
+                                "feed" => rel = selected.clone(),
+                                "day" => {
+                                    rel.tag = crate::adsblol::tag_for(2026, 9, 7, Feed::Staging, 0);
+                                    rel.parts[0].name = format!("{}.tar", rel.tag);
+                                }
+                                "parts" => rel.parts[0].size = 0,
+                                _ => {}
+                            }
+                            Ok(Some(rel))
+                        }
+                    }
+                },
+            );
+            assert_eq!(
+                lookups.load(Ordering::Relaxed),
+                usize::from(!matches!(problem, "offline" | "selected-staging")),
+                "{problem}"
+            );
+            if matches!(problem, "mlat-failed" | "mlat-disabled") {
+                let got = result.unwrap();
+                let expected = build_day_store(
+                    vec![f.parts[0].clone()],
+                    &f.spec,
+                    vec![f.releases[0].tag.clone()],
+                    day_context((2026, 9, 8)),
+                );
+                let expected = merge_stores(vec![expected], DAY_JOIN_GAP_S).filtered(
+                    &want.bbox,
+                    want.t_start,
+                    want.t_end,
+                );
+                assert!(!got.legs.is_empty());
+                assert_same_legs(&got.legs, &expected.legs);
+                assert_eq!(got.meta.sources, expected.meta.sources);
+                let notes = got.meta.stats["notes"].as_array().unwrap();
+                assert_eq!(
+                    notes
+                        .iter()
+                        .any(|n| n.as_str().unwrap().contains(NO_MLATONLY)),
+                    problem == "mlat-failed"
+                );
+                assert!(
+                    notes
+                        .iter()
+                        .any(|n| n.as_str().unwrap().contains(&selected.tag))
+                );
+                if problem == "mlat-failed" {
+                    assert!(
+                        notes
+                            .iter()
+                            .any(|n| n.as_str().unwrap().contains(&f.releases[1].tag))
+                    );
+                }
+                assert_eq!(calls[0].load(Ordering::Relaxed), 1);
+                assert_eq!(calls[1].load(Ordering::Relaxed), 1);
+                assert_eq!(
+                    calls[2].load(Ordering::Relaxed),
+                    usize::from(opts.include_mlat)
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                match problem {
+                    "publication" => {
+                        assert!(error.contains("could not cache completed day"), "{error}")
+                    }
+                    "offline" => assert!(error.contains("offline, not cached"), "{error}"),
+                    _ => assert!(error.contains(&selected.tag), "{problem}: {error}"),
+                }
+                if matches!(
+                    problem,
+                    "feed" | "day" | "parts" | "absent" | "lookup" | "offline"
+                ) {
+                    assert_eq!(calls[1].load(Ordering::Relaxed), 0, "{problem}");
+                }
+                assert!(
+                    !path.is_file(),
+                    "a failed fallback must not publish partial data"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn failed_main_archive_reuses_processed_cache_then_retries_the_upgrade() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         for (main, cached_mlat, include_jets) in
@@ -2345,6 +2768,7 @@ mod tests {
                         };
                         ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
                     },
+                    |_, _, _, _, _| panic!("processed fallback keeps priority over staging lookup"),
                 )
             };
             let got =
@@ -2485,6 +2909,7 @@ mod tests {
                     };
                     ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
                 },
+                |_, _, _, _, _| Ok(None),
             )
             .unwrap_err()
             .to_string();
@@ -2549,6 +2974,9 @@ mod tests {
                         let bytes = &f.archives[i];
                         let end = if fail && i == 0 { 128 } else { bytes.len() };
                         ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
+                    },
+                    |_, _, _, _, _| {
+                        panic!("completed raw fallback keeps priority over staging lookup")
                     },
                 )
             };
@@ -2708,6 +3136,7 @@ mod tests {
                     let end = if i == 0 { 128 } else { bytes.len() };
                     ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
                 },
+                |_, _, _, _, _| Ok(None),
             )
             .unwrap_err()
             .to_string();
@@ -2766,6 +3195,7 @@ mod tests {
                                 context,
                             )
                         },
+                        |_, _, _, _, _| panic!("a completed main feed needs no staging lookup"),
                     )
                 };
                 let main_store = build_day_store(
@@ -2902,6 +3332,7 @@ mod tests {
                         let end = bytes.len() - if fail { 512 } else { 0 };
                         ingest_day_reader(&bytes[..end], rel.feed.label(), spec, progress, context)
                     },
+                    |_, _, _, _, _| Ok(None),
                 );
                 if problem == "publication" {
                     let error = result.unwrap_err().to_string();
@@ -3108,6 +3539,7 @@ mod tests {
                                 }
                             },
                             |_, _, _, _| panic!("completed raw recovery must not open an archive"),
+                            |_, _, _, _, _| panic!("completed raw recovery cannot look up staging"),
                         )
                         .unwrap();
                         assert!(!got.legs.is_empty());
@@ -3136,6 +3568,7 @@ mod tests {
                             },
                             |_, _, _, _, _, _, _| panic!("complete processed cache keeps priority"),
                             |_, _, _, _| panic!("processed cache must not open an archive"),
+                            |_, _, _, _, _| panic!("processed cache cannot look up staging"),
                         )
                         .unwrap();
                         assert_eq!(reused.meta.stats["cache_hits"], 1);
@@ -3198,6 +3631,7 @@ mod tests {
                             }
                         },
                         |_, _, _, _| panic!("completed raw feeds must not reopen an archive"),
+                        |_, _, _, _, _| panic!("completed raw feeds cannot look up staging"),
                     )
                     .unwrap();
                     assert_eq!(remote_lookups, usize::from(!offline));
@@ -3237,6 +3671,7 @@ mod tests {
                         },
                         |_, _, _, _, _, _, _| panic!("complete processed cache must keep priority"),
                         |_, _, _, _| panic!("processed cache must not reopen an archive"),
+                        |_, _, _, _, _| panic!("processed cache cannot look up staging"),
                     )
                     .unwrap();
                     assert_eq!(reused.meta.stats["cache_hits"], 1);
@@ -3306,6 +3741,7 @@ mod tests {
                     find_day_releases_for_fetch_cached(None, y, m, d, dir, true, include_mlat)
                 },
                 |_, _, _, _| panic!("a usable offline cache cannot require an archive"),
+                |_, _, _, _, _| panic!("offline recovery cannot look up staging"),
             )
             .unwrap();
             let recovered = problem == "metadata";
@@ -3435,6 +3871,7 @@ mod tests {
                         archive_opens.fetch_add(1, Ordering::Relaxed);
                         Err(DataError("covering raw retry opened an archive".into()))
                     },
+                    |_, _, _, _, _| panic!("offline recovery cannot look up staging"),
                 )
                 .unwrap();
                 assert_eq!(archive_opens.load(Ordering::Relaxed), 0);
@@ -3848,6 +4285,7 @@ mod tests {
                         mlat_error: Some(DataError("synthetic optional lookup outage".into())),
                     })
                 },
+                |_, _, _, _, _| panic!("a usable main cache cannot look up staging"),
             )
             .unwrap();
             assert_eq!(calls, 1);
@@ -3957,6 +4395,7 @@ mod tests {
                             Err(DataError("synthetic main release lookup outage".into()))
                         }
                     },
+                    |_, _, _, _, _| panic!("a failed release lookup cannot try a staging archive"),
                 )
                 .unwrap();
                 assert_eq!(calls, 1);
@@ -4070,6 +4509,7 @@ mod tests {
                                 Err(DataError("synthetic main release lookup outage".into()))
                             }
                         },
+                        |_, _, _, _, _| panic!("completed raw recovery cannot look up staging"),
                     )
                     .unwrap();
                     assert_eq!(calls, 2, "one failed lookup, one local manifest read");
@@ -4190,6 +4630,7 @@ mod tests {
                             Err(DataError("synthetic main release lookup outage".into()))
                         }
                     },
+                    |_, _, _, _, _| panic!("a failed release lookup cannot try a staging archive"),
                 )
                 .unwrap_err();
                 assert_eq!(
@@ -4431,6 +4872,7 @@ mod tests {
                             Err(DataError("synthetic main release lookup outage".into()))
                         }
                     },
+                    |_, _, _, _, _| panic!("a failed release lookup cannot try a staging archive"),
                 )
                 .unwrap_err();
                 assert_eq!(
@@ -4481,6 +4923,7 @@ mod tests {
                             Err(DataError("synthetic main release lookup outage".into()))
                         }
                     },
+                    |_, _, _, _, _| panic!("failed publication cannot trigger staging lookup"),
                 )
                 .unwrap_err();
                 assert!(error.to_string().contains("could not cache completed day"));

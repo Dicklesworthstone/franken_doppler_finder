@@ -361,6 +361,64 @@ pub(crate) fn find_day_releases_for_fetch_cached(
     })
 }
 
+/// Look up staging only after an advertised prod archive has failed. Keep this
+/// alternative separate from the preferred day listing so a later run retries prod.
+pub(crate) fn find_staging_release_for_fetch_cached(
+    net: Option<&Net>,
+    y: i64,
+    m: u32,
+    d: u32,
+    dir: &Path,
+) -> Result<Option<DayRelease>, DataError> {
+    cached_staging_release(y, m, d, dir, || {
+        let owned;
+        let net = match net {
+            Some(net) => net,
+            None => {
+                owned = Net::new()?;
+                &owned
+            }
+        };
+        find_release(net, y, m, d, Feed::Staging)
+    })
+}
+
+fn cached_staging_release(
+    y: i64,
+    m: u32,
+    d: u32,
+    dir: &Path,
+    lookup: impl FnOnce() -> Result<Option<DayRelease>, DataError>,
+) -> Result<Option<DayRelease>, DataError> {
+    let path = dir.join("releases-staging.json");
+    let valid = |r: &DayRelease| {
+        r.feed == Feed::Staging
+            && crate::fetch::release_for_day(r, (y, m, d))
+            && valid_archive_parts(&r.tag, &r.parts)
+    };
+    if let Some(mut releases) = read_cached_listing(&path)
+        && releases.len() == 1
+        && valid(&releases[0])
+        && cached_listing_final(&releases, y, m, d, &path)
+    {
+        return Ok(releases.pop());
+    }
+    let Some(release) = lookup()? else {
+        return Ok(None);
+    };
+    if !valid(&release) {
+        return Err(DataError::new(
+            "staging lookup returned an invalid release for the requested day",
+        ));
+    }
+    fdop_http::write_atomic(
+        &path,
+        &serde_json::to_vec_pretty(std::slice::from_ref(&release))
+            .map_err(|e| DataError(e.to_string()))?,
+    )?;
+    Ok(Some(release))
+}
+
 fn cached_fetch_releases(
     y: i64,
     m: u32,
@@ -598,6 +656,95 @@ mod tests {
         assert!(error.to_string().contains("main API"));
         assert!(!dir.join("releases.json").exists());
         assert!(!dir.join("releases-main.json").exists());
+    }
+
+    #[test]
+    fn staging_lookup_keeps_preferred_metadata_and_refreshes_split_archives() {
+        let dir = cache_dir("staging-alternative");
+        let settled = fdop_types::time::unix_from_utc(2026, 9, 11, 1, 0, 0.0);
+        let full = dir.join("releases.json");
+        let main = dir.join("releases-main.json");
+        write_listing(
+            &full,
+            &[cached_release(Feed::Prod), cached_release(Feed::Mlatonly)],
+            settled,
+        );
+        write_listing(&main, &[cached_release(Feed::Prod)], settled);
+        let originals = [std::fs::read(&full).unwrap(), std::fs::read(&main).unwrap()];
+        let staging = cached_release(Feed::Staging);
+        let got = cached_staging_release(2026, 9, 8, &dir, || Ok(Some(staging.clone())))
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, staging);
+        let path = dir.join("releases-staging.json");
+        write_listing(&path, std::slice::from_ref(&staging), settled);
+        assert_eq!(
+            cached_staging_release(2026, 9, 8, &dir, || panic!(
+                "settled complete tar is cached"
+            ))
+            .unwrap(),
+            Some(staging.clone())
+        );
+
+        let mut split = staging.clone();
+        split.parts[0].name.push_str(".aa");
+        for checked_at in [settled, settled - 3.0 * 86_400.0] {
+            write_listing(&path, std::slice::from_ref(&split), checked_at);
+            let mut queried = false;
+            let got = cached_staging_release(2026, 9, 8, &dir, || {
+                queried = true;
+                Ok(Some(staging.clone()))
+            })
+            .unwrap();
+            assert!(queried, "a split prefix cannot certify the last asset");
+            assert_eq!(got, Some(staging.clone()));
+        }
+        assert_eq!(std::fs::read(&full).unwrap(), originals[0]);
+        assert_eq!(std::fs::read(&main).unwrap(), originals[1]);
+    }
+
+    #[test]
+    fn staging_lookup_rejects_wrong_day_feed_and_incomplete_identities() {
+        let settled = fdop_types::time::unix_from_utc(2026, 9, 11, 1, 0, 0.0);
+        for problem in ["feed", "repo", "day", "parts"] {
+            let dir = cache_dir(&format!("staging-{problem}"));
+            let valid = cached_release(Feed::Staging);
+            let mut wrong = valid.clone();
+            match problem {
+                "feed" => wrong = cached_release(Feed::Prod),
+                "repo" => wrong.repo = repo_for_year(2025),
+                "day" => {
+                    wrong.tag = tag_for(2026, 9, 7, Feed::Staging, 0);
+                    wrong.parts[0].name = format!("{}.tar", wrong.tag);
+                }
+                "parts" => wrong.parts[0].name.push_str(".ab"),
+                _ => unreachable!(),
+            }
+            let path = dir.join("releases-staging.json");
+            write_listing(&path, std::slice::from_ref(&wrong), settled);
+            let before = std::fs::read(&path).unwrap();
+            let mut calls = 0;
+            assert!(
+                cached_staging_release(2026, 9, 8, &dir, || {
+                    calls += 1;
+                    Ok(Some(wrong.clone()))
+                })
+                .is_err(),
+                "{problem}"
+            );
+            assert_eq!(calls, 1);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(
+                cached_staging_release(2026, 9, 8, &dir, || Ok(None))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                cached_staging_release(2026, 9, 8, &dir, || Ok(Some(valid.clone()))).unwrap(),
+                Some(valid)
+            );
+        }
     }
 
     #[test]

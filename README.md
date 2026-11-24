@@ -1039,6 +1039,7 @@ Cache layout:
 ├── adsb/<YYYY-MM-DD>/<feeds>_<S>_<W>_<N>_<E>.fdtrk   regional track store per UTC day (gzip, magic FDOPTRK1)
 ├── adsb/<YYYY-MM-DD>/releases.json                   archive release metadata
 ├── adsb/<YYYY-MM-DD>/releases-main.json              main-only discovery metadata
+├── adsb/<YYYY-MM-DD>/releases-staging.json           lazy alternative metadata after a prod failure
 ├── adsb/<YYYY-MM-DD>/raw/*.fdopraw.gz                completed filtered raw feeds for retry
 ├── weather/                                          Open-Meteo and radiosonde responses
 ├── geoid/<lat>_<lon>.txt                             NGS geoid height at a region's centre
@@ -1080,6 +1081,17 @@ archive identified only by a checkpoint.
 The report retains failed-feed details and actual missing-feed warnings. A successful new
 catalogue keeps priority, and later online runs retry the preferred upgrade while reusing
 completed raw feeds. Final catalogue publication failures remain errors.
+
+If the advertised prod archive fails and neither processed nor completed raw main-feed data
+can supply the day, an online fetch now discovers and tries staging. It validates that
+release's day, repository, feed and archive parts, then uses the same complete-stream
+ingestion and day-store publication as the ordinary fetch. Requested completed MLAT
+checkpoints join the same build without being downloaded again. The fallback retains the
+original prod/MLAT failure details and any missing-feed warning. Staging metadata is cached
+separately in `releases-staging.json`, and the resulting catalogue is labelled staging,
+so later online runs still retry prod. Offline requests, successful main feeds and usable
+local fallbacks do not trigger this additional lookup. A missing or failed staging
+alternative cannot turn an incomplete archive into a completed day.
 
 If a requested MLAT archive fails during download or ingestion, a completely ingested
 and successfully published prod/staging main catalogue can still supply that day. The
@@ -1439,7 +1451,7 @@ filled from usable observations. A sounding with no observed winds aloft is stil
 
 | Data | Source | Notes |
 |---|---|---|
-| ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing |
+| ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing, or when its archive fails and no usable local main catalogue remains |
 | Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Known jets are dropped by default and retained with `--include-jets`; unknown types are kept |
 | Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. A slow service does not discard a usable profile from the other source. Radiosonde stations are selected by archive dates covering the requested sounding brackets, so a station closed today can still serve historical recordings. US country metadata includes Alaska and Hawaii stations; their full identifiers are preserved when requesting soundings, while continental stations retain their existing cache keys. The 15 °C standard atmosphere is used only if no usable profile arrives, with a warning |
 | Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search. When a requested tile cannot be loaded, use the finest cached parent down to z10, including the coarse tiles prefetched for this search; parent lookup never downloads extra tiles. A warning identifies the number of recovered tiles and the lowest resolution used. Only a tile with no usable requested or parent data counts as 0 m, with a separate warning. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
@@ -2229,6 +2241,46 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover an unavailable prod archive through staging
+
+`failed_prod_archive_fetches_uncached_staging_then_retries_prod` starts with discovery
+advertising only prod and MLAT, a truncated prod tar, and an available staging tar. The
+preceding fetch fails; the repaired path produces the same complete legs and source tags
+as fresh staging-plus-MLAT ingestion for both ordinary and jet-inclusive policies. Each
+archive is attempted once, offline reuse works, and the next online run upgrades to prod
+without another staging lookup or MLAT download. Three companion regressions cover
+release identity, split-archive metadata, failed/incomplete alternatives, publication
+errors, offline mode and optional MLAT behavior.
+
+All four new regressions pass. The selected data component suite passes 133 tests and
+fails the existing `offline_raw_recovery_requires_main_and_preserves_processed_cache_priority`
+assertion; the identical failure reproduces with the unchanged fetch implementation.
+These runs compile the exact production fetch, discovery, ingestion, build and cache
+modules with real locked dependencies in a scratch-only offline harness. HTTP entry
+points panic rather than simulate successful responses. Native data builds were killed
+in unchanged `asupersync 0.6.2` before project tests compiled, including an optimization-
+level-zero retry. This establishes the archive/cache state machine, not the production
+HTTP runtime or live-service behavior.
+
+### Native core validation after the search and ridge repairs
+
+The complete search module passes 149 tests with three ignored timing/resource checks. The complete
+measurement module passes 48 tests and fails the existing
+`refused_coarse_family_keeps_a_distinct_aircraft_eligible` fixture premise. Its exact
+pre-change source produces the same failure and identical detection and fit values;
+the assertion remains unchanged.
+
+The actual, unchanged `src/selftest.rs`, invoked through a minimal scratch entrypoint
+linked to the complete current core and genuine locked dependencies, passes its 1,300 s
+synthetic-audio decode, detection, measurement, search and refinement chain. It recovers
+ACE391 and A1DFEB with 1.520666 m position error, a 75 m radius and +0.014271 s clock error.
+This uses the pinned compiler through RCH with the repository's development optimization
+profile; it does not establish the full release CLI/workspace gate or reference/field
+accuracy. The full core suite was stopped during long-running unrelated curve-match
+tests; its affected-module results above are complete.
+The full-workspace formatting check still fails on existing drift: every remaining
+formatter replacement matches the baseline, and none intersects these changed lines.
 
 ### Keep admissible steep-pass frequencies after raw correction
 

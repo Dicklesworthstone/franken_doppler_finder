@@ -354,8 +354,8 @@ fn guided_trace_with_background(
                         // either direction; only the corrected position decides.
                         let peak = match (short_background, raw_only) {
                             (Some(background), true) => guided_raw_ridge_peak(
-                                short, j, fp, along, peak_band, peak_band, reference, half, min_snr,
-                                min_z, background, band,
+                                short, j, fp, along, peak_band, peak_band, reference, half,
+                                min_snr, min_z, background, band,
                             ),
                             _ => guided_ridge_peak_with_exclusion(
                                 short,
