@@ -2589,8 +2589,9 @@ fn profile_valid_clock(
 /// A wide uncertainty window can put every regular sample outside a compact pass's
 /// accepted clock basin. Capped residuals may then favor a distant, invalid plateau.
 /// Preserve every original success; only a failed coarse scan tries the exact
-/// recording clocks implied by its assigned physical CPAs. Each seed must already
-/// explain every event before its original scan-cell neighborhood is polished.
+/// recording clocks implied by its assigned physical CPAs. Preserve successful
+/// exact-seed recovery before searching a finite rejected seed's scan-cell neighborhood:
+/// uncertain fitted CPA centres need not individually explain the other events.
 fn profile_valid_clock_seeded(
     lo: f64,
     hi: f64,
@@ -2613,6 +2614,7 @@ fn profile_valid_clock_seeded(
     let restore = last?;
     let mut tried = false;
     let mut best: Option<(f64, f64)> = None;
+    let mut rejected = Vec::new();
     for (i, &seed) in seeds.iter().enumerate() {
         if !seed.is_finite() || seed < lo || seed > hi || seeds[..i].contains(&seed) {
             continue;
@@ -2620,6 +2622,9 @@ fn profile_valid_clock_seeded(
         tried = true;
         let (value, valid) = cost(seed);
         if !valid || !value.is_finite() {
+            if value.is_finite() {
+                rejected.push(seed);
+            }
             continue;
         }
         // Keep the observed seed itself: local scan nodes need not land on it,
@@ -2633,6 +2638,19 @@ fn profile_valid_clock_seeded(
         }
         if best.is_none_or(|old| candidate.1 < old.1) {
             best = Some(candidate);
+        }
+    }
+    if best.is_none() {
+        // An admitted CPA-time interval can put its fitted centre beside the joint
+        // trace minimum. Retry only that seed's original scan-cell neighborhood,
+        // after every old recovery has failed; all accepted clocks keep the gates.
+        for seed in rejected {
+            if let Some(candidate) =
+                profile_valid_clock((seed - half).max(lo), (seed + half).min(hi), &mut cost)
+                && best.is_none_or(|old| candidate.1 < old.1)
+            {
+                best = Some(candidate);
+            }
         }
     }
     if let Some((clock, _)) = best {
@@ -7077,10 +7095,17 @@ mod tests {
                 .is_none()
             );
             assert_eq!(&calls[..original_calls.len()], &original_calls);
-            assert_eq!(
-                &calls[original_calls.len()..],
-                &[1.173, *original_calls.last().unwrap()]
-            );
+            let extra = &calls[original_calls.len()..calls.len() - 1];
+            assert_eq!(extra[0], 1.173);
+            if finite {
+                // Only the distinct, finite rejected seed earns a bounded retry.
+                // Invalid clocks can never pass; its final fits must still be restored.
+                assert!(extra.len() > 1 && extra.len() < 50);
+                assert!(extra.iter().all(|&t| (1.173 - 2.0..=1.173 + 2.0).contains(&t)));
+            } else {
+                assert_eq!(extra, &[1.173]);
+            }
+            assert_eq!(calls.last(), original_calls.last());
             calls.clear();
             assert!(
                 profile_valid_clock_seeded(-400.0, 400.0, &seeds[..3], |t| {
@@ -7110,6 +7135,63 @@ mod tests {
             .expect("the initially weaker seed reaches the better eligible basin");
         assert!((recovered.0 - 400.3).abs() < 0.01);
         assert!(recovered.1 < 0.0001);
+    }
+
+    #[test]
+    fn rejected_clock_seed_neighborhoods_recover_only_after_old_seed_paths_fail() {
+        let score = |t: f64| {
+            if (t - 100.1).abs() < 0.08 {
+                ((t - 100.1).powi(2) + 1.0, true)
+            } else if (t - 400.39).abs() < 0.08 {
+                ((t - 400.39).powi(2) + 2.0, true)
+            } else {
+                (0.0, false)
+            }
+        };
+        let seed = 100.39;
+        assert!(!score(seed).1);
+        let mut original_calls = Vec::new();
+        assert!(
+            profile_valid_clock(0.0, 800.0, |t| {
+                original_calls.push(t);
+                score(t)
+            })
+            .is_none()
+        );
+        let mut calls = Vec::new();
+        let recovered = profile_valid_clock_seeded(0.0, 800.0, &[seed], |t| {
+            calls.push(t);
+            score(t)
+        })
+        .expect("a rejected fitted centre can still bracket an eligible shared clock");
+        assert_eq!(&calls[..original_calls.len()], &original_calls);
+        assert!(
+            calls[original_calls.len()..]
+                .iter()
+                .all(|&t| (seed - 2.0..=seed + 2.0).contains(&t))
+        );
+        assert!(calls.len() < original_calls.len() + 100);
+        assert!((recovered.0 - 100.1).abs() < 0.01);
+        assert_eq!(recovered.1, score(recovered.0).0);
+        assert_eq!(calls.last().copied(), Some(recovered.0));
+
+        // A later exact seed already succeeds under the established algorithm.
+        // Preserve it and its evaluation sequence even though the rejected seed's
+        // unvisited neighborhood contains a lower eligible objective.
+        calls.clear();
+        let kept = profile_valid_clock_seeded(0.0, 800.0, &[seed, 400.39], |t| {
+            calls.push(t);
+            score(t)
+        })
+        .unwrap();
+        assert_eq!(kept, (400.39, 2.0));
+        assert_eq!(calls[original_calls.len()], seed);
+        assert!(
+            calls[original_calls.len() + 1..]
+                .iter()
+                .all(|&t| (400.39 - 2.0..=400.39 + 2.0).contains(&t))
+        );
+        assert_eq!(calls.last().copied(), Some(kept.0));
     }
 
     #[test]
@@ -7307,6 +7389,51 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn broad_clock_profiles_recover_between_uncertain_cpa_seeds() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        for start in [0.0, 1_788_895_000.0] {
+            let mut case = compact_fine_grid_case(start, false);
+            let assignments = [(0, 0, start + 120.0), (1, 1, start + 360.0)];
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            for (event, offset) in case.events.iter_mut().zip([-3.0, 6.0]) {
+                // A fitted centre is uncertain metadata, not an exact observation.
+                // Preserve both physical ridges while moving the two admitted centres
+                // to opposite sides of their actual shared recording clock.
+                event.t_rec += offset;
+                event.t_tol = 1200.0;
+            }
+            case.p.start_lo = start - 1200.0 + 0.17;
+            case.p.start_hi = start + 1200.0 - 3.27;
+            let fitted = eval_point_weighted(
+                &o,
+                &assignments,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                true,
+                PointGates::All,
+                false,
+                None,
+                false,
+            )
+            .expect("a shared clock between uncertain CPA seeds must retain the physical pair");
+            assert!(
+                (fitted.t_s - start).abs() < 0.05,
+                "start={start}: clock error {} s",
+                fitted.t_s - start
+            );
+            assert!(
+                fitted
+                    .chis
+                    .iter()
+                    .all(|fit| fit.chi < 0.1 && fit.cov == 1.0)
+            );
         }
     }
 

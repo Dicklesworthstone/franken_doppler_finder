@@ -2110,10 +2110,14 @@ A failed local polish cannot erase that retained clock, and the returned trace f
 recomputed at the returned clock. A window with no eligible sampled clock is rejected
 without another scan unless the 400-cell cap widened its sampling interval. In that case,
 the fitter also tries the recording start implied by each aircraft's exact closest approach.
-Each seed must lie inside the original joint clock window and already explain both aircraft
-under the same trace and coverage gates before its neighboring scan interval is polished.
-The seed itself remains available if local polishing misses it. An unsuccessful retry
-restores the original rejected fit for spatial recovery.
+Each seed must lie inside the original joint clock window. Seeds that already explain both
+aircraft retain priority, including the seed itself when local polishing misses it. If every
+original scan and eligible-seed recovery fails, the fitter also searches the original scan-cell
+neighborhood of each finite rejected seed: uncertain fitted closest-approach times can lie on
+opposite sides of the correct shared clock. These local retries keep the same trace and coverage
+gates, and stay inside the original joint window. An unsuccessful retry restores the original
+rejected fit for spatial recovery. Each distinct rejected seed can add one bounded local scan;
+this does not search every possible interval in a broad clock window.
 
 Position refinement also checks these physical timing seeds when the clock scan is
 widened by its cap. It uses the same unconstrained, fixed-weight trace objective as the
@@ -2244,6 +2248,24 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover a shared clock between uncertain closest-approach estimates
+
+`broad_clock_profiles_recover_between_uncertain_cpa_seeds` keeps two physical flight tracks
+and their received-frequency observations fixed, while offsetting their fitted timing centers
+by -3 and +6 seconds inside their existing 1,200-second uncertainty intervals. On the preceding
+code, the shared-clock solver returns no eligible pair. The recovery retains both aircraft
+at the known observer in relative and Unix time, with less than 0.05 seconds of clock error,
+complete coverage and each trace's normalized loss below 0.1.
+
+The companion controls preserve original successful scans and exact-seed recoveries, bound
+new evaluations to the rejected seeds' original scan-cell neighborhoods, filter duplicate and
+nonfinite seeds, and restore the original rejected fit when every retry fails. The selected
+native suite passes 109 tests, with no failures and one ignored timing benchmark, through
+genuine RCH and the pinned compiler. It uses exact production search/refinement helpers,
+complete production track and physics code, and genuine locked dependencies. This is synthetic
+component evidence; full-workspace checks, release selftest and reference/field replays remain
+incomplete for this change.
 
 ### Recover an unavailable prod archive through staging
 

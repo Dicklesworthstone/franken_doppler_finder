@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover shared clocks around rejected closest-approach estimates
+
+- Preserve successful original clock scans and exact-CPA-seed recoveries. If both fail,
+  search each finite rejected seed's original scan-cell neighborhood; a fitted timing
+  center need not itself explain every aircraft before nearby shared clocks are tried.
+- Retain the original joint window, trace and coverage gates, seed deduplication and
+  nonfinite handling. Failed retries restore the original rejected fit for spatial
+  recovery. Quick screening, narrow clocks and ungated position refinement are unchanged.
+- The physical regression fails on `3606b7d`: two unchanged tracks and their received
+  frequency traces lose their valid shared clock after fitted timing centers move by
+  -3 and +6 seconds within their 1,200-second uncertainties. The repair recovers both
+  relative/Unix cases with clock error below 0.05 seconds, full coverage and trace loss
+  below 0.1 at the known observer.
+- All 109 selected native tests pass, with no failures and one ignored timing benchmark,
+  using the pinned compiler through genuine RCH and locked dependencies. Controls cover
+  bounded recovery, retained original successes, invalid/duplicate seeds and final-fit
+  restoration. Complete production track/physics code and exact search/refinement helpers
+  are exercised; this does not establish full-core, full-pipeline or field accuracy.
+- Workspace formatting still reports existing drift. The one changed-range formatting
+  issue was corrected; the execution host disconnected before its final recheck.
+  Full-workspace gates, release selftest and reference/field replays remain incomplete.
+
 ### Keep local checkpoint metadata from authorizing archive retries
 
 - Remember whether prod was advertised before adding release identities recovered from
