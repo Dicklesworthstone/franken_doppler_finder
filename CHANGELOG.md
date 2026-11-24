@@ -19,6 +19,18 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Discover late audio tracks and preserve their recording clocks
+
+- Permit complete stream discovery for containers that introduce audio after the initial probe window.
+  Discard probe packets and rewind before decoding when a selected track needs this longer scan.
+  Ordinary compressed decoding preserves its original samples and decoder priming.
+- Normalize selected audio against the container timestamp instead of FFmpeg's selected-stream start.
+  A late audio track retains its delay relative to video, including when seeking into the recording.
+- All 22 exact-source native audio/time tests passed on the pinned Rust toolchain, including the new
+  real FFmpeg transport-stream regression with audio only in its middle, selected channels, exact PCM
+  slices, MP3/AAC sample comparisons and timestamp gaps. This component run does not establish
+  full-CLI or field accuracy.
+
 ### Recover valid aircraft pairs between narrow clock samples
 
 - After a failed shared-clock scan, permit the existing physical closest-approach

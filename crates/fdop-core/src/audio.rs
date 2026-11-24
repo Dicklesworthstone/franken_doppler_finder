@@ -5,6 +5,18 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+// Dynamic containers can introduce an audio stream after the ordinary probe window.
+// Let FFmpeg inspect through EOF where the demuxer permits late streams. Discard
+// probe packets so discovery does not buffer a long recording in memory.
+const FULL_PROBE_ARGS: [&str; 6] = [
+    "-probesize",
+    "9223372036854775807",
+    "-analyzeduration",
+    "9223372036854775807",
+    "-fflags",
+    "+nobuffer",
+];
+
 /// Zero-based audio-stream ordinal and optional channel within that stream. With no
 /// channel selected, FFmpeg downmixes the selected stream to mono as before.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -17,6 +29,8 @@ pub struct AudioSelection {
 pub struct MediaInfo {
     pub path: String,
     pub duration_s: f64,
+    /// Container PTS origin, in seconds. This is independent of the selected track.
+    pub start_time_s: f64,
     pub format: String,
     pub audio_codec: String,
     pub sample_rate: u32,
@@ -43,12 +57,12 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
 /// Describe the selected audio stream and validate its channel before decoding. The
 /// stream ordinal counts audio streams only, matching FFmpeg's `0:a:N` mapping.
 pub fn probe_with_selection(path: &Path, selection: AudioSelection) -> Result<MediaInfo, String> {
-    media_info(path, &probe_document(path, false)?, selection)
+    media_info(path, &probe_document(path, false, true)?, selection)
 }
 
 /// Probe once so a whole-file audit uses the same stream inventory throughout.
 pub fn probe_audio_streams(path: &Path) -> Result<Vec<MediaInfo>, String> {
-    let doc = probe_document(path, false)?;
+    let doc = probe_document(path, false, true)?;
     all_stream_info(path, &doc)
 }
 
@@ -87,7 +101,7 @@ pub struct AudioInventory {
 }
 
 pub fn probe_audio_inventory(path: &Path) -> Result<AudioInventory, String> {
-    audit_inventory(path, &probe_document(path, true)?)
+    audit_inventory(path, &probe_document(path, true, true)?)
 }
 
 fn audit_inventory(path: &Path, doc: &serde_json::Value) -> Result<AudioInventory, String> {
@@ -114,8 +128,16 @@ fn audit_inventory(path: &Path, doc: &serde_json::Value) -> Result<AudioInventor
     Ok(AudioInventory { streams: audio, location_tag_detected })
 }
 
-fn probe_document(path: &Path, require_clean_probe: bool) -> Result<serde_json::Value, String> {
-    let out = Command::new("ffprobe")
+fn probe_document(
+    path: &Path,
+    require_clean_probe: bool,
+    complete: bool,
+) -> Result<serde_json::Value, String> {
+    let mut cmd = Command::new("ffprobe");
+    if complete {
+        cmd.args(FULL_PROBE_ARGS);
+    }
+    let out = cmd
         .args([
             "-v",
             "error",
@@ -171,6 +193,11 @@ fn media_info(
     info.duration_s = fmt["duration"]
         .as_str()
         .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    info.start_time_s = fmt["start_time"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|time| time.is_finite())
         .unwrap_or(0.0);
     info.audio_codec = a["codec_name"].as_str().unwrap_or("").to_string();
     info.sample_rate = a["sample_rate"]
@@ -404,7 +431,18 @@ pub fn decode_with_selection(
 ) -> Result<Vec<f32>, String> {
     // `pan` can silently fill an unavailable input channel with zeroes. Validate the
     // source first so an invalid selection cannot look like a silent recording.
-    probe_with_selection(path, selection)?;
+    let info = probe_with_selection(path, selection)?;
+    // Preserve ordinary decoder priming when the short probe already resolves the
+    // selected source. Rewinding a normally readable MP3/AAC at zero can skip priming.
+    // Keep the complete probe's container epoch whichever decoder path is used.
+    let full_probe = probe_document(path, false, false)
+        .and_then(|doc| media_info(path, &doc, selection))
+        .map_or(true, |quick| {
+            quick.audio_codec != info.audio_codec
+                || quick.channels != info.channels
+                || quick.sample_rate != info.sample_rate
+                || quick.start_time_s != info.start_time_s
+        });
     let start = start.max(0.0);
     let start_s = format!("{start:.3}");
     let stream = format!("0:a:{}", selection.stream);
@@ -412,10 +450,15 @@ pub fn decode_with_selection(
         .channel
         .map(|n| format!("pan=mono|c0=c{n},"))
         .unwrap_or_default();
-    let filter = format!("{channel}asetpts=PTS-{start_s}/TB,aresample=async=1:first_pts=0");
+    // start_at_zero can rebase a transport stream on the first *selected* packet.
+    // Subtract the container epoch explicitly to retain an audio track's true delay.
+    let filter = format!(
+        "{channel}asetpts=PTS-({})/TB-{start_s}/TB,aresample=async=1:first_pts=0",
+        info.start_time_s
+    );
     let mut cmd = Command::new("ffmpeg");
-    // MPEG-TS/HLS otherwise collapse timestamp jumps over ten seconds. Retain them, but
-    // remove an arbitrary container start timestamp before interpreting relative seeks.
+    // Preserve timestamp jumps, including MPEG-TS/HLS gaps over ten seconds.
+    // Full probing discards packets, so that path must rewind even at zero.
     cmd.args([
         "-nostdin",
         "-hide_banner",
@@ -425,9 +468,11 @@ pub fn decode_with_selection(
         // packets. The sample count is used as the recording duration downstream.
         "-xerror",
         "-copyts",
-        "-start_at_zero",
     ]);
-    if start > 0.0 {
+    if full_probe {
+        cmd.args(FULL_PROBE_ARGS);
+    }
+    if start > 0.0 || full_probe {
         cmd.args(["-ss", &start_s]);
     }
     cmd.arg("-i").arg(path);
@@ -439,8 +484,8 @@ pub fn decode_with_selection(
         "1",
         "-ar",
         &sr.to_string(),
-        // copyts retains the seek offset. Shift it out before filling initial/internal
-        // gaps; async=1 only fills/trims, whereas larger values can stretch the signal.
+        // Shift out the container epoch and seek offset before filling gaps.
+        // async=1 only fills/trims; larger values can stretch the signal.
         "-af",
         &filter,
     ]);
@@ -722,7 +767,7 @@ mod tests {
     #[test]
     fn selected_audio_supplies_the_probe_and_clock_hint() {
         let mut j = serde_json::json!({
-            "format": {"format_name": "matroska", "duration": "0"},
+            "format": {"format_name": "matroska", "duration": "0", "start_time": "-12.345678"},
             "streams": [
                 {"codec_type": "video", "tags": {"creation_time": "2026-09-07T10:00:00Z"}},
                 {"codec_type": "audio", "codec_name": "aac", "sample_rate": "4000",
@@ -740,12 +785,14 @@ mod tests {
             (first.audio_stream, first.sample_rate, first.channels),
             (0, 4000, 1)
         );
+        assert_eq!(first.start_time_s, -12.345678);
         assert_eq!(first.creation_time.as_deref(), Some("2026-09-08T11:00:00Z"));
         let selection = AudioSelection {
             stream: 1,
             channel: Some(1),
         };
         let second = media_info(path, &j, selection).unwrap();
+        assert_eq!(second.start_time_s, first.start_time_s);
         assert_eq!(second.audio_codec, "pcm_f32le");
         assert_eq!((second.audio_stream, second.audio_channel), (1, Some(1)));
         assert_eq!((second.sample_rate, second.channels), (8000, 2));
@@ -1112,6 +1159,152 @@ mod tests {
                 "selected channel seek {start} changed timestamps"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn complete_discovery_preserves_compressed_decoder_priming() {
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-audio-priming-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (extension, codec) in [("mp3", "libmp3lame"), ("m4a", "aac")] {
+            let path = dir.join(format!("tone.{extension}"));
+            let encoded = Command::new("ffmpeg")
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=8000:duration=6",
+                    "-c:a",
+                    codec,
+                ])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                encoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&encoded.stderr)
+            );
+            // The original decoder setup retains the codec's leading priming packets.
+            let reference = Command::new("ffmpeg")
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-xerror",
+                    "-copyts",
+                    "-start_at_zero",
+                    "-i",
+                ])
+                .arg(&path)
+                .args([
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "8000",
+                    "-af",
+                    "asetpts=PTS,aresample=async=1:first_pts=0",
+                    "-f",
+                    "f32le",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                reference.status.success(),
+                "{}",
+                String::from_utf8_lossy(&reference.stderr)
+            );
+            let actual = decode(&path, 0.0, None, 8000).unwrap();
+            assert!(actual.iter().any(|x| x.abs() > 0.05));
+            let bytes: Vec<u8> = actual.iter().flat_map(|x| x.to_le_bytes()).collect();
+            assert_eq!(bytes, reference.stdout, "{extension} priming changed");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn late_transport_audio_keeps_its_recording_offset() {
+        const SR: u32 = 4000;
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-late-audio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut transport = Vec::new();
+        // Audio appears only in the middle program. The video before and after it
+        // also keeps that program outside the ordinary beginning/end probe windows.
+        for (index, duration, offset) in [(0, 20, 0), (1, 2, 20), (2, 20, 22)] {
+            let part = dir.join(format!("part-{index}.ts"));
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(["-nostdin", "-v", "error", "-f", "lavfi", "-i"])
+                .arg(format!("testsrc2=s=640x360:r=25:d={duration}"));
+            if index == 1 {
+                cmd.args(["-f", "lavfi", "-i", "sine=frequency=400:duration=2"]);
+            }
+            cmd.args(["-map", "0:v:0"]);
+            if index == 1 {
+                cmd.args(["-map", "1:a:0", "-c:a", "mp2"]);
+            }
+            let result = cmd
+                .args([
+                    "-c:v",
+                    "mpeg2video",
+                    "-b:v",
+                    "1M",
+                    "-mpegts_flags",
+                    "+initial_discontinuity",
+                    "-tables_version",
+                    &index.to_string(),
+                    "-output_ts_offset",
+                    &offset.to_string(),
+                ])
+                .arg(&part)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            transport.extend(std::fs::read(part).unwrap());
+        }
+        let path = dir.join("middle-audio.ts");
+        std::fs::write(&path, transport).unwrap();
+        let inventory = probe_audio_inventory(&path).unwrap();
+        assert_eq!(inventory.streams.len(), 1);
+        assert_eq!(inventory.streams[0].audio_stream, 0);
+        assert_eq!(inventory.streams[0].channels, 1);
+
+        let pcm = decode(&path, 0.0, None, SR).unwrap();
+        let first_sound = |samples: &[f32]| {
+            samples.iter().position(|x| x.abs() > 0.02).unwrap() as f64 / SR as f64
+        };
+        // MPEG video frame timing and MP2 encoder padding shift the audible onset
+        // by less than 100 ms. The twenty seconds before the pass must survive.
+        assert!((first_sound(&pcm) - 20.0).abs() < 0.1);
+        assert!(pcm[..19 * SR as usize].iter().all(|&x| x == 0.0));
+        assert!(pcm.len() > 21 * SR as usize);
+        let clip = decode(&path, 19.0, Some(2.0), SR).unwrap();
+        assert_eq!(clip.len(), 2 * SR as usize);
+        assert!((first_sound(&clip) - 1.0).abs() < 0.1);
     }
 
     #[test]

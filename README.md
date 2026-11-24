@@ -772,6 +772,11 @@ relative to video retains that delay. The container's arbitrary starting timesta
 collapsing internal gaps. Tones are not stretched to repair timing, so a gap does not shift later flyovers
 or change their Doppler frequencies. A decoder-reported corrupt packet or a nonfinite PCM sample stops the run before measurement.
 
+Stream discovery can read the whole file when its container allows tracks to appear later, including
+an audio program present only in the middle of an MPEG transport stream. This can add an input scan.
+The selected track keeps its offset from the container's start, even when its first sound arrives
+much later than the video. Ordinary compressed audio retains its original decoded samples.
+
 | Shared option | Meaning |
 |---|---|
 | `--cache <PATH>` | Cache root for ADS-B day stores, terrain, gazetteer, map tiles and geoid heights. Default: see [Configuration](#configuration) |
