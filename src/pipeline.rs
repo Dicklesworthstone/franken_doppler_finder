@@ -1906,7 +1906,7 @@ fn locate_with_clock(
     match coarse.prefetch_bbox(&region.bbox.padded_km(d_max / 1000.0 + 2.0), 4000) {
         Ok(n) => log.say(&format!("terrain: {n} coarse tiles ready (z10)")),
         Err(e) => warnings.push(format!(
-            "terrain prefetch: {e}; elevations fall back to 0 m where tiles are missing"
+            "terrain prefetch: {e}; queried positions use cached terrain when available and otherwise fall back to 0 m"
         )),
     }
     let mut tracks_terrain_s = t.elapsed().as_secs_f64();
@@ -2212,8 +2212,8 @@ fn locate_with_clock(
             v.why
         ));
     }
-    // Cached parent tiles retain real terrain when the requested resolution is unavailable.
-    // Report that loss of resolution separately from tiles with no usable terrain at all.
+    // A cached child supplies only its own footprint inside a missing requested tile.
+    // Distinguish finer recovery, parent resolution loss and actual zero-height fallbacks.
     for (dem, stage) in [(&coarse, "coarse"), (&fine, "fine")] {
         let recovered = dem.recovered_tiles();
         if recovered > 0 {
@@ -2223,15 +2223,22 @@ fn locate_with_clock(
                 dem.lowest_used_zoom(),
             ));
         }
+        let finer = dem.recovered_finer_tiles();
+        if finer > 0 {
+            warnings.push(format!(
+                "terrain: {finer} cached higher-resolution tiles supplied queried {stage} (z{}) positions because the requested tiles and cached parents could not be loaded",
+                dem.zoom(),
+            ));
+        }
     }
     let (lost_coarse, lost_fine) = (coarse.failures(), fine.failures());
     if lost_coarse + lost_fine > 0 {
         warnings.push(format!(
-            "terrain: {lost_coarse} coarse (z10) and {lost_fine} fine (z13) tiles could not be {}; ground elevation there was taken as 0 m",
+            "terrain: queried positions in {lost_coarse} coarse (z10) and {lost_fine} fine (z13) tiles had no usable requested, cached parent or cached finer terrain{}; ground elevation at those positions was taken as 0 m",
             if a.offline {
-                "read from the cache (--offline)"
+                " (--offline)"
             } else {
-                "fetched"
+                ""
             }
         ));
     }

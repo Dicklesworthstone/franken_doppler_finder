@@ -4,7 +4,8 @@
 //! web-mercator tile coordinates, pixel centres at +0.5, bilinear within one tile (clamped at
 //! the tile edge, no cross-tile blending). If the requested tile is unavailable, an already
 //! cached parent down to z10 (the pipeline's coarse terrain resolution) can supply elevation.
-//! Recovery never downloads a parent, and its lower resolution is counted for reporting.
+//! Otherwise a cached finer tile through z13 can supply the queried position's elevation.
+//! Recovery never downloads other resolutions, and each recovery is counted for reporting.
 //!
 //! One exception: a pixel below [`LOWEST_GROUND_M`] is left out of the blend. The elevation
 //! here is only ever the observer's ground, and no ground lies that low, so such a pixel is
@@ -18,13 +19,15 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 pub const TERRARIUM_URL: &str = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium";
 const TILE: usize = 256;
 /// Do not replace missing fine terrain by a surface coarser than the location search uses.
 const MIN_RECOVERY_ZOOM: u32 = 10;
+/// Bound finer-cache lookups to the resolution already used by the fine search.
+const MAX_RECOVERY_ZOOM: u32 = 13;
 
 /// The lowest dry land on Earth, the Dead Sea shore (about -430 m). A tile value below it is
 /// not a surface anyone records from.
@@ -36,7 +39,13 @@ struct TerrainTile {
     heights: Arc<Vec<f32>>,
 }
 
-type TileCell = Arc<OnceLock<Option<TerrainTile>>>;
+#[derive(Default)]
+struct TileEntry {
+    tile: OnceLock<Option<TerrainTile>>,
+    fallback_used: AtomicBool,
+}
+
+type TileCell = Arc<TileEntry>;
 
 pub struct TerrariumDem {
     zoom: u32,
@@ -47,6 +56,7 @@ pub struct TerrariumDem {
     failures: AtomicUsize,
     fetched: AtomicUsize,
     recovered: AtomicUsize,
+    finer_recovered: AtomicUsize,
     lowest_zoom: AtomicU32,
 }
 
@@ -124,6 +134,7 @@ impl TerrariumDem {
             failures: AtomicUsize::new(0),
             fetched: AtomicUsize::new(0),
             recovered: AtomicUsize::new(0),
+            finer_recovered: AtomicUsize::new(0),
             lowest_zoom: AtomicU32::new(zoom),
         }
     }
@@ -140,7 +151,8 @@ impl TerrariumDem {
     pub fn zoom(&self) -> u32 {
         self.zoom
     }
-    /// Requested tiles with neither their own data nor a usable cached parent (counted once).
+    /// Requested tiles with a queried position lacking usable terrain (each counted once).
+    /// A missing prefetch tile alone does not count: a cached finer tile may cover the query.
     pub fn failures(&self) -> usize {
         self.failures.load(Ordering::Relaxed)
     }
@@ -152,7 +164,11 @@ impl TerrariumDem {
     pub fn recovered_tiles(&self) -> usize {
         self.recovered.load(Ordering::Relaxed)
     }
-    /// Coarsest resolution used; the requested zoom when no parent recovery was needed.
+    /// Distinct cached finer tiles supplying queried positions (each counted once).
+    pub fn recovered_finer_tiles(&self) -> usize {
+        self.finer_recovered.load(Ordering::Relaxed)
+    }
+    /// Coarsest cached parent used; the requested zoom when no parent recovery was needed.
     pub fn lowest_used_zoom(&self) -> u32 {
         self.lowest_zoom.load(Ordering::Relaxed)
     }
@@ -210,20 +226,36 @@ impl TerrariumDem {
             // Many requested tiles share one parent. Cache its immutable decoded grid,
             // including misses, without opening a network client or duplicating the grid.
             let parent = self.cell(zoom, px, py);
-            if let Some(tile) = parent.get_or_init(|| self.cached_tile(zoom, px, py)) {
+            if let Some(tile) = parent.tile.get_or_init(|| self.cached_tile(zoom, px, py)) {
                 self.recovered.fetch_add(1, Ordering::Relaxed);
                 self.lowest_zoom.fetch_min(zoom, Ordering::Relaxed);
                 return Some(tile.clone());
             }
         }
-        self.failures.fetch_add(1, Ordering::Relaxed);
         None
     }
 
     fn tile(&self, x: u32, y: u32) -> Option<TerrainTile> {
         self.cell(self.zoom, x, y)
+            .tile
             .get_or_init(|| self.load_tile(x, y))
             .clone()
+    }
+
+    fn cached_finer_tile(&self, xf: f64, yf: f64) -> Option<TerrainTile> {
+        for zoom in (self.zoom + 1..=MAX_RECOVERY_ZOOM).rev() {
+            let scale = f64::from(1u32 << (zoom - self.zoom));
+            let (x, y) = ((xf * scale).floor() as u32, (yf * scale).floor() as u32);
+            let child = self.cell(zoom, x, y);
+            if let Some(tile) = child.tile.get_or_init(|| {
+                let tile = self.cached_tile(zoom, x, y)?;
+                self.finer_recovered.fetch_add(1, Ordering::Relaxed);
+                Some(tile)
+            }) {
+                return Some(tile.clone());
+            }
+        }
+        None
     }
 
     /// Load (fetching as needed) every tile covering `bbox`, in parallel.
@@ -274,13 +306,24 @@ impl Elevation for TerrariumDem {
     fn elev_m(&self, lat: f64, lon: f64) -> f64 {
         let (xf, yf) = tile_xy(lat, lon, self.zoom);
         let (tx, ty) = (xf.floor(), yf.floor());
-        let Some(tile) = self.tile(tx as u32, ty as u32) else {
+        let Some(tile) = self
+            .tile(tx as u32, ty as u32)
+            .or_else(|| self.cached_finer_tile(xf, yf))
+        else {
+            let requested = self.cell(self.zoom, tx as u32, ty as u32);
+            if !requested.fallback_used.swap(true, Ordering::Relaxed) {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+            }
             return self.fallback_m;
         };
-        // Sample the observer's coordinates in the selected parent's grid, not the
-        // original fine tile's fractional coordinates (which repeat in every child).
-        let scale = f64::from(1u32 << (self.zoom - tile.zoom));
-        let (xf, yf) = (xf / scale, yf / scale);
+        // Rescale before taking fractional coordinates: a selected tile may cover
+        // several requested tiles, or just one part of a missing requested tile.
+        let scale = f64::from(1u32 << self.zoom.abs_diff(tile.zoom));
+        let (xf, yf) = if tile.zoom > self.zoom {
+            (xf * scale, yf * scale)
+        } else {
+            (xf / scale, yf / scale)
+        };
         let (tx, ty) = (xf.floor(), yf.floor());
         let tile = &tile.heights;
         let px = ((xf - tx) * 256.0 - 0.5).clamp(0.0, 254.999);
@@ -510,6 +553,132 @@ mod tests {
             let fresh = TerrariumDem::new(&dir, requested).with_offline(true);
             assert_eq!(fresh.elev_m(AT.0, AT.1), 777.0);
             assert_eq!(fresh.recovered_tiles(), 0);
+        }
+    }
+
+    #[test]
+    fn cached_children_supply_only_their_own_ground_to_missing_coarse_tiles() {
+        let dir = fresh_cache("finer-coverage");
+        let dem = TerrariumDem::new(&dir, 10)
+            .with_offline(true)
+            .with_fallback(-999.0);
+        let (x, y) = tile_xy(AT.0, AT.1, 10);
+        let (x, y) = (x.floor() as u32, y.floor() as u32);
+        let (fx, fy) = (x << (Z - 10), y << (Z - 10));
+        let surface = |base: f64, px: f64, py: f64| base + 2.0 * px + 3.0 * py;
+        let mut samples = Vec::new();
+        for (cx, cy, base) in [(fx + 1, fy + 2, 600.0), (fx + 2, fy + 2, 1600.0)] {
+            put_tile(
+                &dem,
+                Z,
+                cx,
+                cy,
+                &encode(|px, py| surface(base, px as f64, py as f64)),
+            );
+            for dx in [0.000_01, 0.5, 0.999_99] {
+                for dy in [0.000_01, 0.5, 0.999_99] {
+                    let (lat, lon) = tile_latlon(f64::from(cx) + dx, f64::from(cy) + dy, Z);
+                    let px = (dx * 256.0 - 0.5).clamp(0.0, 254.999);
+                    let py = (dy * 256.0 - 0.5).clamp(0.0, 254.999);
+                    samples.push((lat, lon, surface(base, px, py)));
+                }
+            }
+        }
+        // Prefetch cannot claim that a sparsely covered parent is fully ready or
+        // that any observer has already been assigned the fallback elevation.
+        let (north, west) = tile_latlon(f64::from(x) + 0.1, f64::from(y) + 0.1, 10);
+        let (south, east) = tile_latlon(f64::from(x) + 0.9, f64::from(y) + 0.9, 10);
+        assert_eq!(
+            dem.prefetch_bbox(&BBox::new(south, west, north, east), 1)
+                .unwrap(),
+            0
+        );
+        assert_eq!(dem.failures(), 0);
+        assert_eq!(dem.recovered_finer_tiles(), 0);
+        samples.par_iter().for_each(|&(lat, lon, want)| {
+            let got = dem.elev_m(lat, lon);
+            assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+        });
+        assert_eq!(dem.failures(), 0);
+        assert_eq!(dem.recovered_finer_tiles(), 2);
+
+        // The exact east/west boundary belongs to the second cached child.
+        let (lat, lon) = tile_latlon(f64::from(fx + 2), f64::from(fy + 2) + 0.5, Z);
+        let (bx, by) = tile_xy(lat, lon, Z);
+        assert_eq!(bx, f64::from(fx + 2));
+        let want = surface(1600.0, 0.0, (by - by.floor()) * 256.0 - 0.5);
+        assert!((dem.elev_m(lat, lon) - want).abs() < 1e-6);
+
+        // A different child of the same missing parent has no coverage. It must
+        // not inherit either cached child's heights, even after repeated queries.
+        let (lat, lon) = tile_latlon(f64::from(fx + 4) + 0.5, f64::from(fy + 2) + 0.5, Z);
+        (0..64).into_par_iter().for_each(|_| {
+            assert_eq!(dem.elev_m(lat, lon), -999.0);
+        });
+        assert_eq!(dem.failures(), 1);
+        assert_eq!(dem.recovered_tiles(), 0);
+        assert_eq!(dem.recovered_finer_tiles(), 2);
+        assert_eq!(dem.fetched(), 0);
+        assert!(!dem.tile_path(x, y).exists());
+    }
+
+    #[test]
+    fn finer_cache_recovery_preserves_existing_resolution_and_skips_corrupt_tiles() {
+        for (tag, requested, good, bad, expected_zoom) in [
+            ("requested", 10, vec![10, 13], vec![], Some(10)),
+            ("parent", 12, vec![10, 13], vec![], Some(10)),
+            ("finest", 10, vec![11, 12, 13], vec![], Some(13)),
+            ("corrupt-fine", 10, vec![11, 12], vec![13], Some(12)),
+            ("corrupt-middle", 10, vec![11], vec![12, 13], Some(11)),
+            ("corrupt-requested", 10, vec![13], vec![10], Some(13)),
+            ("above-limit", 10, vec![14], vec![], None),
+        ] {
+            let dir = fresh_cache(&format!("finer-{tag}"));
+            let dem = TerrariumDem::new(&dir, requested)
+                .with_offline(true)
+                .with_fallback(-999.0);
+            for &zoom in &good {
+                let (x, y) = tile_xy(AT.0, AT.1, zoom);
+                put_tile(
+                    &dem,
+                    zoom,
+                    x as u32,
+                    y as u32,
+                    &encode(|_, _| f64::from(zoom) * 100.0),
+                );
+            }
+            for &zoom in &bad {
+                let (x, y) = tile_xy(AT.0, AT.1, zoom);
+                put_tile(&dem, zoom, x as u32, y as u32, b"corrupt terrain tile");
+            }
+            (0..64).into_par_iter().for_each(|_| {
+                assert_eq!(
+                    dem.elev_m(AT.0, AT.1),
+                    expected_zoom.map_or(-999.0, |z| f64::from(z) * 100.0),
+                    "{tag}"
+                );
+            });
+            assert_eq!(
+                dem.failures(),
+                usize::from(expected_zoom.is_none()),
+                "{tag}"
+            );
+            assert_eq!(
+                dem.recovered_tiles(),
+                usize::from(expected_zoom.is_some_and(|z| z < requested)),
+                "{tag}"
+            );
+            assert_eq!(
+                dem.recovered_finer_tiles(),
+                usize::from(expected_zoom.is_some_and(|z| z > requested)),
+                "{tag}"
+            );
+            assert_eq!(
+                dem.lowest_used_zoom(),
+                expected_zoom.map_or(requested, |z| z.min(requested)),
+                "{tag}"
+            );
+            assert_eq!(dem.fetched(), 0);
         }
     }
 

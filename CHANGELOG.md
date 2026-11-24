@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Reuse cached fine terrain when the coarse search lacks its tile
+
+- Let a missing requested tile with no usable cached parent use the queried position's
+  cached finer tiles through z13, finest first. Existing requested and parent results
+  retain precedence. Each child supplies only its own footprint; another child of the
+  same absent parent cannot inherit its elevations. Recovery performs no extra downloads.
+- Keep separate counts and pipeline warnings for parent resolution loss, distinct finer
+  tiles actually used and requested tiles containing a queried fallback position. A
+  prefetch-only miss no longer claims that an observer was assigned sea-level terrain.
+- Nine native offline terrain tests pass with genuine locked PNG/Rayon/shared-type
+  dependencies and the pinned compiler through RCH. The preceding implementation passes
+  seven original tests and fails both new regressions. Coverage includes two independent
+  child planes, interpolation and exact boundaries, uncovered siblings, corruption,
+  precedence, the z13 limit and concurrent accounting. HTTP setup/downloads are excluded
+  from this component build; full workspace, CLI selftest and field/reference gates
+  remain unverified. No location-accuracy or runtime improvement is claimed.
+
 ### Carry uncertain clock recovery into weighted position refinement
 
 - Profile each finite physical timing seed's original scan-cell neighborhood even

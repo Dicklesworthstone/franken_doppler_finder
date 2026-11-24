@@ -1462,7 +1462,7 @@ wind-only levels outside thermal support remain excluded.
 | ADS-B and MLAT tracks | [adsb.lol](https://adsb.lol) `globe_history_<year>` GitHub releases | ODbL. One global archive per UTC day (`prod` about 3.6–3.9 GB, `mlatonly` about 0.3 GB), streamed and filtered to the region; `staging` is used when `prod` is missing, or when its archive fails and no usable local main catalogue remains |
 | Aircraft engine class | `crates/fdop-types/data/icao_engine_class.tsv` | 2,614 ICAO type designators → piston, turboprop, jet, electric or other. Known jets are dropped by default and retained with `--include-jets`; unknown types are kept |
 | Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. A slow service does not discard a usable profile from the other source. Radiosonde stations are selected by archive dates covering the requested sounding brackets, so a station closed today can still serve historical recordings. US country metadata includes Alaska and Hawaii stations; their full identifiers are preserved when requesting soundings, while continental stations retain their existing cache keys. The 15 °C standard atmosphere is used only if no usable profile arrives, with a warning |
-| Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search. When a requested tile cannot be loaded, use the finest cached parent down to z10, including the coarse tiles prefetched for this search; parent lookup never downloads extra tiles. A warning identifies the number of recovered tiles and the lowest resolution used. Only a tile with no usable requested or parent data counts as 0 m, with a separate warning. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
+| Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search. When a requested tile cannot be loaded, use the finest cached parent down to z10, including coarse tiles prefetched for this search. If neither is usable, check the queried position's finer cached tiles through z13, finest first. Recovery never downloads another resolution, and a finer tile supplies only its own footprint inside a missing tile. Warnings distinguish parent resolution loss, distinct finer tiles used and queried positions that actually fell back to 0 m. A prefetch miss alone does not imply a zero-height observer. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
 | Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL. Taken once two reads agree, then kept in the cache; −30 m, with a warning, if the reads fail or never agree, or under `--offline` |
 | Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Offline fallback uses the gazetteer's internal points |
 | Basemap | [USGS The National Map](https://www.usgs.gov/programs/national-geospatial-program/national-map) Topo tiles; OSM in the HTML report | |
@@ -2255,6 +2255,28 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Use cached fine terrain when the coarse tile is missing
+
+`cached_children_supply_only_their_own_ground_to_missing_coarse_tiles` exercises two
+different synthetic z13 terrain planes inside one absent z10 tile. Actual PNG decoding
+and bilinear sampling recover both planes at interior and edge pixels, including their
+shared longitude boundary. An uncovered sibling still returns the configured fallback.
+Concurrent reads count each finer tile and each requested tile with a fallback once;
+prefetching a missing tile alone claims neither full coverage nor a zero-height observer.
+
+`finer_cache_recovery_preserves_existing_resolution_and_skips_corrupt_tiles` checks
+requested-tile and cached-parent precedence, the finest available child, corrupt z13 and
+z12 recovery, a corrupt requested tile, and the z13 lookup limit. No recovery downloads
+another resolution or changes a valid requested/parent result.
+
+All nine native offline terrain tests pass through genuine RCH with the pinned compiler
+and the repository's locked PNG, Rayon and shared-type dependencies. The preceding
+implementation passes the seven original tests and fails both new physical cache
+regressions. The component build omits HTTP setup and the unused download branch; it
+exercises real PNG files, filesystem caching, interpolation and concurrent reads, not
+network fetching. Full crate/workspace gates, CLI selftest and reference/field replays
+remain unverified. No end-to-end localization or runtime improvement is claimed.
 
 ### Keep uncertain timing seeds eligible during weighted refinement
 
