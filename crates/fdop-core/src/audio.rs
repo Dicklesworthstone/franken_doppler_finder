@@ -221,7 +221,16 @@ fn read_pcm(mut input: impl Read) -> io::Result<Vec<f32>> {
         samples.try_reserve(words.len()).map_err(|e| {
             io::Error::new(io::ErrorKind::OutOfMemory, format!("decoded audio: {e}"))
         })?;
-        samples.extend(words.iter().map(|word| f32::from_le_bytes(*word)));
+        for &word in words {
+            let sample = f32::from_le_bytes(word);
+            if !sample.is_finite() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("non-finite decoded PCM at sample {}", samples.len()),
+                ));
+            }
+            samples.push(sample);
+        }
         buffer.copy_within(complete..available, 0);
         pending = available - complete;
     }
@@ -292,7 +301,7 @@ fn decode_command(mut cmd: Command) -> Result<Vec<f32>, String> {
     })?;
     let status = status.map_err(|e| format!("ffmpeg wait failed: {e}"))?;
     if !status.success() {
-        return Err(format!("ffmpeg decode failed: {errors}"));
+        return Err(format!("ffmpeg decode failed ({status}): {errors}"));
     }
     Ok(samples)
 }
@@ -325,6 +334,9 @@ pub fn decode_with_selection(
         "-hide_banner",
         "-loglevel",
         "error",
+        // By default FFmpeg can emit partial PCM and exit successfully after corrupt
+        // packets. The sample count is used as the recording duration downstream.
+        "-xerror",
         "-copyts",
         "-start_at_zero",
     ]);
@@ -376,7 +388,7 @@ mod tests {
                 self.bytes.read(&mut buffer[..n])
             }
         }
-        let values = [0.0, -0.0, 1.0, -1.0, f32::MIN_POSITIVE, f32::MAX, f32::NAN];
+        let values = [0.0, -0.0, 1.0, -1.0, f32::MIN_POSITIVE, f32::MAX];
         let expected: Vec<u32> = (0..40_001)
             .map(|i| values[i % values.len()].to_bits())
             .collect();
@@ -404,6 +416,24 @@ mod tests {
         for missing in 1..=3 {
             let err = read_pcm(&bytes[..bytes.len() - missing]).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[test]
+    fn nonfinite_pcm_is_a_decode_error_at_the_first_bad_sample() {
+        let mut bytes = vec![0; DECODE_BUFFER_BYTES + 8];
+        for value in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            bytes[DECODE_BUFFER_BYTES..DECODE_BUFFER_BYTES + 4]
+                .copy_from_slice(&value.to_le_bytes());
+            let err = read_pcm(bytes.as_slice()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "non-finite decoded PCM at sample {}",
+                    DECODE_BUFFER_BYTES / 4
+                )
+            );
         }
     }
 
@@ -471,6 +501,50 @@ mod tests {
         let error = decode_command(invalid).unwrap_err();
         assert!(error.contains("ffmpeg decode failed"), "{error}");
         assert!(error.contains("fdop_filter_that_does_not_exist"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn corrupt_recording_is_not_accepted_as_a_shorter_decode() {
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-corrupt-audio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tone.wav");
+        let made = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=137:sample_rate=8000:duration=2",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        assert_eq!(decode(&path, 0.0, None, 8000).unwrap().len(), 16000);
+        // Keep the header intact and remove 200 complete samples. The decoder can
+        // emit a long, word-aligned prefix even though the final packet is corrupt.
+        let bytes = std::fs::read(&path).unwrap();
+        let damaged = dir.join("truncated.wav");
+        std::fs::write(&damaged, &bytes[..bytes.len() - 400]).unwrap();
+        assert!(probe(&damaged).is_ok());
+        let err = decode(&damaged, 0.0, None, 8000).unwrap_err();
+        assert!(err.contains("ffmpeg decode failed"), "{err}");
     }
 
     #[test]
