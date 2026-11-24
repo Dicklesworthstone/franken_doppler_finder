@@ -1217,6 +1217,7 @@ fn fetch_window_with_sources(
             // online identity authoritative for every feed it actually advertised.
             let context = day_context(day);
             let rels = &mut day_releases[di];
+            let advertised_prod = rels.iter().any(|rel| rel.feed == Feed::Prod);
             let alternatives: Vec<_> =
                 crate::raw_cache::recovery_releases(&dir, &[], context, opts.include_mlat)
                     .into_iter()
@@ -1262,7 +1263,8 @@ fn fetch_window_with_sources(
             // An advertised prod archive can be unavailable while staging is
             // complete. Discover that alternative only after every local recovery
             // failed; never retry the failed prod download within this request.
-            if opts.offline || !rels.iter().any(|rel| rel.feed == Feed::Prod) {
+            // Unlisted raw identities are local recovery evidence only.
+            if opts.offline || !advertised_prod {
                 continue;
             }
             let alternative = match staging(net.as_ref(), day.0, day.1, day.2, &dir) {
@@ -2544,10 +2546,12 @@ mod tests {
             "mlat-disabled",
             "offline",
             "selected-staging",
+            "selected-staging-raw-prod",
         ] {
             let f = offline_raw_fixture(Feed::Staging, false);
+            let selected_staging = problem.starts_with("selected-staging");
             let selected = checkpoint_release(
-                if problem == "selected-staging" {
+                if selected_staging {
                     Feed::Staging
                 } else {
                     Feed::Prod
@@ -2556,8 +2560,37 @@ mod tests {
             );
             let want = IngestSpec {
                 keep_unknown: true,
+                include_jets: problem == "selected-staging-raw-prod",
                 ..f.want
             };
+            if problem == "selected-staging-raw-prod" {
+                // Local identity recovery can see a complete ordinary prod feed
+                // which cannot cover this jet-inclusive request. It is not evidence
+                // that online discovery advertised prod or that staging is untried.
+                let prod = checkpoint_release(Feed::Prod, &f.archives[0]);
+                let context = day_context((2026, 9, 8));
+                let part = ingest_day_reader(
+                    f.archives[0].as_slice(),
+                    prod.feed.label(),
+                    &f.spec,
+                    &|_| {},
+                    context,
+                )
+                .unwrap();
+                crate::raw_cache::save(&f.dir, &prod, &f.spec, context, &part).unwrap();
+                assert!(
+                    crate::raw_cache::recovery_releases(&f.dir, &[], context, true).contains(&prod)
+                );
+                let expanded = IngestSpec {
+                    include_jets: true,
+                    ..f.spec
+                };
+                assert!(
+                    crate::raw_cache::load(&f.dir, &prod, &expanded, context)
+                        .unwrap()
+                        .is_none()
+                );
+            }
             let opts = FetchOptions {
                 offline: problem == "offline",
                 include_mlat: problem != "mlat-disabled",
@@ -2634,9 +2667,13 @@ mod tests {
             );
             assert_eq!(
                 lookups.load(Ordering::Relaxed),
-                usize::from(!matches!(problem, "offline" | "selected-staging")),
+                usize::from(problem != "offline" && !selected_staging),
                 "{problem}"
             );
+            if selected_staging {
+                assert_eq!(calls[0].load(Ordering::Relaxed), 0, "{problem}");
+                assert_eq!(calls[1].load(Ordering::Relaxed), 1, "{problem}");
+            }
             if matches!(problem, "mlat-failed" | "mlat-disabled") {
                 let got = result.unwrap();
                 let expected = build_day_store(

@@ -1092,6 +1092,9 @@ separately in `releases-staging.json`, and the resulting catalogue is labelled s
 so later online runs still retry prod. Offline requests, successful main feeds and usable
 local fallbacks do not trigger this additional lookup. A missing or failed staging
 alternative cannot turn an incomplete archive into a completed day.
+Unadvertised release identities recovered from local raw checkpoints remain local-only:
+an unusable prod checkpoint cannot authorize another download of an already selected
+staging archive.
 
 If a requested MLAT archive fails during download or ingestion, a completely ingested
 and successfully published prod/staging main catalogue can still supply that day. The
@@ -2251,7 +2254,10 @@ as fresh staging-plus-MLAT ingestion for both ordinary and jet-inclusive policie
 archive is attempted once, offline reuse works, and the next online run upgrades to prod
 without another staging lookup or MLAT download. Three companion regressions cover
 release identity, split-archive metadata, failed/incomplete alternatives, publication
-errors, offline mode and optional MLAT behavior.
+errors, offline mode and optional MLAT behavior. The selected-staging control also covers
+a complete unadvertised prod checkpoint with an incompatible jet policy: its recoverable
+metadata must not trigger another staging lookup or archive attempt. That control fails
+before capturing the advertised main-feed choice separately from local recovery metadata.
 
 All four new regressions pass. The selected data component suite passes 133 tests and
 fails the existing `offline_raw_recovery_requires_main_and_preserves_processed_cache_priority`
@@ -2281,6 +2287,9 @@ accuracy. The full core suite was stopped during long-running unrelated curve-ma
 tests; its affected-module results above are complete.
 The full-workspace formatting check still fails on existing drift: every remaining
 formatter replacement matches the baseline, and none intersects these changed lines.
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, also run through RCH,
+could not complete: the pinned compiler was killed by SIGKILL while checking unchanged
+`asupersync 0.5.0` dependency metadata, before any repository lint diagnostics appeared.
 
 ### Keep admissible steep-pass frequencies after raw correction
 

@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep local checkpoint metadata from authorizing archive retries
+
+- Remember whether prod was advertised before adding release identities recovered from
+  local raw checkpoints. A complete but policy-incompatible prod checkpoint must not
+  cause a failed, already selected staging archive to be discovered or downloaded again.
+- Extend the staging regression with a jet-inclusive request and an ordinary-only prod
+  checkpoint. It verifies that metadata recovery finds the checkpoint but actual loading
+  rejects its policy, then requires zero extra lookups and one staging archive attempt.
+  The preceding implementation makes one extra lookup and fails that assertion.
+  After the repair all five focused staging tests pass; the selected-module suite
+  retains 133 passes and the same independently confirmed pre-existing cache assertion.
+- The full-workspace Clippy attempt ended with the pinned compiler killed by SIGKILL
+  while checking unchanged `asupersync 0.5.0` metadata. No repository lint diagnostics
+  appeared before termination; the gate remains incomplete.
+
 ### Fetch staging when an advertised prod archive cannot supply a day
 
 - After a prod archive fails and processed/raw local recovery cannot supply the day,
