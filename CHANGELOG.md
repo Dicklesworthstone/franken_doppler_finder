@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Carry uncertain clock recovery into weighted position refinement
+
+- Profile each finite physical timing seed's original scan-cell neighborhood even
+  when its centre scores worse than the initial clock minimum. The fine search can
+  already recover such intervals; weighted refinement must not discard them because
+  the fitted closest-approach centre is uncertain.
+- Retain the original clock bounds, seed deduplication, nonfinite handling, strict
+  improvement and tie rules, fixed-weight objective and final trace-state restoration.
+  Narrow scans and quick screening keep their evaluation sequence. The added bounded
+  work can increase refinement cost; no timing improvement is claimed.
+- All 14 native exact-source clock-helper tests pass through genuine RCH and the pinned
+  compiler. The baseline passes 13 and fails the new bounded-neighborhood regression,
+  returning clock 0 and loss 0.5 instead of reaching the lower minimum near 100.1.
+  The exact-source physical weighted-clock regression also passes all four relative/
+  Unix-time and equal/unequal-weight combinations within 0.05 s; the preceding helper
+  misses the first fixture's clock by 551.2477538483614 s. The expanded spatial-
+  refinement regression, full workspace gates, release selftest and field/reference
+  replays remain pending after shared-host resource failures.
+
 ### Preserve sound speed when radiosondes add wind-only layers
 
 - Interpolate relative humidity alongside temperature when retaining a wind-only

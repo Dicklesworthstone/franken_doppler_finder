@@ -2126,10 +2126,12 @@ this does not search every possible interval in a broad clock window.
 
 Position refinement also checks these physical timing seeds when the clock scan is
 widened by its cap. It uses the same unconstrained, fixed-weight trace objective as the
-confidence contour: a seed must improve the original minimum before its neighboring
-interval is polished. The original result wins ties, and the returned trace fits are
-recomputed at the selected clock. No fine-grid trace-acceptance gate is added to the
-contour. Each distinct improving seed can require a local scan, so cost grows with the
+confidence contour: every finite seed can propose a better clock in its neighboring
+interval, even when the uncertain fitted centre itself scores worse than the original
+minimum. Only a strict improvement replaces that minimum. The original result wins ties,
+and the returned trace fits are recomputed at the selected clock. No fine-grid
+trace-acceptance gate is added to the
+contour. Each distinct finite seed can require a local scan, so cost grows with the
 number of assigned events. Quick screening and narrow clock windows retain their
 original evaluation sequence; this targeted recovery does not exhaustively search
 every possible clock interval.
@@ -2253,6 +2255,34 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Keep uncertain timing seeds eligible during weighted refinement
+
+`ungated_clock_profiles_near_a_seed_that_is_worse_than_the_original` isolates a
+clock-profile failure: the original scan returns clock 0 with loss 0.5, and a worse
+seed at 100.39 hides the lower minimum at 100.1 inside its own scan cell. The repaired
+solver checks that interval and reaches the minimum within 0.01 s. It retains the
+same bounds, duplicate/nonfinite filtering, strict loss comparison and returned
+callback state. This is a control-flow fixture, not simulated audio.
+
+The exact four production clock helpers and 14 focused tests pass natively through
+genuine RCH with the pinned compiler; the preceding implementation passes 13 and fails
+the new case. Narrow scans retain their exact evaluation sequence. Finite worse or
+tied seeds may add bounded work but cannot replace the original result without a
+strict improvement; nonfinite seeds retain their previous evaluation sequence.
+
+The new `weighted_clock_refinement_recovers_between_uncertain_cpa_seeds` regression
+uses unchanged received-frequency traces and uncertain fitted timing centres in both
+relative and Unix time, with and without fixed event weights. Its exact-source native
+component run uses the production track, propagation, trace-scoring and point-evaluation
+code with genuine dependencies. The preceding clock helper misses the unweighted,
+relative-time fixture's known clock by 551.2477538483614 s; the repair passes all four
+combinations within 0.05 s, with full trace coverage and the same weighted objective.
+
+The existing spatial-refinement regression also gains those uncertain-centre cases,
+but that expanded regression and the full workspace/release-selftest/reference gates
+remain pending after resource-limited full-core builds. No field-accuracy or runtime
+improvement is claimed.
 
 ### Preserve sound speed when radiosondes add wind-only layers
 

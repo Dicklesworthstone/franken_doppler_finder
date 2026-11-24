@@ -2668,8 +2668,9 @@ fn profile_valid_clock_seeded(
 }
 
 /// Refine broad clocks against the same unconstrained weighted objective as the
-/// contour. Physical CPA seeds may improve the original minimum, but may never
-/// replace it with a tied or worse fit or introduce fine-grid acceptance gates.
+/// contour. A physical CPA seed's uncertain centre cannot reject a better clock
+/// in its scan-cell neighborhood. Only a strict improvement replaces the original
+/// minimum; no fine-grid acceptance gates are introduced.
 fn profile_clock_seeded(
     lo: f64,
     hi: f64,
@@ -2696,11 +2697,12 @@ fn profile_clock_seeded(
         }
         tried = true;
         let value = cost(seed);
-        if !value.is_finite() || value >= original_cost {
+        if !value.is_finite() {
             continue;
         }
-        // Compare every seed with the original minimum: an initially weaker
-        // seed can reach a better basin than a seed already polished here.
+        // An uncertain fitted centre can score worse than the original minimum
+        // while its bounded neighborhood contains the shared physical clock.
+        // Compare the polished proposal, retaining the exact seed as a candidate.
         let mut candidate = (seed, value);
         if let Some(polished) = profile_clock(
             (seed - half).max(lo),
@@ -7239,10 +7241,19 @@ mod tests {
             });
             assert_eq!(recovered, original);
             assert_eq!(&calls[..original_calls.len()], &original_calls);
-            assert_eq!(
-                &calls[original_calls.len()..],
-                &[1.173, *original_calls.last().unwrap()]
-            );
+            let extra = &calls[original_calls.len()..calls.len() - 1];
+            assert_eq!(extra[0], 1.173);
+            if kind == 2 {
+                assert_eq!(extra, &[1.173]);
+            } else {
+                assert!(extra.len() > 1 && extra.len() < 50);
+                assert!(
+                    extra
+                        .iter()
+                        .all(|&t| (1.173 - 2.0..=1.173 + 2.0).contains(&t))
+                );
+            }
+            assert_eq!(calls.last(), original_calls.last());
         }
     }
 
@@ -7299,6 +7310,42 @@ mod tests {
             .expect("every seed improving the original minimum must be polished");
         assert!((recovered.0 - 400.3).abs() < 0.01);
         assert!(recovered.1 < 0.0001);
+    }
+
+    #[test]
+    fn ungated_clock_profiles_near_a_seed_that_is_worse_than_the_original() {
+        let seed = 100.39;
+        let score = |t: f64| {
+            if (t - 100.1).abs() < 0.08 {
+                (t - 100.1).powi(2)
+            } else {
+                0.5 + 1e-6 * t * t
+            }
+        };
+        let mut original_calls = Vec::new();
+        let original = profile_clock(0.0, 800.0, false, |t| {
+            original_calls.push(t);
+            score(t)
+        })
+        .unwrap();
+        assert!(score(seed) > original.1);
+        let mut calls = Vec::new();
+        let recovered = profile_clock_seeded(0.0, 800.0, &[seed, seed, f64::NAN], |t| {
+            calls.push(t);
+            score(t)
+        })
+        .expect("a seed's centre cannot reject its whole clock-cell neighborhood");
+        assert!((recovered.0 - 100.1).abs() < 0.01, "{recovered:?}");
+        assert!(recovered.1 < original.1);
+        assert_eq!(recovered.1, score(recovered.0));
+        assert_eq!(&calls[..original_calls.len()], &original_calls);
+        assert!(
+            calls[original_calls.len()..]
+                .iter()
+                .all(|&t| (seed - 2.0..=seed + 2.0).contains(&t))
+        );
+        assert!(calls.len() < original_calls.len() + 50);
+        assert_eq!(calls.last().copied(), Some(recovered.0));
     }
 
     #[test]
@@ -7495,12 +7542,73 @@ mod tests {
     }
 
     #[test]
-    fn broad_clock_refinement_keeps_location_clock_and_weighted_contour_consistent() {
+    fn weighted_clock_refinement_recovers_between_uncertain_cpa_seeds() {
         let dem = FlatElevation(0.0);
         let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
         for (start, reflected) in [(0.0, false), (1_788_895_000.0, true)] {
             let mut case = compact_fine_grid_case(start, reflected);
-            for event in &mut case.events {
+            let assignments = [(0, 0, start + 120.0), (1, 1, start + 360.0)];
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            for (event, offset) in case.events.iter_mut().zip([-3.0, 6.0]) {
+                // The fine stage can already recover these unchanged physical ridges.
+                // Refinement must also profile their shared clock when neither
+                // uncertain fitted centre itself improves the coarse clock scan.
+                event.t_rec += offset;
+                event.t_tol = 1200.0;
+            }
+            case.p.start_lo = start - 1200.0 + 0.17;
+            case.p.start_hi = start + 1200.0 - 3.27;
+            for weights in [None, Some([1.0, 0.3])] {
+                let fitted = eval_point_weighted(
+                    &o,
+                    &assignments,
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &atmo,
+                    true,
+                    PointGates::Off,
+                    false,
+                    weights.as_ref().map(|w| w.as_slice()),
+                    false,
+                )
+                .expect("the ungated objective retains the physical pair's shared clock");
+                assert!(
+                    (fitted.t_s - start).abs() < 0.05,
+                    "start={start}, reflected={reflected}, weights={weights:?}: clock error {} s",
+                    fitted.t_s - start
+                );
+                assert!(
+                    fitted
+                        .chis
+                        .iter()
+                        .all(|fit| fit.chi < 0.1 && fit.cov == 1.0)
+                );
+                let expected_total: f64 = fitted
+                    .chis
+                    .iter()
+                    .zip(&case.events)
+                    .enumerate()
+                    .map(|(i, (fit, event))| event.n_eff * fit.chi * weights.map_or(1.0, |w| w[i]))
+                    .sum();
+                assert_eq!(fitted.total, expected_total);
+            }
+        }
+    }
+
+    #[test]
+    fn broad_clock_refinement_keeps_location_clock_and_weighted_contour_consistent() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        for (start, reflected, offsets) in [
+            (0.0, false, [0.0, 0.0]),
+            (1_788_895_000.0, true, [0.0, 0.0]),
+            (0.0, false, [-3.0, 6.0]),
+            (1_788_895_000.0, true, [-3.0, 6.0]),
+        ] {
+            let mut case = compact_fine_grid_case(start, reflected);
+            for (event, offset) in case.events.iter_mut().zip(offsets) {
+                event.t_rec += offset;
                 event.t_tol = 1200.0;
             }
             case.p.start_lo = start - 1200.0 + 0.17;
