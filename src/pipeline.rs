@@ -317,6 +317,29 @@ fn search_data_bounds(region: BBox, events: &[search::SearchEvent], c_max: Optio
     (d_max, region.padded_km(support_km))
 }
 
+/// Earliest source time needed by a retained trace, with the existing 300 s of track
+/// context. Keep the original 1200 s padding whenever it already covers the trace.
+///
+/// In the homogeneous moving-medium transform, R_fit/c_fit = q/a and travel time is
+/// (w.r + q)/a, where a = c² - |w|² and q² = (w.r)² + a|r|². Cauchy–Schwarz gives
+/// |w.r|/q <= |w|/c < 1, so travel time is less than 2 R_fit/c_fit for any admitted
+/// subsonic wind. This uses the same fitted straight-trace envelope as the spatial
+/// bound, including the full distance, speed and CPA-time ranges. It does not bound
+/// arbitrary curved tracks or spatially varying propagation.
+fn trace_catalogue_start(clock_start: f64, events: &[search::SearchEvent]) -> f64 {
+    events
+        .iter()
+        .filter_map(|event| {
+            let radius = event.catalogue_radius_m()?;
+            let first = event.tr_t.iter().copied().reduce(f64::min)?;
+            let travel = (2.0 * (radius / event.c_fit).next_up()).next_up();
+            let start =
+                (((clock_start + first).next_down() - travel).next_down() - 300.0).next_down();
+            start.is_finite().then_some(start)
+        })
+        .fold(clock_start - 1200.0, f64::min)
+}
+
 struct PublishedWindow {
     clock: (f64, f64),
     adsb_end: f64,
@@ -330,10 +353,11 @@ impl PublishedWindow {
         duration: f64,
         geoid_n_m: f64,
         include_jets: bool,
+        events: &[search::SearchEvent],
     ) -> fdop_data::IngestSpec {
         fdop_data::IngestSpec {
             bbox,
-            t_start: self.clock.0 - 1200.0,
+            t_start: trace_catalogue_start(self.clock.0, events),
             t_end: (self.clock.1 + duration + 1200.0).min(self.adsb_end),
             geoid_n_m,
             keep_unknown: true,
@@ -531,10 +555,12 @@ fn start_weather(
     window: &PublishedWindow,
     duration: f64,
     curve_params: &curvematch::MatchParams,
+    events: &[search::SearchEvent],
 ) -> WeatherReceiver {
     let (tx, rx) = std::sync::mpsc::channel();
     let (cache, offline) = (a.cache.clone(), a.offline);
     let (w0, w1) = window.weather_span(bbox, duration, a.curve_match.then_some(curve_params));
+    let w0 = w0.min(trace_catalogue_start(window.clock.0, events));
     std::thread::spawn(move || {
         let t = Instant::now();
         let fallback_tx = tx.clone();
@@ -1958,7 +1984,7 @@ fn locate_with_clock(
     let output = reserve_output(a.out.as_deref(), &default_run_dir(&a.media))?;
     let run_dir = output.path.clone();
     *claimed_dir = Some(output);
-    let mut weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
+    let mut weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params, &[]);
     let mut curve_clock = archive.clock;
     // whether `curve_clock` is the creation_time window; it stays so if a wider retry keeps the
     // metadata attempt's curve match
@@ -2047,6 +2073,16 @@ fn locate_with_clock(
         "{} aircraft-like events go to the search",
         base_events.len()
     ));
+    let source_start = trace_catalogue_start(archive.clock.0, &base_events);
+    let weather_start = archive
+        .weather_span(region.bbox, dur, a.curve_match.then_some(&curve_params))
+        .0;
+    if source_start < weather_start {
+        log.say(
+            "the measured traces require earlier source positions; extending the weather window",
+        );
+        weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params, &base_events);
+    }
     let heard: Vec<f64> = dets.iter().map(|d| d.t0r).collect();
     let t = Instant::now();
     let (geoid_n, geoid_src) =
@@ -2095,7 +2131,7 @@ fn locate_with_clock(
             catalogue_sound_speed(&*wx.atmo),
         );
         // ---- ADS-B for this attempt ------------------------------------------------------
-        let spec = archive.track_spec(fetch_box, dur, geoid_n, a.include_jets);
+        let spec = archive.track_spec(fetch_box, dur, geoid_n, a.include_jets, &base_events);
         log.say(&format!(
             "ADS-B: {} .. {} over [{:.2},{:.2},{:.2},{:.2}] (geoid N {geoid_n:.2} m, {geoid_src})",
             iso_utc(spec.t_start),
@@ -2119,7 +2155,8 @@ fn locate_with_clock(
                 meta_window = false;
                 metadata_fallback = true;
                 archive = published_start_window(a, full_window, dur, now(), &mut warnings)?;
-                weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
+                weather_rx =
+                    start_weather(a, region.bbox, &archive, dur, &curve_params, &base_events);
                 log.say(&describe_window(&archive, false, true));
                 continue;
             }
@@ -2143,7 +2180,7 @@ fn locate_with_clock(
             } else {
                 log.say("weather arrived during ADS-B loading; expanding the flight catalogue");
                 let t = Instant::now();
-                let spec = archive.track_spec(late_box, dur, geoid_n, a.include_jets);
+                let spec = archive.track_spec(late_box, dur, geoid_n, a.include_jets, &base_events);
                 let expanded = fdop_data::fetch_window(&spec, &a.cache, &opts).map(Some);
                 adsb_s += t.elapsed().as_secs_f64();
                 expanded
@@ -2366,7 +2403,8 @@ fn locate_with_clock(
                 meta_window = false;
                 metadata_fallback = true;
                 archive = fallback;
-                weather_rx = start_weather(a, region.bbox, &archive, dur, &curve_params);
+                weather_rx =
+                    start_weather(a, region.bbox, &archive, dur, &curve_params, &base_events);
                 log.say(&describe_window(&archive, false, true));
                 continue;
             }
@@ -4598,6 +4636,134 @@ mod tests {
     }
 
     #[test]
+    fn archive_catalogue_retains_sources_before_the_fixed_time_padding() {
+        use fdop_types::geo::Enu;
+        use fdop_types::store::{FlightLeg, TrackPoint, alt_src};
+
+        let (lat, lon) = (40.876466, -73.524951);
+        let region = BBox::new(lat - 0.001, lon - 0.001, lat + 0.001, lon + 0.001);
+        let enu = Enu::new(lat, lon, fdop_types::MIC_HEIGHT_M);
+        let day = unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let start = day + 1300.0;
+        let (c, speed, distance, centre) = (343.0_f64, 300.0_f64, 15_000.0_f64, 300.0);
+        let offsets = [-1800.0, -1200.0, -600.0, 0.0, 600.0];
+        let mut event = search::SearchEvent {
+            id: "early-emission".into(),
+            t_rec: centre + distance / c,
+            t_tol: 3.0,
+            v_gate: [280.0, 320.0],
+            d_gate: [12_000.0, 18_750.0],
+            f0: 112.0,
+            f0_tol: 4.5,
+            sigma_hz: 0.25,
+            n_eff: 20.0,
+            quality: 10.0,
+            misfit: false,
+            c_fit: c,
+            tr_t: offsets
+                .iter()
+                .map(|&tau| centre + tau + distance.hypot(speed * tau) / c)
+                .collect(),
+            tr_f: Vec::new(),
+            q_t: Vec::new(),
+            q_f: Vec::new(),
+        };
+        assert!(event.tr_t.iter().all(|&t| (0.0..1500.0).contains(&t)));
+        let (_, bbox) = search_data_bounds(region, std::slice::from_ref(&event), Some(c));
+        let window = PublishedWindow {
+            clock: (start, start),
+            adsb_end: f64::INFINITY,
+            pending: Vec::new(),
+        };
+        let spec = window.track_spec(
+            bbox,
+            1500.0,
+            fdop_data::geoid::DEFAULT_GEOID_M,
+            false,
+            std::slice::from_ref(&event),
+        );
+        let source = start + centre + offsets[0];
+        assert!(source < start - 1200.0);
+        assert!(spec.t_start < source - 300.0);
+        assert_eq!(
+            fdop_data::fetch::utc_days(spec.t_start, spec.t_end),
+            vec![(2026, 9, 7), (2026, 9, 8)]
+        );
+        let legacy = fdop_data::IngestSpec {
+            t_start: start - 1200.0,
+            ..spec
+        };
+        let leg = FlightLeg {
+            key: "early-emission".into(),
+            icao: "000001".into(),
+            reg: String::new(),
+            typ: "C172".into(),
+            source: "synthetic".into(),
+            engine: fdop_types::engine::EngineClass::Piston,
+            points: (0..=150)
+                .map(|i| {
+                    let tau = -2100.0 + 20.0 * f64::from(i);
+                    let cross_track = (distance * distance - 1000.0_f64.powi(2)).sqrt();
+                    let (lat, lon, alt) = enu.to_geodetic([speed * tau, cross_track, 1000.0]);
+                    TrackPoint {
+                        t: start + centre + tau,
+                        lat,
+                        lon,
+                        alt_m: alt as f32,
+                        gs_mps: f32::NAN,
+                        track_deg: f32::NAN,
+                        vrate_mps: f32::NAN,
+                        alt_src: alt_src::GEOM,
+                        flags: 0,
+                    }
+                })
+                .collect(),
+        };
+        let a = offline_test_args("early-emission-catalogue");
+        cache_test_day(&a, bbox, (2026, 9, 8), vec![leg]);
+        let opts = fdop_data::FetchOptions {
+            offline: true,
+            ..Default::default()
+        };
+        let old = fdop_data::fetch_window(&legacy, &a.cache, &opts).unwrap();
+        assert!(
+            !old.legs
+                .iter()
+                .flat_map(|l| &l.points)
+                .any(|p| p.t == source)
+        );
+        // The earlier day is required by the actual fetch, not just its log message.
+        let missing = fdop_data::fetch_window(&spec, &a.cache, &opts).unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("2026-09-07 (offline, not cached)")
+        );
+        cache_test_day(&a, bbox, (2026, 9, 7), Vec::new());
+        let retained = fdop_data::fetch_window(&spec, &a.cache, &opts).unwrap();
+        assert!(
+            retained
+                .legs
+                .iter()
+                .flat_map(|l| &l.points)
+                .any(|p| p.t == source)
+        );
+
+        // The ordinary footprint and invalid/unbounded-trace fallback are unchanged.
+        assert_eq!(trace_catalogue_start(start, &[]), start - 1200.0);
+        event.tr_t = vec![event.t_rec - 10.0, event.t_rec + 10.0];
+        assert_eq!(
+            trace_catalogue_start(start, std::slice::from_ref(&event)),
+            start - 1200.0
+        );
+        event.tr_t.push(f64::NAN);
+        assert_eq!(
+            trace_catalogue_start(start, std::slice::from_ref(&event)),
+            start - 1200.0
+        );
+    }
+
+    #[test]
     fn archive_catalogue_scales_each_fit_without_shrinking_existing_coverage() {
         let region = BBox::new(40.875466, -73.525951, 40.877466, -73.523951);
         let event = search::SearchEvent {
@@ -4851,8 +5017,13 @@ mod tests {
                 adsb_end: day + 86_400.0,
                 pending: Vec::new(),
             };
-            let spec =
-                window.track_spec(fetch_box, 300.0, fdop_data::geoid::DEFAULT_GEOID_M, false);
+            let spec = window.track_spec(
+                fetch_box,
+                300.0,
+                fdop_data::geoid::DEFAULT_GEOID_M,
+                false,
+                &[],
+            );
             let opts = fdop_data::FetchOptions {
                 offline: true,
                 ..Default::default()
@@ -5024,6 +5195,7 @@ mod tests {
                 fixture.duration,
                 fdop_data::geoid::DEFAULT_GEOID_M,
                 include_jets,
+                &[],
             ),
             &a.cache,
             &fdop_data::FetchOptions {
@@ -5258,9 +5430,12 @@ mod tests {
             offline: true,
             ..Default::default()
         };
-        let store =
-            fdop_data::fetch_window(&w.track_spec(bbox, 600.0, -30.0, false), &a.cache, &opts)
-                .unwrap();
+        let store = fdop_data::fetch_window(
+            &w.track_spec(bbox, 600.0, -30.0, false, &[]),
+            &a.cache,
+            &opts,
+        )
+        .unwrap();
         assert_eq!(store.meta.stats["days"], json!(["2026-09-08"]));
         assert!(
             first_published_window(
@@ -5281,9 +5456,12 @@ mod tests {
             adsb_end: f64::INFINITY,
             pending: Vec::new(),
         };
-        let error =
-            fdop_data::fetch_window(&w.track_spec(bbox, 3600.0, -30.0, false), &a.cache, &opts)
-                .unwrap_err();
+        let error = fdop_data::fetch_window(
+            &w.track_spec(bbox, 3600.0, -30.0, false, &[]),
+            &a.cache,
+            &opts,
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()

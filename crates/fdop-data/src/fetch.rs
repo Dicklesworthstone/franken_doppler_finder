@@ -2670,11 +2670,18 @@ mod tests {
 
     #[test]
     fn failed_prod_archive_fetches_uncached_staging_then_retries_prod() {
+        use crate::ingest::tests::{gz, tar_of};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        for include_jets in [false, true] {
+        for (include_jets, unreadable_prod) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let f = offline_raw_fixture(Feed::Staging, include_jets);
             let prod = checkpoint_release(Feed::Prod, &f.archives[0]);
+            let corrupt_archive = tar_of(&[(
+                "trace_full_a1b2c3.json",
+                gz(r#"{"error":"trace unavailable"}"#),
+            )]);
             let releases = [prod.clone(), f.releases[1].clone()];
             let calls = std::array::from_fn::<_, 3, _>(|_| AtomicUsize::new(0));
             let lookups = AtomicUsize::new(0);
@@ -2699,8 +2706,12 @@ mod tests {
                             Feed::Mlatonly => 2,
                         };
                         calls[index].fetch_add(1, Ordering::Relaxed);
-                        let bytes = &f.archives[usize::from(rel.feed == Feed::Mlatonly)];
-                        let end = if fail_prod && rel.feed == Feed::Prod {
+                        let bytes = if fail_prod && rel.feed == Feed::Prod && unreadable_prod {
+                            &corrupt_archive
+                        } else {
+                            &f.archives[usize::from(rel.feed == Feed::Mlatonly)]
+                        };
+                        let end = if fail_prod && rel.feed == Feed::Prod && !unreadable_prod {
                             128
                         } else {
                             bytes.len()
@@ -2754,6 +2765,12 @@ mod tests {
                 [1, 1, 1]
             );
             assert_eq!(lookups.load(Ordering::Relaxed), 1);
+            assert!(
+                crate::raw_cache::load(&f.dir, &prod, &f.spec, day_context((2026, 9, 8)))
+                    .unwrap()
+                    .is_none(),
+                "a failed prod feed cannot become a completed raw checkpoint"
+            );
             let notes = got.meta.stats["notes"].as_array().unwrap();
             assert!(notes.iter().any(|n| {
                 let n = n.as_str().unwrap();
@@ -2766,6 +2783,13 @@ mod tests {
                     .iter()
                     .any(|n| n.as_str().unwrap().contains(NO_MLATONLY))
             );
+            if unreadable_prod {
+                assert!(notes.iter().any(|n| {
+                    n.as_str()
+                        .unwrap()
+                        .contains("1 parse errors for 1 trace members")
+                }));
+            }
             let offline = fetch_window(
                 &f.want,
                 &f.cache,

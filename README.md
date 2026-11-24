@@ -1567,8 +1567,11 @@ Design notes:
   Longer or weakly constrained traces can require substantially more cache and processing work;
   no new spatial cap is imposed. The physical range bound covers homogeneous constant-velocity
   support; it does not establish complete coverage for arbitrary curved tracks, spatially
-  varying propagation or the approximate geographic box padding. The separate 1200 s archive
-  time padding is unchanged.
+  varying propagation or the approximate geographic box padding. The archive's 1200 s time
+  padding is retained as a minimum. If a fitted trace needs earlier emission positions,
+  the source-time window expands using the same fitted range bound, including up to twice
+  its fitted sound-travel time for subsonic wind and 300 s of interpolation context. Any
+  additional UTC day must be available, and the weather request covers the earlier sources.
 - **Candidate geometry and clocks use the observer's propagation medium.** Each candidate
   ground point uses the path-averaged atmosphere at that observer for its speed, distance and
   recording-clock checks, with wind in the observer's frame. A constant local east/north wind

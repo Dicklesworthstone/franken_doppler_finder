@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain the earlier flight positions required by long received traces
+
+- Expand the archive's source-time window when the measured trace's propagation envelope extends
+  before the existing 1200 s padding. The bound includes admitted subsonic wind and retains track
+  interpolation context. Initial loads, late-weather reloads and metadata-clock fallback use it.
+  Weather retrieval expands with the required source times.
+- Add a synthetic cached-day regression that demonstrates loss under the old crop, requires the
+  additional UTC day and retains the earlier source sample. Extend unreadable-archive recovery
+  coverage through staging fallback, preserved MLAT, offline reuse and a later prod upgrade.
+- Two native component tests pass on the pinned toolchain: 900 production propagation cases and
+  actual TrackStore save/load/consuming-crop recovery. All 39 fdop-types tests also pass. The full
+  cache-flow regressions, workspace build and field replays remain unexecuted after dependency
+  compilation was killed and the host disconnected.
+
 ### Discover late audio tracks and preserve their recording clocks
 
 - Permit complete stream discovery for containers that introduce audio after the initial probe window.
