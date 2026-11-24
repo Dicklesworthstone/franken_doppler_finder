@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover cached MLAT aircraft when its release lookup is unavailable
+
+- Treat an optional MLAT metadata outage as an opportunity for verified local recovery.
+  A main-only processed fallback can now be rebuilt from completed main and MLAT raw feeds,
+  and a complete staging-plus-MLAT catalogue remains usable when staging is the selected main.
+- Keep the successful live main identity authoritative. Cached staging cannot displace
+  advertised prod; if local reconstruction cannot supply a day, the existing live main
+  ingestion path remains available. Preserve the lookup error and report actual missing feeds.
+- Add two source-reviewed regressions covering prod/staging, ordinary/jet-inclusive policy,
+  exact joint-build equivalence, durable offline reuse, preserved source caches and fresh-main
+  fallback. An eight-case control-flow model passes; native Rust tests, formatting, Clippy,
+  release selftest and reference/field runs were unavailable because no build computer was
+  attached. No native test pass, field-accuracy change or timing improvement is claimed.
+
 ### Recover steep ridge seeds from observed spectral motion
 
 - When the original ±25 Hz/s seed scan has no qualified direction, let qualified

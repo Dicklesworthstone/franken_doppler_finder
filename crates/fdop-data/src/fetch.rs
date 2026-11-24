@@ -861,6 +861,7 @@ fn fetch_window_with_sources(
         }
         // a store built while a release was missing: use it when nothing better exists
         let mut discovery_error = None;
+        let mut mlat_discovery_failed = false;
         let rels = if opts.offline {
             Vec::new()
         } else {
@@ -875,8 +876,9 @@ fn fetch_window_with_sources(
             ) {
                 Ok(found) => {
                     if let Some(error) = found.mlat_error {
+                        mlat_discovery_failed = true;
                         notes.push(format!(
-                            "{label}: MLAT-only release lookup failed; using the available main feed: {error}"
+                            "{label}: MLAT-only release lookup failed; newer MLAT releases could not be checked: {error}"
                         ));
                     }
                     found.releases
@@ -892,7 +894,12 @@ fn fetch_window_with_sources(
         let available = feedset_available(&rels, opts.include_mlat);
         for fs in partial_feedsets(feedset) {
             if partial.is_none()
-                && (opts.offline || available.as_ref().is_none_or(|a| a.as_str() == *fs))
+                && (opts.offline
+                    || available.as_ref().is_none_or(|a| {
+                        a.as_str() == *fs
+                            || (mlat_discovery_failed
+                                && fs.strip_suffix("+mlatonly") == Some(a.as_str()))
+                    }))
                 && let Some((p, s)) = find_cached(&dir, fs, &want, &label, opts, required_context)
             {
                 partial = Some((*fs, p, s));
@@ -919,25 +926,33 @@ fn fetch_window_with_sources(
         } else {
             None
         };
-        if local_recovery && (partial.is_none() || upgrade_main.is_some() || context_recovery) {
+        if (local_recovery || mlat_discovery_failed)
+            && (partial.is_none() || upgrade_main.is_some() || context_recovery)
+        {
             // A completed raw pair can upgrade a main-only processed fallback after
             // interrupted publication. Keep its selected main feed and require MLAT
             // too. A legacy store can instead gain verified midnight support, but
             // only from the same main feed without losing any existing MLAT coverage.
             // Cached release identities cannot trigger another network request. Use
             // the same padded spec as online, never the clipped want.
-            let mut rels = match discover(None, day.0, day.1, day.2, &dir, true, opts.include_mlat)
-            {
-                Ok(found) => found.releases,
-                Err(error) if partial.is_some() => {
-                    let note = format!(
-                        "{label}: cached release metadata unreadable ({error}); using the processed main-feed catalogue"
-                    );
-                    opts.say(&format!("[adsb] WARNING {note}"));
-                    notes.push(note);
-                    Vec::new()
+            let mut rels = if mlat_discovery_failed {
+                // The main lookup succeeded. Keep that live identity authoritative:
+                // local metadata can supply missing MLAT, never substitute staging
+                // for advertised prod or authorize another archive download.
+                rels.clone()
+            } else {
+                match discover(None, day.0, day.1, day.2, &dir, true, opts.include_mlat) {
+                    Ok(found) => found.releases,
+                    Err(error) if partial.is_some() => {
+                        let note = format!(
+                            "{label}: cached release metadata unreadable ({error}); using the processed main-feed catalogue"
+                        );
+                        opts.say(&format!("[adsb] WARNING {note}"));
+                        notes.push(note);
+                        Vec::new()
+                    }
+                    Err(error) => return Err(discovery_error.unwrap_or(error)),
                 }
-                Err(error) => return Err(discovery_error.unwrap_or(error)),
             };
             let recovered_releases = crate::raw_cache::recovery_releases(
                 &dir,
@@ -4347,6 +4362,200 @@ mod tests {
                     .iter()
                     .any(|line| { line.contains("synthetic optional lookup outage") })
             );
+        }
+    }
+
+    #[test]
+    fn optional_discovery_outage_rebuilds_completed_mlat_feeds() {
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_jets in [false, true] {
+                let f = offline_raw_fixture_with_listing(main, include_jets, true);
+                let context = day_context((2026, 9, 8));
+                let main_store = build_day_store(
+                    vec![f.parts[0].clone()],
+                    &f.spec,
+                    vec![f.releases[0].tag.clone()],
+                    context,
+                );
+                let key = bbox_key(&f.spec.bbox).1;
+                let main_path = f.dir.join(format!(
+                    "{}_{key}.fdtrk",
+                    cache_feedset(&feedset_name(main, false), include_jets)
+                ));
+                main_store.save(&main_path).unwrap();
+                f.checkpoint(0);
+                f.checkpoint(1);
+                let paths = [
+                    main_path,
+                    f.dir.join("releases-main.json"),
+                    crate::raw_cache::path(&f.dir, &f.releases[0], &f.spec),
+                    crate::raw_cache::path(&f.dir, &f.releases[1], &f.spec),
+                ];
+                let original = paths.each_ref().map(|p| std::fs::read(p).unwrap());
+                let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
+                tags.sort();
+                let fresh = build_day_store(f.parts.to_vec(), &f.spec, tags.clone(), context);
+                let expected = merge_stores(vec![fresh.clone()], DAY_JOIN_GAP_S).filtered(
+                    &f.want.bbox,
+                    f.want.t_start,
+                    f.want.t_end,
+                );
+                let mut calls = 0;
+                let mut run = |outage: bool| {
+                    fetch_window_with_sources(
+                        &f.want,
+                        &f.cache,
+                        &FetchOptions::default(),
+                        |net, y, m, d, _, offline, include_mlat| {
+                            calls += 1;
+                            assert!(net.is_some() && !offline && include_mlat);
+                            assert_eq!((y, m, d), (2026, 9, 8));
+                            Ok(crate::adsblol::ReleaseDiscovery {
+                                releases: vec![f.releases[0].clone()],
+                                mlat_error: outage.then(|| {
+                                    DataError("synthetic optional lookup outage".into())
+                                }),
+                            })
+                        },
+                        |_, _, _, _| panic!("completed local feeds must avoid all downloads"),
+                        |_, _, _, _, _| panic!("the successful main lookup stays authoritative"),
+                    )
+                    .unwrap()
+                };
+                // A successful lookup reporting no MLAT keeps the existing cache
+                // policy. Only an unavailable lookup opens this local recovery.
+                let ordinary = run(false);
+                assert_eq!(ordinary.meta.stats["cache_hits"], 1);
+                assert_eq!(ordinary.meta.sources, [f.releases[0].tag.clone()]);
+                assert!(ordinary.legs.is_empty(), "the main feed's type is unknown");
+                let got = run(true);
+                assert_eq!(calls, 2, "no extra metadata lookup is needed");
+                assert!(!got.legs.is_empty(), "MLAT identifies the usable aircraft");
+                assert_same_legs(&got.legs, &expected.legs);
+                assert_eq!(got.meta.sources, tags);
+                assert_eq!(got.meta.stats["cache_hits"], 0);
+                let notes = got.meta.stats["notes"].as_array().unwrap();
+                assert!(notes.iter().any(|n| {
+                    n.as_str().unwrap().contains("synthetic optional lookup outage")
+                }));
+                assert!(
+                    !notes
+                        .iter()
+                        .any(|n| n.as_str().unwrap().contains(NO_MLATONLY))
+                );
+                let saved = TrackStore::load(&f.dir.join(format!(
+                    "{}_{key}.fdtrk",
+                    cache_feedset(&feedset_name(main, true), include_jets)
+                )))
+                .unwrap();
+                assert_same_legs(&saved.legs, &fresh.legs);
+                assert_eq!(saved.meta.stats, fresh.meta.stats);
+                for (path, before) in paths.iter().zip(original) {
+                    assert_eq!(std::fs::read(path).unwrap(), before);
+                }
+                let reused = fetch_window(
+                    &f.want,
+                    &f.cache,
+                    &FetchOptions {
+                        offline: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_same_legs(&reused.legs, &got.legs);
+                assert_eq!(reused.meta.stats["cache_hits"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn optional_discovery_outage_keeps_complete_staging_only_for_the_same_main() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for main in [Feed::Staging, Feed::Prod] {
+            let f = offline_raw_fixture_with_listing(Feed::Staging, false, true);
+            f.checkpoint(0);
+            let context = day_context((2026, 9, 8));
+            let mut tags: Vec<_> = f.releases.iter().map(|r| r.tag.clone()).collect();
+            tags.sort();
+            let cached = build_day_store(f.parts.to_vec(), &f.spec, tags, context);
+            let path = f.dir.join(format!(
+                "staging+mlatonly_{}.fdtrk",
+                bbox_key(&f.spec.bbox).1
+            ));
+            cached.save(&path).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let want = IngestSpec {
+                keep_unknown: true,
+                ..f.want
+            };
+            let live = checkpoint_release(main, &f.archives[0]);
+            let downloads = AtomicUsize::new(0);
+            let mut lookups = 0;
+            let got = fetch_window_with_sources(
+                &want,
+                &f.cache,
+                &FetchOptions::default(),
+                |net, _, _, _, _, offline, include_mlat| {
+                    lookups += 1;
+                    assert!(net.is_some() && !offline && include_mlat);
+                    Ok(crate::adsblol::ReleaseDiscovery {
+                        releases: vec![live.clone()],
+                        mlat_error: Some(DataError("synthetic optional lookup outage".into())),
+                    })
+                },
+                |rel, spec, context, progress| {
+                    assert_eq!(main, Feed::Prod, "complete staging must stay cached");
+                    assert_eq!(rel, &live, "a local identity cannot authorize a download");
+                    downloads.fetch_add(1, Ordering::Relaxed);
+                    ingest_day_reader(
+                        f.archives[0].as_slice(),
+                        rel.feed.label(),
+                        spec,
+                        progress,
+                        context,
+                    )
+                },
+                |_, _, _, _, _| panic!("a successful main lookup must not rediscover staging"),
+            )
+            .unwrap();
+            let expected = if main == Feed::Staging {
+                cached
+            } else {
+                // The optional outage must not turn the request offline: live
+                // prod remains downloadable when only staging is cached locally.
+                let part = ingest_day_reader(
+                    f.archives[0].as_slice(),
+                    main.label(),
+                    &f.spec,
+                    &|_| {},
+                    context,
+                )
+                .unwrap();
+                build_day_store(vec![part], &f.spec, vec![live.tag.clone()], context)
+            };
+            let expected = merge_stores(vec![expected], DAY_JOIN_GAP_S).filtered(
+                &want.bbox,
+                want.t_start,
+                want.t_end,
+            );
+            assert!(!got.legs.is_empty());
+            assert_same_legs(&got.legs, &expected.legs);
+            assert_eq!(got.meta.sources, expected.meta.sources);
+            assert_eq!(lookups, 1);
+            assert_eq!(downloads.load(Ordering::Relaxed), usize::from(main == Feed::Prod));
+            assert_eq!(got.meta.stats["cache_hits"], usize::from(main == Feed::Staging));
+            let notes = got.meta.stats["notes"].as_array().unwrap();
+            assert!(notes.iter().any(|n| {
+                n.as_str().unwrap().contains("synthetic optional lookup outage")
+            }));
+            assert_eq!(
+                notes
+                    .iter()
+                    .any(|n| n.as_str().unwrap().contains(NO_MLATONLY)),
+                main == Feed::Prod
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
         }
     }
 

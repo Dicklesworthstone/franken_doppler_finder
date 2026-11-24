@@ -1058,7 +1058,11 @@ also applies to offline legacy caches and to partial-feed fallback.
 Availability checks look up only the main feed (prod, or staging when prod is absent).
 Fetches with MLAT disabled also skip its release lookup. With MLAT enabled, an optional
 MLAT lookup failure keeps the successfully discovered main feed and records the error in
-progress and final notes, so a usable main cache or archive can still supply the day.
+progress and final notes. It can retain a complete processed catalogue for that same main
+feed or rebuild the day from verified completed main and MLAT raw checkpoints, including
+a main-only processed fallback whose MLAT upgrade was interrupted. The live main identity
+remains authoritative, and checkpoint metadata never authorizes a download. If no local
+rebuild succeeds, a usable main cache or the advertised main archive still supplies the day.
 A failed main-feed lookup can also reuse a readable, covering processed main-feed catalogue,
 or rebuild one from completed raw feeds and release metadata retained in sidecars or checkpoints. A main-only processed
 fallback can be upgraded when verified local checkpoints contain that same main feed plus MLAT.
@@ -2260,6 +2264,27 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover cached MLAT aircraft during an optional release lookup outage
+
+An online fetch previously returned its main-only processed fallback when the optional
+MLAT release lookup failed, even if completed raw main and MLAT feeds could rebuild the
+full catalogue. The same local data was recoverable offline. The optional-outage path now
+attempts that existing joint reconstruction and can also retain a complete same-main
+staging catalogue. A successful live prod lookup still takes priority over cached staging.
+
+Two adjacent regressions exercise the real synthetic archive parser, raw checkpoints,
+joint altitude/type reconciliation, publication and offline reuse. They cover prod and
+staging, ordinary and jet-inclusive policies, unchanged behavior when discovery succeeds
+without MLAT, unavailable raw data, and fresh prod ingestion when only staging is cached.
+The assertions compare recovered tracks, provenance and persisted statistics with a fresh
+joint build; source checkpoints and partial catalogues must remain unchanged.
+
+These regressions have been source-reviewed but have **not run natively** in this session:
+no build computer was attached. A small control-flow model exercised eight branch cases;
+it does not validate Rust compilation, archive decoding or the full pipeline. Workspace
+formatting, Clippy, tests, release selftest and reference/field replays remain unrun.
+No field-accuracy or runtime improvement is claimed.
 
 ### Recover steep observed ridges beyond the initial slope scan
 
