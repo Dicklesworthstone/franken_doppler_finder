@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve short audio gaps and overlapping packet timing
+
+- Set timestamp correction from the selected stream's time base and input/output sample
+  periods, rounded upward to FFmpeg's float precision. Short missing packets no longer
+  collapse elapsed time; overlapping packets are trimmed without stretching the tone.
+  Invalid or coarse timing metadata retains the existing decoder tolerance.
+- Add timing-precision and real-media regressions; expand continuous compressed-audio
+  controls to 44.1/48 kHz input and the production 4 kHz output.
+- Direct FFmpeg checks pass for 2–90 ms gaps, a nonzero epoch, all 14 seek/gap-only slices,
+  a 40 ms overlap and eight byte-identical compressed/rate controls. Whitespace checks
+  pass; pinned formatting, native Rust, full workspace, release selftest and
+  reference/field validation remain incomplete
+  after repeated build-host disconnections.
+
 ### Recover shared clocks beside unsupported CPA timing seeds
 
 - When every existing clock recovery fails, search the original scan-cell neighborhood

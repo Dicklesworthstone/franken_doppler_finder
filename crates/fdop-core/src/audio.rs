@@ -420,6 +420,37 @@ fn decode_command(mut cmd: Command) -> Result<Vec<f32>, String> {
     Ok(samples)
 }
 
+// Timestamp and sample clocks quantize each packet boundary. Keep one tick of each
+// before treating a discrepancy as missing/overlapping audio. FFmpeg otherwise waits
+// for 100 ms, silently moving later flyovers when a shorter packet is lost. Unknown
+// or coarser timing retains that existing behavior rather than trusting false precision.
+fn timestamp_tolerance(
+    doc: &serde_json::Value,
+    info: &MediaInfo,
+    output_rate: u32,
+) -> Option<f32> {
+    if info.sample_rate == 0 || output_rate == 0 {
+        return None;
+    }
+    let stream = doc["streams"]
+        .as_array()?
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .nth(info.audio_stream)?;
+    let (num, den) = stream["time_base"].as_str()?.split_once('/')?;
+    let (num, den) = (num.parse::<u64>().ok()?, den.parse::<u64>().ok()?);
+    if num == 0 || den == 0 {
+        return None;
+    }
+    let seconds = num as f64 / den as f64
+        + 1.0 / info.sample_rate as f64
+        + 1.0 / output_rate as f64;
+    // Both FFmpeg options are floats. Round upward so serialization cannot tighten
+    // the quantization allowance; never widen the existing 100 ms hard threshold.
+    let tolerance = (seconds as f32).next_up();
+    (tolerance < 0.1).then_some(tolerance)
+}
+
 /// Decode one audio stream, optionally taking one channel instead of downmixing. The
 /// selected channel retains its amplitude and container-relative packet timestamps.
 pub fn decode_with_selection(
@@ -431,7 +462,11 @@ pub fn decode_with_selection(
 ) -> Result<Vec<f32>, String> {
     // `pan` can silently fill an unavailable input channel with zeroes. Validate the
     // source first so an invalid selection cannot look like a silent recording.
-    let info = probe_with_selection(path, selection)?;
+    let doc = probe_document(path, false, true)?;
+    let info = media_info(path, &doc, selection)?;
+    let compensation = timestamp_tolerance(&doc, &info, sr)
+        .map(|t| format!(":min_comp={t}:min_hard_comp={t}"))
+        .unwrap_or_default();
     // Preserve ordinary decoder priming when the short probe already resolves the
     // selected source. Rewinding a normally readable MP3/AAC at zero can skip priming.
     // Keep the complete probe's container epoch whichever decoder path is used.
@@ -453,7 +488,7 @@ pub fn decode_with_selection(
     // start_at_zero can rebase a transport stream on the first *selected* packet.
     // Subtract the container epoch explicitly to retain an audio track's true delay.
     let filter = format!(
-        "{channel}asetpts=PTS-({})/TB-{start_s}/TB,aresample=async=1:first_pts=0",
+        "{channel}asetpts=PTS-({})/TB-{start_s}/TB,aresample=async=1:first_pts=0{compensation}",
         info.start_time_s
     );
     let mut cmd = Command::new("ffmpeg");
@@ -1173,20 +1208,23 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        for (extension, codec) in [("mp3", "libmp3lame"), ("m4a", "aac")] {
-            let path = dir.join(format!("tone.{extension}"));
+        for (extension, codec, input_rate, output_rate) in [
+            ("mp3", "libmp3lame", 8000, 8000),
+            ("m4a", "aac", 8000, 8000),
+            ("mp3", "libmp3lame", 44_100, 4000),
+            ("mp3", "libmp3lame", 48_000, 4000),
+            ("m4a", "aac", 44_100, 4000),
+            ("m4a", "aac", 48_000, 4000),
+            // Matroska rounds packet timestamps to milliseconds even for these
+            // sample rates. Quantization must not add/drop uninterrupted samples.
+            ("mka", "aac", 44_100, 4000),
+            ("mka", "aac", 48_000, 4000),
+        ] {
+            let path = dir.join(format!("tone-{input_rate}.{extension}"));
             let encoded = Command::new("ffmpeg")
-                .args([
-                    "-nostdin",
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "sine=frequency=440:sample_rate=8000:duration=6",
-                    "-c:a",
-                    codec,
-                ])
+                .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i"])
+                .arg(format!("sine=frequency=440:sample_rate={input_rate}:duration=6"))
+                .args(["-c:a", codec])
                 .arg(&path)
                 .output()
                 .unwrap();
@@ -1214,7 +1252,7 @@ mod tests {
                     "-ac",
                     "1",
                     "-ar",
-                    "8000",
+                    &output_rate.to_string(),
                     "-af",
                     "asetpts=PTS,aresample=async=1:first_pts=0",
                     "-f",
@@ -1228,10 +1266,13 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&reference.stderr)
             );
-            let actual = decode(&path, 0.0, None, 8000).unwrap();
+            let actual = decode(&path, 0.0, None, output_rate).unwrap();
             assert!(actual.iter().any(|x| x.abs() > 0.05));
             let bytes: Vec<u8> = actual.iter().flat_map(|x| x.to_le_bytes()).collect();
-            assert_eq!(bytes, reference.stdout, "{extension} priming changed");
+            assert_eq!(
+                bytes, reference.stdout,
+                "{extension} {input_rate}->{output_rate} priming or timing changed"
+            );
         }
     }
 
@@ -1305,6 +1346,122 @@ mod tests {
         let clip = decode(&path, 19.0, Some(2.0), SR).unwrap();
         assert_eq!(clip.len(), 2 * SR as usize);
         assert!((first_sound(&clip) - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn timestamp_compensation_respects_selected_source_precision() {
+        let mut doc = serde_json::json!({"streams": [
+            {"codec_type":"video", "time_base":"1/25"},
+            {"codec_type":"audio", "time_base":"1/1000"},
+            {"codec_type":"audio", "time_base":"1/90000"}
+        ]});
+        let mut info = MediaInfo {
+            sample_rate: 44_100,
+            ..Default::default()
+        };
+        let first = timestamp_tolerance(&doc, &info, 4000).unwrap();
+        assert!((0.001_272_675_7..0.001_272_676).contains(&(first as f64)));
+        info.audio_stream = 1;
+        info.sample_rate = 48_000;
+        let second = timestamp_tolerance(&doc, &info, 4000).unwrap();
+        assert!((0.000_281_944_44..0.000_281_944_5).contains(&(second as f64)));
+        assert!(second < first);
+        for invalid in [
+            "", "N/A", "0/1000", "1/0", "-1/1000", "1/-1000", "1/1000/2",
+            "NaN/1", "1/1", "1/10",
+        ] {
+            doc["streams"][2]["time_base"] = serde_json::json!(invalid);
+            assert!(timestamp_tolerance(&doc, &info, 4000).is_none(), "{invalid}");
+        }
+        doc["streams"][2]["time_base"] = serde_json::Value::Null;
+        assert!(timestamp_tolerance(&doc, &info, 4000).is_none());
+        doc["streams"][2]["time_base"] = serde_json::json!("1/90000");
+        assert!(timestamp_tolerance(&doc, &info, 0).is_none());
+        info.sample_rate = 0;
+        assert!(timestamp_tolerance(&doc, &info, 4000).is_none());
+        info.sample_rate = 48_000;
+        info.audio_stream = 2;
+        assert!(timestamp_tolerance(&doc, &info, 4000).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn short_packet_gaps_and_overlaps_preserve_the_audio_clock() {
+        const SR: u32 = 8000;
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-short-audio-gaps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, filter: &str| {
+            let path = dir.join(name);
+            let made = Command::new("ffmpeg")
+                .args([
+                    "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                    "sine=frequency=137:duration=6:sample_rate=8000",
+                    "-af", filter, "-c:a", "pcm_f32le",
+                ])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            path
+        };
+        let reference = make("continuous.mka", "anull");
+        let reference = decode(&reference, 0.0, None, SR).unwrap();
+        assert_eq!(reference.len(), 6 * SR as usize);
+        for (gap_ms, offset) in [(2, 0), (10, 0), (40, 0), (90, 0), (40, 123)] {
+            let path = make(
+                &format!("gap-{gap_ms}-{offset}.mka"),
+                &format!(
+                    "asetnsamples=n=8:p=0,aselect='lt(n,2000)+gte(n,{})',asetpts=PTS+{offset}/TB",
+                    2000 + gap_ms
+                ),
+            );
+            let lo = 2 * SR as usize;
+            let hi = lo + gap_ms * 8;
+            let mut expected = reference.clone();
+            expected[lo..hi].fill(0.0);
+            let actual = decode(&path, 0.0, None, SR).unwrap();
+            // This checks every surviving sample as well as the missing interval:
+            // restoring time must not stretch or shift the original engine tone.
+            assert_eq!(actual, expected, "{gap_ms} ms gap, origin {offset}");
+            for (start, duration) in [(1.75, 0.5), (3.0, 1.0)] {
+                let clip = decode(&path, start, Some(duration), SR).unwrap();
+                let a = (start * SR as f64) as usize;
+                let b = ((start + duration) * SR as f64) as usize;
+                assert_eq!(clip, expected[a..b], "seek {start}, gap {gap_ms}");
+            }
+            if gap_ms >= 10 {
+                let duration = (gap_ms - 2) as f64 / 1000.0;
+                let inside = decode(&path, 2.001, Some(duration), SR).unwrap();
+                assert_eq!(inside.len(), (gap_ms - 2) * 8);
+                assert!(inside.iter().all(|&x| x == 0.0));
+            }
+        }
+        // Four ten-ms packets overlap the preceding packet. A muxer may clamp their
+        // PTS to its previous timestamp; they still must not lengthen the recording.
+        let overlap = make(
+            "overlap.mka",
+            "asetnsamples=n=80:p=0,asetpts=PTS-if(gte(T\\,2)\\,0.04/TB\\,0)",
+        );
+        let expected: Vec<_> = reference[..16_000]
+            .iter()
+            .chain(&reference[16_320..])
+            .copied()
+            .collect();
+        let actual = decode(&overlap, 0.0, None, SR).unwrap();
+        assert_eq!(actual, expected, "overlapping packets changed later sample times");
+        for (start, duration) in [(1.75, 0.5), (3.0, 1.0)] {
+            let clip = decode(&overlap, start, Some(duration), SR).unwrap();
+            let a = (start * SR as f64) as usize;
+            let b = ((start + duration) * SR as f64) as usize;
+            assert_eq!(clip, expected[a..b], "overlap seek {start}");
+        }
     }
 
     #[test]
