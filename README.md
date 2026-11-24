@@ -751,7 +751,7 @@ fdop selftest           # offline end-to-end known-answer run
 
 `fdop` has six subcommands. Run `fdop <cmd> --help` for the built-in text. The shared options `--cache`,
 `--offline`, `--include-jets` and `-q/--quiet` belong to `locate` and `fetch`, and go after the subcommand. `detect` needs no data
-and takes `-o`, `-q` and the audio selection options below. `runs` and `doctor` take `--cache` too.
+and takes `-o`, `-q`, `--json` and the audio selection options below. `runs` and `doctor` take `--cache` too.
 
 For media with multiple audio tracks, `locate` and `detect` analyse the first audio track by default, matching
 the stream described by the media probe. Select another with `--audio-stream N` (audio tracks counted from 0).
@@ -891,7 +891,10 @@ output directory is `fdop_runs/detect`.
 `--audio-stream N` and `--audio-channel N` select the same source as in `locate`. For example,
 `fdop detect clip.mov --audio-stream 1 --audio-channel 0` measures the first channel of the second audio track.
 
-One line per event goes to stdout:
+The default output prints one line per event. The progress output on stderr identifies the independent aircraft passes after applying the same aircraft checks and duplicate/harmonic grouping as `locate`. Several successful fits can describe one pass.
+
+Use `fdop detect clip.mov --json` for a machine-readable audit. Its stdout includes the selected stream and channel, decoded duration, a flag for a readable location tag, independent pass count and event IDs, measured events and warnings. The tag flag reports presence without copying tagged coordinates. The count applies to the selected audio. A count of zero cannot establish that a recording is safe to publish.
+
 
 ```text
 e<N>  t_rec <seconds into file> s  f0 <Hz> Hz  v <m/s> m/s  d <m> m  rms <Hz>  ok | <failed quality gates>
@@ -5333,9 +5336,9 @@ Developer examples (`cargo run --release -p <package> --example <name> -- ...`; 
 The video's lesson is that this leak is easy to miss: the curves are usually inaudible. Before you publish
 audio or video recorded somewhere sensitive:
 
-1. **Audit it:** `fdop detect your_file.mp4`. Every line marked `ok` is a flyover an analyst can measure. Two or
-   more, with the time between them intact, is high risk. One, plus a known recording time, is also high
-   risk.
+1. **Audit it:** `fdop detect your_file.mp4`. Check the independent aircraft pass count and the location-tag warning. Two
+   independent passes with the time between them intact are high risk. One pass together with a known
+   recording time is also high risk. Check other audio tracks and individual channels before publishing.
 2. **What the source video found does not work:**
    - high-pass filtering (the 80–500 Hz band overlaps speech, and the curve came back after a boost). `fdop detect`
      warns on such audio and may list fewer flyovers, but a lower count there does not make the file safe;
