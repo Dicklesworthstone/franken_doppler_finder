@@ -136,6 +136,9 @@ pub struct LocateCli {
 pub struct DetectCli {
     /// Audio or video file (anything ffmpeg reads).
     pub media: PathBuf,
+    /// Print the recording audit as JSON on stdout.
+    #[arg(long)]
+    pub json: bool,
     /// Output directory (default fdop_runs/detect).
     #[arg(short, long)]
     pub out: Option<PathBuf>,
@@ -302,73 +305,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             }
             Ok(if out.found { 0 } else { 1 })
         }
-        Cmd::Detect(d) => {
-            let log = Log::new(d.quiet);
-            let selection = d.audio.selection();
-            let info = audio::probe_with_selection(&d.media, selection)?;
-            log.say(&format!(
-                "audio: stream {}, {}, {} {} Hz x{}",
-                selection.stream,
-                selection
-                    .channel
-                    .map_or_else(|| "mono downmix".to_string(), |n| format!("channel {n}")),
-                info.audio_codec,
-                info.sample_rate,
-                info.channels
-            ));
-            let out = d
-                .out
-                .unwrap_or_else(|| PathBuf::from("fdop_runs").join("detect"));
-            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-            let x = audio::decode_with_selection(&d.media, 0.0, None, 4000, selection)?;
-            if let Some(w) = pipeline::low_band_warning(&x, 4000) {
-                eprintln!("fdop: warning: {w}");
-            }
-            // Use exactly the observations `locate` would search, including its bounded
-            // recovery after ordinary measurement finds no aircraft and its final event IDs.
-            let measured =
-                pipeline::measure_recording(&x, 4000, &log, Some(&out.join("survey.png")))?;
-            for warning in &measured.warnings {
-                eprintln!("fdop: warning: {warning}");
-            }
-            let evs = measured.events;
-            std::fs::write(
-                out.join("events.json"),
-                serde_json::to_string_pretty(&evs).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            for e in evs.iter().filter(|e| e.fit.is_some()) {
-                let _ = pipeline::event_png(
-                    e,
-                    fdop_types::C_SOUND,
-                    &out.join(format!("{}.png", e.id)),
-                    None,
-                    "",
-                );
-                let _ = e.trace.write_csv(&out.join(format!("{}_trace.csv", e.id)));
-            }
-            for e in &evs {
-                match &e.fit {
-                    Some(f) => println!(
-                        "{:<4} t_rec {:9.2} s  f0 {:7.2} Hz  v {:6.1} m/s  d {:6.0} m  rms {:.2}  {}",
-                        e.id,
-                        f.best.t0r,
-                        f.best.f0,
-                        f.best.v,
-                        f.best.d,
-                        f.best.rmse,
-                        if e.quality.ok {
-                            "ok".to_string()
-                        } else {
-                            e.quality.reasons.join("; ")
-                        }
-                    ),
-                    None => println!("{:<4} no fit: {}", e.id, e.quality.reasons.join("; ")),
-                }
-            }
-            log.say(&format!("wrote {}", out.join("events.json").display()));
-            Ok(0)
-        }
+        Cmd::Detect(d) => run_detect(d, std::io::stdout().lock()),
         Cmd::Fetch(f) => {
             let log = Log::new(f.common.quiet);
             let cache = cache_of(&f.common);
@@ -502,6 +439,126 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
 }
 
+fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
+    let log = Log::new(d.quiet);
+    let selection = d.audio.selection();
+    let info = audio::probe_with_selection(&d.media, selection)?;
+    log.say(&format!(
+        "audio: stream {}, {}, {} {} Hz x{}",
+        selection.stream,
+        selection
+            .channel
+            .map_or_else(|| "mono downmix".to_string(), |n| format!("channel {n}")),
+        info.audio_codec,
+        info.sample_rate,
+        info.channels
+    ));
+    let out = d
+        .out
+        .unwrap_or_else(|| PathBuf::from("fdop_runs").join("detect"));
+    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+    let x = audio::decode_with_selection(&d.media, 0.0, None, 4000, selection)?;
+    let low_band = pipeline::low_band_warning(&x, 4000);
+    if let Some(w) = &low_band {
+        eprintln!("fdop: warning: {w}");
+    }
+    // Use exactly the observations `locate` would search, including its bounded
+    // recovery after ordinary measurement finds no aircraft and its final event IDs.
+    let measured = pipeline::measure_recording(&x, 4000, &log, Some(&out.join("survey.png")))?;
+    let decoded_duration_s = x.len() as f64 / 4000.0;
+    drop(x);
+    for warning in &measured.warnings {
+        eprintln!("fdop: warning: {warning}");
+    }
+    let mut warnings = measured.warnings;
+    warnings.extend(low_band);
+    if info.location_latlon.is_some() {
+        let note = "the media carries a readable location tag; removing audible flyovers alone leaves those coordinates in the file";
+        eprintln!("fdop: warning: {note}");
+        warnings.push(note.to_string());
+    }
+    let evs = measured.events;
+    std::fs::write(
+        out.join("events.json"),
+        serde_json::to_string_pretty(&evs).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    for e in evs.iter().filter(|e| e.fit.is_some()) {
+        let _ = pipeline::event_png(
+            e,
+            fdop_types::C_SOUND,
+            &out.join(format!("{}.png", e.id)),
+            None,
+            "",
+        );
+        let _ = e.trace.write_csv(&out.join(format!("{}_trace.csv", e.id)));
+    }
+    // A fitted harmonic can pass quality alongside another fit of the same flyover.
+    // Use the search's physical eligibility and grouping for the audit count.
+    let passes = fdop_core::search::independent_measured_events(&evs, 0.0);
+    let ids: Vec<_> = passes.iter().map(|p| p.id.as_str()).collect();
+    log.say(&format!(
+        "{} independent aircraft passes on the selected audio{}",
+        ids.len(),
+        if ids.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", ids.join(", "))
+        }
+    ));
+    if d.json {
+        #[derive(serde::Serialize)]
+        struct DetectionAudit<'a> {
+            audio_stream: usize,
+            audio_channel: Option<usize>,
+            channels_in_stream: u32,
+            decoded_duration_s: f64,
+            location_tag_detected: bool,
+            independent_pass_count: usize,
+            independent_event_ids: Vec<&'a str>,
+            events: &'a [fdop_core::measure::MeasuredEvent],
+            warnings: Vec<String>,
+        }
+        let audit = DetectionAudit {
+            audio_stream: selection.stream,
+            audio_channel: selection.channel,
+            channels_in_stream: info.channels,
+            decoded_duration_s,
+            location_tag_detected: info.location_latlon.is_some(),
+            independent_pass_count: ids.len(),
+            independent_event_ids: ids,
+            events: &evs,
+            warnings,
+        };
+        serde_json::to_writer_pretty(&mut stdout, &audit).map_err(|e| e.to_string())?;
+        writeln!(stdout).map_err(|e| e.to_string())?;
+        return Ok(0);
+    }
+    for e in &evs {
+        match &e.fit {
+            Some(f) => writeln!(
+                stdout,
+                "{:<4} t_rec {:9.2} s  f0 {:7.2} Hz  v {:6.1} m/s  d {:6.0} m  rms {:.2}  {}",
+                e.id,
+                f.best.t0r,
+                f.best.f0,
+                f.best.v,
+                f.best.d,
+                f.best.rmse,
+                if e.quality.ok {
+                    "ok".to_string()
+                } else {
+                    e.quality.reasons.join("; ")
+                }
+            ),
+            None => writeln!(stdout, "{:<4} no fit: {}", e.id, e.quality.reasons.join("; ")),
+        }
+        .map_err(|e| e.to_string())?;
+    }
+    log.say(&format!("wrote {}", out.join("events.json").display()));
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,10 +688,30 @@ mod tests {
                 "-o",
                 out.to_str().unwrap(),
                 "--quiet",
+                "--json",
             ])
             .unwrap();
-            assert_eq!(run(cli).unwrap(), 0);
+            let Cmd::Detect(d) = cli.cmd else {
+                unreachable!()
+            };
+            let mut stdout = Vec::new();
+            assert_eq!(run_detect(d, &mut stdout).unwrap(), 0);
+            let audit: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(audit["independent_pass_count"], n_aircraft);
+            assert_eq!(
+                audit["independent_event_ids"],
+                serde_json::json!(selected.iter().map(|pass| &pass.id).collect::<Vec<_>>())
+            );
+            assert_eq!(audit["audio_stream"], 0);
+            assert!(audit["audio_channel"].is_null());
+            assert_eq!(audit["channels_in_stream"], 1);
+            assert_eq!(audit["decoded_duration_s"], 30.0);
+            assert_eq!(audit["location_tag_detected"], false);
             let actual = std::fs::read_to_string(out.join("events.json")).unwrap();
+            assert_eq!(
+                audit["events"],
+                serde_json::from_str::<serde_json::Value>(&actual).unwrap()
+            );
             assert_eq!(
                 actual,
                 serde_json::to_string_pretty(&expected.events).unwrap(),
