@@ -232,9 +232,9 @@ impl CombImage {
 fn whiten_rows(rows: &mut [f32], nt: usize, nr: usize, p: &MatchParams, dt: f64) {
     let half = ((0.5 * p.floor_window_s / dt).round() as usize).max(1);
     let stride = ((p.floor_stride_s / dt).round() as usize).max(1);
+    let knots: Vec<usize> = (0..nt).step_by(stride).collect();
     rows.par_chunks_mut(nt)
         .for_each_init(Vec::<f32>::new, |tmp, row| {
-            let knots: Vec<usize> = (0..nt).step_by(stride).collect();
             let vals: Vec<f32> = knots
                 .iter()
                 .map(|&k| {
@@ -335,6 +335,9 @@ pub fn build_image(x: &[f32], sr: u32, p: &MatchParams) -> Result<CombImage, Str
             }
         }
     });
+    // The original row buffer is dead after neighbour expansion. Reuse it for the
+    // transposed result so building the comb needs only its two final image buffers.
+    let mut comb = rows;
     let rows = rows2;
     // These are received frequencies. Fast approach tones can exceed the old 2.2*f0_hi
     // crop; all these rows were already whitened. Emitted-tone hypotheses stay bounded
@@ -345,17 +348,27 @@ pub fn build_image(x: &[f32], sr: u32, p: &MatchParams) -> Result<CombImage, Str
         .iter()
         .map(|&(h, w)| ((b * (h as f64).log2()).round() as usize, w))
         .collect();
-    let mut comb = vec![0f32; nt * nu];
-    comb.par_chunks_mut(nu).enumerate().for_each(|(t, out)| {
-        for (u, o) in out.iter_mut().enumerate() {
-            let (mut s, mut w2) = (0f32, 0f32);
-            for &(sh, w) in &shifts {
-                if u + sh < nr {
-                    s += w * rows[(u + sh) * nt + t];
-                    w2 += w * w;
+    // The set of visible harmonics depends on the received-frequency row, never the frame.
+    let norms: Vec<f32> = (0..nu)
+        .map(|u| {
+            let mut weight_sq = 0.0f32;
+            for &(shift, weight) in &shifts {
+                if shift < nr - u {
+                    weight_sq += weight * weight;
                 }
             }
-            *o = if w2 > 0.0 { s / w2.sqrt() } else { 0.0 };
+            weight_sq.sqrt()
+        })
+        .collect();
+    comb.par_chunks_mut(nu).enumerate().for_each(|(t, out)| {
+        for (u, o) in out.iter_mut().enumerate() {
+            let mut sum = 0.0f32;
+            for &(shift, weight) in &shifts {
+                if shift < nr - u {
+                    sum += weight * rows[(u + shift) * nt + t];
+                }
+            }
+            *o = if norms[u] > 0.0 { sum / norms[u] } else { 0.0 };
         }
     });
     Ok(CombImage {
@@ -3400,6 +3413,36 @@ fn score_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_comb_matches_scalar_visible_harmonics_at_every_frame() {
+        let sr = 4000;
+        let pcm: Vec<f32> = (0..8 * sr)
+            .map(|i| (i as f32 * 0.13).sin() * (i as f32 * 0.0027).cos())
+            .collect();
+        for harmonics in [vec![(1, 0.8), (3, 0.4), (2, 0.6)], vec![(2, 1.0)]] {
+            let p = MatchParams {
+                harmonics,
+                ..MatchParams::default()
+            };
+            let im = build_image(&pcm, sr, &p).unwrap();
+            let rows = im.whitened.as_ref().unwrap();
+            for t in 0..im.nt {
+                for u in 0..im.nu {
+                    let (mut sum, mut w2) = (0f32, 0f32);
+                    for &(h, w) in &p.harmonics {
+                        let r = u + (im.bpo * (h as f64).log2()).round() as usize;
+                        if r < im.nu {
+                            sum += w * rows[r * im.nt + t];
+                            w2 += w * w;
+                        }
+                    }
+                    let want = if w2 > 0.0 { sum / w2.sqrt() } else { 0.0 };
+                    assert_eq!(im.comb[t * im.nu + u].to_bits(), want.to_bits());
+                }
+            }
+        }
+    }
     use crate::track::straight_track;
     use fdop_types::FlatElevation;
     use fdop_types::atmo::{Medium, UniformAtmosphere};
