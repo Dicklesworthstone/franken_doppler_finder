@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 8] = b"FDOPTRK1";
 const POINT_BYTES: usize = 8 * 3 + 4 * 4 + 2;
+const POINTS_PER_BATCH: usize = 4096;
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Altitude provenance of a point.
@@ -175,26 +176,28 @@ impl TrackStore {
             w.write_all(&(meta.len() as u32).to_le_bytes())?;
             w.write_all(&meta)?;
             w.write_all(&(self.legs.len() as u32).to_le_bytes())?;
-            let mut buf = Vec::with_capacity(POINT_BYTES * 4096);
+            let mut buf = Vec::with_capacity(POINT_BYTES * POINTS_PER_BATCH);
             for leg in &self.legs {
                 for s in [&leg.key, &leg.icao, &leg.reg, &leg.typ, &leg.source] {
                     w_str(&mut w, s)?;
                 }
                 w.write_all(&[leg.engine.code()])?;
                 w.write_all(&(leg.points.len() as u32).to_le_bytes())?;
-                buf.clear();
-                for p in &leg.points {
-                    buf.extend_from_slice(&p.t.to_le_bytes());
-                    buf.extend_from_slice(&p.lat.to_le_bytes());
-                    buf.extend_from_slice(&p.lon.to_le_bytes());
-                    buf.extend_from_slice(&p.alt_m.to_le_bytes());
-                    buf.extend_from_slice(&p.gs_mps.to_le_bytes());
-                    buf.extend_from_slice(&p.track_deg.to_le_bytes());
-                    buf.extend_from_slice(&p.vrate_mps.to_le_bytes());
-                    buf.push(p.alt_src);
-                    buf.push(p.flags);
+                for batch in leg.points.chunks(POINTS_PER_BATCH) {
+                    buf.clear();
+                    for p in batch {
+                        buf.extend_from_slice(&p.t.to_le_bytes());
+                        buf.extend_from_slice(&p.lat.to_le_bytes());
+                        buf.extend_from_slice(&p.lon.to_le_bytes());
+                        buf.extend_from_slice(&p.alt_m.to_le_bytes());
+                        buf.extend_from_slice(&p.gs_mps.to_le_bytes());
+                        buf.extend_from_slice(&p.track_deg.to_le_bytes());
+                        buf.extend_from_slice(&p.vrate_mps.to_le_bytes());
+                        buf.push(p.alt_src);
+                        buf.push(p.flags);
+                    }
+                    w.write_all(&buf)?;
                 }
-                w.write_all(&buf)?;
             }
             let inner = w.finish()?;
             inner.into_inner().map_err(|e| e.into_error())?
@@ -229,10 +232,16 @@ impl TrackStore {
                 format!("{} is not an fdop track store", path.display()),
             ));
         }
-        let mlen = u32::from_le_bytes(r_exact::<_, 4>(&mut r)?) as usize;
-        let mut mb = vec![0u8; mlen];
-        r.read_exact(&mut mb)?;
-        let meta: StoreMeta = serde_json::from_slice(&mb).map_err(io::Error::other)?;
+        let mlen = u32::from_le_bytes(r_exact::<_, 4>(&mut r)?);
+        let mut metadata = r.by_ref().take(u64::from(mlen));
+        let meta: StoreMeta = serde_json::from_reader(&mut metadata)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if metadata.limit() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete track-store metadata",
+            ));
+        }
         let n_legs = u32::from_le_bytes(r_exact::<_, 4>(&mut r)?) as usize;
         let mut pb = Vec::new();
         for _ in 0..n_legs {
@@ -243,24 +252,30 @@ impl TrackStore {
             let source = r_str(&mut r)?;
             let engine = EngineClass::from_code(r_exact::<_, 1>(&mut r)?[0]);
             let n = u32::from_le_bytes(r_exact::<_, 4>(&mut r)?) as usize;
-            pb.resize(n * POINT_BYTES, 0);
-            r.read_exact(&mut pb)?;
-            let mut points = Vec::with_capacity(n);
-            let (rows, _) = pb.as_chunks::<POINT_BYTES>();
-            for c in rows {
-                let f64_at = |o: usize| f64::from_le_bytes(c[o..o + 8].try_into().unwrap());
-                let f32_at = |o: usize| f32::from_le_bytes(c[o..o + 4].try_into().unwrap());
-                points.push(TrackPoint {
-                    t: f64_at(0),
-                    lat: f64_at(8),
-                    lon: f64_at(16),
-                    alt_m: f32_at(24),
-                    gs_mps: f32_at(28),
-                    track_deg: f32_at(32),
-                    vrate_mps: f32_at(36),
-                    alt_src: c[40],
-                    flags: c[41],
-                });
+            // A declared count can exceed the remaining payload. Allocate decoded
+            // points only after each packed batch has arrived in full.
+            let mut points = Vec::new();
+            while points.len() < n {
+                let count = (n - points.len()).min(POINTS_PER_BATCH);
+                pb.resize(count * POINT_BYTES, 0);
+                r.read_exact(&mut pb)?;
+                points.try_reserve(count).map_err(io::Error::other)?;
+                let (rows, _) = pb.as_chunks::<POINT_BYTES>();
+                for c in rows {
+                    let f64_at = |o: usize| f64::from_le_bytes(c[o..o + 8].try_into().unwrap());
+                    let f32_at = |o: usize| f32::from_le_bytes(c[o..o + 4].try_into().unwrap());
+                    points.push(TrackPoint {
+                        t: f64_at(0),
+                        lat: f64_at(8),
+                        lon: f64_at(16),
+                        alt_m: f32_at(24),
+                        gs_mps: f32_at(28),
+                        track_deg: f32_at(32),
+                        vrate_mps: f32_at(36),
+                        alt_src: c[40],
+                        flags: c[41],
+                    });
+                }
             }
             visit(FlightLeg {
                 key,
@@ -762,6 +777,59 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].key, original.legs[1].key);
         assert_eq!(selected[0].points, original.legs[1].points);
+    }
+
+    #[test]
+    fn reading_partial_last_batch_does_not_visit_an_incomplete_leg() {
+        let path = test_path("partial-batch");
+        let mut store = sample_store();
+        let point = store.legs[0].points[0];
+        store.legs[0].points = (0..POINTS_PER_BATCH + 1)
+            .map(|i| TrackPoint {
+                t: i as f64,
+                ..point
+            })
+            .collect();
+        store.save(&path).unwrap();
+        let loaded = TrackStore::load(&path).unwrap();
+        assert_eq!(loaded.legs[0].points.len(), POINTS_PER_BATCH + 1);
+        for (i, got) in loaded.legs[0].points.iter().enumerate() {
+            assert_eq!(got.t, i as f64);
+        }
+
+        // A valid gzip footer can't make up for an incomplete declared point.
+        let compressed = std::fs::read(&path).unwrap();
+        let mut payload = Vec::new();
+        GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut payload)
+            .unwrap();
+        payload.pop().unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&payload).unwrap();
+        let truncated = encoder.finish().unwrap();
+        let err = TrackStore::read_legs(truncated.as_slice(), &path, |_| {
+            panic!("visited an incomplete leg")
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn incomplete_metadata_length_is_rejected_even_after_complete_json() {
+        let metadata = serde_json::to_vec(&sample_store().meta).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(MAGIC).unwrap();
+        encoder
+            .write_all(&((metadata.len() + 1) as u32).to_le_bytes())
+            .unwrap();
+        encoder.write_all(&metadata).unwrap();
+        let bytes = encoder.finish().unwrap();
+        let err = TrackStore::read_legs(bytes.as_slice(), Path::new("short.fdtrk"), |_| {
+            panic!("visited leg without complete metadata")
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("metadata"));
     }
 
     #[test]
