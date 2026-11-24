@@ -1325,6 +1325,12 @@ fn decoy_unit_s(half: f64) -> f64 {
     3600.0 * ((2.0 * half + DECOY_GAP_S) / 3600.0).ceil().max(1.0)
 }
 
+/// Centre and tolerance of the actual primary search after clipping to dates and publication.
+fn searched_clock_centre(clock: (f64, f64)) -> (f64, f64) {
+    let half = (clock.1 - clock.0) * 0.5;
+    (clock.0 + half, half)
+}
+
 /// Decoy shifts for a clock window `t0 +- tol`, in the order tried: those whose window
 /// `t0 + shift +- tol` fits inside the date window.
 fn decoy_shifts(t0: f64, dates: (f64, f64), tol: f64) -> Vec<f64> {
@@ -1355,7 +1361,7 @@ fn decoy_gate(evidence: f64, runs: &[(f64, Option<f64>)]) -> (bool, String) {
         return (
             false,
             format!(
-                "only {} of {DECOY_CLOCKS} decoy clocks ran inside the dates ({list}); a high or medium answer needs all of them",
+                "only {} of {DECOY_CLOCKS} decoy clocks completed comparable searches inside the dates ({list}); a high or medium answer needs all of them",
                 runs.len()
             ),
         );
@@ -1383,7 +1389,7 @@ fn decoy_gate(evidence: f64, runs: &[(f64, Option<f64>)]) -> (bool, String) {
 /// 2026-11-08T17:51Z).
 fn decoy_args(a: &LocateArgs, t0: f64, tol: f64, shift: f64, run_dir: &Path) -> LocateArgs {
     let mut d = a.clone();
-    d.start = Some(format!("{:.3}", t0 + shift));
+    d.start = Some((t0 + shift).to_string());
     d.clock_tol_s = tol;
     d.out = Some(run_dir.join(format!("decoy_clock_{:+.0}h", shift / 3600.0)));
     d.quiet = true;
@@ -1740,41 +1746,49 @@ pub(crate) fn measure_recording(
     })
 }
 
-/// Run the same locate at decoy clocks for the clock window `t0 +- tol`, each into
-/// `run_dir/decoy_clock_<shift>h`, until [`DECOY_CLOCKS`] have run. A decoy that fails (an
-/// unpublished day, say) is logged and the next shift is tried.
-fn decoy_clock_runs(
-    a: &LocateArgs,
-    now: &dyn Fn() -> f64,
-    (t0, tol): (f64, f64),
-    dates: (f64, f64),
-    run_dir: &Path,
-    log: &Arc<Log>,
-    recording: &PreparedRecording<'_>,
-) -> Vec<(f64, Option<f64>)> {
-    let mut runs = Vec::new();
-    for s in decoy_shifts(t0, dates, tol) {
-        if runs.len() == DECOY_CLOCKS {
-            break;
-        }
-        let d = decoy_args(a, t0, tol, s, run_dir);
-        match locate_with_clock(&d, &Log::new(true), now, true, Some(recording), &mut None) {
-            Ok(o) => {
-                log.say(&format!(
-                    "decoy clock {:+.0} h: top evidence {}",
-                    s / 3600.0,
-                    o.trace_evidence
-                        .map_or_else(|| "none".to_string(), |e| format!("{e:.2} nats"))
-                ));
-                runs.push((s, o.trace_evidence));
+/// The published archive can cover the requested clock and still lack optional track padding.
+fn require_decoy_window(requested: (f64, f64), searched: (f64, f64)) -> Result<(), String> {
+    if searched == requested {
+        return Ok(());
+    }
+    Err(format!(
+        "archive clipped the shifted clock from [{} .. {}] to [{} .. {}]",
+        iso_utc(requested.0), iso_utc(requested.1), iso_utc(searched.0), iso_utc(searched.1)
+    ))
+}
+
+/// An incomplete search may have missed the strongest chance candidate, even when it found none.
+fn require_decoy_comparison(truncated: &[String]) -> Result<(), String> {
+    if truncated.is_empty() {
+        return Ok(());
+    }
+    Err(format!("truncated trace comparison: {}", truncated.join("; ")))
+}
+
+/// Run additional shifts as needed. Only completed comparisons, including genuine empty
+/// results, count toward the existing gate. Keep the rejected controls in the reported reason.
+fn judge_decoy_attempts(
+    evidence: f64,
+    attempts: impl Iterator<Item = (f64, Result<Option<f64>, String>)>,
+) -> (bool, String) {
+    let mut completed = Vec::new();
+    let mut skipped = Vec::new();
+    for (shift, result) in attempts {
+        match result {
+            Ok(score) => {
+                completed.push((shift, score));
+                if completed.len() == DECOY_CLOCKS {
+                    break;
+                }
             }
-            Err(e) => log.say(&format!(
-                "decoy clock {:+.0} h did not run: {e}",
-                s / 3600.0
-            )),
+            Err(why) => skipped.push(format!("{:+.0} h: {why}", shift / 3600.0)),
         }
     }
-    runs
+    let (passes, mut reason) = decoy_gate(evidence, &completed);
+    if !skipped.is_empty() {
+        reason.push_str(&format!("; skipped controls ({})", skipped.join("; ")));
+    }
+    (passes, reason)
 }
 
 /// Run the whole pipeline.
@@ -1792,7 +1806,7 @@ pub(crate) fn locate_recorded(
     locate_with_clock(a, log, &unix_now, false, None, claimed_dir)
 }
 
-/// `decoy` marks a run made by [`decoy_clock_runs`], which checks no decoys of its own.
+/// `decoy` marks a run made by the decoy-clock gate, which checks no decoys of its own.
 fn locate_with_clock(
     a: &LocateArgs,
     log: &Arc<Log>,
@@ -1892,6 +1906,9 @@ fn locate_with_clock(
     };
     let (mut archive, mut meta_window) =
         first_published_window(a, full_window, metadata_window, dur, now(), &mut warnings)?;
+    if decoy {
+        require_decoy_window(full_window, archive.clock)?;
+    }
     let mut metadata_fallback = metadata_window.is_some() && !meta_window;
     let describe_window = |w: &PublishedWindow, metadata: bool, fallback: bool| {
         let (lo, hi) = w.clock;
@@ -2225,6 +2242,9 @@ fn locate_with_clock(
         };
         let res = search::run(&inp, &sp, &|s: &str| log.say(s));
         search_s += t.elapsed().as_secs_f64();
+        if decoy {
+            require_decoy_comparison(&res.funnel.truncated)?;
+        }
         // The curve matcher still loads its own decoy-clock catalogue. A narrow verdict
         // remains diagnostic after a wider retry unless that wider clock is eligible too.
         if let Some(im) = &curve_image
@@ -2283,36 +2303,39 @@ fn locate_with_clock(
         }
         // Grade the metadata attempt completely before accepting its clock. Decoys can
         // reject a provisional high answer too, and must then leave the full dates available.
-        let decoy_window = match given_start {
-            Some(t0) => Some((t0, a.clock_tol_s)),
-            None if meta_window => Some((
-                0.5 * (archive.clock.0 + archive.clock.1),
-                0.5 * (archive.clock.1 - archive.clock.0),
-            )),
-            None => None,
-        };
         if !decoy
+            && (given_start.is_some() || meta_window)
             && assessment.call != CurveCall::Adopts
             && matches!(assessment.confidence, "high" | "medium")
-            && let (Some(window), Some(evidence)) = (decoy_window, assessment.evidence)
+            && let Some(evidence) = assessment.evidence
         {
             let t = Instant::now();
-            let runs = decoy_clock_runs(
-                a,
-                now,
-                window,
-                start_window(d0, d1, region.utc_offset_h),
-                &run_dir,
-                log,
-                &PreparedRecording {
-                    info: &info,
-                    duration_s: dur,
-                    low_band_warning: low_band.as_deref(),
-                    measurements,
-                },
-            );
+            // Move the actual searched interval, including when publication or the dates
+            // narrowed the explicitly requested start. The controls need the same width.
+            let (centre, tol) = searched_clock_centre(archive.clock);
+            let dates = start_window(d0, d1, region.utc_offset_h);
+            let recording = PreparedRecording {
+                info: &info,
+                duration_s: dur,
+                low_band_warning: low_band.as_deref(),
+                measurements,
+            };
+            let attempts = decoy_shifts(centre, dates, tol).into_iter().map(|shift| {
+                let d = decoy_args(a, centre, tol, shift, &run_dir);
+                let result = locate_with_clock(&d, &Log::new(true), now, true, Some(&recording), &mut None)
+                    .map(|o| o.trace_evidence);
+                match &result {
+                    Ok(score) => log.say(&format!(
+                        "decoy clock {:+.0} h: top evidence {}",
+                        shift / 3600.0,
+                        score.map_or_else(|| "none".to_string(), |e| format!("{e:.2} nats"))
+                    )),
+                    Err(e) => log.say(&format!("decoy clock {:+.0} h skipped: {e}", shift / 3600.0)),
+                }
+                (shift, result)
+            });
+            let gate = judge_decoy_attempts(evidence, attempts);
             timings.insert("decoy_clocks_s".into(), json!(t.elapsed().as_secs_f64()));
-            let gate = decoy_gate(evidence, &runs);
             log.say(&format!("decoy clocks: {}", gate.1));
             assessment.apply_decoys(gate);
         }
@@ -4244,6 +4267,37 @@ mod tests {
     }
 
     #[test]
+    fn decoy_gate_replaces_clipped_and_truncated_controls_and_counts_complete_empty_ones() {
+        let complete = (10.0, 20.0);
+        let check = |clock, cuts: &[String], score| {
+            require_decoy_window(complete, clock)?;
+            require_decoy_comparison(cuts)?;
+            Ok(score)
+        };
+        let cut = vec!["fine search budget".to_string()];
+        let attempts = [
+            (-7200.0, check((10.0, 19.0), &[], None)),
+            (-3600.0, check(complete, &cut, None)),
+            (3600.0, check(complete, &cut, Some(1.0))),
+            (-14400.0, Err("ADS-B temporarily unavailable".to_string())),
+            (7200.0, check(complete, &[], None)),
+            (10800.0, check(complete, &[], Some(4.0))),
+            (-10800.0, check(complete, &[], None)),
+            (14400.0, check(complete, &[], Some(17.0))),
+        ];
+        let (pass, why) = judge_decoy_attempts(18.0, attempts[..7].iter().cloned());
+        assert!(!pass && why.contains("only 3 of 4"), "{why}");
+        assert!(why.contains("archive clipped") && why.contains("fine search budget") && why.contains("ADS-B temporarily unavailable"), "{why}");
+        // The fourth complete comparison exposes a rival that the cheaper controls missed.
+        let (pass, why) = judge_decoy_attempts(18.0, attempts.iter().cloned());
+        assert!(!pass && why.contains("vs 17.00"), "{why}");
+        let (pass, why) = judge_decoy_attempts(20.0, attempts.into_iter().chain(std::iter::once_with(|| {
+            panic!("four completed decoys already judged the clock")
+        })));
+        assert!(pass && why.contains("+2 h none"), "{why}");
+    }
+
+    #[test]
     fn decoy_runs_move_only_the_start_and_skip_the_curve_match() {
         let mut a = offline_test_args("decoy-args");
         a.curve_match = true;
@@ -4286,6 +4340,19 @@ mod tests {
         );
         let d = decoy_args(&a, t0, a.clock_tol_s, 3_600.0, Path::new("/runs/x"));
         assert_eq!(d.out.as_deref(), Some(Path::new("/runs/x/decoy_clock_+1h")));
+        let submillisecond = t0 + 0.0002;
+        let shifted = decoy_args(&a, submillisecond, 0.0, 3600.0, Path::new("/runs/x"));
+        assert_eq!(parse_iso_utc(shifted.start.as_deref().unwrap()).unwrap(), submillisecond + 3600.0);
+        // The requested tolerance crosses the date edge: controls reproduce the admitted
+        // asymmetric interval around its actual midpoint, not the nominal start and tolerance.
+        let dates = (t0, t0 + 86_400.0);
+        let real = requested_start_window(dates, Some(t0 + 20.0), 120.0).unwrap();
+        let (centre, half) = searched_clock_centre(real);
+        assert_eq!((centre, half), (t0 + 70.0, 70.0));
+        let shift = decoy_shifts(centre, dates, half)[0];
+        let shifted = decoy_args(&a, centre, half, shift, Path::new("/runs/x"));
+        let start = parse_iso_utc(shifted.start.as_deref().unwrap()).unwrap();
+        assert_eq!((start - shifted.clock_tol_s, start + shifted.clock_tol_s), (real.0 + shift, real.1 + shift));
         // A creation_time window (no --start) becomes the same window as a start: its centre
         // moved, and its half-width as the tolerance.
         a.start = None;

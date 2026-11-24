@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Count complete comparisons in the decoy-clock gate
+
+- Controls that lose part of their start window to archive publication or hit a recorded trace-search comparison cut are skipped. The gate reports the skipped shifts and tries the remaining eligible clocks. A completed search without a candidate still counts. Explicit and metadata clocks use the width actually searched, including fractional-second starts. The four-control requirement and 3-nat lead are unchanged.
+- Added regression cases for replacement shifts, empty controls, truncated searches with and without a candidate, and failure when too few comparisons finish. Field effects have not been measured.
+
 ### Crop merged flight archives without duplicating intact tracks
 
 - The ADS-B fetch path now consumes the merged track store when selecting the final region and time window. Wholly retained flight legs transfer their point buffers to the result, and rejected legs release their memory during the crop. Borrowed track stores and disjoint flight fragments retain the existing interpolation and clipping rules.

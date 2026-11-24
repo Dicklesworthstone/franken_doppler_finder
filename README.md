@@ -281,7 +281,7 @@ retain their original results.
 | radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
 | curve match | listed when the [curve match](#the-curve-match) stands: an asserted trace answer is within 3 km of it, and the curves support the trace answer's exact place and recording start under the common-point checks below. Also listed, failed, on a medium answer when the curve match ran with enough decoy clocks to judge (40) and stands nowhere |
 | measurement line | listed, failed, only on a medium answer that rests on a core match measured past the old line (a detection score under 4.5, past the strongest 24, found only on the contrast image, from a faster supplemental seed, or recovered from a harmonic after its primary failed) when no curve match ran with enough decoy clocks to judge it |
-| decoy clocks | listed on a high or medium answer from the trace search when `--start` is given or the answer came from the file's `creation_time` window: `locate` runs again with that clock window moved by −2, −1, +1 and +2 steps (the next of ±3 and ±4 steps when a window would leave `--dates`), and the answer's evidence must lead the best decoy's by ≥ 3 nats. A step is whole hours, at least the window's width plus 10 minutes: 1 h for `--start`. Fewer than four decoys that run fail it |
+| decoy clocks | listed on a high or medium answer from the trace search when `--start` is given or the answer came from the file's `creation_time` window: `locate` runs again with that clock window moved by −2, −1, +1 and +2 steps (the next of ±3 and ±4 steps when a window would leave `--dates`), and the answer's evidence must lead the best decoy's by ≥ 3 nats. A step is whole hours, at least the window's width plus 10 minutes: 1 h for `--start`. Four complete decoy comparisons are required. An archive-clipped clock or a truncated trace comparison is skipped and the next eligible shift is tried |
 
 Refinement uses the grid to find a basin, then improves the observer position with a bounded continuous
 search that evaluates the same physical trace model at every proposed point. The grid spacing controls
@@ -442,7 +442,11 @@ given by `--start`, or by the file's `creation_time`. `locate` runs again four t
 −1, +1 and +2 steps, each into `decoy_clock_<shift>h/` inside the run directory. A step is whole hours, at least
 the window's width plus 10 minutes, so no decoy window reaches the true start: 1 h for `--start`, and 2 h for a
 one-hour recording's `creation_time` window, which spans the recording. A decoy draws no figures or map and looks
-up no place name online. Hours off, no true pass lines up, but the recording, the place and the day's traffic are
+up no place name online. Each shift keeps the width of the start window actually searched, including a primary
+window narrowed by the dates or by archive publication. A control can count with no candidate when its shifted
+clock was fully covered and its trace comparison finished. The gate records skipped shifts and their reasons,
+tries the remaining shifts, and grades the answer low if fewer than four complete comparisons remain.
+Hours off, no true pass lines up, but the recording, the place and the day's traffic are
 the same, so the best decoy shows how much evidence chance fits to this recording's sounds reach there. The answer
 must lead it by 3 nats, the medium margin line, or it becomes **low**. The margin gate cannot see this, because it
 compares explanations at one clock. The gate was added after a wrong date graded high on `c2c7578`
