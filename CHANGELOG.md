@@ -19,6 +19,25 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover steep ridge seeds from observed spectral motion
+
+- When the original ±25 Hz/s seed scan has no qualified direction, let qualified
+  neighboring spectral peaks propose a steeper direction. Preserve every qualified
+  original winner and retain its fallback when recovery fails. The selected direction
+  must pass the existing full integration, in-band, SNR, robust-z and valley gates,
+  with observed support at the integration window's endpoints. Repeating short
+  descents cannot supply the new direction in the reset-control fixture.
+- The independent 700 Hz, 200 m/s, 3,500 m spectral regression previously returned
+  zero points from its −43.497433 Hz/s seed. It now traces 1,201 points across 120 s
+  with 0.293742 Hz RMS error, below its 0.5 Hz spectral bin. This enables the existing
+  free-reseeding path to follow that ridge without changing detector banks or grades.
+- All 17 native trace tests pass with genuine serde and exact production sampling
+  code through RCH and the pinned compiler. Controls include old direction priority,
+  stationary tones, jumps, resets, short/isolated bursts, empty input and seed bounds.
+  Changed-line formatting and whitespace checks pass. PCM/FFT extraction, fitting,
+  full workspace/CLI selftest and reference/field gates remain unverified; no broader
+  false-positive, field-accuracy or timing improvement is claimed.
+
 ### Reuse cached fine terrain when the coarse search lacks its tile
 
 - Let a missing requested tile with no usable cached parent use the queried position's

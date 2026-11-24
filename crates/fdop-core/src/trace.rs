@@ -530,6 +530,77 @@ fn best_slope(
     }
 }
 
+/// Keep every qualified original seed direction. If its entire slope scan failed,
+/// nearby observed peaks can supply a steeper direction: their motion must agree,
+/// and the usual full integration must qualify it before it can guide the trace.
+fn seed_slope(
+    spec: &Spec,
+    j: usize,
+    frequency: f64,
+    p: &TraceParams,
+    noise_band: f64,
+    half: usize,
+) -> f64 {
+    let original = best_slope(
+        spec, j, frequency, 0.0, 25.0, 0.25, p, noise_band, half, true,
+    )
+    .map_or(0.0, |b| b.0);
+    let observed = |frame, predicted, slope, support| {
+        ridge_profile(
+            spec,
+            frame,
+            predicted,
+            slope,
+            p.band,
+            noise_band,
+            support,
+            PeakChoice::StrongestQualified {
+                min_snr: p.min_snr,
+                min_z: p.min_z,
+            },
+        )
+        .filter(|peak| peak.qualified)
+        .map(|peak| peak.values.0)
+    };
+    if observed(j, frequency, original, half).is_some() {
+        return original;
+    }
+    let recover = || {
+        if j == 0 || j + 1 >= spec.nt() {
+            return None;
+        }
+        // Three-frame profiles retain the same in-band vertex, SNR, robust-z and
+        // valley-clearance requirements. These are measured frequencies, not a
+        // model's predicted tangent. Require motion on both sides of the seed,
+        // then check that direction against the full integration below.
+        let before = observed(j - 1, frequency, 0.0, 1)?;
+        let center = observed(j, frequency, 0.0, 1)?;
+        let after = observed(j + 1, frequency, 0.0, 1)?;
+        if !((before < center && center < after) || (before > center && center > after)) {
+            return None;
+        }
+        let slope = (after - before) / (spec.t[j + 1] - spec.t[j - 1]);
+        if !slope.is_finite() || slope.abs() <= 25.0 {
+            return None;
+        }
+        // Apply the existing continuation's local slope search, full integration
+        // and every original peak gate before testing the selected direction.
+        let recovered = best_slope(
+            spec, j, frequency, slope, 1.0, 0.5, p, noise_band, half, false,
+        )?
+        .0;
+        // The neighboring profiles overlap. Require observed peaks at the ends
+        // of the existing integration window too, so a brief descent followed
+        // by a reset cannot lend its direction to an unsupported longer line.
+        for frame in [j.saturating_sub(half), (j + half).min(spec.nt() - 1)] {
+            let predicted = center + recovered * (spec.t[frame] - spec.t[j]);
+            observed(frame, predicted, 0.0, 1)?;
+        }
+        Some(recovered)
+    };
+    recover().unwrap_or(original)
+}
+
 fn polyfit_slope(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len() as f64;
     let (mx, my) = (x.iter().sum::<f64>() / n, y.iter().sum::<f64>() / n);
@@ -557,8 +628,7 @@ pub fn ridge_trace(spec: &Spec, seeds: &[(f64, f64)], p: &TraceParams) -> Trace 
             continue;
         }
         let j0 = spec.frame_index(ts);
-        let slope0 =
-            best_slope(spec, j0, fs, 0.0, 25.0, 0.25, p, nb, half, true).map_or(0.0, |b| b.0);
+        let slope0 = seed_slope(spec, j0, fs, p, nb, half);
         for dir in [1i64, -1] {
             let (mut ht, mut hf) = (vec![spec.t[j0]], vec![fs]);
             let (mut j, mut misses) = (j0 as i64, 0usize);
@@ -812,6 +882,92 @@ mod tests {
         );
     }
 
+    /// Received spectral evidence from an independently solved emission-time pass.
+    /// This isolates ridge tracing; it is not a PCM/STFT or localization fixture.
+    fn steep_seed_scene() -> (Spec, Vec<f64>) {
+        let t: Vec<_> = (0..=1200).map(|i| f64::from(i) * 0.1).collect();
+        let f: Vec<_> = (0..=3000).map(|i| 300.0 + f64::from(i) * 0.5).collect();
+        let received: Vec<_> = t
+            .iter()
+            .map(|&heard| {
+                let relative = heard - (60.0 - 3500.0 / 343.0);
+                let (mut lo, mut hi) = (-1000.0, relative);
+                for _ in 0..70 {
+                    let emitted = 0.5 * (lo + hi);
+                    let range = 3500.0_f64.hypot(200.0 * emitted);
+                    if emitted + range / 343.0 < relative {
+                        lo = emitted;
+                    } else {
+                        hi = emitted;
+                    }
+                }
+                let emitted = 0.5 * (lo + hi);
+                let range = 3500.0_f64.hypot(200.0 * emitted);
+                700.0 * 343.0 / (343.0 + 200.0 * 200.0 * emitted / range)
+            })
+            .collect();
+        let db = f
+            .iter()
+            .flat_map(|&frequency| {
+                received.iter().zip(&t).map(move |(&ridge, &time)| {
+                    (18.0 * (-0.5 * ((frequency - ridge) / 4.0).powi(2)).exp()
+                        + 0.08 * (1.7 * frequency).sin()
+                        + 0.05 * (7.0 * frequency + 13.0 * time).cos()) as f32
+                })
+            })
+            .collect();
+        (
+            Spec {
+                t,
+                f,
+                db,
+                meta: SpecMeta {
+                    sr: 4000,
+                    win_s: 0.5,
+                    hop_s: 0.1,
+                    nfft: 8000,
+                    df: 0.5,
+                    fmin: 300.0,
+                    fmax: 1800.0,
+                    norm: "analytic received Doppler ridge".into(),
+                },
+            },
+            received,
+        )
+    }
+
+    #[test]
+    fn free_trace_recovers_a_steep_physical_seed_from_observed_nearby_peaks() {
+        let (spec, received) = steep_seed_scene();
+        let p = TraceParams {
+            integ_s: 1.5,
+            ..Default::default()
+        };
+        let j = 498;
+        let slope = (received[j + 1] - received[j - 1]) / (spec.t[j + 1] - spec.t[j - 1]);
+        assert!(slope < -40.0, "{slope}");
+        let trace = ridge_trace(&spec, &[(spec.t[j], received[j])], &p);
+        let rms = (trace
+            .t
+            .iter()
+            .zip(&trace.f)
+            .map(|(&time, &frequency)| (frequency - received[spec.frame_index(time)]).powi(2))
+            .sum::<f64>()
+            / trace.len().max(1) as f64)
+            .sqrt();
+        eprintln!(
+            "steep physical seed: slope {slope:.6} Hz/s, {} points, endpoints {:?}, RMS {rms:.6} Hz",
+            trace.len(),
+            trace.t.first().zip(trace.t.last())
+        );
+        assert!(trace.t.first().is_some_and(|&t| t <= 40.0));
+        assert!(trace.t.last().is_some_and(|&t| t >= 68.0));
+        assert!(
+            rms < spec.df(),
+            "the recovered trace left its observed ridge: {rms} Hz"
+        );
+    }
+
     #[test]
     fn slope_selection_preserves_eligible_winners_and_unqualified_seed_directions() {
         // The same physical fixture has a nonzero old winner. A deliberately
@@ -858,6 +1014,11 @@ mod tests {
                 ),
                 Some(original)
             );
+            assert_eq!(
+                seed_slope(&spec, 200, received[200], &p, 24.0, 15),
+                original.0,
+                "the new initializer changed an original seed direction"
+            );
         }
         let p = TraceParams {
             integ_s: 1.5,
@@ -867,6 +1028,148 @@ mod tests {
         assert!(ridge_trace(&blank, &[(20.0, 100.0)], &p).is_empty());
         blank.db.fill(0.0);
         assert!(ridge_trace(&blank, &[(20.0, 100.0)], &p).is_empty());
+    }
+
+    fn seed_control_scene(ridge: impl Fn(usize) -> Option<(f64, f64)>) -> Spec {
+        let t: Vec<_> = (0..=80).map(|i| f64::from(i) * 0.1).collect();
+        let f: Vec<_> = (0..=400).map(|i| 900.0 + f64::from(i) * 0.5).collect();
+        let mut db = Vec::with_capacity(t.len() * f.len());
+        for &frequency in &f {
+            for (j, &time) in t.iter().enumerate() {
+                let signal = ridge(j).map_or(0.0, |(center, height)| {
+                    height * (-0.5 * ((frequency - center) / 4.0).powi(2)).exp()
+                });
+                db.push(
+                    (signal
+                        + 0.08 * (1.7 * frequency).sin()
+                        + 0.05 * (7.0 * frequency + 13.0 * time).cos()) as f32,
+                );
+            }
+        }
+        Spec {
+            t,
+            f,
+            db,
+            meta: SpecMeta {
+                sr: 4000,
+                win_s: 0.5,
+                hop_s: 0.1,
+                nfft: 8000,
+                df: 0.5,
+                fmin: 900.0,
+                fmax: 1100.0,
+                norm: "analytic seed control".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn local_seed_motion_still_needs_full_integration_support() {
+        let p = TraceParams {
+            integ_s: 1.5,
+            ..Default::default()
+        };
+        let (j, frequency, slope) = (40, 1000.0, -43.5);
+        // All three short profiles see a bright moving ridge, but it is present
+        // for only five frames: its full-integration SNR stays below the gate.
+        let spec = seed_control_scene(|frame| {
+            (frame.abs_diff(j) <= 2)
+                .then_some((frequency + slope * (frame as f64 - j as f64) * 0.1, 12.0))
+        });
+        let peaks: Vec<_> = (j - 1..=j + 1)
+            .map(|frame| {
+                ridge_profile(
+                    &spec,
+                    frame,
+                    frequency,
+                    0.0,
+                    p.band,
+                    24.0,
+                    1,
+                    PeakChoice::StrongestQualified {
+                        min_snr: p.min_snr,
+                        min_z: p.min_z,
+                    },
+                )
+                .filter(|peak| peak.qualified)
+                .expect("the short-lived ridge must supply nearby observed peaks")
+                .values
+                .0
+            })
+            .collect();
+        assert!(peaks[0] > peaks[1] && peaks[1] > peaks[2]);
+        let observed_slope = (peaks[2] - peaks[0]) / (spec.t[j + 1] - spec.t[j - 1]);
+        assert!(observed_slope < -25.0, "{observed_slope}");
+        assert!(
+            best_slope(
+                &spec,
+                j,
+                frequency,
+                observed_slope,
+                1.0,
+                0.5,
+                &p,
+                24.0,
+                15,
+                false,
+            )
+            .is_none(),
+            "short motion must still fail the full integration gate"
+        );
+        let original = best_slope(&spec, j, frequency, 0.0, 25.0, 0.25, &p, 24.0, 15, true)
+            .unwrap()
+            .0;
+        assert_eq!(seed_slope(&spec, j, frequency, &p, 24.0, 15), original);
+        assert!(ridge_trace(&spec, &[(spec.t[j], frequency)], &p).is_empty());
+    }
+
+    #[test]
+    fn seed_recovery_preserves_stationary_jumping_and_resetting_controls() {
+        let p = TraceParams {
+            integ_s: 1.5,
+            ..Default::default()
+        };
+        let (j, frequency) = (40, 1000.0);
+        for kind in ["steady", "single jump", "reset", "one-frame burst", "blank"] {
+            let spec = seed_control_scene(|frame| match kind {
+                "steady" => Some((frequency, 18.0)),
+                "single jump" => Some((
+                    if frame < j {
+                        frequency + 8.0
+                    } else {
+                        frequency
+                    },
+                    18.0,
+                )),
+                "reset" => {
+                    // The short overlapping profiles and full integration can
+                    // accept one bright descent. Its endpoint frequencies have
+                    // no observed support after the tone resets every 0.8 s.
+                    let phase = (frame as isize - j as isize + 3).rem_euclid(8) as f64 - 3.0;
+                    Some((frequency - 4.35 * phase, 18.0))
+                }
+                "one-frame burst" => (frame == j).then_some((frequency, 18.0)),
+                _ => None,
+            });
+            for (frame, center) in [
+                (j, frequency),
+                (j, frequency + 50.0),
+                (0, frequency),
+                (80, frequency),
+            ] {
+                let original =
+                    best_slope(&spec, frame, center, 0.0, 25.0, 0.25, &p, 24.0, 15, true)
+                        .map_or(0.0, |peak| peak.0);
+                assert_eq!(
+                    seed_slope(&spec, frame, center, &p, 24.0, 15),
+                    original,
+                    "{kind}: unsupported recovery from frame {frame}, frequency {center}"
+                );
+            }
+            if matches!(kind, "blank" | "one-frame burst") {
+                assert!(ridge_trace(&spec, &[(spec.t[j], frequency)], &p).is_empty());
+            }
+        }
     }
 
     #[test]

@@ -1821,8 +1821,13 @@ Design notes:
   slope's profile, applying the same in-band vertex, SNR, robust-z and valley-clearance
   requirements. A bright shoulder from a tone outside the band cannot hide an eligible
   aircraft ridge. The original strongest winner stays identical when it qualifies. Across
-  slopes, qualifying peaks retain their existing robust-z ranking. If none qualifies, the
-  original direction remains available only to initialize a seed, never as a measured point.
+  slopes, qualifying peaks retain their existing robust-z ranking. If the initial ±25 Hz/s
+  scan has no qualified direction, nearby observed peaks can propose a steeper direction:
+  frequency motion must agree on both sides of the seed, and the selected direction must
+  pass the existing full integration and peak gates, with observed peaks at the integration
+  window's endpoints. Qualified original directions stay unchanged.
+  If recovery fails, the original direction remains available only to initialize a seed,
+  never as a measured point. This does not widen the detector's frequency or speed banks.
 - **Frequency estimates preserve the spectral peak's shape.** Ordinary and short windows integrate
   along the full Doppler curve. Noise exclusion accounts for the Hann main lobe and chirp smear, so
   narrowing the frequency tolerance does not count the signal as its own noise. Normalized spectra
@@ -2255,6 +2260,28 @@ An unfinished fetch keeps `weather_fetch_s` unavailable even when a provisional 
 ---
 
 ## Testing
+
+### Recover steep observed ridges beyond the initial slope scan
+
+`free_trace_recovers_a_steep_physical_seed_from_observed_nearby_peaks` independently
+solves emission time for a 700 Hz tone on a 200 m/s pass at 3,500 m closest approach.
+At its seed the received ridge falls at 43.497433 Hz/s, outside the initial ±25 Hz/s
+scan. The preceding tracer returns no points. The repair returns 1,201 observed
+points across 0–120 s with 0.293742 Hz RMS frequency error, below one 0.5 Hz bin.
+This is analytic spectral evidence, not a PCM/STFT or localization result.
+
+Neighboring spectral motion alone can lend a false direction to repeating short
+descents. The selected full-integration direction therefore also needs qualified
+observed peaks at the existing integration window's endpoints. Tests retain the
+original directions for stationary tones, jumps, resets, isolated bursts, blank
+input, off-target seeds and boundary seeds; a short moving packet still fails full
+integration support. Existing qualified seed choices and their gates stay intact.
+
+All 17 native trace tests pass through genuine RCH with the pinned compiler and
+genuine serde, using the complete production trace module and exact production
+spectrogram sampling code. FFT extraction, downstream fitting, the complete
+workspace/CLI selftest and reference/field replays remain unverified. This does
+not establish broader noise rejection or accuracy on recordings.
 
 ### Use cached fine terrain when the coarse tile is missing
 
