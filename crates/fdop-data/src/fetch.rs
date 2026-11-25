@@ -2500,6 +2500,61 @@ mod tests {
     }
 
     #[test]
+    fn misplaced_listings_recover_the_requested_day_from_completed_raw_feeds() {
+        let context = day_context((2026, 9, 8));
+        for main in [Feed::Prod, Feed::Staging] {
+            let f = offline_raw_fixture(main, false);
+            f.checkpoint(0);
+            f.checkpoint(1);
+            let mut misplaced = f.releases.clone();
+            for release in &mut misplaced {
+                release.tag = crate::adsblol::tag_for(2026, 9, 7, release.feed, 0);
+                release.parts[0].name = format!("{}.tar", release.tag);
+            }
+            let path = f.dir.join("releases.json");
+            std::fs::write(&path, serde_json::to_vec(&misplaced).unwrap()).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let mut tags: Vec<_> = f
+                .releases
+                .iter()
+                .map(|release| release.tag.clone())
+                .collect();
+            tags.sort();
+            let fresh = build_day_store(f.parts.to_vec(), &f.spec, tags.clone(), context);
+            let expected = merge_stores(vec![fresh], DAY_JOIN_GAP_S).filtered(
+                &f.want.bbox,
+                f.want.t_start,
+                f.want.t_end,
+            );
+            assert!(!expected.legs.is_empty());
+            let options = FetchOptions {
+                offline: true,
+                ..Default::default()
+            };
+            let recovered = fetch_window(&f.want, &f.cache, &options).unwrap();
+            assert_eq!(recovered.meta.sources, tags);
+            assert_same_legs(&recovered.legs, &expected.legs);
+            assert_eq!(recovered.meta.stats["cache_hits"], 0);
+            assert!(
+                recovered.meta.stats["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|note| {
+                        note.as_str()
+                            .unwrap()
+                            .contains("release metadata recovered from completed raw checkpoints")
+                    })
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            let cached = fetch_window(&f.want, &f.cache, &options).unwrap();
+            assert_eq!(cached.meta.stats["cache_hits"], 1);
+            assert_same_legs(&cached.legs, &expected.legs);
+            assert_eq!(cached.meta.sources, tags);
+        }
+    }
+
+    #[test]
     fn prod_lookup_outage_builds_staging_and_retries_preferred_feed() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 

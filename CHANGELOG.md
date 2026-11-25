@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover the requested archive day from misplaced release listings
+
+- Validate cached full and main release listings against the requested UTC day, archive
+  repository year and feed. Treat mismatches as cache misses before selecting an archive
+  or certifying availability, so wrong-day data cannot create a false-empty catalogue.
+- Preserve invalid listing files until successful discovery replaces them. Offline requests
+  can still use a valid separate main listing or rebuild from completed raw feeds.
+- Add day/year/feed and mixed-list regressions, plus synthetic tar-to-checkpoint-to-store
+  recovery that compares rebuilt flight observations with fresh ingestion and subsequent
+  processed-cache reuse.
+- Source review, pinned formatting of changed spans and whitespace checks completed. The
+  native data test build was killed in the unchanged `proc-macro2` dependency before project
+  compilation; workspace tests, Clippy, release selftest and reference/field replays did not run.
+
 ### Enforce the quick-check budget within a single flight pair
 
 - Stop primary joined-seed scoring at the remaining global allowance instead of finishing

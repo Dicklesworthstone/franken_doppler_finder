@@ -1081,6 +1081,12 @@ Cache layout:
 └── runs.sqlite                                       the run ledger (FrankenSQLite)
 ```
 
+Cached release listings must match the requested UTC day, repository year and feed before
+they can select an archive or certify availability. A misplaced full or main listing is a
+cache miss. Online discovery can replace it after a successful lookup; offline recovery
+can use a valid separate main listing or completed raw checkpoints. An invalid listing
+alone cannot establish that the requested day has no aircraft.
+
 Expanded jet-inclusive stores append `+jets` to the feedset, for example
 `prod+mlatonly+jets_<S>_<W>_<N>_<E>.fdtrk`. Their metadata must also contain the boolean
 `stats.include_jets: true` before an expanded request can reuse them. Renaming an old

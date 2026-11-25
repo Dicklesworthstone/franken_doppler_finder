@@ -298,8 +298,11 @@ fn day_settled_at(y: i64, m: u32, d: u32, checked_at: f64) -> bool {
 /// release lookup altogether. Missing lookup-time evidence also requires an online check.
 fn cached_listing_final(v: &[DayRelease], y: i64, m: u32, d: u32, path: &Path) -> bool {
     !v.is_empty()
-        && v.iter().all(|r| valid_archive_parts(&r.tag, &r.parts))
-        && v.iter().all(|r| r.parts.len() == 1 && r.parts[0].name.ends_with(".tar"))
+        && v.iter().all(|r| {
+            crate::fetch::release_for_day(r, (y, m, d)) && valid_archive_parts(&r.tag, &r.parts)
+        })
+        && v.iter()
+            .all(|r| r.parts.len() == 1 && r.parts[0].name.ends_with(".tar"))
         && std::fs::metadata(path)
             .and_then(|m| m.modified())
             .ok()
@@ -320,7 +323,7 @@ pub fn find_day_releases_cached(
     offline: bool,
 ) -> Result<Vec<DayRelease>, DataError> {
     let path = dir.join("releases.json");
-    let cached = read_cached_listing(&path);
+    let cached = read_cached_listing(&path, (y, m, d));
     if let Some(v) = &cached
         && (offline || cached_listing_final(v, y, m, d, &path))
     {
@@ -348,11 +351,19 @@ pub fn find_day_releases_cached(
     Ok(rels)
 }
 
-fn read_cached_listing(path: &Path) -> Option<Vec<DayRelease>> {
+fn read_cached_listing(path: &Path, day: (i64, u32, u32)) -> Option<Vec<DayRelease>> {
     std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice::<Vec<DayRelease>>(&b).ok())
-        .filter(|v| !v.is_empty() && v.iter().all(|r| valid_archive_parts(&r.tag, &r.parts)))
+        // The directory and an uploaded tar shape cannot establish its UTC day.
+        // A misplaced listing must be refreshed (or recovered from raw checkpoints),
+        // never used to certify an empty catalogue after filtering the wrong archive.
+        .filter(|v| {
+            !v.is_empty()
+                && v.iter().all(|r| {
+                    crate::fetch::release_for_day(r, day) && valid_archive_parts(&r.tag, &r.parts)
+                })
+        })
 }
 
 /// Fetch/availability discovery can use a completed main lookup without MLAT. Its separate
@@ -417,7 +428,7 @@ fn cached_staging_release(
             && crate::fetch::release_for_day(r, (y, m, d))
             && valid_archive_parts(&r.tag, &r.parts)
     };
-    if let Some(mut releases) = read_cached_listing(&path)
+    if let Some(mut releases) = read_cached_listing(&path, (y, m, d))
         && releases.len() == 1
         && valid(&releases[0])
         && cached_listing_final(&releases, y, m, d, &path)
@@ -451,7 +462,7 @@ fn cached_fetch_releases(
 ) -> Result<ReleaseDiscovery, DataError> {
     let full_path = dir.join("releases.json");
     let main_path = dir.join("releases-main.json");
-    if let Some(mut releases) = read_cached_listing(&full_path)
+    if let Some(mut releases) = read_cached_listing(&full_path, (y, m, d))
         && (offline || cached_listing_final(&releases, y, m, d, &full_path))
     {
         if !include_mlat {
@@ -461,7 +472,7 @@ fn cached_fetch_releases(
         // Existing main entries keep their priority, and this combined view is never certified.
         if offline
             && !releases.iter().any(|r| r.feed != Feed::Mlatonly)
-            && let Some(main) = read_cached_listing(&main_path)
+            && let Some(main) = read_cached_listing(&main_path, (y, m, d))
             && main.iter().all(|r| r.feed != Feed::Mlatonly)
         {
             releases.splice(0..0, main);
@@ -476,7 +487,7 @@ fn cached_fetch_releases(
     }
     // A main-only result cannot prove that a requested optional feed is absent online.
     if (!include_mlat || offline)
-        && let Some(releases) = read_cached_listing(&main_path)
+        && let Some(releases) = read_cached_listing(&main_path, (y, m, d))
         && releases.iter().all(|r| r.feed != Feed::Mlatonly)
         && (offline || cached_listing_final(&releases, y, m, d, &main_path))
     {
@@ -567,6 +578,107 @@ mod tests {
     }
 
     #[test]
+    fn misplaced_release_listings_refresh_before_selecting_archive_data() {
+        let settled = fdop_types::time::unix_from_utc(2026, 9, 11, 1, 0, 0.0);
+        for main in [Feed::Prod, Feed::Staging] {
+            for include_mlat in [false, true] {
+                for problem in ["day", "year", "feed", "mixed-day"] {
+                    let dir = cache_dir(&format!("misplaced-{main:?}-{include_mlat}-{problem}"));
+                    let path = dir.join(if include_mlat {
+                        "releases.json"
+                    } else {
+                        "releases-main.json"
+                    });
+                    let main_release = cached_release(main);
+                    let mut wrong = main_release.clone();
+                    match problem {
+                        "day" | "mixed-day" => {
+                            wrong.tag = tag_for(2026, 9, 7, main, 0);
+                            wrong.parts[0].name = format!("{}.tar", wrong.tag);
+                        }
+                        "year" => wrong.repo = repo_for_year(2025),
+                        "feed" => wrong.feed = Feed::Mlatonly,
+                        _ => unreachable!(),
+                    }
+                    let mut misplaced = vec![wrong];
+                    if problem == "mixed-day" {
+                        misplaced.push(cached_release(Feed::Mlatonly));
+                    }
+                    assert!(
+                        misplaced
+                            .iter()
+                            .all(|r| valid_archive_parts(&r.tag, &r.parts))
+                    );
+                    write_listing(&path, &misplaced, settled);
+                    let original = std::fs::read(&path).unwrap();
+                    assert!(!cached_listing_final(&misplaced, 2026, 9, 8, &path));
+                    // Offline cache rejection cannot start a lookup or replace bytes.
+                    let offline =
+                        cached_fetch_releases(2026, 9, 8, &dir, true, include_mlat, |_| {
+                            panic!("offline discovery opened the network")
+                        })
+                        .unwrap();
+                    assert!(offline.releases.is_empty());
+                    assert!(
+                        find_day_releases_cached(None, 2026, 9, 8, &dir, true)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+
+                    let mut calls = Vec::new();
+                    let found =
+                        cached_fetch_releases(2026, 9, 8, &dir, false, include_mlat, |feed| {
+                            calls.push(feed);
+                            Ok((feed == main || feed == Feed::Mlatonly)
+                                .then(|| cached_release(feed)))
+                        })
+                        .unwrap();
+                    let mut expected = vec![main_release];
+                    let mut expected_calls = if main == Feed::Prod {
+                        vec![Feed::Prod]
+                    } else {
+                        vec![Feed::Prod, Feed::Staging]
+                    };
+                    if include_mlat {
+                        expected.push(cached_release(Feed::Mlatonly));
+                        expected_calls.push(Feed::Mlatonly);
+                    }
+                    assert_eq!(calls, expected_calls);
+                    assert_eq!(found.releases, expected);
+                    assert_eq!(read_cached_listing(&path, (2026, 9, 8)).unwrap(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn misplaced_full_listing_leaves_the_valid_main_cache_usable_offline() {
+        let settled = fdop_types::time::unix_from_utc(2026, 9, 11, 1, 0, 0.0);
+        for main in [Feed::Prod, Feed::Staging] {
+            let dir = cache_dir(&format!("misplaced-full-{main:?}"));
+            let full_path = dir.join("releases.json");
+            let main_path = dir.join("releases-main.json");
+            let valid = cached_release(main);
+            let mut misplaced = cached_release(Feed::Mlatonly);
+            misplaced.tag = tag_for(2026, 9, 7, Feed::Mlatonly, 0);
+            misplaced.parts[0].name = format!("{}.tar", misplaced.tag);
+            write_listing(&full_path, &[misplaced], settled);
+            write_listing(&main_path, std::slice::from_ref(&valid), settled);
+            let before = [&full_path, &main_path].map(|path| std::fs::read(path).unwrap());
+            let got = cached_fetch_releases(2026, 9, 8, &dir, true, true, |_| {
+                panic!("offline discovery opened the network")
+            })
+            .unwrap();
+            assert_eq!(got.releases, [valid]);
+            assert_eq!(
+                [&full_path, &main_path].map(|path| std::fs::read(path).unwrap()),
+                before
+            );
+        }
+    }
+
+    #[test]
     fn main_only_discovery_uses_its_own_cache_and_never_queries_mlat() {
         for main in [Feed::Prod, Feed::Staging] {
             let dir = cache_dir(main.tag_word());
@@ -590,7 +702,10 @@ mod tests {
             );
             assert!(!dir.join("releases.json").exists());
             let main_path = dir.join("releases-main.json");
-            assert_eq!(read_cached_listing(&main_path).unwrap(), [release.clone()]);
+            assert_eq!(
+                read_cached_listing(&main_path, (2026, 9, 8)).unwrap(),
+                [release.clone()]
+            );
             let settled = fdop_types::time::unix_from_utc(2026, 9, 11, 1, 0, 0.0);
             write_listing(&main_path, std::slice::from_ref(&release), settled);
             for offline in [false, true] {
@@ -654,7 +769,7 @@ mod tests {
                     "an incomplete lookup must not advance the full listing's certification"
                 );
                 assert_eq!(
-                    read_cached_listing(&dir.join("releases-main.json")).unwrap(),
+                    read_cached_listing(&dir.join("releases-main.json"), (2026, 9, 8)).unwrap(),
                     [release.clone()]
                 );
                 assert!(
@@ -752,7 +867,7 @@ mod tests {
                 }
                 let alternative = dir.join("releases-staging.json");
                 assert_eq!(
-                    read_cached_listing(&alternative).unwrap(),
+                    read_cached_listing(&alternative, (2026, 9, 8)).unwrap(),
                     [staging.clone()]
                 );
                 // Availability preflight and fetch can repeat discovery. Reuse the
@@ -792,7 +907,7 @@ mod tests {
                 let expected: Vec<_> = upgraded.into_iter().map(cached_release).collect();
                 assert_eq!(preferred.strict().unwrap(), expected);
                 let path = if include_mlat { &full } else { &main };
-                assert_eq!(read_cached_listing(path).unwrap(), expected);
+                assert_eq!(read_cached_listing(path, (2026, 9, 8)).unwrap(), expected);
             }
         }
     }
