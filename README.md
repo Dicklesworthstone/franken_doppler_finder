@@ -1163,7 +1163,14 @@ The recent-day availability check recognizes these feeds, and the rebuild still 
 full payload, coverage, time window, aircraft policy and midnight context before reconciling
 heights and publishing a store. Reports note recovered metadata; source cache files stay unchanged.
 
-ADS-B day ingest rejects a feed when every trace member fails to parse. An empty archive and a readable feed with no aircraft in the requested region and time remain valid. When some trace members are unreadable, the report warns how many were skipped. Raw checkpoints and processed day catalogues whose saved counts show every trace failed are skipped while the fetcher looks for another usable copy.
+ADS-B day ingest rejects a feed when every trace member fails to parse. A nonempty trace
+needs a finite numeric timestamp; missing or malformed timestamps cannot establish an empty
+day and follow the same recovery path as unreadable members. Explicitly empty traces, finite
+zero or fractional timestamps, and readable feeds with no aircraft in the requested region
+and time remain valid. When some trace members are unreadable, the report warns how many
+were skipped. Raw checkpoints and processed day catalogues whose saved counts show every
+trace failed are skipped while the fetcher looks for another usable copy. This cannot identify
+older false-empty caches whose saved counts incorrectly recorded successful parsing.
 
 Completed raw feed checkpoints live under `adsb/<YYYY-MM-DD>/raw/` as
 `<feed[+jets]>_<S>_<W>_<N>_<E>.fdopraw.gz`. They retain the filtered reports before

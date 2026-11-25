@@ -19,6 +19,19 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover flight data when nonempty traces lack their timestamp
+
+- Treat absent or malformed timestamps on nonempty ADS-B traces as parse failures instead
+  of silently placing their observations at Unix epoch zero. An entirely untimed feed now
+  reaches the existing staging recovery; mixed feeds retain their usable aircraft and report
+  skipped members. Explicit empty traces and finite zero or fractional epochs remain valid.
+- Add parser regressions and extend the synthetic archive recovery case through staging,
+  preserved MLAT, offline reuse and a later healthy prod upgrade. Previously cached false-empty
+  catalogues without parse-error provenance cannot be identified by this change.
+- Source review completed. The native regression run was blocked before test execution by
+  build-host storage pressure and disconnection. Formatting, Clippy, workspace tests, release
+  selftest and reference/field replays remain unverified for this change.
+
 ### Preserve short audio gaps and overlapping packet timing
 
 - Set timestamp correction from the selected stream's time base and input/output sample

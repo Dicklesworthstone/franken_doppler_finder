@@ -2670,18 +2670,27 @@ mod tests {
 
     #[test]
     fn failed_prod_archive_fetches_uncached_staging_then_retries_prod() {
-        use crate::ingest::tests::{gz, tar_of};
+        use crate::ingest::tests::{gz, pc12_json, tar_of};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        for (include_jets, unreadable_prod) in
-            [(false, false), (false, true), (true, false), (true, true)]
-        {
+        for (include_jets, prod_failure) in [
+            (false, "truncated"),
+            (false, "unreadable"),
+            (false, "untimed"),
+            (true, "truncated"),
+            (true, "unreadable"),
+            (true, "untimed"),
+        ] {
             let f = offline_raw_fixture(Feed::Staging, include_jets);
             let prod = checkpoint_release(Feed::Prod, &f.archives[0]);
-            let corrupt_archive = tar_of(&[(
-                "trace_full_a1b2c3.json",
-                gz(r#"{"error":"trace unavailable"}"#),
-            )]);
+            let corrupt_trace = if prod_failure == "untimed" {
+                let mut trace: serde_json::Value = serde_json::from_str(&pc12_json()).unwrap();
+                trace.as_object_mut().unwrap().remove("timestamp");
+                trace.to_string()
+            } else {
+                r#"{"error":"trace unavailable"}"#.to_string()
+            };
+            let corrupt_archive = tar_of(&[("trace_full_a1b2c3.json", gz(&corrupt_trace))]);
             let releases = [prod.clone(), f.releases[1].clone()];
             let calls = std::array::from_fn::<_, 3, _>(|_| AtomicUsize::new(0));
             let lookups = AtomicUsize::new(0);
@@ -2706,12 +2715,18 @@ mod tests {
                             Feed::Mlatonly => 2,
                         };
                         calls[index].fetch_add(1, Ordering::Relaxed);
-                        let bytes = if fail_prod && rel.feed == Feed::Prod && unreadable_prod {
+                        let bytes = if fail_prod
+                            && rel.feed == Feed::Prod
+                            && prod_failure != "truncated"
+                        {
                             &corrupt_archive
                         } else {
                             &f.archives[usize::from(rel.feed == Feed::Mlatonly)]
                         };
-                        let end = if fail_prod && rel.feed == Feed::Prod && !unreadable_prod {
+                        let end = if fail_prod
+                            && rel.feed == Feed::Prod
+                            && prod_failure == "truncated"
+                        {
                             128
                         } else {
                             bytes.len()
@@ -2783,7 +2798,7 @@ mod tests {
                     .iter()
                     .any(|n| n.as_str().unwrap().contains(NO_MLATONLY))
             );
-            if unreadable_prod {
+            if prod_failure != "truncated" {
                 assert!(notes.iter().any(|n| {
                     n.as_str()
                         .unwrap()

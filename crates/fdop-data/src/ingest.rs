@@ -590,7 +590,13 @@ fn parse_member(
         Ok(v) => v,
         Err(_) => return Parsed::Error,
     };
-    let base = tf.timestamp.0.unwrap_or(0.0);
+    // Row offsets need their source epoch to establish absolute time coverage.
+    // An untimed nonempty trace cannot establish an empty catalogue at epoch zero.
+    let base = match tf.timestamp.0 {
+        Some(base) => base,
+        None if tf.trace.is_empty() => return Parsed::NoOverlap,
+        None => return Parsed::Error,
+    };
     let n_geoid = spec.geoid_n_m;
     let mut pts: Vec<RawPoint> = Vec::with_capacity(tf.trace.len());
     let mut leg_boundaries = crate::build::BoundaryEvents::default();
@@ -1178,6 +1184,100 @@ pub(crate) mod tests {
         let (aircraft, stats) = ingest_reader(mixed.as_slice(), "prod", &outside, &|_| {}).unwrap();
         assert!(aircraft.is_empty());
         assert_eq!((stats.members, stats.parse_errors), (2, 1));
+    }
+
+    #[test]
+    fn untimed_traces_cannot_establish_a_flight_catalogue() {
+        let trace: serde_json::Value = serde_json::from_str(&pc12_json()).unwrap();
+        let valid = gz(&trace.to_string());
+        let (expected, _) = ingest_reader(
+            tar_of(&[("trace_full_a.json", valid.clone())]).as_slice(),
+            "prod",
+            &spec(),
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(expected.len(), 1);
+        let expected = serde_json::to_value(&expected[0]).unwrap();
+        for timestamp in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("unavailable")),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!(true)),
+        ] {
+            let mut untimed = trace.clone();
+            untimed.as_object_mut().unwrap().remove("timestamp");
+            if let Some(value) = timestamp {
+                untimed["timestamp"] = value;
+            }
+            let bad = gz(&untimed.to_string());
+            // Missing timing proves neither an empty modern day nor a flight at
+            // Unix epoch zero, even when the row offsets happen to overlap it.
+            for request in [
+                spec(),
+                IngestSpec {
+                    t_start: spec().t_start - T0,
+                    t_end: spec().t_end - T0,
+                    ..spec()
+                },
+            ] {
+                let error = ingest_reader(
+                    tar_of(&[("trace_full_a.json", bad.clone())]).as_slice(),
+                    "prod",
+                    &request,
+                    &|_| {},
+                )
+                .expect_err("a nonempty trace needs its source time base");
+                assert!(error.to_string().contains("1 parse errors for 1 trace members"));
+            }
+            let (aircraft, stats) = ingest_reader(
+                tar_of(&[
+                    ("trace_full_a.json", bad),
+                    ("trace_full_b.json", valid.clone()),
+                ])
+                .as_slice(),
+                "prod",
+                &spec(),
+                &|_| {},
+            )
+            .unwrap();
+            assert_eq!((stats.members, stats.parse_errors), (2, 1));
+            assert_eq!(aircraft.len(), 1);
+            assert_eq!(serde_json::to_value(&aircraft[0]).unwrap(), expected);
+
+            untimed["trace"] = serde_json::json!([]);
+            let (aircraft, stats) = ingest_reader(
+                tar_of(&[("trace_full_a.json", gz(&untimed.to_string()))]).as_slice(),
+                "prod",
+                &spec(),
+                &|_| {},
+            )
+            .unwrap();
+            assert!(aircraft.is_empty());
+            assert_eq!((stats.members, stats.parse_errors), (1, 0));
+        }
+
+        // Explicit zero and fractional epochs are valid. Shift the row offsets
+        // to retain exactly the same observations and flight-boundary times.
+        for epoch in [0.0, T0 + 0.25] {
+            let mut shifted = trace.clone();
+            shifted["timestamp"] = serde_json::json!(epoch);
+            for row in shifted["trace"].as_array_mut().unwrap() {
+                row[0] = serde_json::json!(row[0].as_f64().unwrap() + (T0 - epoch));
+            }
+            let (aircraft, stats) = ingest_reader(
+                tar_of(&[("trace_full_a.json", gz(&shifted.to_string()))]).as_slice(),
+                "prod",
+                &spec(),
+                &|_| {},
+            )
+            .unwrap();
+            assert_eq!((stats.members, stats.parse_errors), (1, 0));
+            assert_eq!(aircraft.len(), 1);
+            assert_eq!(serde_json::to_value(&aircraft[0]).unwrap(), expected);
+        }
     }
 
     #[test]
