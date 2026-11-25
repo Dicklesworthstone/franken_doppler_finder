@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Enforce the quick-check budget within a single flight pair
+
+- Stop primary joined-seed scoring at the remaining global allowance instead of finishing
+  an arbitrarily large event pair first. Retain the original deterministic candidate prefix,
+  including rejected comparisons, and run alternative recovery only after complete primary joins.
+- Record any partially checked pair in the funnel and warnings, including the final pair, so
+  an incomplete comparison fails the margin gate. Exact exhaustion without another distinct
+  seed remains complete. Batch preparation and hash-index memory are not bounded by this limit.
+- Add ordered-prefix/worker-count regressions at zero, batch boundaries and exact exhaustion;
+  strengthen integration assertions for rejected seeds, later pairs and partial final pairs.
+- Independent source review and added-line whitespace checks completed. Native tests, formatting,
+  Clippy, release selftest and reference/field replays could not run after the build-host outage.
+  No end-to-end timing or field-accuracy improvement is claimed.
+
 ### Recover flight data when nonempty traces lack their timestamp
 
 - Treat absent or malformed timestamps on nonempty ADS-B traces as parse failures instead

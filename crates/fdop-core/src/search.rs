@@ -282,7 +282,8 @@ pub struct SearchParams {
     pub kappa: f64,
     /// Residual cap in units of sigma (bounded influence of stray trace points).
     pub cap_sigma: f64,
-    /// Joined points that may reach the quick check, and cells the fine grid may score. A cut
+    /// Joined points that may reach the quick check, and cells the fine grid may score. The
+    /// joined-point limit includes rejected seeds and can stop within an event pair. A cut
     /// leaves rivals unchecked and fails the margin gate (`SearchResult::margin_passes`), and it
     /// can hide the best place: a flight pair's first cell can lie beyond where its third flight
     /// confirms. So these sit above the largest searches estimated from real runs, about 11 M
@@ -1269,6 +1270,8 @@ const JOIN_CHUNK_HYPOTHESES: usize = 64;
 // of its rejected seeds until the join ends. This is a buffer size, not a search cut.
 const JOIN_OUTPUT_SEEDS: usize = 4096;
 
+/// Stream the original ordered representatives up to `budget`. Reaching the allowance
+/// alone is not a cut: only an additional distinct seed proves a comparison incomplete.
 #[allow(clippy::too_many_arguments)]
 fn join_batches(
     hi: &[Hyp],
@@ -1279,10 +1282,11 @@ fn join_batches(
     tt: f64,
     same_flight_min_dt: f64,
     t_base: f64,
+    budget: usize,
     mut consume: impl FnMut(&[Joined]),
-) -> usize {
+) -> (usize, bool) {
     if hi.is_empty() || hj.is_empty() {
-        return 0;
+        return (0, false);
     }
     let mut map: HashMap<(i32, i32, i64), Vec<u32>> = HashMap::with_capacity(hi.len() / 2);
     for (k, h) in hi.iter().enumerate() {
@@ -1291,9 +1295,10 @@ fn join_batches(
     // One representative per (flights, 600 m cell, 20 s), as in the original join.
     let r2 = r * r;
     let mut seen = std::collections::HashSet::new();
-    let mut ready = Vec::with_capacity(JOIN_OUTPUT_SEEDS);
+    let mut ready = Vec::with_capacity(JOIN_OUTPUT_SEEDS.min(budget));
     let mut joined = 0usize;
-    for batch in hj.chunks(JOIN_BATCH_HYPOTHESES) {
+    let mut truncated = false;
+    'scan: for batch in hj.chunks(JOIN_BATCH_HYPOTHESES) {
         let parts: Vec<Vec<Joined>> = batch
             .par_chunks(JOIN_CHUNK_HYPOTHESES)
             .map(|chunk| {
@@ -1343,6 +1348,10 @@ fn join_batches(
                 if let Some(k) = joined_cell(&j)
                     && seen.insert(k)
                 {
+                    if ready.len() >= budget.saturating_sub(joined) {
+                        truncated = true;
+                        break 'scan;
+                    }
                     ready.push(j);
                     if ready.len() == JOIN_OUTPUT_SEEDS {
                         joined += ready.len();
@@ -1357,7 +1366,7 @@ fn join_batches(
         joined += ready.len();
         consume(&ready);
     }
-    joined
+    (joined, truncated)
 }
 
 /// A failed midpoint does not rule out every other seed in its 600 m / 20 s cell.
@@ -3851,6 +3860,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
     funnel.event_pairs = pairs.len();
     let mut pairs_done = 0usize;
+    let mut primary_cut = false;
     let mut failed_pairs = Vec::new();
     let check_batch = |batch: &[Joined], joined_so_far: usize| {
         // Only survivors outlive this bounded output batch. Keep a result for every
@@ -3889,7 +3899,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
         };
         let tt = evs[i].t_tol + evs[j].t_tol + slop;
         let quick_before = quick.len();
-        let joined = join_batches(
+        let (joined, truncated) = join_batches(
             ha,
             hb,
             a,
@@ -3898,23 +3908,36 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
             tt,
             SAME_FLIGHT_MIN_DT_S,
             t_base,
+            p.max_quick.saturating_sub(funnel.joined),
             |batch| {
                 funnel.joined += batch.len();
                 quick.extend(check_batch(batch, funnel.joined).into_iter().flatten());
             },
         );
+        progress(&format!("join {}x{}: {}", evs[a].id, evs[b].id, joined));
+        if truncated {
+            warnings.push(format!(
+                "{}x{}: checked {joined} original joined seeds before the quick-check budget ({}); this event pair is incomplete; narrow the region or dates",
+                evs[a].id, evs[b].id, p.max_quick
+            ));
+            funnel.truncated.push(format!(
+                "join {}x{}: budget {} exhausted",
+                evs[a].id, evs[b].id, p.max_quick
+            ));
+            primary_cut = true;
+            break;
+        }
+        pairs_done += 1;
         if quick.len() - quick_before < joined {
             failed_pairs.push((a, b, quick_before..quick.len()));
         }
-        progress(&format!("join {}x{}: {}", evs[a].id, evs[b].id, joined));
-        pairs_done += 1;
-        // Preserve the complete first-pass event pairs and their original budget policy.
-        // Earlier failures must not spend recovery work ahead of a later pair's old success.
-        if funnel.joined > p.max_quick {
-            break;
-        }
     }
     for (a, b, old_survivors) in failed_pairs {
+        // A partial primary pair already used the full allowance and recorded the cut.
+        // Original representatives retain priority over recovery from earlier failures.
+        if primary_cut {
+            break;
+        }
         let mut accepted = quick[old_survivors]
             .iter()
             .filter_map(|(j, _)| joined_cell(j))
@@ -3960,7 +3983,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     // not remain live while the fine search, confirmation and refinement allocate.
     drop(hyps);
     if pairs_done < pairs.len() {
-        warnings.push(format!("joined {pairs_done} of {} event pairs before the quick-check budget ({}); narrow the region or dates", pairs.len(), p.max_quick));
+        warnings.push(format!("completed {pairs_done} of {} event-pair joins before the quick-check budget ({}); narrow the region or dates", pairs.len(), p.max_quick));
         funnel
             .truncated
             .push(format!("pairs: {} -> {pairs_done}", pairs.len()));
@@ -5243,10 +5266,20 @@ mod tests {
         t_base: f64,
     ) -> Vec<Joined> {
         let mut out = Vec::new();
-        let count = join_batches(hi, hj, ei, ej, r, tt, same_flight_min_dt, t_base, |batch| {
-            out.extend_from_slice(batch);
-        });
+        let (count, truncated) = join_batches(
+            hi,
+            hj,
+            ei,
+            ej,
+            r,
+            tt,
+            same_flight_min_dt,
+            t_base,
+            usize::MAX,
+            |batch| out.extend_from_slice(batch),
+        );
         assert_eq!(count, out.len());
+        assert!(!truncated);
         out
     }
 
@@ -5374,12 +5407,12 @@ mod tests {
             let mut visited = 0usize;
             let mut batches = 0usize;
             let mut largest = 0usize;
-            let count = rayon::ThreadPoolBuilder::new()
+            let (count, truncated) = rayon::ThreadPoolBuilder::new()
                 .num_threads(workers)
                 .build()
                 .unwrap()
                 .install(|| {
-                    join_batches(&hi, &hj, 2, 5, 600.0, 20.0, 30.0, 0.0, |batch| {
+                    join_batches(&hi, &hj, 2, 5, 600.0, 20.0, 30.0, 0.0, usize::MAX, |batch| {
                         assert!(!batch.is_empty());
                         assert!(batch.len() <= JOIN_OUTPUT_SEEDS);
                         batches += 1;
@@ -5405,8 +5438,65 @@ mod tests {
                 });
             assert_eq!(visited, hi.len() * hj.len());
             assert_eq!(count, visited);
+            assert!(!truncated);
             assert!(batches > 1);
             assert!(largest < count);
+        }
+    }
+
+    #[test]
+    fn pair_join_budget_keeps_the_exact_ordered_prefix_and_reports_real_cuts() {
+        let h = Hyp {
+            trk: 0,
+            t_e: 100.0,
+            e: 100.0,
+            n: 100.0,
+            t_s: 200.0,
+        };
+        let hi: Vec<_> = (0..4).map(|trk| Hyp { trk, ..h }).collect();
+        // Repeated hypotheses straddle worker/input batches. Exhausting the budget
+        // before a duplicate must not call it an unchecked independent representative.
+        let hj: Vec<_> = (100..8305)
+            .flat_map(|trk| [Hyp { trk, ..h }; 2])
+            .collect();
+        let expected = exhaustive_join(&hi, &hj, 600.0, 20.0, 0.0);
+        assert_eq!(expected.len(), 4 * 8205);
+        for workers in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            for budget in [
+                0,
+                1,
+                JOIN_OUTPUT_SEEDS - 1,
+                JOIN_OUTPUT_SEEDS,
+                JOIN_OUTPUT_SEEDS + 1,
+                expected.len() - 1,
+                expected.len(),
+                expected.len() + 1,
+            ] {
+                let mut actual = Vec::new();
+                let (count, truncated) = pool.install(|| {
+                    join_batches(&hi, &hj, 2, 5, 600.0, 20.0, 30.0, 0.0, budget, |batch| {
+                        assert!(!batch.is_empty() && batch.len() <= JOIN_OUTPUT_SEEDS);
+                        assert!(actual.len() + batch.len() <= budget);
+                        actual.extend_from_slice(batch);
+                    })
+                });
+                assert_eq!(count, budget.min(expected.len()));
+                assert_eq!(truncated, budget < expected.len());
+                assert_eq!(actual, expected[..count], "workers={workers}, budget={budget}");
+            }
+        }
+        // A zero allowance is complete when the pair has no distinct eligible seed.
+        for (a, b) in [(&[][..], &hj[..]), (&hi[..], &[][..]), (&hi[..1], &hi[..1])] {
+            assert_eq!(
+                join_batches(a, b, 2, 5, 600.0, 20.0, 30.0, 0.0, 0, |_| {
+                    panic!("a zero budget must never invoke the quick checker")
+                }),
+                (0, false)
+            );
         }
     }
 
@@ -10123,7 +10213,7 @@ mod tests {
     }
 
     #[test]
-    fn join_recovery_preserves_later_original_pairs_at_budget_boundary() {
+    fn exhausted_pair_budget_stops_before_later_pairs_and_recovery() {
         let med = fdop_types::atmo::Medium::still(343.0);
         let mut case = close_flyover_case(0.0, false);
         let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
@@ -10155,29 +10245,21 @@ mod tests {
         event.quality = 90.0;
         case.tracks.push(third);
         case.events.push(event);
-        // The failed A/B first pass exactly fills this allowance. The established strict
-        // `>` policy still visits A/C's whole original first pass before stopping. Retrying
-        // A/B early would instead mark a recovery cut and hide this existing success.
+        // The failed A/B first pass exactly fills this allowance. A/C has a genuine
+        // candidate, but neither that later pair nor recovery from A/B may exceed it.
         case.p.max_quick = 1;
         let result = run_case(&case, med);
-        let top = result
-            .candidates
-            .first()
-            .unwrap_or_else(|| panic!("{:?}", result.funnel));
-        for key in ["A", "C"] {
-            assert!(
-                top.events
-                    .iter()
-                    .any(|m| m.event == key && m.flight == key && m.role == "pair" && m.core)
-            );
-        }
-        assert!(haversine_m(case.obs.0, case.obs.1, top.lat, top.lon) < 75.0);
-        assert!(top.t_start_utc.abs() < 0.2);
-        assert!(result.funnel.joined > case.p.max_quick);
+        assert_eq!(result.funnel.joined, case.p.max_quick);
+        assert_eq!(result.funnel.quick_passed, 0);
+        assert!(result.candidates.is_empty());
         assert_eq!(
             result.funnel.truncated,
-            ["join alternatives AxB: budget 1 exhausted", "pairs: 3 -> 2",]
+            ["join AxC: budget 1 exhausted", "pairs: 3 -> 1"]
         );
+        assert!(result.warnings.iter().any(|warning| {
+            warning.starts_with("AxC: checked 0 original joined seeds")
+                && warning.contains("this event pair is incomplete")
+        }));
         assert!(!result.margin_passes(3.0));
     }
 
@@ -14838,7 +14920,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_pair_budget_counts_rejected_seeds_before_starting_another_pair() {
+    fn quick_pair_budget_bounds_rejected_seeds_inside_one_pair() {
         let med = fdop_types::atmo::Medium::still(343.0);
         let mut case = two_flyover_case(med);
         let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
@@ -14855,7 +14937,7 @@ mod tests {
             &prop,
         );
         // Keep the known A/B pair first; the third actual pass still supplies two
-        // more pairable combinations that the zero budget must leave unchecked.
+        // more pairable combinations that a cut in the first must leave unchecked.
         third.misfit = true;
         case.events.push(third);
         case.p.region = BBox::new(
@@ -14869,7 +14951,7 @@ mod tests {
         case.p.max_quick = 0;
         case.p.max_fine = 0;
         // Force all quick checks to fail. Counting survivors instead of joined seeds
-        // would now join every pair, changing the budget's meaning and hiding its cut.
+        // would perform every comparison despite these finite allowances.
         case.p.quick_chi = -1.0;
         let frame = Frame::new(&case.p.region);
         let dem = FlatElevation(0.0);
@@ -14912,25 +14994,34 @@ mod tests {
             t_base,
         )
         .len();
-        assert!(expected_first > 0);
-        let result = run_case(&case, med);
-        assert_eq!(result.funnel.events_used, 3);
-        assert_eq!(result.funnel.event_pairs, 3);
-        assert_eq!(
-            result.funnel.joined, expected_first,
-            "recovery must spend no extra comparison"
-        );
-        assert_eq!(result.funnel.quick_passed, 0);
-        assert_eq!(result.funnel.fine_scored, 0);
-        assert_eq!(
-            result.funnel.truncated,
-            [
-                "join alternatives e1xe2: budget 0 exhausted",
-                "pairs: 3 -> 1",
-            ]
-        );
-        assert!(result.candidates.is_empty());
-        assert!(!result.margin_passes(3.0));
+        assert!(expected_first > 1);
+        // A partial final pair needs the same cut report as one with later pairs.
+        for event_count in [3, 2] {
+            case.events.truncate(event_count);
+            for budget in [0, 1] {
+                case.p.max_quick = budget;
+                let result = run_case(&case, med);
+                let pair_count = event_count * (event_count - 1) / 2;
+                assert_eq!(result.funnel.events_used, event_count);
+                assert_eq!(result.funnel.event_pairs, pair_count);
+                assert_eq!(result.funnel.joined, budget);
+                assert_eq!(result.funnel.quick_passed, 0);
+                assert_eq!(result.funnel.fine_scored, 0);
+                assert_eq!(
+                    result.funnel.truncated,
+                    [
+                        format!("join e1xe2: budget {budget} exhausted"),
+                        format!("pairs: {pair_count} -> 0"),
+                    ]
+                );
+                assert!(result.warnings.iter().any(|warning| {
+                    warning.starts_with(&format!("e1xe2: checked {budget} original joined seeds"))
+                        && warning.contains("this event pair is incomplete")
+                }));
+                assert!(result.candidates.is_empty());
+                assert!(!result.margin_passes(3.0));
+            }
+        }
     }
 
     /// The confirmer cap is a cut like the pair and fine budgets: `run` must record it in the

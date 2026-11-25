@@ -2031,7 +2031,9 @@ Design notes:
   four events and two other field searches one each.
   The comparison budgets default to 20 M joined points, 2 M fine cells and 2 M confirmations, above the largest
   searches estimated from real runs (about 11 M and 1 M). A pair-join, fine-stage or confirmation-budget cut is
-  reported in `funnel.truncated` and the warnings. No flag changes these budgets, and they do not scale with RAM:
+  reported in `funnel.truncated` and the warnings. The joined-point allowance includes rejected seeds and
+  is enforced within each event pair; even a partial final pair is an incomplete comparison.
+  No flag changes these budgets, and they do not scale with RAM:
   the largest runs here peak at about 10 GiB on a 32 GiB machine, and smaller machines have not been tried. An
   event that exceeds its hypothesis budget, or falls beyond `--max-events`, drops to confirmer-only, which
   `funnel.hypotheses` shows;
@@ -2159,20 +2161,23 @@ The initial pair join discards duplicate flight/place/clock seeds as they are ge
 batches of 4,096 input hypotheses and ordered worker chunks. Previously it held every compatible
 raw pair before deduplicating: a dense bucket could exhaust memory before the quick-check budget
 was considered. The hash index, deduplication keys, active worker chunks and quick survivors still
-consume memory; this is not a fixed total-memory bound. The same first representative, candidate
-order, spatial and clock cells, and complete comparison are retained. No detection cap, search
-budget or confidence line changes.
+consume memory; this is not a fixed total-memory bound. The original first representative, candidate
+order, and spatial and clock cells are retained up to the configured comparison allowance.
 
 Complete representatives now reach the quick trace check in groups of at most 4,096 seeds while
 their event pair is still being joined. Rejected seeds therefore do not accumulate until the end
 of even one large pair. This bounds the completed-output buffer, rather than the complete search:
 the join's deduplication keys and active worker chunks still grow with the data. The joined-seed
-budget counts rejected seeds and stops at the same complete-pair boundary. Hypothesis clouds are
-released before fine scoring, and fine-grid input seeds before confirmation and refinement.
-Later stages retain their surviving candidates; the changes impose no additional search cut.
+budget counts rejected seeds and stops before an event pair exceeds the remaining global allowance.
+If another distinct seed remains, the report identifies the incomplete pair and the margin gate
+fails, including when this is the only or final pair. Finishing exactly at the allowance does not
+by itself imply a cut. This limits quick trace checks, not total runtime: the hash index and the
+last prepared worker batch still require work. Hypothesis clouds are released before fine scoring,
+and fine-grid input seeds before confirmation and refinement. Already checked survivors remain
+eligible for later stages, with an incomplete-comparison warning when the join was cut.
 
 A rejected representative no longer discards its entire 600 m / 20 s flight-pair cell. After
-all original event-pair passes allowed by the existing budget policy, a recovery pass tries
+all original event-pair passes finish without a cut, a recovery pass tries
 other compatible seeds in rejected cells. Successful first representatives keep their cells;
 each recovered cell stops at its first passing alternative. The same geometry, clock and
 trace gates apply. Additional comparisons consume only the remaining global quick-check
@@ -4969,8 +4974,8 @@ These focused checks do not establish a workspace, CLI selftest or real-recordin
 
 ### Search working set (2026-11-07): focused native integration passes
 
-The pinned `nightly-2026-08-31` full-core test binary passes these three checks through the actual
-search code, in addition to the pair-join component measurements in Performance:
+The pinned `nightly-2026-08-31` full-core test binary passed these three checks on the recorded
+2026-11-07 build, in addition to the pair-join component measurements in Performance:
 
 - `pair_join_preserves_every_ordered_representative_across_batches`: complete ordered seed equality,
   including multiple batches, worker counts, clock/spatial boundaries and repeated-flight exclusions.
@@ -4978,6 +4983,10 @@ search code, in addition to the pair-join component measurements in Performance:
   consume the joined budget and record the same complete-pair truncation.
 - `two_synthetic_flyovers_locate_the_observer`: correct A/B identities, less than 60 m position error,
   less than 1 s clock error, successful refinement and coherent candidate/margin reporting.
+
+The current budget regression is `quick_pair_budget_bounds_rejected_seeds_inside_one_pair`;
+it requires the exact allowance and an explicit cut within even the final pair. Its native run,
+and the new ordered-prefix budget checks, remain unverified after the build-host outage.
 
 The broader core run was stopped after 32 passes, two failures and four declared audio-test ignores
 to reproduce the failures individually. Both exact reruns fail without changing their assertions:
@@ -5644,7 +5653,7 @@ audio or video recorded somewhere sensitive:
 | Margin gate reads `both at their fine-grid cells, because one could not be refined` | Refining the answer or its best rival moved a locating match out of its gates, so the margin compares the two scores from before refinement. A warning gives the refused position | Nothing to change. `margin_top_score` and `margin_rival_score` in `result.json` hold the pair compared; `top_score` is still the answer's refined score |
 | An event reads `trace follows only N % of the central frequency drop: no ridge through the CPA` | The fit joins two steady tones with nothing between them, or the pass is too faint to trace through its steepest part | Nothing to change: the event can neither drive nor confirm an answer, though it still counts as heard |
 | A search runs for an hour or more | A busy recording and a wide region: every rival is compared, at 50–70 ms of CPU per fine cell, and `fine grid N/M` on stderr shows how far it has got | Narrow `--near` to a county, a point or a box |
-| Warning `joined N of M event pairs before the quick-check budget (...)`, `N quick-check survivors > 2000000; scoring the best 2000000` or `confirmation budget: checking 2000000 of N fine candidates; rival comparison is incomplete` | The search outgrew a comparison budget | The margin gate fails and the answer grades **low**; a numerical margin is labelled provisional. Narrow the region or the dates and rerun |
+| Warning `completed N of M event-pair joins before the quick-check budget (...)`, `N quick-check survivors > 2000000; scoring the best 2000000` or `confirmation budget: checking 2000000 of N fine candidates; rival comparison is incomplete` | The search outgrew a comparison budget | The margin gate fails and the answer grades **low**; a numerical margin is labelled provisional. Narrow the region or the dates and rerun |
 | Warning `ADS-B <day>: no mlatonly data in this catalogue, so aircraft located only by multilateration ... are missing` (or `prod release unavailable, using staging`) | The cache lacks a feed because its release was unavailable or its download failed | Rerun online to obtain any now-available feeds. Aircraft missing from the data can neither match nor count as unheard passes |
 | Disk filling up | Many cached regions and days | Delete old `adsb/<date>/` folders under the cache root |
 
