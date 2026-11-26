@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover ADS-B feeds after incomplete release uploads
+
+- Release discovery distinguishes missing tags from published tags with unusable archives. It can use a complete later suffix without recording a broken upload as proof that the feed was absent.
+- Online discovery rechecks an older release listing when a missing feed matters to the request. The cache still supports offline reads and earlier readers. Regression cases cover a missing middle part, a repaired release under the next tag and an old negative lookup.
+
 ### Show measured flyover times in a recording audit
 
 - Single-source and whole-file JSON audits now include `measured_pass_spans` alongside independent event IDs. Whole-file text output lists the recording-time span under the corresponding track and channel. The endpoints come from the measured trace for that pass.

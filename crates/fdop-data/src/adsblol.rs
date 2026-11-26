@@ -175,29 +175,51 @@ pub fn find_release(
     d: u32,
     feed: Feed,
 ) -> Result<Option<DayRelease>, DataError> {
-    let repo = repo_for_year(y);
     let hdrs = api_headers();
     let refs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    lookup_release_tags(y, m, d, feed, |url| match net.get(url, &refs) {
+        Ok(r) => r
+            .json()
+            .map(Some)
+            .map_err(|e| DataError(format!("{url}: {e}"))),
+        Err(e) if e.status == Some(404) => Ok(None),
+        Err(e) if e.status == Some(403) || e.status == Some(429) => Err(DataError(format!(
+            "GitHub API refused {url} ({e}); unauthenticated calls are limited to 60/hour, set GITHUB_TOKEN"
+        ))),
+        Err(e) => Err(e.into()),
+    })
+}
+
+fn lookup_release_tags(
+    y: i64,
+    m: u32,
+    d: u32,
+    feed: Feed,
+    mut get: impl FnMut(&str) -> Result<Option<serde_json::Value>, DataError>,
+) -> Result<Option<DayRelease>, DataError> {
+    let repo = repo_for_year(y);
+    let mut unusable = Vec::new();
     for n in 0..4 {
         let tag = tag_for(y, m, d, feed, n);
         let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-        match net.get(&url, &refs) {
-            Ok(r) => {
-                let v = r.json().map_err(|e| DataError(format!("{url}: {e}")))?;
-                if let Some(rel) = parse_release_json(&v, feed, &repo) {
-                    return Ok(Some(rel));
-                }
-            }
-            Err(e) if e.status == Some(404) => continue,
-            Err(e) if e.status == Some(403) || e.status == Some(429) => {
-                return Err(DataError(format!(
-                    "GitHub API refused {url} ({e}); unauthenticated calls are limited to 60/hour, set GITHUB_TOKEN"
-                )));
-            }
-            Err(e) => return Err(e.into()),
+        let Some(json) = get(&url)? else { continue };
+        if let Some(release) = parse_release_json(&json, feed, &repo)
+            && release.tag == tag
+        {
+            return Ok(Some(release));
         }
+        // A present but incomplete upload may be replaced under the next suffix.
+        // If none is usable, a failed lookup cannot certify this feed's absence.
+        unusable.push(tag);
     }
-    Ok(None)
+    if unusable.is_empty() {
+        Ok(None)
+    } else {
+        Err(DataError(format!(
+            "no usable ADS-B archive for published release tag(s) {}: expected a matching tag and complete uploaded tar assets",
+            unusable.join(", ")
+        )))
+    }
 }
 
 /// An available main release, optionally with failed preferred/MLAT lookups.
@@ -323,7 +345,7 @@ pub fn find_day_releases_cached(
     offline: bool,
 ) -> Result<Vec<DayRelease>, DataError> {
     let path = dir.join("releases.json");
-    let cached = read_cached_listing(&path, (y, m, d));
+    let cached = read_listing_for_request(&path, (y, m, d), (!offline).then_some(true));
     if let Some(v) = &cached
         && (offline || cached_listing_final(v, y, m, d, &path))
     {
@@ -345,25 +367,58 @@ pub fn find_day_releases_cached(
         std::fs::create_dir_all(dir)?;
         fdop_http::write_atomic(
             &path,
-            &serde_json::to_vec_pretty(&rels).map_err(|e| DataError(e.to_string()))?,
+            &encode_checked_listing(&rels, true)?,
         )?;
     }
     Ok(rels)
 }
 
+// Keep the existing array of release objects readable by older builds and raw recovery.
+// Missing fields identify older listings whose negative lookups might include broken uploads.
+#[derive(Serialize, Deserialize)]
+struct ListingEntry<T> {
+    #[serde(flatten)]
+    release: T,
+    checked_mlat: Option<bool>, // Some(false) certifies only the main-feed lookup.
+}
+
+fn encode_checked_listing(releases: &[DayRelease], include_mlat: bool) -> Result<Vec<u8>, DataError> {
+    let entries: Vec<_> = releases
+        .iter()
+        .map(|release| ListingEntry { release, checked_mlat: Some(include_mlat) })
+        .collect();
+    serde_json::to_vec_pretty(&entries).map_err(|e| DataError(e.to_string()))
+}
+
 fn read_cached_listing(path: &Path, day: (i64, u32, u32)) -> Option<Vec<DayRelease>> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Vec<DayRelease>>(&b).ok())
-        // The directory and an uploaded tar shape cannot establish its UTC day.
-        // A misplaced listing must be refreshed (or recovered from raw checkpoints),
-        // never used to certify an empty catalogue after filtering the wrong archive.
-        .filter(|v| {
-            !v.is_empty()
-                && v.iter().all(|r| {
-                    crate::fetch::release_for_day(r, day) && valid_archive_parts(&r.tag, &r.parts)
-                })
-        })
+    read_listing_for_request(path, day, None)
+}
+
+fn read_listing_for_request(
+    path: &Path,
+    day: (i64, u32, u32),
+    online_include_mlat: Option<bool>,
+) -> Option<Vec<DayRelease>> {
+    let bytes = std::fs::read(path).ok()?;
+    let entries: Vec<ListingEntry<DayRelease>> = serde_json::from_slice(&bytes).ok()?;
+    if entries.is_empty() || !entries.iter().all(|entry| {
+        let r = &entry.release;
+        crate::fetch::release_for_day(r, day) && valid_archive_parts(&r.tag, &r.parts)
+    }) {
+        return None;
+    }
+    // Offline reads only need positive archive identities. Online, a listing lacking
+    // a requested feed must prove the lookup distinguished absence from a broken upload.
+    if let Some(include_mlat) = online_include_mlat {
+        let has = |feed| entries.iter().any(|entry| entry.release.feed == feed);
+        if (!has(Feed::Prod) && entries.iter().any(|entry| entry.checked_mlat.is_none()))
+            || (include_mlat && !has(Feed::Mlatonly)
+                && entries.iter().any(|entry| entry.checked_mlat != Some(true)))
+        {
+            return None;
+        }
+    }
+    Some(entries.into_iter().map(|entry| entry.release).collect())
 }
 
 /// Fetch/availability discovery can use a completed main lookup without MLAT. Its separate
@@ -462,7 +517,8 @@ fn cached_fetch_releases(
 ) -> Result<ReleaseDiscovery, DataError> {
     let full_path = dir.join("releases.json");
     let main_path = dir.join("releases-main.json");
-    if let Some(mut releases) = read_cached_listing(&full_path, (y, m, d))
+    if let Some(mut releases) =
+        read_listing_for_request(&full_path, (y, m, d), (!offline).then_some(include_mlat))
         && (offline || cached_listing_final(&releases, y, m, d, &full_path))
     {
         if !include_mlat {
@@ -487,7 +543,7 @@ fn cached_fetch_releases(
     }
     // A main-only result cannot prove that a requested optional feed is absent online.
     if (!include_mlat || offline)
-        && let Some(releases) = read_cached_listing(&main_path, (y, m, d))
+        && let Some(releases) = read_listing_for_request(&main_path, (y, m, d), (!offline).then_some(false))
         && releases.iter().all(|r| r.feed != Feed::Mlatonly)
         && (offline || cached_listing_final(&releases, y, m, d, &main_path))
     {
@@ -523,7 +579,8 @@ fn cached_fetch_releases(
         true,
     )?;
     if found.prod_error.is_none() && !found.releases.is_empty() {
-        let path = if include_mlat && found.mlat_error.is_none() {
+        let checked_mlat = include_mlat && found.mlat_error.is_none();
+        let path = if checked_mlat {
             &full_path
         } else {
             &main_path
@@ -531,7 +588,7 @@ fn cached_fetch_releases(
         std::fs::create_dir_all(dir)?;
         fdop_http::write_atomic(
             path,
-            &serde_json::to_vec_pretty(&found.releases).map_err(|e| DataError(e.to_string()))?,
+            &encode_checked_listing(&found.releases, checked_mlat)?,
         )?;
     }
     Ok(found)
@@ -568,7 +625,7 @@ mod tests {
     }
 
     fn write_listing(path: &Path, releases: &[DayRelease], checked_at: f64) {
-        std::fs::write(path, serde_json::to_vec(releases).unwrap()).unwrap();
+        std::fs::write(path, encode_checked_listing(releases, true).unwrap()).unwrap();
         std::fs::File::options()
             .write(true)
             .open(path)
@@ -1202,6 +1259,74 @@ mod tests {
                 parse_release_json(&incomplete, Feed::Prod, "r").is_none(),
                 "{key}"
             );
+        }
+    }
+
+    #[test]
+    fn published_unusable_release_is_retried_without_certifying_absence() {
+        let dir = cache_dir("incomplete-upload");
+        let discover = |feed, repaired: bool| {
+            lookup_release_tags(2026, 9, 8, feed, |url| {
+                let tag = url.rsplit('/').next().unwrap();
+                let suffixes: &[&str] = match (feed, tag.ends_with("-0"), repaired) {
+                    (Feed::Prod, true, _) => &[".tar"],
+                    (Feed::Mlatonly, true, _) => &[".tar.aa", ".tar.ac"],
+                    (Feed::Mlatonly, false, true) if tag.ends_with("-1") => &[".tar"],
+                    _ => return Ok(None),
+                };
+                Ok(Some(serde_json::json!({
+                    "tag_name": tag,
+                    "assets": suffixes.iter().map(|suffix| serde_json::json!({
+                        "name": format!("{tag}{suffix}"),
+                        "state": "uploaded",
+                        "size": 1024,
+                        "browser_download_url": format!("https://example.invalid/{tag}{suffix}"),
+                    })).collect::<Vec<_>>()
+                })))
+            })
+        };
+        let first = cached_fetch_releases(2026, 9, 8, &dir, false, true, |f| discover(f, false))
+            .unwrap();
+        assert_eq!(first.releases.len(), 1);
+        assert_eq!(first.releases[0].feed, Feed::Prod);
+        assert!(first.mlat_error.unwrap().to_string().contains(&tag_for(2026, 9, 8, Feed::Mlatonly, 0)));
+        assert!(dir.join("releases-main.json").is_file());
+        assert!(!dir.join("releases.json").exists());
+
+        let retry = cached_fetch_releases(2026, 9, 8, &dir, false, true, |f| discover(f, true))
+            .unwrap()
+            .strict()
+            .unwrap();
+        assert_eq!(retry[1].tag, tag_for(2026, 9, 8, Feed::Mlatonly, 1));
+        assert_eq!(find_day_releases_cached(None, 2026, 9, 8, &dir, true).unwrap(), retry);
+        assert!(discover(Feed::Staging, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn only_legacy_negative_lookups_require_a_new_online_check() {
+        for (path_name, main, include_mlat) in [
+            ("releases.json", Feed::Prod, true),
+            ("releases-main.json", Feed::Staging, false),
+        ] {
+            let dir = cache_dir("legacy-negative");
+            let path = dir.join(path_name);
+            let old = vec![cached_release(main)];
+            std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            let day = (2026, 9, 8);
+            assert_eq!(read_cached_listing(&path, day).unwrap(), old);
+            if main == Feed::Prod {
+                assert_eq!(read_listing_for_request(&path, day, Some(false)).unwrap(), old);
+            }
+            assert!(read_listing_for_request(&path, day, Some(include_mlat)).is_none());
+
+            // Rechecking a genuine absence upgrades only the small listing. The old
+            // reader can still recover the same release from the upgraded representation.
+            let found = cached_fetch_releases(day.0, day.1, day.2, &dir, false, include_mlat, |f| {
+                Ok((f == main).then(|| cached_release(f)))
+            }).unwrap();
+            assert_eq!(found.releases, old);
+            assert_eq!(read_listing_for_request(&path, day, Some(include_mlat)).unwrap(), old);
+            assert_eq!(serde_json::from_slice::<Vec<DayRelease>>(&std::fs::read(path).unwrap()).unwrap(), old);
         }
     }
 

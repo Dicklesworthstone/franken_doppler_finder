@@ -1214,6 +1214,8 @@ processed fallback, incomplete main data remains an error under the default poli
 publication failures remain errors under every policy. Online retries still try to add the advertised MLAT feed,
 reusing the completed main raw checkpoint; partial MLAT bytes are never published.
 
+An advertised release with incomplete tar assets triggers a check of later tag suffixes. If all published versions are unusable, discovery records a lookup failure and can retry. When online discovery next relies on an older listing that omits a requested feed, it checks that absence again. Offline searches can still use the archives named in the old listing.
+
 Main-only discoveries use `releases-main.json`. They never replace `releases.json` or
 certify that MLAT is absent. A later online request for both feeds retries MLAT unless an
 existing full listing is reusable under the established publication rules. Offline reconstruction
