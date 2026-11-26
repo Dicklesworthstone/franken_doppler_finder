@@ -539,10 +539,16 @@ pub fn decode_with_selection(
         .unwrap_or_default();
     // start_at_zero can rebase a transport stream on the first *selected* packet.
     // Subtract the container epoch explicitly to retain an audio track's true delay.
-    let filter = format!(
-        "{channel}asetpts=PTS-({})/TB-{start_s}/TB,aresample=async=1:first_pts=0{compensation}",
+    // A source rate/layout change reinitializes its filtergraph. Normalize in a
+    // separate graph so the clock resampler keeps its state instead of inserting
+    // the elapsed recording time as silence again at every format change.
+    // Shift timestamps before normalization to preserve compressed-audio priming.
+    let normalize = format!(
+        "[{stream}]{channel}asetpts=PTS-({})/TB-{start_s}/TB,aformat=sample_fmts=flt:sample_rates={sr}:channel_layouts=mono[fdop_normalized]",
         info.start_time_s
     );
+    let clock =
+        format!("[fdop_normalized]aresample=async=1:first_pts=0{compensation}[fdop_clocked]");
     let mut cmd = Command::new("ffmpeg");
     // Preserve timestamp jumps, including MPEG-TS/HLS gaps over ten seconds.
     // Full probing discards packets, so that path must rewind even at zero.
@@ -564,17 +570,18 @@ pub fn decode_with_selection(
     }
     cmd.arg("-i").arg(path);
     cmd.args([
+        "-filter_complex",
+        &normalize,
+        // async=1 only fills/trims; larger values can stretch the signal.
+        "-filter_complex",
+        &clock,
         "-map",
-        &stream,
+        "[fdop_clocked]",
         "-vn",
         "-ac",
         "1",
         "-ar",
         &sr.to_string(),
-        // Shift out the container epoch and seek offset before filling gaps.
-        // async=1 only fills/trims; larger values can stretch the signal.
-        "-af",
-        &filter,
     ]);
     if let Some(d) = dur {
         // Limit output after gap filling: an input limit can stop before the next packet
@@ -582,7 +589,15 @@ pub fn decode_with_selection(
         cmd.args(["-t", &format!("{d:.3}")]);
     }
     cmd.args(["-f", "f32le", "-"]);
-    decode_command(cmd)
+    decode_command(cmd).map_err(|error| {
+        if error.contains("fdop_normalized")
+            && (error.contains("Invalid stream specifier") || error.contains("matches no streams"))
+        {
+            format!("{error}; install FFmpeg 7.1 or newer for linked audio filtergraphs")
+        } else {
+            error
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1451,6 +1466,163 @@ mod tests {
                 bytes, reference.stdout,
                 "{extension} {input_rate}->{output_rate} priming or timing changed"
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg 7.1+ and ffprobe"]
+    fn source_format_changes_preserve_audio_and_recording_clock() {
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-audio-format-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |path: &Path, rate: u32, channels: u32, frequency: u32, offset: f64| {
+            let made = Command::new("ffmpeg")
+                .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i"])
+                .arg(format!("sine=frequency={frequency}:sample_rate={rate}"))
+                .args(["-frames:a", "100", "-ac", &channels.to_string()])
+                .args(["-c:a", "mp2", "-threads", "1", "-output_ts_offset"])
+                .arg(offset.to_string())
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                made.status.success(),
+                "{}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+        };
+        // Derive endpoints from the actual decoded frames, including codec priming
+        // and trailing samples; nominal generator duration is not the media clock.
+        let span = |path: &Path| {
+            let result = Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", "a:0", "-show_frames"])
+                .args([
+                    "-show_entries",
+                    "frame=pts_time,duration_time",
+                    "-of",
+                    "json",
+                ])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            let frames = doc["frames"].as_array().unwrap();
+            assert!(frames.len() >= 100);
+            let seconds = |frame: &serde_json::Value, key: &str| {
+                frame[key].as_str().unwrap().parse::<f64>().unwrap()
+            };
+            let first = frames.first().unwrap();
+            let last = frames.last().unwrap();
+            (
+                seconds(first, "pts_time"),
+                seconds(last, "pts_time") + seconds(last, "duration_time"),
+            )
+        };
+        let tone = |pcm: &[f32], start: f64, duration: f64, hz: f64| {
+            let lo = (start * 4000.0).round() as usize;
+            let count = (duration * 4000.0).round() as usize;
+            let window = &pcm[lo..lo + count];
+            let rms =
+                (window.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() / count as f64).sqrt();
+            assert!(rms > 0.04, "tone at {start}s disappeared: RMS {rms}");
+            let crossings = window
+                .windows(2)
+                .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+                .count();
+            let measured = crossings as f64 / duration;
+            assert!(
+                (measured - hz).abs() <= 1.0 / duration,
+                "tone {hz} became {measured} Hz"
+            );
+        };
+        for (name, first_rate, next_rate, next_channels) in
+            [("rate", 44_100, 48_000, 1), ("layout", 48_000, 48_000, 2)]
+        {
+            let first = dir.join(format!("{name}-first.ts"));
+            let next = dir.join(format!("{name}-next.ts"));
+            make(&first, first_rate, 1, 400, 123.0);
+            make(&next, next_rate, next_channels, 600, 0.0);
+            let (origin, first_end) = span(&first);
+            let (next_start, _) = span(&next);
+            for gap in [-0.04, 0.0, 0.04] {
+                let shifted = dir.join(format!("{name}-{gap}-shifted.ts"));
+                let moved = Command::new("ffmpeg")
+                    .args(["-nostdin", "-v", "error", "-copyts", "-i"])
+                    .arg(&next)
+                    .args([
+                        "-map",
+                        "0:a:0",
+                        "-c:a",
+                        "copy",
+                        "-mpegts_copyts",
+                        "1",
+                        "-muxdelay",
+                        "0",
+                    ])
+                    .args([
+                        "-output_ts_offset",
+                        &(first_end + gap - next_start).to_string(),
+                    ])
+                    .arg(&shifted)
+                    .output()
+                    .unwrap();
+                assert!(
+                    moved.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&moved.stderr)
+                );
+                let (shifted_start, _) = span(&shifted);
+                assert!((shifted_start - first_end - gap).abs() < 2.0 / 90_000.0);
+                let path = dir.join(format!("{name}-{gap}.ts"));
+                let mut bytes = std::fs::read(&first).unwrap();
+                bytes.extend(std::fs::read(&shifted).unwrap());
+                std::fs::write(&path, bytes).unwrap();
+                let (source_start, source_end) = span(&path);
+                assert_eq!(source_start, origin);
+                let duration = source_end - source_start;
+                let switch = shifted_start - origin;
+                // Channel zero exists on both sides, even when the layout changes.
+                for channel in [None, Some(0)] {
+                    let selection = AudioSelection { stream: 0, channel };
+                    let pcm = decode_with_selection(&path, 0.0, None, 4000, selection).unwrap();
+                    assert!(
+                        (pcm.len() as f64 / 4000.0 - duration).abs() <= 2.0 / 4000.0,
+                        "{name}, gap {gap}, channel {channel:?}: {} samples for {duration}s",
+                        pcm.len()
+                    );
+                    let first_sound = pcm.iter().position(|x| x.abs() > 0.02).unwrap();
+                    let last_sound = pcm.iter().rposition(|x| x.abs() > 0.02).unwrap();
+                    assert!(first_sound as f64 / 4000.0 < 0.03);
+                    assert!(duration - last_sound as f64 / 4000.0 < 0.03);
+                    tone(&pcm, 0.5, 1.0, 400.0);
+                    tone(&pcm, switch + 0.4, 1.0, 600.0);
+                    if gap > 0.0 {
+                        let lo = ((first_end - origin + 0.008) * 4000.0).ceil() as usize;
+                        let hi = ((switch - 0.008) * 4000.0).floor() as usize;
+                        assert!(
+                            pcm[lo..hi].iter().all(|x| x.abs() < 1e-5),
+                            "format change erased the true packet gap"
+                        );
+                    }
+                    let start = ((switch - 0.4) * 1000.0).floor() / 1000.0;
+                    let clip =
+                        decode_with_selection(&path, start, Some(1.2), 4000, selection).unwrap();
+                    assert_eq!(clip.len(), 4800);
+                    tone(&clip, switch - start - 0.3, 0.2, 400.0);
+                    tone(&clip, switch - start + 0.1, 0.2, 600.0);
+                }
+            }
         }
     }
 

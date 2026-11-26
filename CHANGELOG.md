@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve the audio clock across source format changes
+
+- Normalize sample-rate and channel-layout changes in a separate linked filtergraph so
+  timestamp repair keeps its state. A source format change no longer inserts elapsed
+  recording time as silence again. Preserve true gaps, overlap trimming, channel selection,
+  seek offsets and compressed decoder priming.
+- Require FFmpeg 7.1 or newer and report an upgrade hint when linked filtergraphs are
+  unsupported. No Rust dependencies or toolchain pins changed.
+- Add real-media synthetic regressions for rate/layout changes with continuous timestamps,
+  40 ms gaps and overlaps, a nonzero epoch, downmix and selected channels: 12 whole decodes
+  and 12 seeks. The preceding decoder fails, returning 7.67675 seconds for a 5.022367-second
+  source span. Updated whole decodes stay within two output samples of the source clock.
+- Exact production audio/time modules pass 18 ordinary and all 10 opt-in FFmpeg tests
+  natively on the pinned compiler. Changed-line formatting and whitespace checks pass.
+  Full workspace tests, Clippy, release selftest and reference/field replays remain unrun;
+  no field-accuracy or performance improvement is claimed.
+
 ### Keep recovered clocks through weighted refinement
 
 - Retry the existing scan-cell neighborhood of a physical timing seed whose weighted
