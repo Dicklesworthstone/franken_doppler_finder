@@ -31,10 +31,13 @@ pub enum Cmd {
     Locate(LocateCli),
     /// Detect and measure flyovers only (no ADS-B); writes events.json, traces and figures.
     Detect(DetectCli),
-    /// Export the first video track as a silent MP4 and check it for audio and location tags.
+    /// Remove the original audio and export a verified MP4, optionally with a separate soundtrack.
     Mute {
         /// Local video recording to copy.
         media: PathBuf,
+        /// Use the first audio track of this separate local file as the only soundtrack.
+        #[arg(long)]
+        soundtrack: Option<PathBuf>,
         /// New .mp4 file for the verified export.
         #[arg(short, long)]
         out: PathBuf,
@@ -330,12 +333,13 @@ fn run(cli: Cli) -> Result<i32, String> {
             Ok(if out.found { 0 } else { 1 })
         }
         Cmd::Detect(d) => run_detect(d, std::io::stdout().lock()),
-        Cmd::Mute { media, out } => {
-            crate::mute::export(&media, &out)?;
-            println!(
-                "Wrote {}. Verified zero audio streams and no recognized location tags. Review the video itself before sharing.",
-                out.display()
-            );
+        Cmd::Mute { media, soundtrack, out } => {
+            crate::mute::export(&media, &out, soundtrack.as_deref())?;
+            if soundtrack.is_some() {
+                println!("Wrote {} with one replacement soundtrack and no recognized location tags. Review the video and audit the replacement audio before sharing.", out.display());
+            } else {
+                println!("Wrote {}. Verified zero audio streams and no recognized location tags. Review the video itself before sharing.", out.display());
+            }
             Ok(0)
         }
         Cmd::Fetch(f) => {

@@ -109,6 +109,8 @@ pub struct AudioInventory {
     pub possible_location_telemetry: Vec<TelemetryTrack>,
     /// A complete inventory showed one non-cover video stream and zero chapters.
     pub single_video_without_chapters: bool,
+    /// Exactly one non-cover video, one audio stream, no other streams and no chapters.
+    pub video_with_soundtrack_without_chapters: bool,
 }
 
 pub fn probe_audio_inventory(path: &Path) -> Result<AudioInventory, String> {
@@ -149,16 +151,20 @@ fn audit_inventory(path: &Path, doc: &serde_json::Value) -> Result<AudioInventor
             });
         }
     }
-    let single_video_without_chapters = matches!(streams.as_slice(), [s] if
+    let video_and_audio_only = streams.len() == audio.len() + 1
+        && streams.iter().any(|s|
         s["codec_type"] == "video"
         && s["disposition"]["attached_pic"].as_u64() == Some(0)
         && s["disposition"]["timed_thumbnails"].as_u64() == Some(0))
         && doc["chapters"].as_array().is_some_and(Vec::is_empty);
+    let single_video_without_chapters = video_and_audio_only && audio.is_empty();
+    let video_with_soundtrack_without_chapters = video_and_audio_only && audio.len() == 1;
     Ok(AudioInventory {
         streams: audio,
         location_tag_detected,
         possible_location_telemetry,
         single_video_without_chapters,
+        video_with_soundtrack_without_chapters,
     })
 }
 

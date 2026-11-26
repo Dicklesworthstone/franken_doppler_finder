@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Export video with a separate narration or music track
+
+- Add `fdop mute VIDEO --soundtrack FILE --out share.mp4`. Copy the first non-cover video, drop all original audio and use only the first audio track from the separate local file. Short replacement audio is padded and long audio is trimmed to the video.
+- Check the staged MP4 for the requested video/audio layout, zero chapters and recognized location tags before publishing. Existing destinations are protected by a no-clobber install.
+
 ### Compare trace evidence against all completed decoy searches
 
 - Include a completed control with no candidate at zero nats when other controls return negative scores. The existing three-nat lead now compares against the strongest of all completed controls.

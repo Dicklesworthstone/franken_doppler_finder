@@ -948,7 +948,7 @@ fdop detect clip.m4a -o runs/detect
 Use `detect` to audit your own recordings (see
 [Protecting your own recordings](#protecting-your-own-recordings)).
 
-### `fdop mute <MEDIA> --out <VIDEO.mp4>`
+### `fdop mute <MEDIA> --out <VIDEO.mp4> [--soundtrack <FILE>]`
 
 When the soundtrack is optional, make a silent copy before sharing a video:
 
@@ -956,17 +956,28 @@ When the soundtrack is optional, make a silent copy before sharing a video:
 fdop mute clip.mov --out silent.mp4
 ```
 
+To keep narration or music, supply a separate local recording. Only its first audio
+track enters the export. For example, to publish a voice-over recorded elsewhere:
+
+```bash
+fdop mute clip.mov --soundtrack narration.wav --out narrated.mp4
+fdop detect narrated.mp4 --all-audio
+```
+
 `mute` works offline with FFmpeg and FFprobe. It copies the first video stream that is not
-cover art into a new MP4, without re-encoding. It drops every audio track, additional video
+cover art into a new MP4, without re-encoding. It drops every original audio track, additional video
 stream, subtitle track, data track, attachment and chapter, and disables copying container
-and stream metadata. Before publishing the export, FFprobe verifies that its entire stream
-list consists of one non-cover video and that it has zero chapters and no recognized
-location tags. An occupied output path
-is an error. The destination directory must already exist. Audio-only inputs and video
+and stream metadata. With `--soundtrack`, FFmpeg encodes the replacement as AAC, starting
+its first sample at the beginning of the export. A short track is padded with silence and
+a long one ends with the video. FFprobe verifies the completed file has one non-cover video
+track, the requested number of audio tracks (zero or one), zero chapters, no other streams
+and no recognized location tags. An occupied output path is an error.
+The destination directory must already exist. Inputs without video and video
 codecs that FFmpeg cannot copy into MP4 produce an error.
 
 Review the pictures and anything embedded in the encoded video, including in-band captions,
-before sharing. Those travel with the video stream.
+before sharing. Those travel with the video stream. The replacement audio can carry its own
+location clues. Listen to it and audit the final export.
 
 ### `fdop fetch`: pre-download ADS-B
 
@@ -5706,7 +5717,9 @@ audio or video recorded somewhere sensitive:
 
 If you can publish the video without sound, `fdop mute your_file.mp4 --out silent.mp4`
 removes all audio tracks, including commentary and alternate microphones. It verifies
-the new file before reporting success. Review the visual content separately.
+the new file before reporting success. To keep music or narration, add
+`--soundtrack narration.wav` using audio recorded away from the sensitive site.
+Review the visual content separately.
 
 1. **Audit it:** `fdop detect your_file.mp4 --all-audio`. Check the independent aircraft pass count,
    location-tag warning and possible telemetry tracks. Two
