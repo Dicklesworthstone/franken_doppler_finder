@@ -1715,6 +1715,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

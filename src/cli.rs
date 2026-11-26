@@ -1,4 +1,4 @@
-//! Command line: `fdop locate | detect | fetch | runs | doctor | selftest`.
+//! Command line: `fdop locate | detect | mute | fetch | runs | doctor | selftest`.
 
 use crate::pipeline::{self, LocateArgs, Log};
 use clap::{Args, Parser, Subcommand};
@@ -31,6 +31,14 @@ pub enum Cmd {
     Locate(LocateCli),
     /// Detect and measure flyovers only (no ADS-B); writes events.json, traces and figures.
     Detect(DetectCli),
+    /// Export the first video track as a silent MP4 and check it for audio and location tags.
+    Mute {
+        /// Local video recording to copy.
+        media: PathBuf,
+        /// New .mp4 file for the verified export.
+        #[arg(short, long)]
+        out: PathBuf,
+    },
     /// Pre-download and cache ADS-B tracks for dates + region.
     Fetch(FetchCli),
     /// List past `locate` runs from the run ledger.
@@ -312,6 +320,14 @@ fn run(cli: Cli) -> Result<i32, String> {
             Ok(if out.found { 0 } else { 1 })
         }
         Cmd::Detect(d) => run_detect(d, std::io::stdout().lock()),
+        Cmd::Mute { media, out } => {
+            crate::mute::export(&media, &out)?;
+            println!(
+                "Wrote {}. Verified zero audio streams and no recognized location tags. Review the video itself before sharing.",
+                out.display()
+            );
+            Ok(0)
+        }
         Cmd::Fetch(f) => {
             let log = Log::new(f.common.quiet);
             let cache = cache_of(&f.common);

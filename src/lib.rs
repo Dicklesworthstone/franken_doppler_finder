@@ -11,5 +11,6 @@
 pub mod cli;
 pub mod doctor;
 pub mod ledger;
+mod mute;
 pub mod pipeline;
 pub mod selftest;

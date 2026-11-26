@@ -19,6 +19,16 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Export a verified silent copy of a video
+
+- Add `fdop mute <media> --out <new.mp4>`. The command copies the first non-cover-art
+  video stream, drops the soundtrack and secondary streams, and disables chapter and
+  metadata copying. It checks the staged MP4 for audio and recognized location tags
+  before publishing it at an unused destination.
+- A synthetic multi-track export passed the FFmpeg integration test, including identical
+  decoded primary-video hashes. Audio-only input and occupied destinations were refused.
+  Visual information and metadata embedded inside the video bitstream still require review.
+
 ### Detect location metadata retained in silent exports
 
 - Inspect FFprobe's chapter and program tags alongside the existing container and stream tags.

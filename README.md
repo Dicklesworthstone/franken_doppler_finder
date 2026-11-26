@@ -754,7 +754,7 @@ fdop selftest           # offline end-to-end known-answer run
 
 ## Command reference
 
-`fdop` has six subcommands. Run `fdop <cmd> --help` for the built-in text. The shared options `--cache`,
+`fdop` has seven subcommands. Run `fdop <cmd> --help` for the built-in text. The shared options `--cache`,
 `--offline`, `--include-jets` and `-q/--quiet` belong to `locate` and `fetch`, and go after the subcommand. `detect` needs no data
 and takes `-o`, `-q`, `--json` and the audio selection options below. `runs` and `doctor` take `--cache` too.
 
@@ -931,6 +931,25 @@ fdop detect clip.m4a -o runs/detect
 
 Use `detect` to audit your own recordings (see
 [Protecting your own recordings](#protecting-your-own-recordings)).
+
+### `fdop mute <MEDIA> --out <VIDEO.mp4>`
+
+When the soundtrack is optional, make a silent copy before sharing a video:
+
+```bash
+fdop mute clip.mov --out silent.mp4
+```
+
+`mute` works offline with FFmpeg and FFprobe. It copies the first video stream that is not
+cover art into a new MP4, without re-encoding. It drops every audio track, additional video
+stream, subtitle track, data track, attachment and chapter, and disables copying container
+and stream metadata. FFprobe checks the completed export for zero audio streams and no
+recognized location tags before it appears at the requested path. An occupied output path
+is an error. The destination directory must already exist. Audio-only inputs and video
+codecs that FFmpeg cannot copy into MP4 produce an error.
+
+Review the pictures and anything embedded in the encoded video, including in-band captions,
+before sharing. Those travel with the video stream.
 
 ### `fdop fetch`: pre-download ADS-B
 
@@ -5616,6 +5635,10 @@ Developer examples (`cargo run --release -p <package> --example <name> -- ...`; 
 
 The video's lesson is that this leak is easy to miss: the curves are usually inaudible. Before you publish
 audio or video recorded somewhere sensitive:
+
+If you can publish the video without sound, `fdop mute your_file.mp4 --out silent.mp4`
+removes all audio tracks, including commentary and alternate microphones. It verifies
+the new file before reporting success. Review the visual content separately.
 
 1. **Audit it:** `fdop detect your_file.mp4 --all-audio`. Check the independent aircraft pass count and the location-tag warning. Two
    independent passes with the time between them intact are high risk. One pass together with a known
