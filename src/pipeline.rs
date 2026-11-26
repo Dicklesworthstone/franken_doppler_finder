@@ -1404,7 +1404,7 @@ fn decoy_gate(evidence: f64, runs: &[(f64, Option<f64>)]) -> (bool, String) {
     }
     let best = runs
         .iter()
-        .filter_map(|r| r.1)
+        .map(|(_, score)| score.unwrap_or(0.0))
         .reduce(f64::max)
         .unwrap_or(0.0);
     let lead = evidence - best;
@@ -1807,10 +1807,16 @@ fn judge_decoy_attempts(
     evidence: f64,
     attempts: impl Iterator<Item = (f64, Result<Option<f64>, String>)>,
 ) -> (bool, String) {
+    if !evidence.is_finite() {
+        return (false, "primary trace evidence is nonfinite; the decoy lead cannot be measured".into());
+    }
     let mut completed = Vec::new();
     let mut skipped = Vec::new();
     for (shift, result) in attempts {
         match result {
+            Ok(Some(score)) if !score.is_finite() => {
+                skipped.push(format!("{:+.0} h: nonfinite trace evidence", shift / 3600.0));
+            }
             Ok(score) => {
                 completed.push((shift, score));
                 if completed.len() == DECOY_CLOCKS {
@@ -4331,6 +4337,34 @@ mod tests {
             &runs([Some(14.88), Some(14.64), Some(14.91), Some(16.88)])[..3],
         );
         assert!(!pass && why.contains("only 3 of 4"), "{why}");
+    }
+
+    #[test]
+    fn empty_decoys_compete_at_zero_and_invalid_scores_do_not_count() {
+        let runs = |scores: [Option<f64>; 4]| {
+            [-7200.0, -3600.0, 3600.0, 7200.0].into_iter().zip(scores)
+        };
+        let mixed = [None, Some(-4.0), Some(-5.0), Some(-6.0)];
+        let check = |primary, scores| {
+            judge_decoy_attempts(primary, runs(scores).map(|(shift, score)| (shift, Ok(score))))
+        };
+        let (pass, why) = check(1.0, mixed);
+        assert!(!pass && why.contains("vs 0.00") && why.contains("+1.00 nats"), "{why}");
+        assert!(check(3.0, mixed).0);
+        // When all four controls find candidates, the measured best can itself be negative.
+        assert!(check(-1.0, [Some(-4.0), Some(-5.0), Some(-6.0), Some(-7.0)]).0);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let attempts = runs([Some(invalid), None, Some(-2.0), Some(-3.0)]);
+            let (pass, why) = judge_decoy_attempts(
+                3.0, attempts.clone().map(|(s, score)| (s, Ok(score))),
+            );
+            assert!(!pass && why.contains("only 3 of 4") && why.contains("nonfinite trace evidence"), "{why}");
+            let (pass, why) = judge_decoy_attempts(
+                3.0, attempts.chain([(10800.0, Some(2.0))]).map(|(s, score)| (s, Ok(score))),
+            );
+            assert!(!pass && why.contains("vs 2.00") && why.contains("+3 h 2.00"), "{why}");
+            assert!(!judge_decoy_attempts(invalid, std::iter::once_with(|| panic!("no finite primary evidence"))).0);
+        }
     }
 
     #[test]

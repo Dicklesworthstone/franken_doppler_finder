@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Compare trace evidence against all completed decoy searches
+
+- Include a completed control with no candidate at zero nats when other controls return negative scores. The existing three-nat lead now compares against the strongest of all completed controls.
+- Skip and report nonfinite control scores, try another covered control if available, and decline a decoy grade for nonfinite primary evidence.
+
 ### Require measured evidence for an independent recording clock
 
 - A trace match now needs a finite independent clock fit over at least 60% of the measured trace to pass the clock-lock check. Missing coverage and unusable fits report an unavailable clock. A measured zero-second offset still passes.

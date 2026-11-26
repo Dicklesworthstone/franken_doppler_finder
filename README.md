@@ -451,7 +451,7 @@ the window's width plus 10 minutes, so no decoy window reaches the true start: 1
 one-hour recording's `creation_time` window, which spans the recording. A decoy draws no figures or map and looks
 up no place name online. Each shift keeps the width of the start window actually searched, including a primary
 window narrowed by the dates or by archive publication. A control can count with no candidate when its shifted
-clock was fully covered and its trace comparison finished. The gate records skipped shifts and their reasons,
+clock was fully covered and its trace comparison finished. Such an empty control contributes zero nats even when other controls find candidates with negative evidence. A nonfinite candidate score makes the control unusable. The gate records skipped shifts and their reasons,
 tries the remaining shifts, and grades the answer low if fewer than four complete comparisons remain.
 Hours off, no true pass lines up, but the recording, the place and the day's traffic are
 the same, so the best decoy shows how much evidence chance fits to this recording's sounds reach there. The answer
