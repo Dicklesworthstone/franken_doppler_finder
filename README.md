@@ -907,7 +907,7 @@ output directory is `fdop_runs/detect`.
 For a prepublication check of the whole file, run `fdop detect clip.mov --all-audio --json`.
 It measures each audio track's mono mix and each individual channel on multichannel tracks, one at a time.
 This can reveal a pass on a secondary track or on channels that cancel in the mix. The JSON gives
-`audio_stream_count`, the file-wide `location_tag_detected` flag, and one entry in `sources` for each view. A muted video still receives a metadata check. With zero audio tracks the source list is empty. The tag check covers recognized location tags in the container and stream metadata exposed by FFprobe. An incomplete stream inventory fails the audit. Each entry has its own pass count,
+`audio_stream_count`, the file-wide `location_tag_detected` flag, and one entry in `sources` for each view. A muted video still receives a metadata check. With zero audio tracks the source list is empty. The tag check covers recognized location tags that FFprobe exposes on the container, streams, chapters and programs, including separate GPS latitude and longitude fields. An incomplete stream inventory fails the audit. Each entry has its own pass count,
 event IDs, warnings and `events_file` path (relative to the working directory for a relative output path).
 The same aircraft can appear in several views, so compare their counts individually.
 The complete summary appears on stdout after every view succeeds. A decode or measurement failure exits
@@ -917,7 +917,7 @@ directory under a fresh `fdop_runs/detect-all` (with a numeric suffix when occup
 
 The default output prints one line per event. The progress output on stderr identifies the independent aircraft passes after applying the same aircraft checks and duplicate/harmonic grouping as `locate`. Several successful fits can describe one pass.
 
-Use `fdop detect clip.mov --json` for a machine-readable audit. Its stdout includes the selected stream and channel, decoded duration, a flag for a nonblank recognized location tag, independent pass count and event IDs, measured events and warnings. The tag flag covers the container and all streams. Coordinates and text in recognized location tags, such as a QuickTime place name, both trigger it. The audit omits the tag values. The count applies to the selected audio. A count of zero cannot establish that a recording is safe to publish.
+Use `fdop detect clip.mov --json` for a machine-readable audit. Its stdout includes the selected stream and channel, decoded duration, a flag for a nonblank recognized location tag, independent pass count and event IDs, measured events and warnings. The tag flag covers the container, all streams, chapters and programs. An individual GPS coordinate field or a recording-place tag can trigger it even when no complete coordinate pair is available. The audit omits the tag values. The count applies to the selected audio. A count of zero cannot establish that a recording is safe to publish.
 
 
 ```text

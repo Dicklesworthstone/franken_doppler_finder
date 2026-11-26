@@ -19,6 +19,15 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Detect location metadata retained in silent exports
+
+- Inspect FFprobe's chapter and program tags alongside the existing container and stream tags.
+  A recording-place field or a single GPS latitude or longitude field now triggers the
+  publication warning. The audit reports presence and omits the private tag value.
+- A native regression reproduced the missed warning on a synthetic silent Matroska video
+  with a chapter GPS tag. A second regression checked all four metadata scopes and blank
+  values. Both passed on the pinned nightly with the production audio module.
+
 ### Recover the requested archive day from misplaced release listings
 
 - Validate cached full and main release listings against the requested UTC day, archive

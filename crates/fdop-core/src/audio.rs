@@ -124,7 +124,7 @@ fn audit_inventory(path: &Path, doc: &serde_json::Value) -> Result<AudioInventor
     } else {
         Vec::new()
     };
-    let location_tag_detected = media_tags(&doc["format"], streams).any(|(k, v)| is_location_tag(k, v));
+    let location_tag_detected = media_tags(doc).any(|(k, v)| is_location_tag(k, v));
     Ok(AudioInventory { streams: audio, location_tag_detected })
 }
 
@@ -145,6 +145,8 @@ fn probe_document(
             "json",
             "-show_format",
             "-show_streams",
+            "-show_entries",
+            "chapter_tags:program_tags",
         ])
         .arg(path)
         .output()
@@ -242,7 +244,7 @@ fn media_info(
             }
         }
     }
-    info.tags = media_tags(fmt, streams)
+    info.tags = media_tags(j)
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
     for (k, v) in &info.tags {
@@ -261,12 +263,13 @@ fn media_info(
     Ok(info)
 }
 
-fn media_tags<'a>(
-    format: &'a serde_json::Value,
-    streams: &'a [serde_json::Value],
-) -> impl Iterator<Item = (&'a str, &'a str)> {
-    std::iter::once(format)
-        .chain(streams)
+fn media_tags(doc: &serde_json::Value) -> impl Iterator<Item = (&str, &str)> {
+    let sections = ["streams", "chapters", "programs"]
+        .into_iter()
+        .filter_map(|name| doc[name].as_array())
+        .flatten();
+    std::iter::once(&doc["format"])
+        .chain(sections)
         .filter_map(|source| source["tags"].as_object())
         .flatten()
         .filter_map(|(k, v)| Some((k.as_str(), v.as_str()?)))
@@ -279,8 +282,23 @@ fn is_location_tag(key: &str, value: &str) -> bool {
         .strip_prefix("location-")
         .is_some_and(|lang| lang.len() == 3 && lang.bytes().all(|b| b.is_ascii_lowercase()));
     !value.trim().is_empty()
-        && (key.contains("iso6709") || key == "location" || localized
-            || key.ends_with(".location") || key == "com.apple.quicktime.location.name")
+        && (key.contains("iso6709")
+            || localized
+            || key.ends_with(".location")
+            || matches!(
+                key.as_str(),
+                "location"
+                    | "com.apple.quicktime.location.name"
+                    | "recording_location"
+                    | "location_name"
+                    | "location_latitude"
+                    | "location_longitude"
+                    | "gpslatitude"
+                    | "gpslongitude"
+                    | "gpscoordinates"
+                    | "gps_latitude"
+                    | "gps_longitude"
+            ))
 }
 
 /// Parse the leading `±DD.DDDD±DDD.DDDD` of an ISO 6709 string.
@@ -797,6 +815,87 @@ mod tests {
 
         j["streams"][1]["tags"] = serde_json::json!({"location-accuracy": "10"});
         assert!(probe(&j).location_iso6709.is_none());
+    }
+
+    #[test]
+    fn split_gps_and_place_tags_warn_in_each_metadata_scope() {
+        let path = Path::new("tagged.mkv");
+        let doc = serde_json::json!({
+            "format": {"format_name": "matroska", "nb_streams": 1},
+            "streams": [{"codec_type": "audio", "channels": 1}],
+            "chapters": [{}], "programs": [{}]
+        });
+        for (section, name) in [
+            ("/format", "GPSCoordinates"),
+            ("/streams/0", "RECORDING_LOCATION"),
+            ("/chapters/0", "GPSLatitude"),
+            ("/programs/0", "GPS_LONGITUDE"),
+        ] {
+            for (value, expected) in [("private-place-marker", true), ("  ", false)] {
+                let mut tagged = doc.clone();
+                tagged.pointer_mut(section).unwrap()["tags"] = serde_json::json!({(name): value});
+                let inventory = audit_inventory(path, &tagged).unwrap();
+                assert_eq!(
+                    inventory.location_tag_detected, expected,
+                    "{section} {name}"
+                );
+                assert_eq!(inventory.streams[0].location_iso6709.is_some(), expected);
+                assert!(inventory.streams[0].location_latlon.is_none());
+            }
+        }
+        let mut unrelated = doc;
+        unrelated["chapters"][0]["tags"] =
+            serde_json::json!({"title": "GPSLatitude", "GPSLatitudeRef": "N"});
+        assert!(
+            !audit_inventory(path, &unrelated)
+                .unwrap()
+                .location_tag_detected
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn chapter_gps_is_visible_in_a_silent_export() {
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-chapter-audit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let metadata = dir.join("chapters.ffmeta");
+        let video = dir.join("silent.mkv");
+        std::fs::write(
+            &metadata,
+            b";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=200\nGPSLatitude=private-chapter-marker\n",
+        )
+        .unwrap();
+        let export = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=s=16x16:d=0.2",
+            ])
+            .args(["-f", "ffmetadata", "-i"])
+            .arg(metadata)
+            .args(["-map", "0:v", "-map_chapters", "1", "-c:v", "ffv1"])
+            .arg(&video)
+            .output()
+            .unwrap();
+        assert!(
+            export.status.success(),
+            "{}",
+            String::from_utf8_lossy(&export.stderr)
+        );
+        let audit = probe_audio_inventory(&video).unwrap();
+        assert!(audit.streams.is_empty());
+        assert!(audit.location_tag_detected);
     }
 
     #[test]
