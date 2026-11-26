@@ -1876,9 +1876,16 @@ fn locate_with_clock(
     if !a.media.is_file() {
         return Err(format!("{}: not a file", a.media.display()));
     }
-    let info = match recording {
-        Some(r) => r.info.clone(),
-        None => audio::probe_with_selection(&a.media, a.audio_selection)?,
+    let (info, probe) = match recording {
+        Some(r) => (r.info.clone(), None),
+        None => {
+            let probe = if a.offline {
+                audio::AudioProbe::open_offline(&a.media)
+            } else {
+                audio::AudioProbe::open(&a.media)
+            }?;
+            (probe.selected_info(a.audio_selection)?, Some(probe))
+        }
     };
     log.say(&format!(
         "media: {:.1} s, {} {} Hz x{}, audio stream {}, channel {}, creation_time {:?}",
@@ -1923,10 +1930,9 @@ fn locate_with_clock(
     // missing/incorrect duration tag. Decode before publication clipping; weather still
     // overlaps detection and measurement. Metadata retains both start/end conventions.
     let t = Instant::now();
-    let x = if recording.is_none() {
-        audio::decode_with_selection(&a.media, 0.0, None, a.sr, a.audio_selection)?
-    } else {
-        Vec::new()
+    let x = match probe {
+        Some(probe) => audio::decode_probed(&probe, 0.0, None, a.sr, a.audio_selection)?,
+        None => Vec::new(),
     };
     let dur = recording.map_or_else(|| x.len() as f64 / a.sr as f64, |r| r.duration_s);
     let low_band = match recording {

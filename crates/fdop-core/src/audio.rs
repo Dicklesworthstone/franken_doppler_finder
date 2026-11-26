@@ -61,31 +61,65 @@ pub fn probe_with_selection(path: &Path, selection: AudioSelection) -> Result<Me
     AudioProbe::open(path)?.selected_info(selection)
 }
 
+#[derive(Clone, Copy)]
+enum InputAccess {
+    Default,
+    Offline,
+}
+
+impl InputAccess {
+    fn command(self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        if matches!(self, Self::Offline) {
+            // FFmpeg applies this whitelist to nested inputs as well. Local
+            // segments, local encrypted media and embedded data remain readable.
+            command.args(["-protocol_whitelist", "file,crypto,data"]);
+        }
+        command
+    }
+}
+
 /// A file's complete stream discovery and, when decoding begins, its ordinary
 /// probe. Every selected view uses the same container epoch and stream ordering.
 pub struct AudioProbe<'a> {
     path: &'a Path,
     complete: serde_json::Value,
     ordinary: OnceCell<Option<serde_json::Value>>,
+    access: InputAccess,
 }
 
 impl<'a> AudioProbe<'a> {
-    fn read(path: &'a Path, require_clean_probe: bool) -> Result<Self, String> {
+    fn read(path: &'a Path, require_clean_probe: bool, access: InputAccess) -> Result<Self, String> {
         Ok(Self {
             path,
-            complete: probe_document(path, require_clean_probe, true)?,
+            complete: probe_document(path, require_clean_probe, true, access)?,
+            access,
             ordinary: OnceCell::new(),
         })
     }
 
     /// Discover all streams, including late tracks in dynamic containers.
     pub fn open(path: &'a Path) -> Result<Self, String> {
-        Self::read(path, false)
+        Self::read(path, false, InputAccess::Default)
+    }
+
+    /// Permit only local files and embedded data throughout discovery and decoding.
+    pub fn open_offline(path: &'a Path) -> Result<Self, String> {
+        Self::read(path, false, InputAccess::Offline)
     }
 
     /// Require clean discovery and a complete inventory for a publication audit.
     pub fn for_audit(path: &'a Path) -> Result<(Self, AudioInventory), String> {
-        let probe = Self::read(path, true)?;
+        Self::audit(path, InputAccess::Default)
+    }
+
+    /// Perform complete publication-audit discovery with network access disabled.
+    pub fn for_offline_audit(path: &'a Path) -> Result<(Self, AudioInventory), String> {
+        Self::audit(path, InputAccess::Offline)
+    }
+
+    fn audit(path: &'a Path, access: InputAccess) -> Result<(Self, AudioInventory), String> {
+        let probe = Self::read(path, true, access)?;
         let inventory = audit_inventory(path, &probe.complete)?;
         Ok((probe, inventory))
     }
@@ -97,7 +131,7 @@ impl<'a> AudioProbe<'a> {
 
 /// Probe once so a whole-file audit uses the same stream inventory throughout.
 pub fn probe_audio_streams(path: &Path) -> Result<Vec<MediaInfo>, String> {
-    let doc = probe_document(path, false, true)?;
+    let doc = probe_document(path, false, true, InputAccess::Default)?;
     all_stream_info(path, &doc)
 }
 
@@ -149,7 +183,7 @@ pub struct AudioInventory {
 }
 
 pub fn probe_audio_inventory(path: &Path) -> Result<AudioInventory, String> {
-    audit_inventory(path, &probe_document(path, true, true)?)
+    audit_inventory(path, &probe_document(path, true, true, InputAccess::Default)?)
 }
 
 fn audit_inventory(path: &Path, doc: &serde_json::Value) -> Result<AudioInventory, String> {
@@ -207,8 +241,9 @@ fn probe_document(
     path: &Path,
     require_clean_probe: bool,
     complete: bool,
+    access: InputAccess,
 ) -> Result<serde_json::Value, String> {
-    let mut cmd = Command::new("ffprobe");
+    let mut cmd = access.command("ffprobe");
     if complete {
         cmd.args(FULL_PROBE_ARGS);
     }
@@ -576,7 +611,7 @@ pub fn decode_probed(
     // Keep the complete probe's container epoch whichever decoder path is used.
     let ordinary = probe
         .ordinary
-        .get_or_init(|| probe_document(path, false, false).ok());
+        .get_or_init(|| probe_document(path, false, false, probe.access).ok());
     let full_probe = ordinary
         .as_ref()
         .and_then(|doc| media_info(path, doc, selection).ok())
@@ -605,7 +640,7 @@ pub fn decode_probed(
     );
     let clock =
         format!("[fdop_normalized]aresample=async=1:first_pts=0{compensation}[fdop_clocked]");
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = probe.access.command("ffmpeg");
     // Preserve timestamp jumps, including MPEG-TS/HLS gaps over ten seconds.
     // Full probing discards packets, so that path must rewind even at zero.
     cmd.args([
@@ -659,6 +694,16 @@ pub fn decode_probed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_media_commands_allow_only_local_input_protocols() {
+        for program in ["ffprobe", "ffmpeg"] {
+            let offline = InputAccess::Offline.command(program);
+            let args: Vec<_> = offline.get_args().filter_map(|arg| arg.to_str()).collect();
+            assert_eq!(args, ["-protocol_whitelist", "file,crypto,data"]);
+            assert_eq!(InputAccess::Default.command(program).get_args().count(), 0);
+        }
+    }
 
     #[test]
     fn all_stream_probe_keeps_audio_ordinals_and_requires_known_channels() {
@@ -1353,6 +1398,11 @@ mod tests {
         assert_eq!(
             decode_probed(&source, 0.0, None, 4000, AudioSelection::default()).unwrap(),
             pcm
+        );
+        let local = AudioProbe::open_offline(&path).unwrap();
+        assert_eq!(
+            decode_probed(&local, 0.0, None, 4000, selection).unwrap(),
+            alternate
         );
         assert!(matches!(source.ordinary.get(), Some(Some(_))));
         assert_eq!(

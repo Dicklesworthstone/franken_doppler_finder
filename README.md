@@ -763,8 +763,7 @@ fdop selftest           # offline end-to-end known-answer run
 ## Command reference
 
 `fdop` has seven subcommands. Run `fdop <cmd> --help` for the built-in text. The shared options `--cache`,
-`--offline`, `--include-jets` and `-q/--quiet` belong to `locate` and `fetch`, and go after the subcommand. `detect` needs no data
-and takes `-o`, `-q`, `--json` and the audio selection options below. `runs` and `doctor` take `--cache` too.
+Put `--offline` after `locate`, `fetch` or `detect`. For `locate` and `detect`, both FFprobe and FFmpeg restrict media inputs to local files and embedded data. A local playlist that needs a remote segment will fail in this mode. `detect` needs no archive data and also takes `-o`, `-q`, `--json` and the audio selection options below. `--include-jets` belongs to `locate` and `fetch`. `runs` and `doctor` take `--cache` too.
 
 For media with multiple audio tracks, `locate` and `detect` analyse the first audio track by default, matching
 the stream described by the media probe. Select another with `--audio-stream N` (audio tracks counted from 0).
@@ -914,7 +913,7 @@ output directory is `fdop_runs/detect`.
 `--audio-stream N` and `--audio-channel N` select the same source as in `locate`. For example,
 `fdop detect clip.mov --audio-stream 1 --audio-channel 0` measures the first channel of the second audio track.
 
-For a prepublication check of the whole file, run `fdop detect clip.mov --all-audio --json`.
+For a prepublication check of the whole file, run `fdop detect clip.mov --all-audio --json`. Add `--offline` to restrict every media probe and decode to local inputs.
 It measures each audio track's mono mix and each individual channel on multichannel tracks, one at a time.
 This can reveal a pass on a secondary track or on channels that cancel in the mix. The JSON gives
 `audio_stream_count`, the file-wide `location_tag_detected` flag, and one entry in `sources` for each view. A muted video still receives a metadata check. With zero audio tracks the source list is empty. The tag check covers recognized location tags that FFprobe exposes on the container, streams, chapters and programs, including separate GPS latitude and longitude fields. An incomplete stream inventory fails the audit. Each entry has its own pass count,

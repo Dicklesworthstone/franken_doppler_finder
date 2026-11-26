@@ -150,6 +150,9 @@ pub struct DetectCli {
     /// Audit every audio stream, its mono mix and each channel of multichannel audio.
     #[arg(long, conflicts_with_all = ["audio_stream", "audio_channel"])]
     pub all_audio: bool,
+    /// Restrict media probing and decoding to local files and embedded data.
+    #[arg(long)]
+    pub offline: bool,
     /// Print the recording audit as JSON on stdout.
     #[arg(long)]
     pub json: bool,
@@ -583,7 +586,11 @@ struct SourceAudit {
 }
 
 fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
-    let (probe, inventory) = audio::AudioProbe::for_audit(&d.media)?;
+    let (probe, inventory) = if d.offline {
+        audio::AudioProbe::for_offline_audit(&d.media)
+    } else {
+        audio::AudioProbe::for_audit(&d.media)
+    }?;
     let streams = inventory.streams;
     let location_tag_detected = inventory.location_tag_detected;
     let log = Log::new(d.quiet);
@@ -677,7 +684,11 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
     }
     let log = Log::new(d.quiet);
     let selection = d.audio.selection();
-    let probe = audio::AudioProbe::open(&d.media)?;
+    let probe = if d.offline {
+        audio::AudioProbe::open_offline(&d.media)
+    } else {
+        audio::AudioProbe::open(&d.media)
+    }?;
     let info = probe.selected_info(selection)?;
     let out = d
         .out
@@ -940,6 +951,7 @@ mod tests {
             "fdop",
             "detect",
             multi.to_str().unwrap(),
+            "--offline",
             "--all-audio",
             "--json",
             "--quiet",

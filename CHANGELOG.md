@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Enforce offline media input in the probe and decoder
+
+- `fdop locate --offline` restricts both FFprobe passes and the FFmpeg decode to local file, crypto and embedded-data protocols. Local playlists can use local segments. Remote media dependencies are disallowed.
+- Add `fdop detect --offline` for single-source and whole-file audits. Cover the protocol arguments for both tools and exercise local-only decoding in the multi-track integration fixtures.
+
 ### Share media discovery across every audio audit view
 
 - `fdop detect --all-audio` now performs one complete FFprobe pass per file and one ordinary probe on the first decode. Each track and channel still gets its own decode and measurements. A video with no audio needs only the complete inventory.
