@@ -94,10 +94,21 @@ fn all_stream_info(path: &Path, doc: &serde_json::Value) -> Result<Vec<MediaInfo
         .collect()
 }
 
-/// Complete audio inventory and file-wide location-tag presence for a publication audit.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TelemetryTrack {
+    /// FFprobe index among all streams in the container.
+    pub stream_index: u64,
+    pub codec_tag: String,
+}
+
+/// Stream inventory and metadata findings for a publication audit.
 pub struct AudioInventory {
     pub streams: Vec<MediaInfo>,
     pub location_tag_detected: bool,
+    /// Data track formats that can carry GPS. Their packets have not been inspected.
+    pub possible_location_telemetry: Vec<TelemetryTrack>,
+    /// A complete inventory showed one non-cover video stream and zero chapters.
+    pub single_video_without_chapters: bool,
 }
 
 pub fn probe_audio_inventory(path: &Path) -> Result<AudioInventory, String> {
@@ -125,7 +136,30 @@ fn audit_inventory(path: &Path, doc: &serde_json::Value) -> Result<AudioInventor
         Vec::new()
     };
     let location_tag_detected = media_tags(doc).any(|(k, v)| is_location_tag(k, v));
-    Ok(AudioInventory { streams: audio, location_tag_detected })
+    let mut possible_location_telemetry = Vec::new();
+    for stream in streams {
+        if stream["codec_type"] == "data"
+            && let Some(tag @ ("gpmd" | "camm")) = stream["codec_tag_string"].as_str()
+        {
+            possible_location_telemetry.push(TelemetryTrack {
+                stream_index: stream["index"]
+                    .as_u64()
+                    .ok_or("telemetry stream lacks an index")?,
+                codec_tag: tag.to_owned(),
+            });
+        }
+    }
+    let single_video_without_chapters = matches!(streams.as_slice(), [s] if
+        s["codec_type"] == "video"
+        && s["disposition"]["attached_pic"].as_u64() == Some(0)
+        && s["disposition"]["timed_thumbnails"].as_u64() == Some(0))
+        && doc["chapters"].as_array().is_some_and(Vec::is_empty);
+    Ok(AudioInventory {
+        streams: audio,
+        location_tag_detected,
+        possible_location_telemetry,
+        single_video_without_chapters,
+    })
 }
 
 fn probe_document(
@@ -604,6 +638,51 @@ mod tests {
         ] {
             assert!(audit_inventory(path, &invalid).is_err());
         }
+    }
+
+    #[test]
+    fn silent_export_inventory_requires_one_non_cover_video_and_no_chapters() {
+        let path = Path::new("export.mp4");
+        let clean = serde_json::json!({
+            "format": {"format_name": "mov,mp4", "nb_streams": 1},
+            "streams": [{"codec_type": "video", "disposition": {"attached_pic": 0, "timed_thumbnails": 0}}],
+            "chapters": [],
+        });
+        assert!(
+            audit_inventory(path, &clean)
+                .unwrap()
+                .single_video_without_chapters
+        );
+        for (pointer, value) in [
+            ("/streams/0/disposition/attached_pic", serde_json::json!(1)),
+            (
+                "/streams/0/disposition/timed_thumbnails",
+                serde_json::json!(1),
+            ),
+            ("/streams/0/disposition", serde_json::json!({})),
+            ("/chapters", serde_json::json!([{}])),
+            ("/chapters", serde_json::Value::Null),
+        ] {
+            let mut doc = clean.clone();
+            *doc.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !audit_inventory(path, &doc)
+                    .unwrap()
+                    .single_video_without_chapters,
+                "{pointer}"
+            );
+        }
+        let mut extra = clean;
+        extra["streams"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"codec_type": "subtitle"}));
+        extra["format"]["nb_streams"] = 2.into();
+        assert!(
+            !audit_inventory(path, &extra)
+                .unwrap()
+                .single_video_without_chapters
+        );
     }
 
     #[test]

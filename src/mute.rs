@@ -77,8 +77,8 @@ pub(crate) fn export(media: &Path, out: &Path) -> Result<(), String> {
         ));
     }
     let audit = audio::probe_audio_inventory(staged.path())?;
-    if !audit.streams.is_empty() || audit.location_tag_detected {
-        return Err("export still has audio or recognized location metadata".into());
+    if !audit.single_video_without_chapters || audit.location_tag_detected {
+        return Err("export verification requires one non-cover video stream, zero chapters and no recognized location tags".into());
     }
     staged
         .persist_noclobber(out)
@@ -201,6 +201,69 @@ mod tests {
         assert!(export(&media, &out).is_err());
         assert!(export(&out, &out).is_err());
         assert_eq!(std::fs::read(&out).unwrap(), bytes);
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn flags_possible_telemetry_in_silent_video_and_checks_the_export() {
+        let root = tempfile::tempdir().unwrap();
+        let clock = root.path().join("clock.mp4");
+        assert!(
+            ffmpeg()
+                .args([
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=s=32x24:r=2:d=1",
+                    "-c:v",
+                    "mpeg4",
+                    "-timecode",
+                    "00:00:00:00"
+                ])
+                .arg(&clock)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let clean_control = audio::probe_audio_inventory(&clock).unwrap();
+        assert!(clean_control.possible_location_telemetry.is_empty());
+        assert!(!clean_control.single_video_without_chapters); // Extra timecode track.
+
+        // Mark the synthetic data track as metadata, then set its sample format.
+        // The harmless timecode sample stays in place: there is no GPS payload.
+        let mut bytes = std::fs::read(&clock).unwrap();
+        let handler_at = bytes
+            .windows(16)
+            .position(|w| &w[..4] == b"hdlr" && &w[12..] == b"tmcd")
+            .expect("timecode media handler")
+            + 12;
+        bytes[handler_at..handler_at + 4].copy_from_slice(b"meta");
+        let tag_at = bytes
+            .windows(20)
+            .position(|w| &w[..4] == b"stsd" && &w[16..] == b"tmcd")
+            .expect("timecode sample description")
+            + 16;
+        for tag in ["gpmd", "camm"] {
+            bytes[tag_at..tag_at + 4].copy_from_slice(tag.as_bytes());
+            let media = root.path().join(format!("{tag}.mp4"));
+            std::fs::write(&media, &bytes).unwrap();
+            let audit = audio::probe_audio_inventory(&media).unwrap();
+            assert!(audit.streams.is_empty());
+            assert!(!audit.location_tag_detected);
+            assert!(!audit.single_video_without_chapters);
+            assert_eq!(
+                audit.possible_location_telemetry,
+                [audio::TelemetryTrack {
+                    stream_index: 1,
+                    codec_tag: tag.to_owned()
+                }]
+            );
+            let out = root.path().join(format!("{tag}-muted.mp4"));
+            export(&media, &out).unwrap();
+            let checked = audio::probe_audio_inventory(&out).unwrap();
+            assert!(checked.single_video_without_chapters);
+            assert!(checked.possible_location_telemetry.is_empty());
+        }
     }
 
     #[test]

@@ -916,6 +916,12 @@ This can reveal a pass on a secondary track or on channels that cancel in the mi
 `audio_stream_count`, the file-wide `location_tag_detected` flag, and one entry in `sources` for each view. A muted video still receives a metadata check. With zero audio tracks the source list is empty. The tag check covers recognized location tags that FFprobe exposes on the container, streams, chapters and programs, including separate GPS latitude and longitude fields. An incomplete stream inventory fails the audit. Each entry has its own pass count,
 event IDs, warnings and `events_file` path (relative to the working directory for a relative output path).
 The same aircraft can appear in several views, so compare their counts individually.
+The file-wide `possible_location_telemetry` list identifies data streams whose format can
+carry GPS samples. Each entry gives the FFprobe `stream_index` and `codec_tag`. The text
+summary warns about the same streams, including on videos with no audio or location tags.
+The audit recognizes two formats and reports their presence without reading GPS samples.
+See [GoPro GPMF (`gpmd`)](https://github.com/gopro/gpmf-parser) and
+[Camera Motion Metadata (`camm`)](https://developers.google.com/streetview/publish/camm-spec).
 The complete summary appears on stdout after every view succeeds. A decode or measurement failure exits
 with an error and identifies the failed view and partial output directory. Each view has its own artifact
 directory under a fresh `fdop_runs/detect-all` (with a numeric suffix when occupied) or a new or empty
@@ -949,8 +955,9 @@ fdop mute clip.mov --out silent.mp4
 `mute` works offline with FFmpeg and FFprobe. It copies the first video stream that is not
 cover art into a new MP4, without re-encoding. It drops every audio track, additional video
 stream, subtitle track, data track, attachment and chapter, and disables copying container
-and stream metadata. FFprobe checks the completed export for zero audio streams and no
-recognized location tags before it appears at the requested path. An occupied output path
+and stream metadata. Before publishing the export, FFprobe verifies that its entire stream
+list consists of one non-cover video and that it has zero chapters and no recognized
+location tags. An occupied output path
 is an error. The destination directory must already exist. Audio-only inputs and video
 codecs that FFmpeg cannot copy into MP4 produce an error.
 
@@ -5657,7 +5664,8 @@ If you can publish the video without sound, `fdop mute your_file.mp4 --out silen
 removes all audio tracks, including commentary and alternate microphones. It verifies
 the new file before reporting success. Review the visual content separately.
 
-1. **Audit it:** `fdop detect your_file.mp4 --all-audio`. Check the independent aircraft pass count and the location-tag warning. Two
+1. **Audit it:** `fdop detect your_file.mp4 --all-audio`. Check the independent aircraft pass count,
+   location-tag warning and possible telemetry tracks. Two
    independent passes with the time between them intact are high risk. One pass together with a known
    recording time is also high risk. Check each track and channel in the summary before publishing.
 2. **What the source video found does not work:**

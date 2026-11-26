@@ -19,6 +19,12 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Flag possible camera telemetry in silent recordings
+
+- Whole-file audits now list data streams with the `gpmd` or `camm` format in `possible_location_telemetry`, separately from recognized location tags. The audit reads the stream index and format without inspecting sample payloads.
+- Before publishing a muted MP4, verify there is exactly one non-cover video stream, no other streams, zero chapters and no recognized location tags.
+- Synthetic MP4s carrying each stream identifier triggered the warning, while a timecode track did not. The silent exports passed the stricter inventory check.
+
 ### Qualify the radius shown with a location
 
 - Add `answer.radius_status` to distinguish a sampled estimate, a lower bound at the search boundary, an unresolved width, a nominal fallback and an unavailable radius. Older answer objects without the field read as unspecified.

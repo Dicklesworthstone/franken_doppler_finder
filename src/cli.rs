@@ -621,11 +621,13 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
         struct WholeFileAudit {
             audio_stream_count: usize,
             location_tag_detected: bool,
+            possible_location_telemetry: Vec<audio::TelemetryTrack>,
             sources: Vec<SourceAudit>,
         }
         let report = WholeFileAudit {
             audio_stream_count: streams.len(),
             location_tag_detected,
+            possible_location_telemetry: inventory.possible_location_telemetry,
             sources,
         };
         serde_json::to_writer_pretty(&mut stdout, &report).map_err(|e| e.to_string())?;
@@ -638,6 +640,14 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
                 "no recognized location tag detected"
             };
             writeln!(stdout, "no audio streams; {metadata}").map_err(|e| e.to_string())?;
+        }
+        for track in inventory.possible_location_telemetry {
+            writeln!(
+                stdout,
+                "warning: data stream {} ({}) may contain location telemetry; GPS samples were not inspected",
+                track.stream_index, track.codec_tag
+            )
+            .map_err(|e| e.to_string())?;
         }
         for source in sources {
             let s = source.summary;
@@ -985,6 +995,7 @@ mod tests {
             assert_eq!(status.unwrap(), 0);
             let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
             assert_eq!(report["audio_stream_count"], 0);
+            assert_eq!(report["possible_location_telemetry"], serde_json::json!([]));
             assert_eq!(report["sources"], serde_json::json!([]));
             assert_eq!(report["location_tag_detected"], tagged);
             assert!(!stdout.contains("private-place-marker"));
