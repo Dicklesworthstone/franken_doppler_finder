@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Require measured evidence for an independent recording clock
+
+- A trace match now needs a finite independent clock fit over at least 60% of the measured trace to pass the clock-lock check. Missing coverage and unusable fits report an unavailable clock. A measured zero-second offset still passes.
+- Add regression cases for a true zero, shifted clocks, sparse traces and a third match whose independent clock is unavailable.
+
 ### Preserve the audio clock across source format changes
 
 - Normalize sample-rate and channel-layout changes in a separate linked filtergraph so

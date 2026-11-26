@@ -1786,6 +1786,9 @@ impl RatioGrid {
     }
 }
 
+/// Minimum fraction of trace points covered by a flight prediction used for a match.
+const MIN_TRACE_COVERAGE: f64 = 0.6;
+
 /// Fit of one event's trace against a model ratio curve at one clock.
 #[derive(Clone, Copy, Debug)]
 struct TraceFit {
@@ -2296,7 +2299,7 @@ struct PointEval {
 fn fine_trace_fits(chis: &[TraceFit], kappa: f64) -> bool {
     !chis
         .iter()
-        .any(|fit| fit.chi.is_nan() || fit.chi > kappa || fit.cov < 0.6)
+        .any(|fit| fit.chi.is_nan() || fit.chi > kappa || fit.cov < MIN_TRACE_COVERAGE)
 }
 
 // A lower weighted loss can sacrifice one aircraft. Only eligible points may
@@ -3010,7 +3013,7 @@ fn calibrate(
                         true,
                         &mut scratch,
                     );
-                    if r.cov >= 0.6 {
+                    if r.cov >= MIN_TRACE_COVERAGE {
                         best = best.min(r.chi);
                     }
                     ts += 0.25;
@@ -3332,7 +3335,10 @@ fn best_confirmer_with_geometry(
                 true,
                 &mut scratch,
             );
-            if chi.chi <= p.kappa && chi.cov >= 0.6 && best.as_ref().is_none_or(|b| chi.chi < b.0) {
+            if chi.chi <= p.kappa
+                && chi.cov >= MIN_TRACE_COVERAGE
+                && best.as_ref().is_none_or(|b| chi.chi < b.0)
+            {
                 best = Some((
                     chi.chi,
                     make_match(ev, tr, &cpa, chi, &prop, "confirmer"),
@@ -4538,6 +4544,13 @@ fn free_clocks(
         .zip(&cand.events)
         .map(|(&(ei, ti), m)| {
             let ev = &evs[ei];
+            if ev.tr_t.len() != ev.tr_f.len() || !cand.t_start_utc.is_finite() {
+                return None;
+            }
+            let (&first, &last) = (ev.tr_t.first()?, ev.tr_t.last()?);
+            if !first.is_finite() || !last.is_finite() {
+                return None;
+            }
             let tr = &tracks[ti as usize];
             let cpa = tr.cpa_nearest_time(o.x, m.cpa_emission_utc(), 30.0)?;
             let prop = prop_for(atmo, o, tr, cpa.t_e);
@@ -4546,15 +4559,16 @@ fn free_clocks(
                 tr,
                 o.x,
                 &prop,
-                lo + ev.tr_t[0] - 1.0,
-                hi + ev.tr_t[ev.tr_t.len() - 1] + 1.0,
+                lo + first - 1.0,
+                hi + last + 1.0,
                 0.2,
                 p.max_gap_s,
             );
-            let (mut bt, mut bc) = (cand.t_start_utc, f64::INFINITY);
+            let mut best_offset = None;
+            let mut best_chi = f64::INFINITY;
             let mut scratch = TraceScratch::default();
-            let mut ts = lo;
-            while ts <= hi {
+            for quarter_seconds in -120..=120 {
+                let ts = cand.t_start_utc + f64::from(quarter_seconds) * 0.25;
                 let r = trace_chi(
                     &ev.tr_t,
                     &ev.tr_f,
@@ -4567,13 +4581,17 @@ fn free_clocks(
                     true,
                     &mut scratch,
                 );
-                if r.chi < bc {
-                    bc = r.chi;
-                    bt = ts;
+                if r.cov >= MIN_TRACE_COVERAGE
+                    && r.f0.is_finite()
+                    && r.rms.is_finite()
+                    && r.chi.is_finite()
+                    && r.chi < best_chi
+                {
+                    best_chi = r.chi;
+                    best_offset = Some(ts - cand.t_start_utc);
                 }
-                ts += 0.25;
             }
-            Some(bt - cand.t_start_utc)
+            best_offset
         })
         .collect()
 }
@@ -4656,7 +4674,7 @@ fn refresh_refined_candidate(
                 true,
                 &mut scratch,
             );
-            (fit.chi <= p.kappa && fit.cov >= 0.6)
+            (fit.chi <= p.kappa && fit.cov >= MIN_TRACE_COVERAGE)
                 .then(|| (cpa.t_e, make_match(ev, tr, &cpa, fit, &prop, &old.role)))
         })();
         let Some((te, matched)) = fitted else {
@@ -16492,6 +16510,48 @@ mod tests {
             (ev.q_t, ev.q_f) = subsample(&ev.tr_t, &ev.tr_f, 40);
         }
         (case, assign)
+    }
+
+    #[test]
+    fn free_clock_requires_a_measured_trace_and_preserves_real_offsets() {
+        let (case, assignments) = analytic_two_flyover_case();
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let o = observer(case.obs.0, case.obs.1, &FlatElevation(0.0));
+        let check = |event: &SearchEvent, shift: f64| {
+            let cand = Candidate {
+                t_start_utc: case.t_s + shift,
+                trk: vec![(0, 0)],
+                events: vec![EventMatch {
+                    t_cpa_emitted_utc: Some(assignments[0].2),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            free_clocks(
+                &cand, &o, std::slice::from_ref(event), &case.tracks, &case.p, &atmo,
+            )[0]
+        };
+        let observed = &case.events[0];
+        for shift in [0.0, 2.0, -9.5] {
+            assert_eq!(check(observed, shift), Some(-shift));
+        }
+        let mut sparse = observed.clone();
+        // Keep 60 genuine observations. The remaining 61 are after the archive
+        // at every trial clock, leaving finite residuals but insufficient coverage.
+        for t in &mut sparse.tr_t[60..] {
+            *t += 1200.0;
+        }
+        assert!(check(&sparse, 0.0).is_none());
+        for t in &mut sparse.tr_t[..60] {
+            *t += 1200.0;
+        }
+        assert!(check(&sparse, 0.0).is_none());
+        let mut invalid = observed.clone();
+        invalid.f0 = f64::NAN;
+        assert!(check(&invalid, 0.0).is_none());
+        invalid.tr_t.clear();
+        invalid.tr_f.clear();
+        assert!(check(&invalid, 0.0).is_none());
     }
 
     #[test]

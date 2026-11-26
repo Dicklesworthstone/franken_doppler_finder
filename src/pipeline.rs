@@ -962,7 +962,7 @@ impl AnswerAssessment {
                     .iter()
                     .find(|e| e.id == m.event)
                     .map_or(4.0, search::lock_tol);
-                m.dt_free.is_none_or(|d| d.abs() <= tol)
+                m.dt_free.is_some_and(|d| d.abs() <= tol)
             });
             answer.evidence = Some(
                 if res
@@ -2660,7 +2660,10 @@ fn locate_with_clock(
                 lock_ok,
                 top.events
                     .iter()
-                    .map(|m| format!("{} dt_free {:+.1}s", m.event, m.dt_free.unwrap_or(f64::NAN)))
+                    .map(|m| match m.dt_free.filter(|dt| dt.is_finite()) {
+                        Some(dt) => format!("{} dt_free {dt:+.1}s", m.event),
+                        None => format!("{} independent clock unavailable", m.event),
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
@@ -5995,11 +5998,17 @@ mod tests {
         let high = assess(&base);
         assert_eq!(high.confidence, "high");
         assert!(!metadata_needs_fallback(true, high.confidence));
-        for defect in ["core", "lock", "margin", "truncated"] {
+        for defect in ["core", "lock", "missing_clock", "invalid_clock", "margin", "truncated"] {
             let mut r = base.clone();
             match defect {
                 "core" => r.candidates[0].events[1].core = false,
                 "lock" => r.candidates[0].events[1].dt_free = Some(4.1),
+                // Two valid core clocks cannot supply the independent lock of a third match.
+                "missing_clock" | "invalid_clock" => r.candidates[0].events.push(search::EventMatch {
+                    event: "unchecked confirmer".into(),
+                    dt_free: (defect == "invalid_clock").then_some(f64::NAN),
+                    ..Default::default()
+                }),
                 "margin" => r.margin["margin_nats"] = json!(2.9),
                 "truncated" => r.funnel.truncated.push("synthetic comparison cut".into()),
                 _ => unreachable!(),

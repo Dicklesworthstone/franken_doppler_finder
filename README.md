@@ -280,7 +280,7 @@ retain their original results.
 | Gate | Passes when |
 |---|---|
 | core matches | at least 2 matches locate the observer: each fits its ADS-B prediction with chi ≤ 4, has its own best clock within 4 s, and beats chance by ≥ 2 nats. When an event has fewer than 20 chance samples to calibrate against (a tiny region), chi ≤ 2 stands in for the nats test |
-| clock lock | every match's own best clock is within its timing tolerance (clamped to 4–6 s) of the shared clock |
+| clock lock | every match has a finite independent clock fit covering at least 60% of its trace, and its best supported clock is within its timing tolerance (clamped to 4–6 s) of the shared clock. An unavailable offset fails the trace clock-lock gate |
 | margin | the search completed its configured comparison and the answer beats the best *different* explanation by ≥ 6 nats or no rival survived. A memory budget that prevents an event from seeding a possible pair fails this gate, as does a pair, fine or confirmation comparison cut. A rival is different if it matches a shared event to another flight, shares no match, or lies more than 5 km away. Both are compared at the same polish (below) |
 | no unheard close pass | no supported tonal aircraft passed much closer than the heard ones without leaving a detection; its closest approach must be interior to the archived track and its surrounding reports at most 90 s apart |
 | radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
