@@ -19,6 +19,18 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Report missing rival comparisons when flight hypotheses exceed memory
+
+- Record a comparison cut when a memory limit drops the hypotheses for an event
+  that could have seeded a pair. The trace margin then stays provisional, even
+  when a second reading supports the same candidate. A cut decoy run cannot
+  count as a complete negative control.
+- Keep intentional driver limits and genuinely empty hypothesis sets distinct from
+  budget cuts. A no-location result identifies an incomplete comparison in its verdict.
+- The archived three-day reference run demoted two events. Applying this rule to
+  that record would change its grade from high to low. A contemporary replay is
+  still needed to measure the result on current code.
+
 ### Export a verified silent copy of a video
 
 - Add `fdop mute <media> --out <new.mp4>`. The command copies the first non-cover-art

@@ -1012,7 +1012,8 @@ impl AnswerAssessment {
             added,
         );
         answer.confidence = match answer.call {
-            CurveCall::Confirms => "medium",
+            // A common point supports this candidate but cannot check an omitted rival.
+            CurveCall::Confirms if res.funnel.truncated.is_empty() => "medium",
             CurveCall::Adopts | CurveCall::Conflicts | CurveCall::Unsupported => "low",
             CurveCall::Silent if answer.unchecked => "low",
             _ => answer.trace_confidence,
@@ -3067,8 +3068,10 @@ fn locate_with_clock(
                 sevs.len(),
                 if sevs.len() < 2 {
                     "need at least two clear tonal aircraft flyovers"
+                } else if !res.funnel.truncated.is_empty() {
+                    "the trace comparison stopped at a search budget; a matching flight pair may remain unchecked (see funnel.truncated)"
                 } else {
-                    "no ADS-B flight pair explains two events at one place and clock (check dates/region, or the aircraft lacked ADS-B)"
+                    "the configured search found no ADS-B flight pair explaining two events at one place and clock (check dates/region or archive coverage)"
                 }
             ),
             gates: vec![],
@@ -5821,6 +5824,13 @@ mod tests {
         assert_eq!(grade(&low, &here), (CurveCall::Confirms, "medium"));
         assert_eq!(grade(&low, &away), (CurveCall::Adopts, "low"));
         assert_eq!(grade(&empty, &here), (CurveCall::Adopts, "low"));
+        // Even two agreeing readings cannot establish the lead over an unsearched rival.
+        let mut incomplete = assessment_result();
+        incomplete
+            .funnel
+            .truncated
+            .push("hypotheses: budget exhausted".into());
+        assert_eq!(grade(&incomplete, &here), (CurveCall::Confirms, "low"));
     }
 
     #[test]

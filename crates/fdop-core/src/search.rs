@@ -3793,6 +3793,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     let mut hyps: Vec<Option<Vec<Hyp>>> = Vec::with_capacity(evs.len());
     let mut nulls: Vec<EventNull> = Vec::with_capacity(evs.len());
     let mut total = 0usize;
+    let mut budget_demotions = Vec::new();
     for e in &evs {
         // An empty cloud cannot seed a join. Let a later event with eligible flights use
         // that driver slot instead, while keeping the empty cloud in the reported funnel.
@@ -3823,7 +3824,10 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
         if let Some(v) = &set.stored {
             total += v.len();
         } else if !full {
-            // beyond --max-events is documented; a budget demotion must not be silent
+            budget_demotions.push(format!(
+                "hypotheses {}: {} exceed the available budget of {cap}",
+                e.id, set.count
+            ));
             warnings.push(format!(
                 "{}: {} hypotheses did not fit the hypothesis budget ({cap} left), so it only confirms; narrow the region or dates to let it drive the search",
                 e.id, set.count
@@ -3840,6 +3844,12 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     let pairable: Vec<usize> = (0..evs.len())
         .filter(|&i| hyps[i].as_ref().is_some_and(|h| !h.is_empty()))
         .collect();
+    // A memory demotion can hide an entire rival pair, even in an empty search.
+    // One nonempty cloud alone cannot seed a pair. The configured driver limit
+    // defines the comparison; clouds beyond that limit were never budget demotions.
+    if p.max_events >= 2 && pairable.len() + budget_demotions.len() >= 2 {
+        funnel.truncated.extend(budget_demotions);
+    }
     // pair joins: clean-clean first, then by expected join size
     let rho = 0.5 * p.along_step_m.hypot(p.cross_step_m);
     let r_join = 2.0 * rho + 120.0;
@@ -14908,7 +14918,14 @@ mod tests {
         case.p.max_hyp_per_event = 10;
         let res = run_case(&case, med);
         assert!(res.candidates.is_empty(), "funnel {:?}", res.funnel);
+        assert_eq!(res.funnel.truncated.len(), 2);
         for id in ["e1", "e2"] {
+            assert!(
+                res.funnel
+                    .truncated
+                    .iter()
+                    .any(|s| s.starts_with(&format!("hypotheses {id}:")))
+            );
             assert!(
                 res.warnings
                     .iter()
@@ -14917,6 +14934,44 @@ mod tests {
                 res.warnings
             );
         }
+    }
+
+    #[test]
+    fn total_hypothesis_budget_marks_only_missing_pair_comparisons() {
+        let med = fdop_types::atmo::Medium::still(343.0);
+        let mut case = compact_fine_grid_case(0.0, false);
+        let complete = run_case(&case, med);
+        assert!(!complete.candidates.is_empty());
+        assert!(complete.funnel.truncated.is_empty());
+        let (id, count) = &complete.funnel.hypotheses[1];
+        assert!(count.is_some_and(|n| n > 0));
+
+        // Enough storage for the first cloud, none for the second. The empty
+        // result cannot count as a complete negative in a decoy-clock check.
+        case.p.max_hyp_total = complete.funnel.hypotheses[0].1.unwrap();
+        let cut = run_case(&case, med);
+        assert!(cut.candidates.is_empty());
+        assert_eq!(cut.funnel.truncated.len(), 1);
+        assert!(cut.funnel.truncated[0].starts_with(&format!("hypotheses {id}:")));
+        assert!(cut.funnel.hypotheses[1].1.is_none());
+
+        // The same two clouds under an explicit one-driver search lose no
+        // intended comparison. Nor does losing a lone cloud with no partner.
+        case.p.max_events = 1;
+        assert!(run_case(&case, med).funnel.truncated.is_empty());
+        case.p.max_events = 2;
+        case.p.max_hyp_total = 0;
+        case.events[1].v_gate = [500.0, 600.0];
+        let lone = run_case(&case, med);
+        assert_eq!(
+            lone.funnel
+                .hypotheses
+                .iter()
+                .filter(|h| h.1.is_none())
+                .count(),
+            1
+        );
+        assert!(lone.funnel.truncated.is_empty());
     }
 
     #[test]

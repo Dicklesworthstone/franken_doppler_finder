@@ -51,6 +51,11 @@ measurement build (`*_gc`), `9087ec4` (runs named `*_b1`), on the commit before 
 section comes from the archived `7e5cf3e` replays, which predate the moving-medium propagation correction, spatial
 refinement, frequency calibration and robust tone fit. Those are not measured results for this code.
 
+The archived three-day reference search (`r_md_gc`) exceeded its hypothesis budget for two flyovers.
+It completed on the 32 GiB benchmark machine and reported high. Under the current grading rule, that same
+search record has an incomplete comparison and would grade low. A new run on the reference recording,
+its wrong dates and the field recordings is needed to measure current grades.
+
 | Question | Answer |
 |---|---|
 | Does it run end to end? | **Yes.** `fdop locate` goes from a media file to a report with a map, a radius and a ZIP code. Every stage is automatic: detection, curve fitting, ADS-B download, weather, terrain, search, geocoding and reporting |
@@ -276,7 +281,7 @@ retain their original results.
 |---|---|
 | core matches | at least 2 matches locate the observer: each fits its ADS-B prediction with chi ≤ 4, has its own best clock within 4 s, and beats chance by ≥ 2 nats. When an event has fewer than 20 chance samples to calibrate against (a tiny region), chi ≤ 2 stands in for the nats test |
 | clock lock | every match's own best clock is within its timing tolerance (clamped to 4–6 s) of the shared clock |
-| margin | no pair, fine or confirmation comparison cut was recorded, and the answer beats the best *different* explanation by ≥ 6 nats or no rival survived. A rival is different if it matches a shared event to another flight, shares no match, or lies more than 5 km away. Both are compared at the same polish (below) |
+| margin | the search completed its configured comparison and the answer beats the best *different* explanation by ≥ 6 nats or no rival survived. A memory budget that prevents an event from seeding a possible pair fails this gate, as does a pair, fine or confirmation comparison cut. A rival is different if it matches a shared event to another flight, shares no match, or lies more than 5 km away. Both are compared at the same polish (below) |
 | no unheard close pass | no supported tonal aircraft passed much closer than the heard ones without leaving a detection; its closest approach must be interior to the archived track and its surrounding reports at most 90 s apart |
 | radius | the 95 % radius is ≤ 1,000 m, its contour is sampled by the grid, and it does not reach the refinement window boundary |
 | curve match | listed when the [curve match](#the-curve-match) stands: an asserted trace answer is within 3 km of it, and the curves support the trace answer's exact place and recording start under the common-point checks below. Also listed, failed, on a medium answer when the curve match ran with enough decoy clocks to judge (40) and stands nowhere |
@@ -414,7 +419,8 @@ evidence-score differences, not calibrated likelihood ratios or a correction for
 
 The curve match then reads the recording a second way, independent of the traces. Where it stands it can raise a
 low trace answer that lies inside its radius to **medium**, provided the curves also support that trace answer's
-exact place and recording start. The matcher scores that common point with its existing bank and catalogue,
+exact place and recording start and the trace comparison completed. A cut leaves the grade low because a rival
+may still outrank the candidate both readings support. The matcher scores that common point with its existing bank and catalogue,
 fixing the shared clock while retaining normal penalized per-pass timing slack. It must hear two independently
 credited flyovers, beat the same best decoy, and remain within the existing 3-nat evidence tie. This allows a
 physically supported trade between nearby positions and recording times; it adds no arbitrary clock-difference
@@ -2052,8 +2058,9 @@ Design notes:
   capacity, temporary collections, audio, tracks and pair joins require additional memory. One event may
   take a third of the total, so a 16 GiB machine gets 86 M hypotheses and 29 M per event, and a 32 GiB machine
   172 M and 57 M. With less than a run needs, the events built last drop to confirmer-only, with a warning, so
-  below 32 GiB the answer can depend on RAM. The three reference runs fit in 32 GiB; there the busy osprey-cam search demoted
-  four events and two other field searches one each.
+  below 32 GiB the answer can depend on RAM. All three archived reference runs completed on the 32 GiB
+  machine. In the three-day reference search, two events exceeded their hypothesis budgets.
+  The busy osprey-cam search demoted four events and two other field searches one each.
   The comparison budgets default to 20 M joined points, 2 M fine cells and 2 M confirmations, above the largest
   searches estimated from real runs (about 11 M and 1 M). A pair-join, fine-stage or confirmation-budget cut is
   reported in `funnel.truncated` and the warnings. The joined-point allowance includes rejected seeds and
@@ -2062,7 +2069,9 @@ Design notes:
   the largest runs here peak at about 10 GiB on a 32 GiB machine, and smaller machines have not been tried. An
   event that exceeds its hypothesis budget, or falls beyond `--max-events`, drops to confirmer-only, which
   `funnel.hypotheses` shows;
-  a budget demotion is also a warning. An event with no eligible flight hypotheses is reported with a zero
+  a budget demotion also produces a warning. If storage prevented an event from seeding a possible pair,
+  `funnel.truncated` identifies the omitted event, the trace margin is provisional, and a decoy clock
+  with that cut cannot count as a complete control. An event with no eligible flight hypotheses is reported with a zero
   count and does not consume a driver slot: later matchable flyovers can still seed the search.
 - **Fast tracks retain the normal sampling cadence outside the reach box.** The previous fixed
   ten-second skip could jump across a small region and miss an entire close flyover. Both inside
@@ -5667,7 +5676,8 @@ the new file before reporting success. Review the visual content separately.
 | Audio is audible in the player but the survey is silent, or the selected track contains commentary | The first track or its mono mix lacks the useful ambient sound; opposite-polarity stereo can cancel | Select the ambient track with `--audio-stream N`, or a microphone channel with `--audio-channel N`; both indices start at 0 |
 | `GitHub API refused ... limited to 60/hour, set GITHUB_TOKEN` | Unauthenticated GitHub API quota | `export GITHUB_TOKEN=$(gh auth token)` or any read-only token |
 | `no location: no location found: N usable flyover events; need at least two clear propeller flyovers` | Fewer than two usable passes | Look at `survey.png` for faint falling curves the detector missed. One flyover cannot be located; a longer recording may hold more |
-| `no location: ...; no ADS-B flight pair explains two events at one place and clock (...)` | Wrong date or region, or the aircraft had no ADS-B | Check `--dates` (local dates) and widen `--near`; try `--ignore-metadata-time` if the file's `creation_time` is wrong |
+| `no location: ...; the configured search found no ADS-B flight pair explaining two events at one place and clock (...)` | Wrong date or region, or the aircraft had no ADS-B | Check `--dates` (local dates) and widen `--near`; try `--ignore-metadata-time` if the file's `creation_time` is wrong |
+| `no location: ...; the trace comparison stopped at a search budget (...)` | A possible flight pair went unchecked | Read `funnel.truncated` for the omitted comparisons. A smaller region or date range may fit the available budget |
 | `ambiguous location: 'Springfield' matches places in K states` | Bare place name | Add the state: `"Springfield, IL"` |
 | `date range ... spans more than 15 days; narrow it` | Range too long | Split it into several runs |
 | `unrecognised date '09/08/2026': put the four-digit year first` | The year is not first. `09/08/2026` is 8 September in the US and 9 August in most other countries | Write it year first: `2026-09-08` |
@@ -5788,8 +5798,8 @@ the new file before reporting success. Review the visual content separately.
   With the benchmark's R2 inputs, the change that landed grades that osprey-cam recording high, 220 m off (`fm`).
   Explicitly truncated
   comparisons now fail the margin gate whether a rival was found or not; that correction does not calibrate
-  the larger event search. Events omitted from pair seeding by driver or hypothesis limits can still leave
-  unexplored explanations, even when no pair/fine/confirmation cut was recorded.
+  the larger event search. The explicit `--max-events` limit still defines which events can seed a pair.
+  A complete comparison within that limit leaves possible explanations involving other driver pairs unexplored.
   Earlier builds also spent slots on events the ridge check refused: 19 of the 24 on that recording.
   Refusals, duplicate measured curves and fits outside the aircraft limits now leave room for later detections;
   the independent-event limit and the measurement-line gate remain in force.
