@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve Census containment across online and offline replays
+
+- Cache a usable Census result under the exact reverse-geocoding query, including its six-decimal coordinates, endpoint, benchmark and vintage. Use the saved reply on subsequent online or offline runs and record its reuse in the report. The ZIP and jurisdiction keep their Census containment provenance.
+- Write completed entries atomically, verify the full query on read and retain the Gazetteer fallback for a miss or an unusable response. Add loopback regressions for replay, corrupt entries, mismatched queries and failed lookups.
+
 ### Enforce offline media input in the probe and decoder
 
 - `fdop locate --offline` restricts both FFprobe passes and the FFmpeg decode to local file, crypto and embedded-data protocols. Local playlists can use local segments. Remote media dependencies are disallowed.

@@ -1593,8 +1593,14 @@ wind-only levels outside thermal support remain excluded.
 | Weather | [Open-Meteo](https://open-meteo.com) historical forecast (pressure levels) and archive; [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu) radiosondes | Pressure levels first; only on failure, load radiosondes and surface weather concurrently. A slow service does not discard a usable profile from the other source. Radiosonde stations are selected by archive dates covering the requested sounding brackets, so a station closed today can still serve historical recordings. US country metadata includes Alaska and Hawaii stations; their full identifiers are preserved when requesting soundings, while continental stations retain their existing cache keys. The 15 °C standard atmosphere is used only if no usable profile arrives, with a warning |
 | Terrain | [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) (Terrarium encoding) | z10 for the coarse search, z13 for the fine search. When a requested tile cannot be loaded, use the finest cached parent down to z10, including coarse tiles prefetched for this search. If neither is usable, check the queried position's finer cached tiles through z13, finest first. Recovery never downloads another resolution, and a finer tile supplies only its own footprint inside a missing tile. Warnings distinguish parent resolution loss, distinct finer tiles used and queried positions that actually fell back to 0 m. A prefetch miss alone does not imply a zero-height observer. A pixel below −430 m, lower than any dry land, is seabed or a spike in the tiles: it is left out of the blend, and a cell with nothing left counts as sea level |
 | Geoid | [NOAA NGS](https://geodesy.noaa.gov) GEOID API | Converts GNSS heights to MSL. Taken once two reads agree, then kept in the cache; −30 m, with a warning, if the reads fail or never agree, or under `--offline` |
-| Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Offline fallback uses the gazetteer's internal points |
+| Regions, places, ZIPs | U.S. Census 2024 Gazetteer files and the Census Geocoder | Online and offline replays reuse cached containment for an exact query. On a cache miss, offline reports use Gazetteer internal points |
 | Basemap | [USGS The National Map](https://www.usgs.gov/programs/national-geospatial-program/national-map) Topo tiles; OSM in the HTML report | |
+
+A successful Census containment lookup is saved under `gazetteer/containment/` in the cache root.
+Subsequent reports reuse that reply for the same coordinates rounded to six decimal places, endpoint,
+benchmark and vintage identifier. The report notes a cache hit and keeps `census-api` as the
+containment source. The Census service can update the boundaries behind `Current_Current`. Remove
+the saved entry to request current boundaries on the next online lookup.
 
 ---
 

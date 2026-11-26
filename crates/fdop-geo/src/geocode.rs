@@ -39,7 +39,11 @@ pub fn reverse_url(lat: f64, lon: f64) -> String {
 
 /// Query the Census Geocoder for the geographies containing (lat, lon).
 pub fn reverse(net: &fdop_http::Net, lat: f64, lon: f64) -> Result<CensusGeo, GeoError> {
-    let resp = net.get(&reverse_url(lat, lon), &[("Accept", "application/json")])?;
+    reverse_query(net, &reverse_url(lat, lon))
+}
+
+fn reverse_query(net: &fdop_http::Net, query: &str) -> Result<CensusGeo, GeoError> {
+    let resp = net.get(query, &[("Accept", "application/json")])?;
     let v = resp.json().map_err(GeoError::Data)?;
     parse_census_geographies(&v)
 }
@@ -141,13 +145,89 @@ pub struct PlaceReport {
     pub notes: Vec<String>,
 }
 
-/// Describe (lat, lon): Census API when `net` is given and answers, else the gazetteer.
+#[derive(Serialize, Deserialize)]
+struct CachedContainment {
+    query: String,
+    geography: CensusGeo,
+}
+
+fn usable_containment(geo: &CensusGeo) -> bool {
+    geo.state.as_ref().is_some_and(|s| !s.trim().is_empty())
+        && geo.layers.iter().any(|layer| layer == "States")
+}
+
+fn containment_path(root: &std::path::Path, query: &str) -> std::path::PathBuf {
+    // As with the weather cache, use a stable FNV-1a filename. The stored URL
+    // must also match in full, so a collision or misplaced file cannot supply a place.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for b in query.bytes() {
+        hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    root.join("gazetteer")
+        .join("containment")
+        .join(format!("{hash:016x}.json"))
+}
+
+fn census_containment(
+    net: Option<&fdop_http::Net>,
+    gaz: &Gazetteer,
+    query: &str,
+    notes: &mut Vec<String>,
+) -> Option<CensusGeo> {
+    let path = gaz.cache_root().map(|root| containment_path(root, query));
+    if let Some(path) = &path
+        && let Ok(file) = std::fs::File::open(path)
+        && let Ok(saved) = serde_json::from_reader::<_, CachedContainment>(file)
+        && saved.query == query
+        && usable_containment(&saved.geography)
+    {
+        notes.push("reused cached Census Geocoder containment for this query".into());
+        return Some(saved.geography);
+    }
+    let Some(net) = net else {
+        notes.push("offline: using gazetteer centroids, not containment".into());
+        return None;
+    };
+    let geography = match reverse_query(net, query) {
+        Ok(geo) if usable_containment(&geo) => geo,
+        Ok(_) => {
+            notes.push("Census Geocoder returned no containing state; using gazetteer centroids".into());
+            return None;
+        }
+        Err(e) => {
+            notes.push(format!("Census Geocoder failed ({e}); using gazetteer centroids"));
+            return None;
+        }
+    };
+    let entry = CachedContainment { query: query.to_owned(), geography };
+    if let Some(path) = path {
+        let saved = serde_json::to_vec(&entry)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| fdop_http::write_atomic(&path, &bytes));
+        if let Err(e) = saved {
+            notes.push(format!("could not cache Census containment for offline reuse: {e}"));
+        }
+    }
+    Some(entry.geography)
+}
+
+/// Describe (lat, lon) from an exact cached Census query, a live reply or the gazetteer.
 /// Never fails: missing pieces are `None` and explained in `notes`.
 pub fn describe_location(
     net: Option<&fdop_http::Net>,
     gaz: &Gazetteer,
     lat: f64,
     lon: f64,
+) -> PlaceReport {
+    describe_query(net, gaz, lat, lon, &reverse_url(lat, lon))
+}
+
+fn describe_query(
+    net: Option<&fdop_http::Net>,
+    gaz: &Gazetteer,
+    lat: f64,
+    lon: f64,
+    query: &str,
 ) -> PlaceReport {
     let mut rep = PlaceReport {
         lat,
@@ -158,23 +238,7 @@ pub fn describe_location(
         Ok(v) => rep.nearest_places = v,
         Err(e) => rep.notes.push(format!("nearest places unavailable: {e}")),
     }
-    let api = match net {
-        Some(n) => match reverse(n, lat, lon) {
-            Ok(g) => Some(g),
-            Err(e) => {
-                rep.notes.push(format!(
-                    "Census Geocoder failed ({e}); using gazetteer centroids"
-                ));
-                None
-            }
-        },
-        None => {
-            rep.notes
-                .push("offline: using gazetteer centroids, not containment".into());
-            None
-        }
-    };
-    if let Some(g) = api.filter(|g| g.state.is_some()) {
+    if let Some(g) = census_containment(net, gaz, query, &mut rep.notes) {
         rep.source = "census-api".into();
         rep.place = g.place;
         rep.place_kind = g.place_kind;
@@ -377,6 +441,77 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(headline(&rep), "Oyster Bay, NY 11771 (Nassau County)");
+    }
+
+    #[test]
+    fn exact_census_reply_survives_online_and_offline_replays() {
+        use crate::gazetteer::tests::{cache_for_test, serve_table};
+
+        let root = cache_for_test();
+        let gaz = Gazetteer::new(&root, false);
+        let (lat, lon) = (40.876466, -73.524951);
+        let canonical = reverse_url(lat, lon);
+        let (endpoint, server) = serve_table(SAMPLE.as_bytes().to_vec());
+        let query = canonical.replace(CENSUS_URL, &endpoint);
+        let path = containment_path(&root, &query);
+        fdop_http::write_atomic(&path, b"interrupted write").unwrap();
+        let net = fdop_http::Net::new().unwrap().with_retries(0);
+        let fresh = describe_query(Some(&net), &gaz, lat, lon, &query);
+        server.join().unwrap();
+        assert_eq!(fresh.source, "census-api");
+        assert_eq!(fresh.zip.as_deref(), Some("11771"));
+        assert_eq!(fresh.zip_source, "census-api");
+        assert!(!fresh.notes.iter().any(|n| n.contains("reused cached Census")));
+
+        // The server is gone. Both forms must use the completed response.
+        for network in [Some(&net), None] {
+            let replay = describe_query(network, &gaz, lat, lon, &query);
+            assert_eq!(replay.headline, fresh.headline);
+            assert_eq!(replay.source, fresh.source);
+            assert_eq!(replay.zip_source, fresh.zip_source);
+            assert!(replay.notes.iter().any(|n| n.contains("reused cached Census")));
+        }
+
+        // A valid JSON entry under a different key must never supply a place.
+        let bytes = std::fs::read(&path).unwrap();
+        for other in [
+            canonical.clone(),
+            query.replace("x=-73.524951", "x=-73.524950"),
+            query.replace("Public_AR_Current", "Public_AR_Other"),
+            query.replace("Current_Current", "Other_Vintage"),
+        ] {
+            let other_path = containment_path(&root, &other);
+            assert_ne!(path, other_path);
+            fdop_http::write_atomic(&other_path, &bytes).unwrap();
+            let miss = describe_query(None, &gaz, lat, lon, &other);
+            assert_eq!(miss.source, "gazetteer");
+            assert_ne!(miss.zip_source, "census-api");
+        }
+        assert_eq!(reverse_url(lat + 0.0000001, lon), canonical);
+        assert_ne!(reverse_url(lat + 0.000001, lon), canonical);
+    }
+
+    #[test]
+    fn unusable_census_replies_never_replace_a_cache_entry() {
+        use crate::gazetteer::tests::{cache_for_test, serve_table};
+
+        let root = cache_for_test();
+        let gaz = Gazetteer::new(&root, false);
+        let net = fdop_http::Net::new().unwrap().with_retries(0);
+        for invalid in ["not JSON", r#"{"result":{"geographies":{"States":[]}}}"#] {
+            let (query, server) = serve_table(invalid.as_bytes().to_vec());
+            let path = containment_path(&root, &query);
+            let invalid_saved = CachedContainment {
+                query: query.clone(),
+                geography: CensusGeo { state: Some(" ".into()), ..Default::default() },
+            };
+            let previous = serde_json::to_vec(&invalid_saved).unwrap();
+            fdop_http::write_atomic(&path, &previous).unwrap();
+            let report = describe_query(Some(&net), &gaz, 40.876466, -73.524951, &query);
+            server.join().unwrap();
+            assert_eq!(report.source, "gazetteer");
+            assert_eq!(std::fs::read(&path).unwrap(), previous);
+        }
     }
 
     #[test]

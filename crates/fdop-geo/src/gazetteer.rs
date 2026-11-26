@@ -217,7 +217,7 @@ pub fn parse_gazetteer(kind: GazKind, text: &str) -> Result<Vec<GazRecord>, GeoE
 
 /// Lazily downloaded, lazily parsed Gazetteer tables.
 pub struct Gazetteer {
-    cache_dir: PathBuf,
+    cache_dir: Option<PathBuf>,
     allow_network: bool,
     tables: [OnceLock<Result<Vec<GazRecord>, GeoError>>; 4],
 }
@@ -225,8 +225,12 @@ pub struct Gazetteer {
 impl Gazetteer {
     /// `cache_dir` is the fdop cache root; files go to `<cache_dir>/gazetteer/`.
     pub fn new(cache_dir: impl Into<PathBuf>, allow_network: bool) -> Self {
+        Self::with_cache_root(Some(cache_dir.into()), allow_network)
+    }
+
+    fn with_cache_root(cache_dir: Option<PathBuf>, allow_network: bool) -> Self {
         Self {
-            cache_dir: cache_dir.into(),
+            cache_dir,
             allow_network,
             tables: [
                 OnceLock::new(),
@@ -239,7 +243,7 @@ impl Gazetteer {
 
     /// Build from already-parsed records (tests, offline fixtures). Missing kinds stay empty.
     pub fn from_records(records: Vec<GazRecord>) -> Self {
-        let g = Self::new(PathBuf::from("/nonexistent-fdop-gazetteer"), false);
+        let g = Self::with_cache_root(None, false);
         let mut by: [Vec<GazRecord>; 4] = Default::default();
         for r in records {
             by[r.kind.idx()].push(r);
@@ -250,8 +254,14 @@ impl Gazetteer {
         g
     }
 
+    /// Records-only fixtures have no backing directory.
+    pub(crate) fn cache_root(&self) -> Option<&Path> {
+        self.cache_dir.as_deref()
+    }
+
     pub fn zip_path(&self, kind: GazKind) -> PathBuf {
-        self.cache_dir
+        self.cache_root()
+            .unwrap_or_else(|| Path::new("/nonexistent-fdop-gazetteer"))
             .join("gazetteer")
             .join(format!("{}.zip", kind.file_stem()))
     }
@@ -589,7 +599,7 @@ VT\t5000710675\t01462073\tStowe town\tA\t187000000\t2000\t72.2\t0.1\t44.465000\t
         assert!(matches!(g.zcta("11771"), Err(GeoError::Offline(_))));
     }
 
-    fn cache_for_test() -> PathBuf {
+    pub(crate) fn cache_for_test() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
             "fdop-gazetteer-recovery-{}-{}",
@@ -606,7 +616,7 @@ VT\t5000710675\t01462073\tStowe town\tA\t187000000\t2000\t72.2\t0.1\t44.465000\t
         zip.finish().unwrap().into_inner()
     }
 
-    fn serve_table(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+    pub(crate) fn serve_table(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
