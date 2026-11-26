@@ -952,7 +952,7 @@ fdop detect clip.m4a -o runs/detect
 Use `detect` to audit your own recordings (see
 [Protecting your own recordings](#protecting-your-own-recordings)).
 
-### `fdop mute <MEDIA> --out <VIDEO.mp4> [--soundtrack <FILE>]`
+### `fdop mute <MEDIA> --out <VIDEO.mp4>`
 
 When the soundtrack is optional, make a silent copy before sharing a video:
 
@@ -968,10 +968,19 @@ fdop mute clip.mov --soundtrack narration.wav --out narrated.mp4
 fdop detect narrated.mp4 --all-audio
 ```
 
+To keep part of the original sound, give one or more intervals in seconds from the start of the recording.
+Use the measured spans from `detect --all-audio` to find passages worth reviewing, then choose edit boundaries after listening.
+
+```bash
+fdop mute clip.mov --silence-range 12.5..48 --silence-range 96..140 --out edited.mp4
+fdop detect edited.mp4 --all-audio --offline
+```
+
+Range mode keeps every channel of the first audio track, applies each cut across those channels, and drops the alternate tracks. The recording clock includes any delay before the primary audio begins and gaps in its timestamps. Ranges include their start and exclude their end, rounded outward to whole samples. Overlapping ranges merge. The output uses ALAC audio. Before publishing, `fdop` decodes the staged file and checks every channel for digital silence throughout the chosen intervals. An interval past the end of primary audio is an error. Use range mode with a stable primary audio format and choose either ranges or a replacement soundtrack.
+
 `mute` works offline with FFmpeg and FFprobe. It copies the first video stream that is not
-cover art into a new MP4, without re-encoding. It drops every original audio track, additional video
-stream, subtitle track, data track, attachment and chapter, and disables copying container
-and stream metadata. With `--soundtrack`, FFmpeg encodes the replacement as AAC, starting
+cover art into a new MP4, without re-encoding. It drops additional video streams, subtitles, data tracks, attachments and chapters, and disables copying container
+and stream metadata. The silent and replacement modes drop every original audio track. With `--soundtrack`, FFmpeg encodes the replacement as AAC, starting
 its first sample at the beginning of the export. A short track is padded with silence and
 a long one ends with the video. FFprobe verifies the completed file has one non-cover video
 track, the requested number of audio tracks (zero or one), zero chapters, no other streams
@@ -5764,7 +5773,7 @@ Review the visual content separately.
    - uniformly pitch-shifting or time-stretching the whole file. This last one is derived, not tested:
      `f0` is a free parameter, so `v` and `d` survive a uniform shift.
 3. **What works:**
-   - cutting out the minutes around each flyover, harmonics included;
+   - silencing the minutes around each flyover, harmonics included, with repeatable `fdop mute --silence-range START..END` intervals;
    - cutting or reordering the stretches between flyovers so their time gaps mean nothing;
    - spectral noise reduction tuned on the curve.
 

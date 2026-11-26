@@ -124,6 +124,14 @@ impl<'a> AudioProbe<'a> {
         Ok((probe, inventory))
     }
 
+    /// FFmpeg gap/overlap correction for a stream on the container-relative clock.
+    pub fn clock_resampler(&self, info: &MediaInfo, output_rate: u32) -> String {
+        let compensation = timestamp_tolerance(&self.complete, info, output_rate)
+            .map(|t| format!(":min_comp={t}:min_hard_comp={t}"))
+            .unwrap_or_default();
+        format!("aresample=async=1:first_pts=0{compensation}")
+    }
+
     pub fn selected_info(&self, selection: AudioSelection) -> Result<MediaInfo, String> {
         media_info(self.path, &self.complete, selection)
     }
@@ -603,9 +611,7 @@ pub fn decode_probed(
     // source first so an invalid selection cannot look like a silent recording.
     let path = probe.path;
     let info = probe.selected_info(selection)?;
-    let compensation = timestamp_tolerance(&probe.complete, &info, sr)
-        .map(|t| format!(":min_comp={t}:min_hard_comp={t}"))
-        .unwrap_or_default();
+    let clock_filter = probe.clock_resampler(&info, sr);
     // Preserve ordinary decoder priming when the short probe already resolves the
     // selected source. Rewinding a normally readable MP3/AAC at zero can skip priming.
     // Keep the complete probe's container epoch whichever decoder path is used.
@@ -639,7 +645,7 @@ pub fn decode_probed(
         info.start_time_s
     );
     let clock =
-        format!("[fdop_normalized]aresample=async=1:first_pts=0{compensation}[fdop_clocked]");
+        format!("[fdop_normalized]{clock_filter}[fdop_clocked]");
     let mut cmd = probe.access.command("ffmpeg");
     // Preserve timestamp jumps, including MPEG-TS/HLS gaps over ten seconds.
     // Full probing discards packets, so that path must rewind even at zero.

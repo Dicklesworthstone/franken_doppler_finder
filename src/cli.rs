@@ -31,13 +31,16 @@ pub enum Cmd {
     Locate(LocateCli),
     /// Detect and measure flyovers only (no ADS-B); writes events.json, traces and figures.
     Detect(DetectCli),
-    /// Remove the original audio and export a verified MP4, optionally with a separate soundtrack.
+    /// Export a verified MP4 with silent, replaced or selectively muted audio.
     Mute {
         /// Local video recording to copy.
         media: PathBuf,
         /// Use the first audio track of this separate local file as the only soundtrack.
         #[arg(long)]
         soundtrack: Option<PathBuf>,
+        /// Mute the first audio track between START and END seconds on the recording clock (repeatable).
+        #[arg(long, value_name = "START..END", conflicts_with = "soundtrack")]
+        silence_range: Vec<crate::mute::SilenceRange>,
         /// New .mp4 file for the verified export.
         #[arg(short, long)]
         out: PathBuf,
@@ -336,9 +339,16 @@ fn run(cli: Cli) -> Result<i32, String> {
             Ok(if out.found { 0 } else { 1 })
         }
         Cmd::Detect(d) => run_detect(d, std::io::stdout().lock()),
-        Cmd::Mute { media, soundtrack, out } => {
-            crate::mute::export(&media, &out, soundtrack.as_deref())?;
-            if soundtrack.is_some() {
+        Cmd::Mute {
+            media,
+            soundtrack,
+            silence_range,
+            out,
+        } => {
+            crate::mute::export(&media, &out, soundtrack.as_deref(), &silence_range)?;
+            if !silence_range.is_empty() {
+                println!("Wrote {} with the requested intervals muted on the first audio track. Review the remaining audio and video before sharing.", out.display());
+            } else if soundtrack.is_some() {
                 println!("Wrote {} with one replacement soundtrack and no recognized location tags. Review the video and audit the replacement audio before sharing.", out.display());
             } else {
                 println!("Wrote {}. Verified zero audio streams and no recognized location tags. Review the video itself before sharing.", out.display());
@@ -1071,6 +1081,20 @@ mod tests {
         let (status, stdout) = run(&bad, true, &root.join("failed"));
         assert!(status.is_err());
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn selective_muting_accepts_multiple_intervals_and_excludes_replacement_audio() {
+        let mut args = vec![
+            "fdop", "mute", "source.mov", "-o", "edited.mp4",
+            "--silence-range", "0..2.5", "--silence-range", "7..10",
+        ];
+        let Cmd::Mute { silence_range, .. } = Cli::try_parse_from(&args).unwrap().cmd else {
+            panic!("expected mute command");
+        };
+        assert_eq!(silence_range.len(), 2);
+        args.extend(["--soundtrack", "voice.wav"]);
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]

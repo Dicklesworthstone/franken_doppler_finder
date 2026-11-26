@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep original audio outside selected mute intervals
+
+- Add repeatable `fdop mute --silence-range START..END` in recording seconds. Mute every channel of the first original audio track, remove alternate tracks and retain the copied primary video. The verification pass decodes the staged ALAC audio and checks the chosen intervals before publishing.
+- Add regressions for overlapping cuts, sample boundaries, delayed primary audio, packet gaps, opposite-polarity stereo, alternate tracks and refusal when an interval exceeds the audio duration.
+
 ### Compare shifted-clock evidence at equal refinement
 
 - Compare the primary and each nonempty decoy at the same scoring stage. The smallest pairwise lead decides the gate. `margin.top_score_before_refinement` records the winner's fine-grid evidence when it was refined.
