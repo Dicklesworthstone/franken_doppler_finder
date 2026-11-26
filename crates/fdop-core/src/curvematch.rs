@@ -1384,8 +1384,7 @@ fn stamp_track(
                     }
                     // The closest sample can be outside reach while the interpolated pass
                     // enters it. Apply the range gate to that pass, after finding its CPA.
-                    if !d.is_finite() || !v.is_finite() || d > reach || !(15.0..=v_cap).contains(&v)
-                    {
+                    if !d.is_finite() || !v.is_finite() || d > reach || v < 15.0 {
                         continue;
                     }
                     let c = c_at(bt);
@@ -1415,6 +1414,12 @@ fn stamp_track(
                             let scale = BASE_C / medium.c;
                             (bank_v, bank_d, arrive) = (v * scale, d * scale, bt + d / medium.c);
                         }
+                    }
+                    // This upper bound comes from the still-air bank. Weather can map a
+                    // faster ground track back inside it, without expanding the templates.
+                    // Only recover previously rejected speeds; ordinary stamps stay unchanged.
+                    if v > v_cap && (bank_v >= BASE_C || !(15.0..=v_cap).contains(&bank_v)) {
+                        continue;
                     }
                     let tv = nearest_log(&p.v_grid, bank_v);
                     let td = nearest_log(&p.d_grid, bank_d);
@@ -1648,12 +1653,21 @@ fn score_exact_with_recovery(
             let Some(cpa) = tr.cpa_near(x, te, 2.0 * p.sample_s) else {
                 continue;
             };
-            if cpa.speed < 15.0 || cpa.speed > v_cap || cpa.d > p.reach_m {
+            if cpa.speed < 15.0 || cpa.d > p.reach_m {
                 continue;
             }
             let (_, _, h) = ecef_to_geodetic(tr.pos_at(cpa.t_e));
             let m = inp.atmo.medium(lat, lon, cpa.t_e, z + MIC_HEIGHT_M, h);
             let prop = Prop::from_medium(&m, &enu);
+            // A ground-speed rejection may still have a supported still-air representation.
+            // fit_geometry also requires a valid medium and motion subsonic relative to it.
+            if cpa.speed > v_cap
+                && prop
+                    .fit_geometry(cpa.rv, cpa.vel, BASE_C)
+                    .is_none_or(|(v, _)| !(15.0..=v_cap).contains(&v))
+            {
+                continue;
+            }
             let arrive = cpa.t_r_p(&prop);
             let aud = arrive - clock0 - im.t0;
             if aud < -30.0 || aud > inp.duration_s + 30.0 {
@@ -8200,6 +8214,247 @@ mod tests {
                 assert_eq!(recovered.rv, scored.rv);
                 assert_eq!(recovered.vel, scored.vel);
             }
+        }
+    }
+
+    #[test]
+    fn curve_speed_gate_recovers_supported_atmospheric_bank_speeds() {
+        let (lat, lon, clock) = SCENE_AT;
+        let p = MatchParams::default();
+        let g = observer_cell(&p);
+        let observer = g.enu.to_ecef(g.observers[0]);
+        let cap = p.v_grid.last().unwrap() * 1.15;
+        let medium = |c, wind_e| Medium {
+            c,
+            wind_e,
+            wind_n: 0.0,
+        };
+        for (speed, m, keep) in [
+            (290.0, medium(BASE_C, 50.0), true),
+            (290.0, medium(355.0, 0.0), true),
+            (290.0, medium(BASE_C, 0.0), false),
+            (290.0, medium(BASE_C, -60.0), false),
+            (380.0, medium(BASE_C, 50.0), false),
+            (290.0, medium(BASE_C, BASE_C), false),
+            (290.0, medium(BASE_C, f64::NAN), false),
+            (290.0, medium(f64::INFINITY, 0.0), false),
+            (10.0, medium(355.0, 50.0), false),
+            // Preserve an ordinary accepted pass even when its wind mapping exceeds the cap.
+            (263.0, medium(BASE_C, -40.0), true),
+        ] {
+            let tr = scene_track(
+                [0.0, 900.0, 600.0 + MIC_HEIGHT_M],
+                [speed, 0.0, 0.0],
+                120.0,
+                -200.0,
+                500.0,
+            );
+            let mut stamps = Vec::new();
+            stamp_track(
+                &tr,
+                &g,
+                &p,
+                &|_| BASE_C,
+                Some(&UniformAtmosphere(m)),
+                clock,
+                (clock - 200.0, clock + 500.0),
+                &mut stamps,
+            );
+            assert_eq!(
+                stamps.len(),
+                usize::from(keep),
+                "speed={speed}, medium={m:?}"
+            );
+            if keep {
+                let (pos, vel) = tr.pv(clock + 120.0);
+                let prop = Prop::from_medium(&m, &Enu::new(lat, lon, MIC_HEIGHT_M));
+                let (v, d, heard) = wind_bank_pass(sub(pos, observer), vel, &prop).unwrap();
+                assert!((f64::from(stamps[0].1.arrive) - 120.0 - heard).abs() < 0.01);
+                let tpl = nearest_log(&p.v_grid, v) * p.d_grid.len() + nearest_log(&p.d_grid, d);
+                assert_eq!(usize::from(stamps[0].1.tpl), tpl);
+                if speed > cap {
+                    assert!((15.0..=cap).contains(&v));
+                } else {
+                    assert!(
+                        v > cap,
+                        "the unchanged ordinary path must exercise the old allowance"
+                    );
+                }
+            }
+        }
+        // The regional sound-speed provider has the same recovery when no path provider exists.
+        let tr = scene_track(
+            [0.0, 900.0, 600.0 + MIC_HEIGHT_M],
+            [290.0, 0.0, 0.0],
+            120.0,
+            -200.0,
+            500.0,
+        );
+        for c in [355.0, BASE_C, 0.0, f64::NAN, f64::INFINITY] {
+            let mut stamps = Vec::new();
+            stamp_track(
+                &tr,
+                &g,
+                &p,
+                &|_| c,
+                None,
+                clock,
+                (clock - 200.0, clock + 500.0),
+                &mut stamps,
+            );
+            assert_eq!(stamps.len(), usize::from(c == 355.0), "sound speed={c}");
+        }
+        let far = scene_track(
+            [0.0, p.reach_m + 100.0, 600.0 + MIC_HEIGHT_M],
+            [290.0, 0.0, 0.0],
+            120.0,
+            -200.0,
+            500.0,
+        );
+        let mut stamps = Vec::new();
+        stamp_track(
+            &far,
+            &g,
+            &p,
+            &|_| BASE_C,
+            Some(&UniformAtmosphere(medium(BASE_C, 50.0))),
+            clock,
+            (clock - 200.0, clock + 500.0),
+            &mut stamps,
+        );
+        assert!(
+            stamps.is_empty(),
+            "speed recovery must retain the physical range gate"
+        );
+    }
+
+    #[test]
+    fn atmospheric_fast_pcm_reaches_votes_and_exact_scoring() {
+        let (lat, lon, clock) = SCENE_AT;
+        let enu = Enu::new(lat, lon, 0.0);
+        let observer = enu.to_ecef([0.0, 0.0, MIC_HEIGHT_M]);
+        let mut tr = scene_track(
+            [0.0, 6_000.0, 1_000.0 + MIC_HEIGHT_M],
+            [290.0, 0.0, 0.0],
+            300.0,
+            -200.0,
+            800.0,
+        );
+        tr.typ = "A320".into();
+        tr.engine = fdop_types::engine::EngineClass::Jet;
+        let tracks = vec![tr];
+        // Keep the production speed bank and all evidence gates. A smaller distance bank
+        // and one-second image hops bound this physical PCM admission regression.
+        let p = MatchParams {
+            hop_s: 1.0,
+            d_grid: vec![3_000.0, 6_000.0, 8_000.0],
+            ..Default::default()
+        };
+        let cap = p.v_grid.last().unwrap() * 1.15;
+        let medium = Medium {
+            c: BASE_C,
+            wind_e: 50.0,
+            wind_n: 0.0,
+        };
+        let prop = Prop::from_medium(&medium, &enu);
+        let cpa = tracks[0]
+            .cpa_near(observer, clock + 300.0, 8.0)
+            .unwrap();
+        assert!(cpa.speed > cap);
+        let (mapped, _, _) = wind_bank_pass(cpa.rv, cpa.vel, &prop).unwrap();
+        assert!((15.0..=cap).contains(&mapped));
+        assert_eq!(
+            nearest_log(&p.v_grid, mapped),
+            nearest_log(&p.v_grid, cpa.speed)
+        );
+        let mut pcm = noise(600 * 2800, 42, 0.05);
+        // At 70 Hz all four generated harmonics remain below the sample rate's usable band.
+        add_flight(
+            &mut pcm,
+            2800.0,
+            clock,
+            &tracks[0],
+            observer,
+            &prop,
+            70.0,
+            2.0,
+        );
+        let pcm: Vec<f32> = pcm.into_iter().map(|v| v as f32).collect();
+        let im = build_image(&pcm, 2800, &p).unwrap();
+        let bank = build_bank(&im, &p);
+        let atmo = UniformAtmosphere(medium);
+        let dem = FlatElevation(0.0);
+        let inp = MatchInputs {
+            image: &im,
+            tracks: &tracks,
+            region: BBox::new(lat, lon, lat, lon),
+            start_lo: clock,
+            start_hi: clock,
+            duration_s: 600.0,
+            catalog: (clock - 200.0, clock + 800.0),
+            dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let mut stamps = Vec::new();
+        stamp_track(
+            &tracks[0],
+            &observer_cell(&p),
+            &p,
+            &|_| BASE_C,
+            Some(&atmo),
+            clock,
+            inp.catalog,
+            &mut stamps,
+        );
+        assert_eq!(
+            stamps.len(),
+            1,
+            "the supported weather mapping must reach the bank"
+        );
+        let (mut votes, mut touched) = (vec![0.0; 3], Vec::new());
+        accumulate_votes(
+            &[stamps[0].1],
+            &bank,
+            &im,
+            clock,
+            clock,
+            &mut votes,
+            &mut touched,
+        );
+        assert!(
+            votes.iter().any(|&v| v > 0.0),
+            "the observed pass must vote for its recording clock"
+        );
+        let idx = vec![ExactTrack::new(0, &tracks[0])];
+        let exact = score_exact(&inp, &p, &bank, &idx, lat, lon, clock)
+            .expect("a supported fast pass must reach exact emitted-path scoring");
+        assert_eq!(
+            exact.n_heard, 1,
+            "the recovered physical tone must retain both heard halves"
+        );
+        assert_eq!(exact.clock, clock);
+        let pass = &exact.passes[0];
+        assert!(counts_as_heard(pass.value, pass.nats, pass.shared));
+        assert!((pass.f0_hz - 70.0).abs() < 3.0);
+        for medium in [
+            Medium::still(BASE_C),
+            Medium {
+                c: BASE_C,
+                wind_e: -60.0,
+                wind_n: 0.0,
+            },
+            Medium::still(f64::NAN),
+        ] {
+            let atmo = UniformAtmosphere(medium);
+            let control = MatchInputs {
+                atmo: &atmo,
+                ..inp
+            };
+            assert!(
+                score_exact(&control, &p, &bank, &idx, lat, lon, clock).is_none(),
+                "unsupported ground speed or medium must not bypass the exact gate: {medium:?}",
+            );
         }
     }
 

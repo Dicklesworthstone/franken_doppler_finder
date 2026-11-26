@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain fast curve matches supported by the observer's weather
+
+- Apply the curve bank's upper speed allowance after atmospheric conversion for ground
+  tracks the old upper gate rejected. Coarse voting and exact rescoring can now retain a
+  fast pass whose equivalent still-air curve is inside the existing template allowance.
+  Keep the physical minimum speed, range gate, bounded CPA retry and evidence thresholds.
+- Add coarse controls for warm calm air, tailwind, unsupported or invalid media, range and
+  original accepted passes, plus a synthetic PCM regression through votes and exact scoring.
+  A 290 m/s track with a 50 m/s tailwind at 343 m/s sound speed maps to 263.158 m/s, within
+  the unchanged 287.098 m/s bank allowance.
+- Independent source review and Doppler-asymptote arithmetic confirm the admission defect.
+  Native regressions, full workspace checks, release selftest and reference/field replays
+  remain unrun because the execution host is unavailable. No field-accuracy claim is made.
+
 ### Preserve Census containment across online and offline replays
 
 - Cache a usable Census result under the exact reverse-geocoding query, including its six-decimal coordinates, endpoint, benchmark and vintage. Use the saved reply on subsequent online or offline runs and record its reuse in the report. The ZIP and jurisdiction keep their Census containment provenance.

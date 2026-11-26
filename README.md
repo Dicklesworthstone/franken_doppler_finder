@@ -833,7 +833,9 @@ The report warns that this mode has no field validation and records the request 
 additive `extra.include_jets` boolean. The detector band, speed limits, measurement limits
 and confidence gates are unchanged. Broadband jet noise and supersonic propagation are
 not modelled. Ordinary runs continue to use the existing non-jet catalogues. Unknown
-types remain eligible in either mode.
+types remain eligible in either mode. The curve match also retains a faster ground track when
+its observer-specific weather maps it into the existing still-air template speed allowance;
+the physical range and minimum-speed gates still apply.
 
 **The time window.** Without `--start`, recording starts are searched from local midnight on the first date to
 local midnight after the last, using every UTC offset the region spans, DST included. If the file's
@@ -2433,6 +2435,25 @@ second weather wait; a larger footprint can require another archive download.
 ---
 
 ## Testing
+
+### Keep weather-supported fast passes in the curve match
+
+The curve match's upper speed allowance comes from its still-air template bank. A ground
+track above that allowance can still produce a represented Doppler curve in warm air or a
+tailwind. Previously both coarse voting and exact rescoring rejected it before considering
+the observer's atmosphere. They now retain such a pass only when its equivalent still-air
+speed lies within the existing allowance and its propagation is subsonic. Previously admitted
+passes retain their scoring path, including nulls and coverage normalization.
+
+For example, a 290 m/s ground track in 343 m/s sound speed and a 50 m/s tailwind has a
+263.158 m/s equivalent bank speed, below the unchanged 287.098 m/s allowance. This follows
+independently from its approach/recession Doppler asymptotes; the old ground-speed test rejects it.
+Added regressions exercise coarse stamps under tailwind and warm calm air, invalid and
+unsupported media, the original speed/range limits, and a synthetic PCM pass reaching both
+recording-clock votes and exact tone scoring. Native execution of these new tests, full
+workspace checks, release selftest and reference/field replays remain unrun after the execution
+host became unavailable. Source review and independent numerical checks support the change;
+they do not establish native test success, field accuracy or confidence calibration.
 
 ### Preserve recording clocks across audio format changes
 
