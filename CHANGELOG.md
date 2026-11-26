@@ -19,6 +19,23 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep recovered clocks through weighted refinement
+
+- Retry the existing scan-cell neighborhood of a physical timing seed whose weighted
+  trace loss is positive infinity, after the original scan and finite-seed recoveries
+  fail to improve. A nearby supported clock can now survive the fine-to-refinement
+  handoff. Existing finite-seed improvements, weights, bounds and gates retain priority.
+- Add focused clock-profile regressions for relative and Unix time, finite and unsupported
+  coarse scans, invalid objectives, bounded work and final callback state. Add a synthetic
+  two-flight handoff regression with complete observed ridges and shorter archive coverage.
+  Its deliberately broad clock interval exercises the public search API; it does not
+  establish recovery for an ordinary fitted recording or a field case.
+- The exact four production clock helpers and 17 focused tests pass natively on the
+  pinned compiler. The preceding helpers fail the new recovery test and the expanded
+  unsupported-objective control. Independent review and changed-line formatting/whitespace
+  checks pass. Physical integration, full workspace, release selftest and reference/field
+  replays remain unrun; no field-accuracy improvement is claimed.
+
 ### Flag possible camera telemetry in silent recordings
 
 - Whole-file audits now list data streams with the `gpmd` or `camm` format in `possible_location_telemetry`, separately from recognized location tags. The audit reads the stream index and format without inspecting sample payloads.

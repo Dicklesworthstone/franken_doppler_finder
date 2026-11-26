@@ -2715,7 +2715,8 @@ fn profile_valid_clock_seeded(
 /// Refine broad clocks against the same unconstrained weighted objective as the
 /// contour. A physical CPA seed's uncertain centre cannot reject a better clock
 /// in its scan-cell neighborhood. Only a strict improvement replaces the original
-/// minimum; no fine-grid acceptance gates are introduced.
+/// minimum; no fine-grid acceptance gates are introduced. Missing support at the
+/// seed gets a bounded retry after the existing finite-seed recoveries fail.
 fn profile_clock_seeded(
     lo: f64,
     hi: f64,
@@ -2736,6 +2737,7 @@ fn profile_clock_seeded(
     let original_cost = original.map_or(f64::INFINITY, |best| best.1);
     let mut best = original;
     let mut tried = false;
+    let mut unscorable = Vec::new();
     for (i, &seed) in seeds.iter().enumerate() {
         if !seed.is_finite() || seed < lo || seed > hi || seeds[..i].contains(&seed) {
             continue;
@@ -2743,6 +2745,9 @@ fn profile_clock_seeded(
         tried = true;
         let value = cost(seed);
         if !value.is_finite() {
+            if value == f64::INFINITY {
+                unscorable.push(seed);
+            }
             continue;
         }
         // An uncertain fitted centre can score worse than the original minimum
@@ -2760,6 +2765,22 @@ fn profile_clock_seeded(
         }
         if best.is_none_or(|old| candidate.1 < old.1) {
             best = Some(candidate);
+        }
+    }
+    if best == original {
+        // A fine-grid clock recovered beside an unsupported fitted centre must
+        // also remain available to the weighted contour. Preserve every old
+        // finite-seed improvement before trying these same scan-cell bounds.
+        for seed in unscorable {
+            if let Some(candidate) = profile_clock(
+                (seed - half).max(lo),
+                (seed + half).min(hi),
+                false,
+                &mut cost,
+            ) && best.is_none_or(|old| candidate.1 < old.1)
+            {
+                best = Some(candidate);
+            }
         }
     }
     if best != original
@@ -7460,11 +7481,13 @@ mod tests {
 
     #[test]
     fn seeded_ungated_clock_preserves_original_minima_and_callback_state() {
-        for kind in 0..3 {
+        for kind in 0..5 {
             let score = |t: f64| match kind {
                 0 => t * t,
                 1 => 0.0,
-                _ => f64::INFINITY,
+                2 => f64::INFINITY,
+                3 => f64::NAN,
+                _ => f64::NEG_INFINITY,
             };
             let mut original_calls = Vec::new();
             let original = profile_clock(-400.0, 400.0, false, |t| {
@@ -7481,7 +7504,7 @@ mod tests {
             assert_eq!(&calls[..original_calls.len()], &original_calls);
             let extra = &calls[original_calls.len()..calls.len() - 1];
             assert_eq!(extra[0], 1.173);
-            if kind == 2 {
+            if kind >= 3 {
                 assert_eq!(extra, &[1.173]);
             } else {
                 assert!(extra.len() > 1 && extra.len() < 50);
@@ -7584,6 +7607,71 @@ mod tests {
         );
         assert!(calls.len() < original_calls.len() + 50);
         assert_eq!(calls.last().copied(), Some(recovered.0));
+    }
+
+    #[test]
+    fn ungated_clock_recovers_unsupported_seeds_after_finite_recovery_fails() {
+        for base in [0.0, 1_788_895_000.0] {
+            for finite_scan in [false, true] {
+                let score = |t: f64| {
+                    let t = t - base;
+                    if (t - 100.1).abs() < 0.08 {
+                        (t - 100.1).powi(2) + 1.0
+                    } else if (t - 400.1).abs() < 0.08 {
+                        (t - 400.1).powi(2) + 2.0
+                    } else if finite_scan && t >= 300.0 {
+                        (t - 600.0).powi(2) + 10.0
+                    } else {
+                        f64::INFINITY
+                    }
+                };
+                let (lo, hi, seed) = (base, base + 800.0, base + 100.39);
+                assert_eq!(score(seed), f64::INFINITY);
+                let mut original_calls = Vec::new();
+                let original = profile_clock(lo, hi, false, |t| {
+                    original_calls.push(t);
+                    score(t)
+                });
+                assert_eq!(original.map(|b| b.1), finite_scan.then_some(10.0));
+                let mut calls = Vec::new();
+                let recovered = profile_clock_seeded(lo, hi, &[seed, seed, f64::NAN], |t| {
+                    calls.push(t);
+                    score(t)
+                })
+                .expect("a supported neighboring clock must reach the weighted objective");
+                assert!((recovered.0 - base - 100.1).abs() < 0.01);
+                assert_eq!(recovered.1, score(recovered.0));
+                assert_eq!(&calls[..original_calls.len()], &original_calls);
+                assert!(calls.len() < original_calls.len() + 100);
+                assert!(
+                    calls[original_calls.len()..]
+                        .iter()
+                        .all(|&t| (seed - 2.0..=seed + 2.0).contains(&t))
+                );
+                assert_eq!(calls.last().copied(), Some(recovered.0));
+
+                // A successful finite-seed recovery keeps its old result and call
+                // order, even if the unsupported seed brackets a lower objective.
+                for legacy_seed in [base + 400.1, base + 400.16] {
+                    let mut legacy_calls = Vec::new();
+                    let legacy = profile_clock_seeded(lo, hi, &[legacy_seed], |t| {
+                        legacy_calls.push(t);
+                        score(t)
+                    });
+                    calls.clear();
+                    let kept = profile_clock_seeded(lo, hi, &[seed, legacy_seed], |t| {
+                        calls.push(t);
+                        score(t)
+                    });
+                    assert_eq!(kept, legacy);
+                    assert!((kept.unwrap().0 - base - 400.1).abs() < 0.01);
+                    let mut expected = original_calls.clone();
+                    expected.push(seed);
+                    expected.extend_from_slice(&legacy_calls[original_calls.len()..]);
+                    assert_eq!(calls, expected);
+                }
+            }
+        }
     }
 
     #[test]
@@ -7979,6 +8067,101 @@ mod tests {
                     .map(|(i, (fit, event))| event.n_eff * fit.chi * weights.map_or(1.0, |w| w[i]))
                     .sum();
                 assert_eq!(fitted.total, expected_total);
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_refinement_keeps_clocks_recovered_beside_unsupported_cpa_centres() {
+        let dem = FlatElevation(0.0);
+        let prop = Prop::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(prop.c));
+        for (start, reflected) in [(0.0, false), (1_788_895_000.0, true)] {
+            let mut case = compact_fine_grid_case(start, reflected);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let assignments = [(0, 0, start + 120.0), (1, 1, start + 360.0)];
+            for (k, (track, event)) in case.tracks.iter_mut().zip(&mut case.events).enumerate() {
+                let when = start + [120.0, 360.0][k];
+                // Keep the entire observed ridge. Only the archive is shortened:
+                // these 30 source-seconds still cover every received observation.
+                let first = track.t.partition_point(|&t| t < when - 15.0);
+                let end = track.t.partition_point(|&t| t <= when + 15.0);
+                track.t = track.t[first..end].to_vec();
+                track.pos = track.pos[first..end].to_vec();
+                track.vel = track.vel[first..end].to_vec();
+                event.t_rec += [-40.0, 40.0][k];
+                event.t_tol = 14_000.0;
+            }
+            case.p.start_lo = start - 11_969.0;
+            case.p.start_hi = start + 12_029.0;
+            let supported = |clock: f64| {
+                case.tracks.iter().zip(&case.events).all(|(track, event)| {
+                    event
+                        .tr_t
+                        .iter()
+                        .filter(|&&t| {
+                            track
+                                .solve_emission_p(clock + t, o.x, &prop, None)
+                                .is_some()
+                        })
+                        .take(5)
+                        .count()
+                        == 5
+                })
+            };
+            assert!(supported(start));
+            let seeds: Vec<_> = assignments
+                .iter()
+                .map(|&(ei, ti, guess)| {
+                    let cpa = case.tracks[ti as usize]
+                        .cpa_nearest_time(o.x, guess, 150.0)
+                        .unwrap();
+                    assert!(gates_ok(&case.events[ei], &cpa, &prop, 0.0));
+                    cpa.t_r_fit_p(&prop) - case.events[ei].t_rec
+                })
+                .collect();
+            assert!(seeds.iter().all(|&seed| !supported(seed)));
+            // The capped global scan lands at clocks ...,-30,+30,... . None
+            // has the five covered samples that either trace objective requires.
+            let (lo, hi) = (case.p.start_lo - 1.0, case.p.start_hi + 1.0);
+            assert!(seeds.iter().zip(&case.events).all(|(&seed, event)| {
+                seed - event.t_tol - 1.0 <= lo && seed + event.t_tol + 1.0 >= hi
+            }));
+            assert!((0..=400).all(|k| !supported(lo + (hi - lo) * k as f64 / 400.0)));
+            for (gates, weights) in [
+                (PointGates::All, None),
+                (PointGates::Off, None),
+                (PointGates::Off, Some([1.0, 0.3])),
+            ] {
+                let fitted = eval_point_weighted(
+                    &o,
+                    &assignments,
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &atmo,
+                    true,
+                    gates,
+                    false,
+                    weights.as_ref().map(|w| w.as_slice()),
+                    false,
+                )
+                .expect("the fine-stage clock must survive weighted refinement");
+                assert!((fitted.t_s - start).abs() < 0.05);
+                assert!(
+                    fitted
+                        .chis
+                        .iter()
+                        .all(|fit| fit.chi < 0.1 && fit.cov == 1.0)
+                );
+                let expected: f64 = fitted
+                    .chis
+                    .iter()
+                    .zip(&case.events)
+                    .enumerate()
+                    .map(|(i, (fit, event))| event.n_eff * fit.chi * weights.map_or(1.0, |w| w[i]))
+                    .sum();
+                assert_eq!(fitted.total, expected);
             }
         }
     }

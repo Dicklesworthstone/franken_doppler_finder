@@ -2624,6 +2624,27 @@ exercises real PNG files, filesystem caching, interpolation and concurrent reads
 network fetching. Full crate/workspace gates, CLI selftest and reference/field replays
 remain unverified. No end-to-end localization or runtime improvement is claimed.
 
+### Retain supported clocks during weighted refinement
+
+Weighted refinement now gives a positive-infinity timing seed the same bounded
+neighborhood retry available to fine scoring, after the existing finite-seed paths
+fail to improve. Missing archive support at the fitted centre no longer rules out
+a supported clock beside it. Successful earlier recoveries retain priority, and
+the returned trace fits still belong to the returned clock.
+
+The added `ungated_clock_recovers_unsupported_seeds_after_finite_recovery_fails`
+regression covers relative and Unix clocks, finite and unsupported coarse scans,
+bounded work and callback restoration. The physical
+`weighted_refinement_keeps_clocks_recovered_beside_unsupported_cpa_centres`
+regression keeps both observed ridges and shortens only the archived flight spans.
+Its clock window is deliberately broader than a typical fitted short ridge, so it
+is public-API/component coverage, not evidence of a new real-recording location.
+The exact four production clock helpers and 17 focused tests pass natively with
+`nightly-2026-08-31`. Against the preceding helpers, the new recovery test and the
+expanded unsupported-objective control fail. Independent source review and changed-line
+format checks also pass. The physical integration regression, full workspace, release
+selftest and reference/field replays remain unrun; no field-accuracy improvement is claimed.
+
 ### Keep uncertain timing seeds eligible during weighted refinement
 
 `ungated_clock_profiles_near_a_seed_that_is_worse_than_the_original` isolates a
