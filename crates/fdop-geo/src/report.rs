@@ -10,11 +10,43 @@ use frankenpandas::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Interpretation of the reported number, separate from the grade for the location.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RadiusStatus {
+    /// Reports predating this field can still be read without inventing a status.
+    #[default]
+    Unspecified,
+    Estimated,
+    LowerBound,
+    Unresolved,
+    Nominal,
+    Unavailable,
+}
+
+impl RadiusStatus {
+    pub fn label(self, metres: f64) -> String {
+        match self {
+            Self::Estimated => format!("estimated radius {metres:.0} m"),
+            Self::LowerBound => format!("radius at least {:.0} m", metres.floor()),
+            Self::Unresolved => format!("unresolved radius ({metres:.0} m shown)"),
+            Self::Nominal => format!("nominal radius {metres:.0} m (refinement unavailable)"),
+            Self::Unspecified => format!("reported radius {metres:.0} m (status unspecified)"),
+            Self::Unavailable => "radius unavailable".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Answer {
+    #[serde(deserialize_with = "answer_number")]
     pub lat: f64,
+    #[serde(deserialize_with = "answer_number")]
     pub lon: f64,
+    #[serde(deserialize_with = "answer_number")]
     pub radius_m: f64,
+    #[serde(default)]
+    pub radius_status: RadiusStatus,
     /// How the radius was derived (e.g. "score-surface 2-sigma region + model floor").
     #[serde(default)]
     pub radius_basis: String,
@@ -27,6 +59,11 @@ pub struct Answer {
     /// (gate name, passed, detail)
     #[serde(default)]
     pub gates: Vec<(String, bool, String)>,
+}
+
+// A refusal has always serialized its absent coordinates and radius as JSON null.
+fn answer_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
 }
 
 impl Answer {
@@ -418,7 +455,7 @@ pub fn render_markdown(inp: &ReportInput) -> String {
     o.push_str(&format!(
         "- **Location:** {}\n- **Confidence:** {}\n- **Verdict:** {}\n",
         if a.has_location() {
-            format!("{:.6}, {:.6} (±{:.0} m)", a.lat, a.lon, a.radius_m)
+            format!("{:.6}, {:.6} ({})", a.lat, a.lon, a.radius_status.label(a.radius_m))
         } else {
             "No location found".into()
         },
@@ -652,7 +689,7 @@ pub fn render_html(inp: &ReportInput, out_dir: &Path) -> Result<PathBuf, GeoErro
         .collect();
     let heat = inp.heatmap.as_ref().map(heat_cells).unwrap_or_default();
     let data = serde_json::json!({
-        "lat": a.lat, "lon": a.lon, "radius": a.radius_m, "title": title,
+        "lat": a.lat, "lon": a.lon, "radius": a.radius_m, "radius_label": a.radius_status.label(a.radius_m), "title": title,
         "candidates": cands, "heat": heat,
     });
     let mut gates = String::new();
@@ -834,9 +871,9 @@ for (const c of D.candidates) {{
 cg.addTo(map); overlays['Candidates'] = cg;
 const circle = L.circle([D.lat, D.lon], {{radius: D.radius, color: '#d7191c', weight: 3, fill: false}}).addTo(map);
 const popup = document.createElement('span');
-popup.textContent = D.title + ' · ' + D.lat.toFixed(6) + ', ' + D.lon.toFixed(6) + ' ±' + Math.round(D.radius) + ' m';
+popup.textContent = D.title + ' · ' + D.lat.toFixed(6) + ', ' + D.lon.toFixed(6) + ' · ' + D.radius_label;
 L.marker([D.lat, D.lon]).bindPopup(popup).addTo(map);
-overlays['Answer radius'] = circle;
+overlays[D.radius_label] = circle;
 L.control.layers({{'USGS Topo': topo, 'USGS Imagery': imagery, 'OpenStreetMap': osm}}, overlays).addTo(map);
 L.control.scale({{imperial: true, metric: true}}).addTo(map);
 map.fitBounds(circle.getBounds().pad(1.5));
@@ -863,8 +900,8 @@ loadMap.addEventListener('click', () => {{
     };
     let location = if a.has_location() {
         format!(
-            "{:.6}, {:.6} &nbsp;±{:.0} m &nbsp;·&nbsp; ",
-            a.lat, a.lon, a.radius_m
+            "{:.6}, {:.6} &nbsp;{} &nbsp;·&nbsp; ",
+            a.lat, a.lon, a.radius_status.label(a.radius_m)
         )
     } else {
         String::new()
@@ -1025,6 +1062,7 @@ pub(crate) mod tests {
                 lon: -73.524951,
                 radius_m: 300.0,
                 radius_basis: "score surface".into(),
+                radius_status: RadiusStatus::Estimated,
                 confidence: "high".into(),
                 verdict: "cross-confirmed".into(),
                 gates: vec![
@@ -1162,6 +1200,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn radius_status_reaches_json_report_headlines_and_map_popups() {
+        let dir = std::env::temp_dir().join(format!("fdop-geo-radius-{}", std::process::id()));
+        let mut input = sample();
+        input.answer.radius_m = 300.8;
+        for (status, json_status, label) in [
+            (
+                RadiusStatus::Estimated,
+                "estimated",
+                "estimated radius 301 m",
+            ),
+            (
+                RadiusStatus::LowerBound,
+                "lower_bound",
+                "radius at least 300 m",
+            ),
+            (
+                RadiusStatus::Unresolved,
+                "unresolved",
+                "unresolved radius (301 m shown)",
+            ),
+            (
+                RadiusStatus::Nominal,
+                "nominal",
+                "nominal radius 301 m (refinement unavailable)",
+            ),
+        ] {
+            input.answer.radius_status = status;
+            let answer = serde_json::to_value(&input.answer).unwrap();
+            assert_eq!(answer["radius_status"], json_status);
+            assert_eq!(answer["radius_m"], 300.8);
+            assert!(render_markdown(&input).contains(label));
+            let html = std::fs::read_to_string(render_html(&input, &dir).unwrap()).unwrap();
+            assert!(html.split("</header>").next().unwrap().contains(label));
+            assert!(html.contains(&format!(r#""radius_label":"{label}""#)));
+        }
+        let mut legacy = serde_json::to_value(&input.answer).unwrap();
+        legacy.as_object_mut().unwrap().remove("radius_status");
+        let restored: Answer = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.radius_status, RadiusStatus::Unspecified);
+    }
+
+    #[test]
     fn html_keeps_online_map_resources_inert_until_requested() {
         let dir = std::env::temp_dir().join(format!("fdop-geo-html-{}", std::process::id()));
         let mut input = sample();
@@ -1196,9 +1276,24 @@ pub(crate) mod tests {
             lon: f64::NAN,
             radius_m: f64::NAN,
             confidence: "none".into(),
+            radius_status: RadiusStatus::Unavailable,
             verdict: "need two usable flyovers".into(),
             ..Default::default()
         };
+        let mut answer = serde_json::to_value(&input.answer).unwrap();
+        assert!(answer["radius_m"].is_null());
+        assert_eq!(answer["radius_status"], "unavailable");
+        assert!(
+            !serde_json::from_value::<Answer>(answer.clone())
+                .unwrap()
+                .has_location()
+        );
+        answer.as_object_mut().unwrap().remove("radius_status");
+        assert!(
+            !serde_json::from_value::<Answer>(answer)
+                .unwrap()
+                .has_location()
+        );
         let dir = std::env::temp_dir().join(format!("fdop-geo-refusal-{}", std::process::id()));
         let html = std::fs::read_to_string(render_html(&input, &dir).unwrap()).unwrap();
         let markdown = render_markdown(&input);

@@ -186,6 +186,16 @@ fn record_run(cache: &std::path::Path, row: &crate::ledger::RunRow) {
     }
 }
 
+/// The ledger stores the number from the report without its radius basis.
+fn history_location(lat: Option<f64>, lon: Option<f64>, radius: Option<f64>) -> String {
+    match (lat, lon, radius) {
+        (Some(lat), Some(lon), Some(m)) => {
+            format!("{lat:>10.6} {lon:>11.6}  reported radius {m:.0} m (see report for basis)")
+        }
+        _ => "no location".into(),
+    }
+}
+
 fn cache_of(c: &Common) -> PathBuf {
     c.cache
         .clone()
@@ -305,7 +315,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                     .and_then(|p| p.zip.clone())
                     .unwrap_or_else(|| "?".into());
                 println!("location   {:.6}, {:.6}", a.lat, a.lon);
-                println!("radius     {:.0} m  ({})", a.radius_m, a.confidence);
+                println!("{}  ({})", a.radius_status.label(a.radius_m), a.confidence);
                 println!("place      {headline}");
                 println!("zip        {zip}");
                 println!("verdict    {}", a.verdict);
@@ -421,11 +431,9 @@ fn run(cli: Cli) -> Result<i32, String> {
             } else {
                 for r in rows {
                     println!(
-                        "{}  {:>10.6} {:>11.6}  r={:>5.0} m  {:<6}  {}  [{} | {} | {}]",
+                        "{}  {}  {:<6}  {}  [{} | {} | {}]",
                         r.created_utc,
-                        r.lat.unwrap_or(f64::NAN),
-                        r.lon.unwrap_or(f64::NAN),
-                        r.radius_m.unwrap_or(f64::NAN),
+                        history_location(r.lat, r.lon, r.radius_m),
                         r.confidence,
                         r.headline,
                         r.input_file,
@@ -697,6 +705,15 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn history_shows_the_reported_radius_and_omits_absent_coordinates() {
+        assert!(
+            super::history_location(Some(0.0), Some(0.0), Some(300.0))
+                .contains("reported radius 300 m (see report for basis)")
+        );
+        assert_eq!(super::history_location(None, None, None), "no location");
+    }
+
     use super::*;
 
     #[test]

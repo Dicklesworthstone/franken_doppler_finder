@@ -55,6 +55,7 @@ fn main() {
     let opts = StaticMapOptions {
         cache_dir: cache.clone(),
         headline: Some(rep.headline.clone()),
+        radius_status: fdop_geo::report::RadiusStatus::Nominal,
         markers: vec![(40.8790, -73.5300)],
         ..Default::default()
     };
@@ -72,6 +73,7 @@ fn main() {
             lat,
             lon,
             radius_m: 300.0,
+            radius_status: fdop_geo::report::RadiusStatus::Nominal,
             radius_basis: "live check".into(),
             confidence: "high".into(),
             verdict: "live check of the renderers".into(),

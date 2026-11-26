@@ -20,6 +20,7 @@ pub struct StaticMapOptions {
     pub size_px: u32,
     /// Title line drawn top-left (e.g. the place headline).
     pub headline: Option<String>,
+    pub radius_status: crate::report::RadiusStatus,
     /// Extra markers (lat, lon), e.g. runner-up candidates.
     pub markers: Vec<(f64, f64)>,
     /// Highest zoom requested from the tile server.
@@ -34,6 +35,7 @@ impl Default for StaticMapOptions {
             cache_dir: crate::default_cache_dir(),
             size_px: 1024,
             headline: None,
+            radius_status: crate::report::RadiusStatus::Unspecified,
             markers: Vec::new(),
             max_zoom: 16,
             stem: "map".into(),
@@ -386,7 +388,10 @@ pub fn static_map(
         lines.push(h.clone());
     }
     lines.push(format!("{lat:.6}, {lon:.6}"));
-    lines.push(format!("radius {radius_m:.0} m (red circle)"));
+    lines.push(format!(
+        "{} (red circle)",
+        opts.radius_status.label(radius_m)
+    ));
     let scale = 2i64;
     let line_h = (GLYPH_H as i64 + 3) * scale;
     let max_chars = ((n as i64 - 60) / ((GLYPH_W as i64 + 1) * scale)) as usize;
@@ -595,6 +600,7 @@ mod tests {
             cache_dir: dir.join("cache"),
             size_px: 512,
             headline: Some("Test Place, NY 11771".into()),
+            radius_status: crate::report::RadiusStatus::LowerBound,
             markers: vec![(40.88, -73.52)],
             ..Default::default()
         };
@@ -603,6 +609,7 @@ mod tests {
         let svg = std::fs::read_to_string(&m.svg).unwrap();
         assert!(svg.contains("stroke=\"#d7191c\""));
         assert!(svg.contains("40.876466, -73.524951"));
+        assert!(svg.contains("radius at least 300 m"));
         assert!(std::fs::metadata(&m.png).unwrap().len() > 1000);
     }
 }

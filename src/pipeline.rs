@@ -7,7 +7,9 @@ use fdop_core::search::{self, SearchInputs, SearchParams};
 use fdop_core::spectro::{Axes, Overlay, Spec, render_png_axes};
 use fdop_core::{audio, physics, track};
 use fdop_geo::region::{Region, RegionContext, parse_region};
-use fdop_geo::report::{Answer, CalibRow, CandidateRow, EventRow, Heatmap, MatchRow, ReportInput};
+use fdop_geo::report::{
+    Answer, CalibRow, CandidateRow, EventRow, Heatmap, MatchRow, RadiusStatus, ReportInput,
+};
 use fdop_types::time::{iso_utc, parse_date, parse_iso_utc, unix_from_utc};
 use fdop_types::{BBox, Elevation};
 use rayon::prelude::*;
@@ -906,7 +908,7 @@ struct AnswerAssessment {
     lon: f64,
     radius: f64,
     radius_basis: String,
-    radius_unresolved: bool,
+    radius_status: RadiusStatus,
     evidence: Option<f64>,
     curve_support: Option<(bool, String)>,
     decoy_gate: Option<(bool, String)>,
@@ -932,7 +934,7 @@ impl AnswerAssessment {
             lon: f64::NAN,
             radius: f64::NAN,
             radius_basis: "no candidate".into(),
-            radius_unresolved: true,
+            radius_status: RadiusStatus::Unavailable,
             evidence: None,
             curve_support: None,
             decoy_gate: None,
@@ -941,9 +943,16 @@ impl AnswerAssessment {
             if let Some(r) = &res.refine {
                 (answer.lat, answer.lon, answer.radius) = (r.lat, r.lon, r.radius_m);
                 answer.radius_basis = r.radius_basis.clone();
-                answer.radius_unresolved = r.radius_lower_bound || r.region_cells == 0;
+                answer.radius_status = if r.region_cells == 0 {
+                    RadiusStatus::Unresolved
+                } else if r.radius_lower_bound {
+                    RadiusStatus::LowerBound
+                } else {
+                    RadiusStatus::Estimated
+                };
             } else {
                 (answer.lat, answer.lon, answer.radius) = (top.lat, top.lon, 300.0);
+                answer.radius_status = RadiusStatus::Nominal;
                 answer.radius_basis =
                     "fine-grid winner (refinement unavailable); nominal 300 m".into();
             }
@@ -975,7 +984,7 @@ impl AnswerAssessment {
                 && res.margin_passes(6.0)
                 && top.unheard_close_passes.is_empty()
                 && answer.radius <= 1000.0
-                && !answer.radius_unresolved
+                && answer.radius_status == RadiusStatus::Estimated
             {
                 "high"
             } else if answer.n_core >= 2 && answer.lock_ok && res.margin_passes(3.0) {
@@ -2596,14 +2605,16 @@ fn locate_with_clock(
         let mopts = fdop_geo::staticmap::StaticMapOptions {
             cache_dir: a.cache.clone(),
             headline: Some(headline),
+            radius_status: report.answer.radius_status,
             markers,
             ..Default::default()
         };
         match fdop_geo::staticmap::static_map(net.as_ref(), lat, lon, radius, &run_dir, &mopts) {
             Ok(m) => {
-                report
-                    .figures
-                    .push(("Map: answer and confidence radius".into(), "map.png".into()));
+                report.figures.push((
+                    format!("Map: {}", report.answer.radius_status.label(radius)),
+                    "map.png".into(),
+                ));
                 if m.offline {
                     warnings
                         .push("map basemap tiles unavailable; map shows the circle only".into());
@@ -2618,7 +2629,7 @@ fn locate_with_clock(
         let (lat, lon, radius) = (assessment.lat, assessment.lon, assessment.radius);
         let (basis, radius_unresolved) = (
             assessment.radius_basis.clone(),
-            assessment.radius_unresolved,
+            assessment.radius_status != RadiusStatus::Estimated,
         );
         let margin_nats = res.margin.get("margin_nats").and_then(|v| v.as_f64());
         let alt_km = res.margin.get("next_distinct_km").and_then(|v| v.as_f64());
@@ -2727,11 +2738,10 @@ fn locate_with_clock(
             (
                 "radius".to_string(),
                 radius <= 1000.0 && !radius_unresolved,
-                if radius_unresolved {
-                    format!("{radius:.0} m radius is unresolved: {basis}")
-                } else {
-                    format!("{radius:.0} m")
-                },
+                format!(
+                    "Trace search: {}. A high trace grade requires a resolved radius of at most 1000 m.",
+                    assessment.radius_status.label(radius)
+                ),
             ),
         ];
         // The curve match is a second reading of the recording. Corroboration requires actual
@@ -2800,7 +2810,7 @@ fn locate_with_clock(
                 ),
             ));
         }
-        let (lat, lon, radius, basis) = match (call, standing) {
+        let (lat, lon, radius, basis, radius_status) = match (call, standing) {
             (CurveCall::Adopts, Some(v)) => (
                 v.lat,
                 v.lon,
@@ -2810,6 +2820,7 @@ fn locate_with_clock(
                     curvematch::TIED_NATS,
                     v.radius_m
                 ),
+                RadiusStatus::Estimated,
             ),
             (CurveCall::Confirms, Some(v)) => {
                 // The curve radius is measured from the curve's own best place. Kept at the trace
@@ -2821,20 +2832,26 @@ fn locate_with_clock(
                     lon,
                     r,
                     format!(
-                        "trace answer confirmed by the curve match {apart:.0} m away; radius {r:.0} m covers every place within {:.0} nats of the curve match's best ({:.0} m from it)",
+                        "trace answer confirmed by the curve match {apart:.0} m away; radius {r:.0} m covers every place within {:.0} nats of the curve match's best ({:.0} m from it). Trace radius basis: {basis}",
                         curvematch::TIED_NATS,
                         v.radius_m
                     ),
+                    if radius_unresolved {
+                        RadiusStatus::Unresolved
+                    } else {
+                        RadiusStatus::Estimated
+                    },
                 )
             }
-            _ => (lat, lon, radius, basis),
+            _ => (lat, lon, radius, basis, assessment.radius_status),
         };
         if let Some((passes, why)) = &assessment.decoy_gate {
             gates.push(("decoy clocks".to_string(), *passes, why.clone()));
         }
         let confidence = assessment.confidence;
         log.say(&format!(
-            "winner {lat:.6},{lon:.6} radius {radius:.0} m, {} events, confidence {confidence}",
+            "winner {lat:.6},{lon:.6} {}, {} events, confidence {confidence}",
+            radius_status.label(radius),
             top.n_explained
         ));
         let place =
@@ -2850,6 +2867,7 @@ fn locate_with_clock(
             lon,
             radius_m: radius,
             radius_basis: basis,
+            radius_status,
             confidence: confidence.into(),
             verdict: if let (false, Some(v), Some(r)) = (on_trace, standing, curve.as_ref()) {
                 format!(
@@ -3014,8 +3032,11 @@ fn locate_with_clock(
         found = true;
         curve_used = CurveCall::Adopts;
         log.say(&format!(
-            "winner {:.6},{:.6} radius {:.0} m from the curve match alone, confidence {}",
-            v.lat, v.lon, v.radius_m, assessment.confidence
+            "winner {:.6},{:.6} {} from the curve match alone, confidence {}",
+            v.lat,
+            v.lon,
+            RadiusStatus::Estimated.label(v.radius_m),
+            assessment.confidence
         ));
         let place = fdop_geo::geocode::describe_location(
             net.as_ref().filter(|_| extras),
@@ -3033,6 +3054,7 @@ fn locate_with_clock(
             lat: v.lat,
             lon: v.lon,
             radius_m: v.radius_m,
+            radius_status: RadiusStatus::Estimated,
             radius_basis: format!(
                 "curve match: places within {:.0} nats of the best span {:.0} m (1 km floor, its modes are 1 km apart)",
                 curvematch::TIED_NATS,
@@ -3061,6 +3083,7 @@ fn locate_with_clock(
             lat: f64::NAN,
             lon: f64::NAN,
             radius_m: f64::NAN,
+            radius_status: RadiusStatus::Unavailable,
             radius_basis: "no candidate".into(),
             confidence: "none".into(),
             verdict: format!(
@@ -5943,6 +5966,24 @@ mod tests {
             trace_answer_at(&result),
             Some((result.candidates[0].lat, result.candidates[0].lon, 100.0))
         );
+    }
+
+    #[test]
+    fn reported_trace_radius_distinguishes_unresolved_and_nominal_values() {
+        let mut res = assessment_result();
+        let added = std::collections::HashSet::new();
+        let status = |r: &search::SearchResult| {
+            AnswerAssessment::new(r, &[], None, None, false, &added).radius_status
+        };
+        assert_eq!(status(&res), RadiusStatus::Estimated);
+        res.refine.as_mut().unwrap().radius_lower_bound = true;
+        assert_eq!(status(&res), RadiusStatus::LowerBound);
+        res.refine.as_mut().unwrap().region_cells = 0;
+        assert_eq!(status(&res), RadiusStatus::Unresolved);
+        res.refine = None;
+        assert_eq!(status(&res), RadiusStatus::Nominal);
+        res.candidates.clear();
+        assert_eq!(status(&res), RadiusStatus::Unavailable);
     }
 
     #[test]

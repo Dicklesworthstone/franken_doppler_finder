@@ -19,6 +19,12 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Qualify the radius shown with a location
+
+- Add `answer.radius_status` to distinguish a sampled estimate, a lower bound at the search boundary, an unresolved width, a nominal fallback and an unavailable radius. Older answer objects without the field read as unspecified.
+- Show the qualifier beside the number in the CLI, Markdown and HTML reports and map legends. The run history retains its existing schema and refers to the original report for the radius basis.
+- The new report and assessment tests exercise clipped and unsampled contours, the 300 m fallback, and legacy answer objects.
+
 ### Report missing rival comparisons when flight hypotheses exceed memory
 
 - Record a comparison cut when a memory limit drops the hypotheses for an event

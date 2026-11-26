@@ -1060,6 +1060,14 @@ returns an error and the directory contains partial outputs.
 | `curvematch.json` | The curve match, when it ran: its places with every pass's evidence, the best place's twins along the heard flights' tracks (`aliases`), each decoy window's best place and score, the margin over the best decoy and its rank p |
 | `detections.json`, `events.json`, `search.json` | Intermediate results. `search.json` keeps the best 10,000 candidates, and `candidates_total` counts them all |
 
+The location summary, interactive and static map labels, and CLI describe what the radius measures.
+In `result.json`, `answer.radius_status` is `estimated` for a measured model extent, `lower_bound` when
+a sampled trace contour reaches the refinement boundary, `unresolved` when its extent remains unknown,
+`nominal` for the 300 m fallback when refinement fails, or `unavailable` for a refusal. A curve match can
+widen the displayed circle around a trace answer while its trace extent remains unresolved. The number in
+`radius_m` is preserved. Earlier reports without the status are read as `unspecified`. The run history
+stores the reported number; open the run's report for its basis.
+
 UTC timestamps are rounded to the nearest millisecond, carrying into the next minute or date when
 needed. Whole seconds omit the fractional part; rounding never leaves a `:60` seconds field or moves
 the reported recording clock back a minute.
