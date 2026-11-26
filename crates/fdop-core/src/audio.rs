@@ -1,6 +1,7 @@
 //! Media probing (ffprobe) and decoding to mono f32 PCM (ffmpeg).
 
 use serde::Serialize;
+use std::cell::OnceCell;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -57,7 +58,41 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
 /// Describe the selected audio stream and validate its channel before decoding. The
 /// stream ordinal counts audio streams only, matching FFmpeg's `0:a:N` mapping.
 pub fn probe_with_selection(path: &Path, selection: AudioSelection) -> Result<MediaInfo, String> {
-    media_info(path, &probe_document(path, false, true)?, selection)
+    AudioProbe::open(path)?.selected_info(selection)
+}
+
+/// A file's complete stream discovery and, when decoding begins, its ordinary
+/// probe. Every selected view uses the same container epoch and stream ordering.
+pub struct AudioProbe<'a> {
+    path: &'a Path,
+    complete: serde_json::Value,
+    ordinary: OnceCell<Option<serde_json::Value>>,
+}
+
+impl<'a> AudioProbe<'a> {
+    fn read(path: &'a Path, require_clean_probe: bool) -> Result<Self, String> {
+        Ok(Self {
+            path,
+            complete: probe_document(path, require_clean_probe, true)?,
+            ordinary: OnceCell::new(),
+        })
+    }
+
+    /// Discover all streams, including late tracks in dynamic containers.
+    pub fn open(path: &'a Path) -> Result<Self, String> {
+        Self::read(path, false)
+    }
+
+    /// Require clean discovery and a complete inventory for a publication audit.
+    pub fn for_audit(path: &'a Path) -> Result<(Self, AudioInventory), String> {
+        let probe = Self::read(path, true)?;
+        let inventory = audit_inventory(path, &probe.complete)?;
+        Ok((probe, inventory))
+    }
+
+    pub fn selected_info(&self, selection: AudioSelection) -> Result<MediaInfo, String> {
+        media_info(self.path, &self.complete, selection)
+    }
 }
 
 /// Probe once so a whole-file audit uses the same stream inventory throughout.
@@ -518,19 +553,34 @@ pub fn decode_with_selection(
     sr: u32,
     selection: AudioSelection,
 ) -> Result<Vec<f32>, String> {
+    decode_probed(&AudioProbe::open(path)?, start, dur, sr, selection)
+}
+
+/// Decode a view using discovery shared by all selections from this file.
+pub fn decode_probed(
+    probe: &AudioProbe<'_>,
+    start: f64,
+    dur: Option<f64>,
+    sr: u32,
+    selection: AudioSelection,
+) -> Result<Vec<f32>, String> {
     // `pan` can silently fill an unavailable input channel with zeroes. Validate the
     // source first so an invalid selection cannot look like a silent recording.
-    let doc = probe_document(path, false, true)?;
-    let info = media_info(path, &doc, selection)?;
-    let compensation = timestamp_tolerance(&doc, &info, sr)
+    let path = probe.path;
+    let info = probe.selected_info(selection)?;
+    let compensation = timestamp_tolerance(&probe.complete, &info, sr)
         .map(|t| format!(":min_comp={t}:min_hard_comp={t}"))
         .unwrap_or_default();
     // Preserve ordinary decoder priming when the short probe already resolves the
     // selected source. Rewinding a normally readable MP3/AAC at zero can skip priming.
     // Keep the complete probe's container epoch whichever decoder path is used.
-    let full_probe = probe_document(path, false, false)
-        .and_then(|doc| media_info(path, &doc, selection))
-        .map_or(true, |quick| {
+    let ordinary = probe
+        .ordinary
+        .get_or_init(|| probe_document(path, false, false).ok());
+    let full_probe = ordinary
+        .as_ref()
+        .and_then(|doc| media_info(path, doc, selection).ok())
+        .is_none_or(|quick| {
             quick.audio_codec != info.audio_codec
                 || quick.channels != info.channels
                 || quick.sample_rate != info.sample_rate
@@ -1295,6 +1345,20 @@ mod tests {
             energy(&alternate, 880.0) > 1000.0 * energy(&alternate, 220.0),
             "explicit selection failed to recover the alternate track"
         );
+        // A single complete inventory and ordinary probe serve all views. A cached
+        // ordinary probe can still require full discovery for a particular track.
+        let (source, inventory) = AudioProbe::for_audit(&path).unwrap();
+        assert_eq!(inventory.streams.len(), 2);
+        assert!(source.ordinary.get().is_none());
+        assert_eq!(
+            decode_probed(&source, 0.0, None, 4000, AudioSelection::default()).unwrap(),
+            pcm
+        );
+        assert!(matches!(source.ordinary.get(), Some(Some(_))));
+        assert_eq!(
+            decode_probed(&source, 0.0, None, 4000, selection).unwrap(),
+            alternate
+        );
         for bad in [
             AudioSelection {
                 stream: 2,
@@ -1685,12 +1749,12 @@ mod tests {
         }
         let path = dir.join("middle-audio.ts");
         std::fs::write(&path, transport).unwrap();
-        let inventory = probe_audio_inventory(&path).unwrap();
+        let (source, inventory) = AudioProbe::for_audit(&path).unwrap();
         assert_eq!(inventory.streams.len(), 1);
         assert_eq!(inventory.streams[0].audio_stream, 0);
         assert_eq!(inventory.streams[0].channels, 1);
 
-        let pcm = decode(&path, 0.0, None, SR).unwrap();
+        let pcm = decode_probed(&source, 0.0, None, SR, AudioSelection::default()).unwrap();
         let first_sound = |samples: &[f32]| {
             samples.iter().position(|x| x.abs() > 0.02).unwrap() as f64 / SR as f64
         };
@@ -1699,7 +1763,7 @@ mod tests {
         assert!((first_sound(&pcm) - 20.0).abs() < 0.1);
         assert!(pcm[..19 * SR as usize].iter().all(|&x| x == 0.0));
         assert!(pcm.len() > 21 * SR as usize);
-        let clip = decode(&path, 19.0, Some(2.0), SR).unwrap();
+        let clip = decode_probed(&source, 19.0, Some(2.0), SR, AudioSelection::default()).unwrap();
         assert_eq!(clip.len(), 2 * SR as usize);
         assert!((first_sound(&clip) - 1.0).abs() < 0.1);
     }

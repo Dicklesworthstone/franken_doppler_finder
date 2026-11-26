@@ -493,7 +493,7 @@ struct DetectionAudit {
 }
 
 fn measure_audio_source(
-    media: &std::path::Path,
+    probe: &audio::AudioProbe<'_>,
     info: &audio::MediaInfo,
     selection: AudioSelection,
     out: &std::path::Path,
@@ -510,7 +510,7 @@ fn measure_audio_source(
         info.channels
     ));
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
-    let x = audio::decode_with_selection(media, 0.0, None, 4000, selection)?;
+    let x = audio::decode_probed(probe, 0.0, None, 4000, selection)?;
     let low_band = pipeline::low_band_warning(&x, 4000);
     if let Some(w) = &low_band {
         eprintln!("fdop: warning: {w}");
@@ -583,7 +583,7 @@ struct SourceAudit {
 }
 
 fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
-    let inventory = audio::probe_audio_inventory(&d.media)?;
+    let (probe, inventory) = audio::AudioProbe::for_audit(&d.media)?;
     let streams = inventory.streams;
     let location_tag_detected = inventory.location_tag_detected;
     let log = Log::new(d.quiet);
@@ -608,7 +608,7 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
             };
             let dir = out.join(&view);
             let audit =
-                measure_audio_source(&d.media, info, selection, &dir, &log).map_err(|e| {
+                measure_audio_source(&probe, info, selection, &dir, &log).map_err(|e| {
                     format!(
                         "incomplete audio audit at {view}: {e} (partial outputs in {})",
                         out.display()
@@ -677,11 +677,12 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
     }
     let log = Log::new(d.quiet);
     let selection = d.audio.selection();
-    let info = audio::probe_with_selection(&d.media, selection)?;
+    let probe = audio::AudioProbe::open(&d.media)?;
+    let info = probe.selected_info(selection)?;
     let out = d
         .out
         .unwrap_or_else(|| PathBuf::from("fdop_runs").join("detect"));
-    let audit = measure_audio_source(&d.media, &info, selection, &out, &log)?;
+    let audit = measure_audio_source(&probe, &info, selection, &out, &log)?;
     log.say(&format!("wrote {}", out.join("events.json").display()));
     if d.json {
         serde_json::to_writer_pretty(&mut stdout, &audit).map_err(|e| e.to_string())?;

@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Share media discovery across every audio audit view
+
+- `fdop detect --all-audio` now performs one complete FFprobe pass per file and one ordinary probe on the first decode. Each track and channel still gets its own decode and measurements. A video with no audio needs only the complete inventory.
+- Single-source detection also reuses the complete probe for decoding. Extend the real-media regressions to compare PCM for different tracks on a shared probe and to seek in a late transport-stream track on the same probe.
+
 ### Export video with a separate narration or music track
 
 - Add `fdop mute VIDEO --soundtrack FILE --out share.mp4`. Copy the first non-cover video, drop all original audio and use only the first audio track from the separate local file. Short replacement audio is padded and long audio is trimmed to the video.
