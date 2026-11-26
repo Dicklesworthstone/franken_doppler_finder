@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Show measured flyover times in a recording audit
+
+- Single-source and whole-file JSON audits now include `measured_pass_spans` alongside independent event IDs. Whole-file text output lists the recording-time span under the corresponding track and channel. The endpoints come from the measured trace for that pass.
+- Extend the synthetic multi-track command regression to cover spans on individual channels and an empty list for the cancelling downmix.
+
 ### Retain fast curve matches supported by the observer's weather
 
 - Apply the curve bank's upper speed allowance after atmospheric conversion for ground

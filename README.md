@@ -920,6 +920,7 @@ It measures each audio track's mono mix and each individual channel on multichan
 This can reveal a pass on a secondary track or on channels that cancel in the mix. The JSON gives
 `audio_stream_count`, the file-wide `location_tag_detected` flag, and one entry in `sources` for each view. A muted video still receives a metadata check. With zero audio tracks the source list is empty. The tag check covers recognized location tags that FFprobe exposes on the container, streams, chapters and programs, including separate GPS latitude and longitude fields. An incomplete stream inventory fails the audit. Each entry has its own pass count,
 event IDs, warnings and `events_file` path (relative to the working directory for a relative output path).
+Each view's `measured_pass_spans` gives the event ID and the first and last measured trace points in recording seconds. The text summary prints these spans too. Use them to find the sound in an editor and listen on either side. A trace can cover only part of an audible flyover.
 All views share one complete stream inventory. The first decode also checks ordinary stream discovery to preserve decoder priming and late-track timing. Adding channels requires additional decodes but no additional FFprobe runs.
 The same aircraft can appear in several views, so compare their counts individually.
 The file-wide `possible_location_telemetry` list identifies data streams whose format can

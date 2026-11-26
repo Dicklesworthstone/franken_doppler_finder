@@ -477,6 +477,13 @@ fn run(cli: Cli) -> Result<i32, String> {
 }
 
 #[derive(serde::Serialize)]
+struct MeasuredPassSpan {
+    event_id: String,
+    first_trace_s: f64,
+    last_trace_s: f64,
+}
+
+#[derive(serde::Serialize)]
 struct AudioAuditSummary {
     audio_stream: usize,
     audio_channel: Option<usize>,
@@ -485,6 +492,7 @@ struct AudioAuditSummary {
     location_tag_detected: bool,
     independent_pass_count: usize,
     independent_event_ids: Vec<String>,
+    measured_pass_spans: Vec<MeasuredPassSpan>,
     warnings: Vec<String>,
 }
 
@@ -554,6 +562,20 @@ fn measure_audio_source(
     // Use the search's physical eligibility and grouping for the audit count.
     let passes = fdop_core::search::independent_measured_events(&evs, 0.0);
     let ids: Vec<_> = passes.iter().map(|p| p.id.clone()).collect();
+    let measured_pass_spans = passes
+        .iter()
+        .filter_map(|pass| {
+            // Search orders the observed points by time. These are the first and
+            // last observations, not estimates of when the aircraft became audible.
+            let first = *pass.tr_t.first()?;
+            let last = *pass.tr_t.last()?;
+            (first.is_finite() && last.is_finite()).then(|| MeasuredPassSpan {
+                event_id: pass.id.clone(),
+                first_trace_s: first,
+                last_trace_s: last,
+            })
+        })
+        .collect();
     log.say(&format!(
         "{} independent aircraft passes on the selected audio{}",
         ids.len(),
@@ -572,6 +594,7 @@ fn measure_audio_source(
             location_tag_detected,
             independent_pass_count: ids.len(),
             independent_event_ids: ids,
+            measured_pass_spans,
             warnings,
         },
         events: evs,
@@ -673,6 +696,14 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
                 source.events_file.display()
             )
             .map_err(|e| e.to_string())?;
+            for pass in s.measured_pass_spans {
+                writeln!(
+                    stdout,
+                    "  {} measured trace: {:.3} to {:.3} s into recording",
+                    pass.event_id, pass.first_trace_s, pass.last_trace_s
+                )
+                .map_err(|e| e.to_string())?;
+            }
         }
     }
     Ok(0)
@@ -889,6 +920,13 @@ mod tests {
                 audit["independent_event_ids"],
                 serde_json::json!(selected.iter().map(|pass| &pass.id).collect::<Vec<_>>())
             );
+            let spans = audit["measured_pass_spans"].as_array().unwrap();
+            assert_eq!(spans.len(), n_aircraft);
+            for (span, pass) in spans.iter().zip(&selected) {
+                assert_eq!(span["event_id"], pass.id);
+                assert!((span["first_trace_s"].as_f64().unwrap() - pass.tr_t[0]).abs() < 1e-9);
+                assert!((span["last_trace_s"].as_f64().unwrap() - pass.tr_t.last().unwrap()).abs() < 1e-9);
+            }
             assert_eq!(audit["audio_stream"], 0);
             assert!(audit["audio_channel"].is_null());
             assert_eq!(audit["channels_in_stream"], 1);
@@ -978,6 +1016,12 @@ mod tests {
             assert_eq!(view["audio_stream"], stream);
             assert_eq!(view["audio_channel"], serde_json::json!(channel));
             assert_eq!(view["independent_pass_count"], passes);
+            let spans = view["measured_pass_spans"].as_array().unwrap();
+            assert_eq!(spans.len(), passes as usize);
+            for span in spans {
+                assert_eq!(span["event_id"], view["independent_event_ids"][0]);
+                assert!(span["last_trace_s"].as_f64().unwrap() > span["first_trace_s"].as_f64().unwrap());
+            }
             let events_path = output.join(view_dir).join("events.json");
             assert_eq!(view["events_file"], events_path.to_str().unwrap());
             assert!(events_path.is_file());
