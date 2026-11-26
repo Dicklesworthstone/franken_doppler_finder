@@ -19,6 +19,11 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Compare shifted-clock evidence at equal refinement
+
+- Compare the primary and each nonempty decoy at the same scoring stage. The smallest pairwise lead decides the gate. `margin.top_score_before_refinement` records the winner's fine-grid evidence when it was refined.
+- `shifted_clocks_compete_at_their_shared_score_basis` covers mixed stages, equally refined winners and a winner without a rival. Independent arithmetic puts the mixed-stage example at a one-nat lead. Field grades on this change remain unmeasured.
+
 ### Recover ADS-B feeds after incomplete release uploads
 
 - Release discovery distinguishes missing tags from published tags with unusable archives. It can use a complete later suffix without recording a broken upload as proof that the feed was absent.

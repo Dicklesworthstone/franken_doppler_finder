@@ -2192,7 +2192,7 @@ pub struct Candidate {
     pub(crate) lock_checked: bool,
     /// The score at its fine-grid cell, once refinement has replaced the candidate.
     #[serde(skip)]
-    pub(crate) fine_score: Option<f64>,
+    pub fine_score: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -4225,6 +4225,7 @@ fn margin_report(cands: &[Candidate]) -> serde_json::Value {
     let compared = alt.map(|a| compared_scores(top, a));
     serde_json::json!({
         "top_score": top.score,
+        "top_score_before_refinement": top.fine_score,
         "next_score": cands.get(1).map(|c| c.score),
         "next_distinct_score": alt.map(|a| a.score),
         "next_distinct_km": alt.map(|a| haversine_m(a.lat, a.lon, top.lat, top.lon) / 1000.0),

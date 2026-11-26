@@ -455,7 +455,8 @@ clock was fully covered and its trace comparison finished. Such an empty control
 tries the remaining shifts, and grades the answer low if fewer than four complete comparisons remain.
 Hours off, no true pass lines up, but the recording, the place and the day's traffic are
 the same, so the best decoy shows how much evidence chance fits to this recording's sounds reach there. The answer
-must lead it by 3 nats, the medium margin line, or it becomes **low**. The margin gate cannot see this, because it
+must lead each completed control by 3 nats, the medium margin line, or it becomes **low**.
+When both clocks use refined evidence, the gate compares their refined scores. When either clock uses fine-grid evidence, it compares both winners at their fine-grid scores. The report shows the scores and basis for each nonempty control. The margin gate cannot see this, because it
 compares explanations at one clock. The gate was added after a wrong date graded high on `c2c7578`
 ([Known issues](#known-issues)), so the development rows are not a test of it. On them it lowers that run and keeps
 every right answer: the five lead their decoys by 14.0 to 67.8 nats, the wrong date by 1.07 (`ab_c2c7578_dec1`,

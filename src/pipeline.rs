@@ -51,6 +51,8 @@ pub struct LocateOutcome {
     /// The trace search's top evidence (nats, the margin gate's "evidence"); None when it found no
     /// candidate. A decoy-clock run hands it back to the run that asked for it.
     pub trace_evidence: Option<f64>,
+    /// Fine-grid evidence for the same winner when `trace_evidence` uses its refined score.
+    pub trace_evidence_before_refinement: Option<f64>,
 }
 
 pub struct Log {
@@ -909,7 +911,7 @@ struct AnswerAssessment {
     radius: f64,
     radius_basis: String,
     radius_status: RadiusStatus,
-    evidence: Option<f64>,
+    evidence: Option<ClockEvidence>,
     curve_support: Option<(bool, String)>,
     decoy_gate: Option<(bool, String)>,
 }
@@ -964,21 +966,7 @@ impl AnswerAssessment {
                     .map_or(4.0, search::lock_tol);
                 m.dt_free.is_some_and(|d| d.abs() <= tol)
             });
-            answer.evidence = Some(
-                if res
-                    .margin
-                    .get("margin_nats")
-                    .and_then(|v| v.as_f64())
-                    .is_some()
-                {
-                    res.margin
-                        .get("margin_top_score")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(top.score)
-                } else {
-                    top.score
-                },
-            );
+            answer.evidence = Some(ClockEvidence::from_trace(top, &res.margin));
             answer.trace_confidence = if answer.n_core >= 2
                 && answer.lock_ok
                 && res.margin_passes(6.0)
@@ -1378,17 +1366,57 @@ fn decoy_shifts(t0: f64, dates: (f64, f64), tol: f64) -> Vec<f64> {
         .collect()
 }
 
+/// The local margin can use refined or fine-grid scores depending on its rival. Across
+/// clocks only compare refinement when both margins used it.
+#[derive(Clone, Copy, Debug)]
+struct ClockEvidence {
+    score: f64,
+    before_refinement: Option<f64>,
+}
+
+impl ClockEvidence {
+    fn from_trace(top: &search::Candidate, margin: &serde_json::Value) -> Self {
+        if margin["margin_basis"] == "fine_grid" {
+            Self { score: top.fine_score.unwrap_or(top.score), before_refinement: None }
+        } else {
+            Self { score: top.score, before_refinement: top.fine_score }
+        }
+    }
+
+    fn is_finite(self) -> bool {
+        self.score.is_finite() && self.before_refinement.is_none_or(f64::is_finite)
+    }
+
+    /// Primary, control and their common basis. An empty search contributes zero at either stage.
+    fn compare(self, control: Option<Self>) -> (f64, f64, &'static str) {
+        match control {
+            None => (self.score, 0.0, "empty"),
+            Some(c) if self.before_refinement.is_some() && c.before_refinement.is_some() => {
+                (self.score, c.score, "refined")
+            }
+            Some(c) => (
+                self.before_refinement.unwrap_or(self.score),
+                c.before_refinement.unwrap_or(c.score),
+                "fine grid",
+            ),
+        }
+    }
+}
+
 /// The decoy-clock gate. Each run is a shift and the trace search's top evidence there (None when
 /// it found no candidate, which adds no evidence). It passes when [`DECOY_CLOCKS`] decoys ran and
 /// `evidence` leads the best of them by [`DECOY_LEAD_NATS`].
-fn decoy_gate(evidence: f64, runs: &[(f64, Option<f64>)]) -> (bool, String) {
+fn decoy_gate(evidence: ClockEvidence, runs: &[(f64, Option<ClockEvidence>)]) -> (bool, String) {
     let list = runs
         .iter()
         .map(|(s, e)| {
             format!(
                 "{:+.0} h {}",
                 s / 3600.0,
-                e.map_or_else(|| "none".to_string(), |e| format!("{e:.2}"))
+                e.map_or_else(|| "none".to_string(), |c| {
+                    let (primary, control, basis) = evidence.compare(Some(c));
+                    format!("{control:.2} ({basis}, primary {primary:.2})")
+                })
             )
         })
         .collect::<Vec<_>>()
@@ -1402,16 +1430,17 @@ fn decoy_gate(evidence: f64, runs: &[(f64, Option<f64>)]) -> (bool, String) {
             ),
         );
     }
-    let best = runs
+    // With different bases the largest control score need not be the smallest lead.
+    let (primary, best, basis) = runs
         .iter()
-        .map(|(_, score)| score.unwrap_or(0.0))
-        .reduce(f64::max)
-        .unwrap_or(0.0);
-    let lead = evidence - best;
+        .map(|(_, control)| evidence.compare(*control))
+        .min_by(|a, b| (a.0 - a.1).total_cmp(&(b.0 - b.1)))
+        .expect("four completed clocks");
+    let lead = primary - best;
     (
         lead >= DECOY_LEAD_NATS,
         format!(
-            "evidence {evidence:.2} nats vs {best:.2} at the best of {DECOY_CLOCKS} decoy clocks, the same search with its clock window moved ({list}): {lead:+.2} nats, needs {DECOY_LEAD_NATS:.1}"
+            "evidence {primary:.2} nats vs {best:.2} at the closest of {DECOY_CLOCKS} decoy clocks by comparable lead ({basis}), the same search with its clock window moved ({list}): {lead:+.2} nats, needs {DECOY_LEAD_NATS:.1}"
         ),
     )
 }
@@ -1804,8 +1833,8 @@ fn require_decoy_comparison(truncated: &[String]) -> Result<(), String> {
 /// Run additional shifts as needed. Only completed comparisons, including genuine empty
 /// results, count toward the existing gate. Keep the rejected controls in the reported reason.
 fn judge_decoy_attempts(
-    evidence: f64,
-    attempts: impl Iterator<Item = (f64, Result<Option<f64>, String>)>,
+    evidence: ClockEvidence,
+    attempts: impl Iterator<Item = (f64, Result<Option<ClockEvidence>, String>)>,
 ) -> (bool, String) {
     if !evidence.is_finite() {
         return (false, "primary trace evidence is nonfinite; the decoy lead cannot be measured".into());
@@ -2382,12 +2411,14 @@ fn locate_with_clock(
             let attempts = decoy_shifts(centre, dates, tol).into_iter().map(|shift| {
                 let d = decoy_args(a, centre, tol, shift, &run_dir);
                 let result = locate_with_clock(&d, &Log::new(true), now, true, Some(&recording), &mut None)
-                    .map(|o| o.trace_evidence);
+                    .map(|o| o.trace_evidence.map(|score| ClockEvidence {
+                        score, before_refinement: o.trace_evidence_before_refinement,
+                    }));
                 match &result {
                     Ok(score) => log.say(&format!(
                         "decoy clock {:+.0} h: top evidence {}",
                         shift / 3600.0,
-                        score.map_or_else(|| "none".to_string(), |e| format!("{e:.2} nats"))
+                        score.map_or_else(|| "none".to_string(), |e| format!("{:.2} nats", e.score))
                     )),
                     Err(e) => log.say(&format!("decoy clock {:+.0} h skipped: {e}", shift / 3600.0)),
                 }
@@ -2604,7 +2635,6 @@ fn locate_with_clock(
         })
         .collect();
     let mut found = !res.candidates.is_empty();
-    let mut trace_evidence: Option<f64> = None;
     let mut curve_used = CurveCall::Silent;
     let draw_map = |report: &mut ReportInput,
                     warnings: &mut Vec<String>,
@@ -2645,7 +2675,6 @@ fn locate_with_clock(
         );
         let margin_nats = res.margin.get("margin_nats").and_then(|v| v.as_f64());
         let alt_km = res.margin.get("next_distinct_km").and_then(|v| v.as_f64());
-        trace_evidence = assessment.evidence;
         let (lock_ok, n_core) = (assessment.lock_ok, assessment.n_core);
         let gates = vec![
             (
@@ -3190,7 +3219,8 @@ fn locate_with_clock(
         run_dir,
         report,
         found,
-        trace_evidence,
+        trace_evidence: assessment.evidence.map(|e| e.score),
+        trace_evidence_before_refinement: assessment.evidence.and_then(|e| e.before_refinement),
     })
 }
 
@@ -4309,13 +4339,54 @@ mod tests {
         }
     }
 
+    fn fine_evidence(score: f64) -> ClockEvidence {
+        ClockEvidence { score, before_refinement: None }
+    }
+
+    fn scalar_decoy_gate(primary: f64, runs: &[(f64, Option<f64>)]) -> (bool, String) {
+        let controls = runs.iter().map(|&(shift, s)| (shift, s.map(fine_evidence))).collect::<Vec<_>>();
+        decoy_gate(fine_evidence(primary), &controls)
+    }
+
+    fn judge_scalar_decoys(
+        primary: f64,
+        attempts: impl Iterator<Item = (f64, Result<Option<f64>, String>)>,
+    ) -> (bool, String) {
+        judge_decoy_attempts(fine_evidence(primary), attempts.map(|(s, r)| (s, r.map(|v| v.map(fine_evidence)))))
+    }
+
+    #[test]
+    fn shifted_clocks_compete_at_their_shared_score_basis() {
+        let mut top = search::Candidate::default();
+        top.score = 24.0;
+        top.fine_score = Some(15.0);
+        let primary = ClockEvidence::from_trace(&top, &json!({"margin_basis": "refined"}));
+        // The highest raw control is seven nats behind at equal refinement. A different
+        // control defeats the gate at the fine cells: its own local rival could not refine.
+        top.score = 17.0;
+        top.fine_score = Some(14.0);
+        let refined = ClockEvidence::from_trace(&top, &json!({}));
+        let fine = ClockEvidence::from_trace(&top, &json!({"margin_basis": "fine_grid"}));
+        let check = |p, a, b| judge_decoy_attempts(p, [
+            (-7200.0, Ok(Some(a))), (-3600.0, Ok(Some(b))), (3600.0, Ok(None)), (7200.0, Ok(None)),
+        ].into_iter());
+        let (pass, why) = check(primary, refined, fine);
+        assert!(!pass && why.contains("15.00 nats vs 14.00") && why.contains("+1.00 nats"), "{why}");
+        assert!(check(primary, refined, refined).0);
+        // Reverse the bases and also cover a genuinely unrefined winner with no local rival.
+        top.fine_score = None;
+        let unrefined = ClockEvidence::from_trace(&top, &json!({}));
+        let (pass, why) = check(unrefined, primary, fine);
+        assert!(!pass && why.contains("17.00 nats vs 15.00"), "{why}");
+    }
+
     #[test]
     fn decoy_gate_reads_rows_from_real_runs() {
         // c2c7578 on the Mac, xdet/dclock_c2c7578 (LOG 2026-11-08T15:48Z): the wrong date
         // nd_o02_1031 graded high, and right answers with their own four decoy clocks.
         let shifts = [-7_200.0, -3_600.0, 3_600.0, 7_200.0];
         let runs = |e: [Option<f64>; 4]| shifts.iter().copied().zip(e).collect::<Vec<_>>();
-        let (pass, why) = decoy_gate(
+        let (pass, why) = scalar_decoy_gate(
             18.41,
             &runs([Some(15.99), Some(17.34), Some(14.70), Some(14.99)]),
         );
@@ -4323,22 +4394,22 @@ mod tests {
             !pass && why.contains("vs 17.34") && why.contains("+1.07 nats"),
             "{why}"
         );
-        let (pass, why) = decoy_gate(
+        let (pass, why) = scalar_decoy_gate(
             26.31,
             &runs([Some(11.69), Some(12.64), Some(11.12), Some(6.31)]),
         );
         assert!(pass && why.contains("+13.67 nats"), "{why}");
         // a decoy where the search found no candidate adds no evidence (a_ref at +2 h)
-        let (pass, why) = decoy_gate(29.58, &runs([Some(13.32), Some(11.80), Some(13.56), None]));
+        let (pass, why) = scalar_decoy_gate(29.58, &runs([Some(13.32), Some(11.80), Some(13.56), None]));
         assert!(
             pass && why.contains("+2 h none") && why.contains("vs 13.56"),
             "{why}"
         );
         // the line is the medium margin line, and it is inclusive
-        assert!(decoy_gate(DECOY_LEAD_NATS, &runs([None; 4])).0);
-        assert!(!decoy_gate(DECOY_LEAD_NATS - 0.01, &runs([None; 4])).0);
+        assert!(scalar_decoy_gate(DECOY_LEAD_NATS, &runs([None; 4])).0);
+        assert!(!scalar_decoy_gate(DECOY_LEAD_NATS - 0.01, &runs([None; 4])).0);
         // three decoys cannot clear a high or medium answer, however far it leads
-        let (pass, why) = decoy_gate(
+        let (pass, why) = scalar_decoy_gate(
             84.81,
             &runs([Some(14.88), Some(14.64), Some(14.91), Some(16.88)])[..3],
         );
@@ -4352,7 +4423,7 @@ mod tests {
         };
         let mixed = [None, Some(-4.0), Some(-5.0), Some(-6.0)];
         let check = |primary, scores| {
-            judge_decoy_attempts(primary, runs(scores).map(|(shift, score)| (shift, Ok(score))))
+            judge_scalar_decoys(primary, runs(scores).map(|(shift, score)| (shift, Ok(score))))
         };
         let (pass, why) = check(1.0, mixed);
         assert!(!pass && why.contains("vs 0.00") && why.contains("+1.00 nats"), "{why}");
@@ -4361,15 +4432,15 @@ mod tests {
         assert!(check(-1.0, [Some(-4.0), Some(-5.0), Some(-6.0), Some(-7.0)]).0);
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let attempts = runs([Some(invalid), None, Some(-2.0), Some(-3.0)]);
-            let (pass, why) = judge_decoy_attempts(
+            let (pass, why) = judge_scalar_decoys(
                 3.0, attempts.clone().map(|(s, score)| (s, Ok(score))),
             );
             assert!(!pass && why.contains("only 3 of 4") && why.contains("nonfinite trace evidence"), "{why}");
-            let (pass, why) = judge_decoy_attempts(
+            let (pass, why) = judge_scalar_decoys(
                 3.0, attempts.chain([(10800.0, Some(2.0))]).map(|(s, score)| (s, Ok(score))),
             );
             assert!(!pass && why.contains("vs 2.00") && why.contains("+3 h 2.00"), "{why}");
-            assert!(!judge_decoy_attempts(invalid, std::iter::once_with(|| panic!("no finite primary evidence"))).0);
+            assert!(!judge_scalar_decoys(invalid, std::iter::once_with(|| panic!("no finite primary evidence"))).0);
         }
     }
 
@@ -4392,13 +4463,13 @@ mod tests {
             (-10800.0, check(complete, &[], None)),
             (14400.0, check(complete, &[], Some(17.0))),
         ];
-        let (pass, why) = judge_decoy_attempts(18.0, attempts[..7].iter().cloned());
+        let (pass, why) = judge_scalar_decoys(18.0, attempts[..7].iter().cloned());
         assert!(!pass && why.contains("only 3 of 4"), "{why}");
         assert!(why.contains("archive clipped") && why.contains("fine search budget") && why.contains("ADS-B temporarily unavailable"), "{why}");
         // The fourth complete comparison exposes a rival that the cheaper controls missed.
-        let (pass, why) = judge_decoy_attempts(18.0, attempts.iter().cloned());
+        let (pass, why) = judge_scalar_decoys(18.0, attempts.iter().cloned());
         assert!(!pass && why.contains("vs 17.00"), "{why}");
-        let (pass, why) = judge_decoy_attempts(20.0, attempts.into_iter().chain(std::iter::once_with(|| {
+        let (pass, why) = judge_scalar_decoys(20.0, attempts.into_iter().chain(std::iter::once_with(|| {
             panic!("four completed decoys already judged the clock")
         })));
         assert!(pass && why.contains("+2 h none"), "{why}");
@@ -6098,7 +6169,7 @@ mod tests {
         // Even a provisional high must retry if the decoys explain it by chance. Applying
         // the same gate to an explicit clock may lower its grade but cannot widen that clock.
         let mut demoted = high;
-        demoted.apply_decoys(decoy_gate(24.0, &[(0.0, Some(23.0)); 4]));
+        demoted.apply_decoys(scalar_decoy_gate(24.0, &[(0.0, Some(23.0)); 4]));
         assert_eq!(demoted.confidence, "low");
         assert!(metadata_needs_fallback(true, demoted.confidence));
         assert!(!metadata_needs_fallback(false, demoted.confidence));
@@ -6114,7 +6185,7 @@ mod tests {
             false,
             &std::collections::HashSet::new(),
         );
-        let failed = decoy_gate(24.0, &[(0.0, Some(23.0)); 4]);
+        let failed = scalar_decoy_gate(24.0, &[(0.0, Some(23.0)); 4]);
         answer.apply_decoys(failed.clone());
         assert!(metadata_needs_fallback(true, answer.confidence));
 
