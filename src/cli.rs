@@ -31,9 +31,9 @@ pub enum Cmd {
     Locate(LocateCli),
     /// Detect and measure flyovers only (no ADS-B); writes events.json, traces and figures.
     Detect(DetectCli),
-    /// Export a verified MP4 with silent, replaced or selectively muted audio.
+    /// Export a verified MP4 or mute selected intervals in an audio-only M4A.
     Mute {
-        /// Local video recording to copy.
+        /// Local audio or video recording.
         media: PathBuf,
         /// Use the first audio track of this separate local file as the only soundtrack.
         #[arg(long)]
@@ -41,7 +41,7 @@ pub enum Cmd {
         /// Mute the first audio track between START and END seconds on the recording clock (repeatable).
         #[arg(long, value_name = "START..END", conflicts_with = "soundtrack")]
         silence_range: Vec<crate::mute::SilenceRange>,
-        /// New .mp4 file for the verified export.
+        /// New .mp4 file, or an audio-only .m4a file when using --silence-range.
         #[arg(short, long)]
         out: PathBuf,
     },
@@ -347,7 +347,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         } => {
             crate::mute::export(&media, &out, soundtrack.as_deref(), &silence_range)?;
             if !silence_range.is_empty() {
-                println!("Wrote {} with the requested intervals muted on the first audio track. Review the remaining audio and video before sharing.", out.display());
+                println!("Wrote {} with the requested intervals muted on the first audio track. Review the final recording before sharing.", out.display());
             } else if soundtrack.is_some() {
                 println!("Wrote {} with one replacement soundtrack and no recognized location tags. Review the video and audit the replacement audio before sharing.", out.display());
             } else {

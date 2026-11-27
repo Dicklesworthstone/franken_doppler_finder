@@ -19,6 +19,10 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Redact selected passages in audio-only recordings
+
+- `fdop mute --silence-range` accepts an `.m4a` destination for voice memos, field recordings, or the audio from a video. The export contains one ALAC track. Verification checks its stream layout, channels, sample rate and digital silence before publishing the file.
+
 ### Keep original audio outside selected mute intervals
 
 - Add repeatable `fdop mute --silence-range START..END` in recording seconds. Mute every channel of the first original audio track, remove alternate tracks and retain the copied primary video. The verification pass decodes the staged ALAC audio and checks the chosen intervals before publishing.

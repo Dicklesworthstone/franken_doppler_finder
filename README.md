@@ -952,7 +952,7 @@ fdop detect clip.m4a -o runs/detect
 Use `detect` to audit your own recordings (see
 [Protecting your own recordings](#protecting-your-own-recordings)).
 
-### `fdop mute <MEDIA> --out <VIDEO.mp4>`
+### `fdop mute <MEDIA> --out <OUTPUT>`
 
 When the soundtrack is optional, make a silent copy before sharing a video:
 
@@ -976,6 +976,15 @@ fdop mute clip.mov --silence-range 12.5..48 --silence-range 96..140 --out edited
 fdop detect edited.mp4 --all-audio --offline
 ```
 
+For a voice memo or field recording, use an `.m4a` destination with the intervals to mute.
+This also works on a video when you want to share just its edited audio. The M4A contains
+one ALAC track and omits pictures, cover art, alternate tracks, chapters and copied metadata.
+
+```bash
+fdop mute field.wav --silence-range 12.5..48 --out edited.m4a
+fdop detect edited.m4a --all-audio --offline
+```
+
 Range mode keeps every channel of the first audio track, applies each cut across those channels, and drops the alternate tracks. The recording clock includes any delay before the primary audio begins and gaps in its timestamps. Ranges include their start and exclude their end, rounded outward to whole samples. Overlapping ranges merge. The output uses ALAC audio. Before publishing, `fdop` decodes the staged file and checks every channel for digital silence throughout the chosen intervals. An interval past the end of primary audio is an error. Use range mode with a stable primary audio format and choose either ranges or a replacement soundtrack.
 
 `mute` works offline with FFmpeg and FFprobe. It copies the first video stream that is not
@@ -985,8 +994,8 @@ its first sample at the beginning of the export. A short track is padded with si
 a long one ends with the video. FFprobe verifies the completed file has one non-cover video
 track, the requested number of audio tracks (zero or one), zero chapters, no other streams
 and no recognized location tags. An occupied output path is an error.
-The destination directory must already exist. Inputs without video and video
-codecs that FFmpeg cannot copy into MP4 produce an error.
+The destination directory must already exist. MP4 output requires a video stream that
+FFmpeg can copy into the container. M4A output requires primary audio and at least one silence range.
 
 Review the pictures and anything embedded in the encoded video, including in-band captions,
 before sharing. Those travel with the video stream. The replacement audio can carry its own

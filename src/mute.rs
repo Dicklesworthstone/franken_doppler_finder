@@ -1,4 +1,4 @@
-//! Remove a recording's original soundtrack, optionally supplying audio from a separate file.
+//! Export a video with a cleaned soundtrack or a selectively muted audio recording.
 
 use fdop_core::audio;
 use std::path::{Path, PathBuf};
@@ -122,11 +122,13 @@ pub(crate) fn export(
     if soundtrack.is_some() && !silence_ranges.is_empty() {
         return Err("choose a replacement soundtrack or silence ranges".into());
     }
-    if !out
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
-    {
-        return Err("mute output must be a new .mp4 file".into());
+    let extension = out.extension().unwrap_or_default();
+    let audio_only = extension.eq_ignore_ascii_case("m4a");
+    if audio_only && silence_ranges.is_empty() {
+        return Err("an .m4a export needs at least one --silence-range".into());
+    }
+    if !audio_only && !extension.eq_ignore_ascii_case("mp4") {
+        return Err("mute output must be a new .mp4 or .m4a file".into());
     }
     if out.try_exists().map_err(|e| e.to_string())? {
         return Err(format!("output already exists: {}", out.display()));
@@ -188,7 +190,11 @@ pub(crate) fn export(
     }
     // Uppercase V excludes cover art. Explicit input numbers prevent FFmpeg
     // from choosing any camera audio or any picture from the replacement.
-    cmd.args(["-map", "0:V:0"]);
+    if audio_only {
+        cmd.arg("-vn");
+    } else {
+        cmd.args(["-map", "0:V:0", "-c:v", "copy"]);
+    }
     if soundtrack.is_some() {
         // Anchor the replacement's first sample to the export timeline. Silence
         // padding makes the copied video's final packet determine the end in both
@@ -223,12 +229,10 @@ pub(crate) fn export(
             "-1",
             "-write_tmcd",
             "0",
-            "-c:v",
-            "copy",
             "-movflags",
             "+faststart",
             "-f",
-            "mp4",
+            if audio_only { "ipod" } else { "mp4" },
             "-y",
         ])
         .arg(staged.path())
@@ -236,13 +240,15 @@ pub(crate) fn export(
         .map_err(|e| format!("ffmpeg not runnable ({e}); install ffmpeg"))?;
     if !result.status.success() || !result.stderr.is_empty() {
         return Err(format!(
-            "MP4 export failed ({}): {}",
+            "media export failed ({}): {}",
             result.status,
             String::from_utf8_lossy(&result.stderr).trim()
         ));
     }
     let audit = audio::probe_audio_inventory(staged.path())?;
-    let expected_layout = if soundtrack.is_some() || redaction.is_some() {
+    let expected_layout = if audio_only {
+        audit.single_audio_without_chapters
+    } else if soundtrack.is_some() || redaction.is_some() {
         audit.video_with_soundtrack_without_chapters
     } else {
         audit.single_video_without_chapters
@@ -252,7 +258,7 @@ pub(crate) fn export(
     }
     if let Some((info, _, intervals)) = redaction {
         let audio = &audit.streams[0];
-        if audio.channels != info.channels || audio.sample_rate != info.sample_rate {
+        if audio.audio_codec != "alac" || audio.channels != info.channels || audio.sample_rate != info.sample_rate {
             return Err("export verification found a changed audio format".into());
         }
         verify_silence(staged.path(), &intervals, audio.channels)?;
@@ -343,6 +349,69 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
         result.stdout
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn exports_only_redacted_primary_audio_from_sound_or_video_recordings() {
+        let dir = tempfile::tempdir().unwrap();
+        let chapters = dir.path().join("markers.txt");
+        std::fs::write(&chapters, ";FFMETADATA1\nlocation=private-source-marker\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\ntitle=private-chapter-marker\n").unwrap();
+        for video in [false, true] {
+            let media = dir.path().join(if video { "camera.mkv" } else { "memo.mka" });
+            let out = media.with_extension("m4a");
+            let mut make = ffmpeg();
+            make.args(["-f", "lavfi", "-i",
+                "aevalsrc=0.5*sin(2*PI*320*t)|0.5*cos(2*PI*440*t):s=8000:d=1",
+                "-f", "lavfi", "-i", "sine=frequency=912:duration=1",
+                "-f", "ffmetadata", "-i"]).arg(&chapters);
+            if video {
+                make.args(["-f", "lavfi", "-i", "color=s=32x24:r=10:d=1", "-map", "3:v", "-c:v", "mpeg4"]);
+            }
+            let made = make.args(["-map", "0:a", "-map", "1:a", "-c:a", "pcm_s16le",
+                "-map_metadata", "2", "-map_chapters", "2", "-metadata:s:a:0",
+                "title=private-track-marker"]).arg(&media).output().unwrap();
+            assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            let original = audio::probe_audio_inventory(&media).unwrap();
+            assert_eq!(original.streams.len(), 2);
+            assert!(original.location_tag_detected);
+            assert!(!original.single_audio_without_chapters);
+
+            let cut = ["0.250125..0.375375".parse().unwrap()];
+            export(&media, &out, None, &cut).unwrap();
+            let audit = audio::probe_audio_inventory(&out).unwrap();
+            assert!(audit.single_audio_without_chapters);
+            assert!(!audit.location_tag_detected);
+            assert_eq!(audit.streams[0].audio_codec, "alac");
+            assert_eq!(audit.streams[0].channels, 2);
+            assert_eq!(audit.streams[0].sample_rate, 8000);
+            let metadata = Command::new("ffprobe")
+                .args(["-v", "error", "-show_format", "-show_streams", "-show_chapters"])
+                .arg(&out).output().unwrap();
+            assert!(metadata.status.success());
+            assert!(!String::from_utf8_lossy(&metadata.stdout).contains("private-"));
+            let samples = |file: &Path| {
+                let pcm = ffmpeg().arg("-i").arg(file)
+                    .args(["-map", "0:a:0", "-f", "s16le", "-"]).output().unwrap();
+                assert!(pcm.status.success());
+                pcm.stdout
+            };
+            // 8 kHz stereo s16: compare every interleaved sample and length,
+            // including the samples directly on either side of the cut.
+            let mut expected = samples(&media);
+            assert_eq!(expected.len(), 8000 * 4);
+            let span = &mut expected[2001 * 4..3003 * 4];
+            assert!(span.iter().any(|&b| b != 0));
+            span.fill(0);
+            assert_eq!(samples(&out), expected);
+            assert!(export(&media, &out, None, &cut).is_err());
+        }
+        let memo = dir.path().join("memo.mka");
+        let refused = dir.path().join("refused.m4a");
+        assert!(export(&memo, &refused, None, &[]).is_err());
+        assert!(export(&memo, &refused, Some(&memo), &[]).is_err());
+        assert!(export(&memo, &refused, None, &["0.9..1.1".parse().unwrap()]).is_err());
+        assert!(!refused.exists());
     }
 
     #[test]
