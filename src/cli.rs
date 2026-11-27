@@ -47,6 +47,9 @@ pub enum Cmd {
         /// Original audio track to retain in range mode (zero-based, default 0).
         #[arg(long, value_name = "N", requires = "cut_mode")]
         audio_stream: Option<usize>,
+        /// Strip H.264/HEVC SEI (including in-band captions and display metadata) from the copied MP4 video.
+        #[arg(long)]
+        strip_video_sei: bool,
         /// New .mp4 file, or an audio-only .m4a file when muting intervals.
         #[arg(short, long)]
         out: PathBuf,
@@ -362,6 +365,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             soundtrack,
             silence_range,
             silence_detected,
+            strip_video_sei,
             audio_stream,
             out,
         } => {
@@ -375,7 +379,8 @@ fn run(cli: Cli) -> Result<i32, String> {
                 revision = Some(crate::mute::SourceRevision::read(&media)?);
                 ranges = audited_silence_ranges(&media, selected, padding)?;
             }
-            crate::mute::export(&media, &out, soundtrack.as_deref(), &ranges, audio_stream, revision.as_ref())?;
+            crate::mute::export(&media, &out, soundtrack.as_deref(), &ranges, audio_stream, revision.as_ref(),
+                crate::mute::ExportChecks { strip_video_sei, ..Default::default() })?;
             if silence_detected.is_some() {
                 println!("Wrote {} with {} measured interval(s) muted on audio stream {selected}. Aircraft sound can extend beyond these cuts. Listen to the export before sharing.", out.display(), ranges.len());
             } else if !ranges.is_empty() {

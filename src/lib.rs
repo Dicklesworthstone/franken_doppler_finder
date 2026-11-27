@@ -15,3 +15,4 @@ pub mod ledger;
 mod mute;
 pub mod pipeline;
 pub mod selftest;
+mod video_sei;

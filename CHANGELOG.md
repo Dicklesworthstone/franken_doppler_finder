@@ -19,6 +19,12 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Strip embedded captions and other SEI from H.264 and HEVC video exports
+
+- `mute --strip-video-sei` removes SEI during MP4 packet copy, then checks the
+  staged pictures and decoder configuration. Unsupported video and retained SEI
+  stop publication. The option can also remove HDR and timing metadata.
+
 ### Retain a clock-consistent alternative for a pruned confirmer
 
 - After ordinary clock pruning, retry a removed confirmer only when two distinct matched

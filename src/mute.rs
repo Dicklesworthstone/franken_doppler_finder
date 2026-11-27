@@ -199,6 +199,11 @@ pub(crate) fn validate_destination(out: &Path, has_ranges: bool) -> Result<bool,
     Ok(audio_only)
 }
 
+#[derive(Default)]
+pub(crate) struct ExportChecks {
+    pub strip_video_sei: bool,
+}
+
 pub(crate) fn export(
     media: &Path,
     out: &Path,
@@ -206,6 +211,7 @@ pub(crate) fn export(
     silence_ranges: &[SilenceRange],
     audio_stream: Option<usize>,
     audited_source: Option<&SourceRevision>,
+    checks: ExportChecks,
 ) -> Result<(), String> {
     if soundtrack.is_some() && !silence_ranges.is_empty() {
         return Err("choose a replacement soundtrack or silence ranges".into());
@@ -214,10 +220,14 @@ pub(crate) fn export(
         return Err("--audio-stream requires at least one --silence-range".into());
     }
     let audio_only = validate_destination(out, !silence_ranges.is_empty())?;
+    if checks.strip_video_sei && audio_only {
+        return Err("--strip-video-sei requires an MP4 video destination".into());
+    }
     let media = local_media(media)?;
     if let Some(source) = audited_source {
         source.check(&media)?;
     }
+    let video_codec = checks.strip_video_sei.then(|| crate::video_sei::Codec::probe(&media)).transpose()?;
     let soundtrack = soundtrack.map(local_media).transpose()?;
     if let Some(track) = &soundtrack {
         if *track == media {
@@ -286,6 +296,9 @@ pub(crate) fn export(
         cmd.arg("-vn");
     } else {
         cmd.args(["-map", "0:V:0", "-c:v", "copy"]);
+        if let Some(codec) = video_codec {
+            cmd.args(["-bsf:v", codec.strip_filter()]);
+        }
     }
     if soundtrack.is_some() {
         // Anchor the replacement's first sample to the export timeline. Silence
@@ -354,6 +367,9 @@ pub(crate) fn export(
     if !expected_layout || audit.location_tag_detected {
         return Err("export verification failed: unexpected streams, chapters or location tags".into());
     }
+    if let Some(codec) = video_codec {
+        codec.verify(staged.path())?;
+    }
     if let Some((info, _, intervals)) = redaction {
         let audio = &audit.streams[0];
         if audio.audio_codec != "alac" || audio.channels != info.channels || audio.sample_rate != info.sample_rate {
@@ -383,7 +399,7 @@ mod tests {
         revision.check(&path).unwrap();
         std::fs::write(&path, b"modified").unwrap();
         let out = dir.path().join("edited.m4a");
-        assert!(export(&path, &out, None, &["0..1".parse().unwrap()], None, Some(&revision))
+        assert!(export(&path, &out, None, &["0..1".parse().unwrap()], None, Some(&revision), ExportChecks::default())
             .unwrap_err().contains("input changed"));
         assert!(!out.exists());
     }
@@ -416,7 +432,7 @@ mod tests {
         assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
         let ranges = ["2.650875..2.778", "0.750125..0.875"];
         let out = dir.path().join("redacted.mp4");
-        export(&media, &out, None, &ranges.map(|s| s.parse().unwrap()), None, None).unwrap();
+        export(&media, &out, None, &ranges.map(|s| s.parse().unwrap()), None, None, ExportChecks::default()).unwrap();
         let inventory = audio::probe_audio_inventory(&out).unwrap();
         assert!(inventory.video_with_soundtrack_without_chapters);
         assert!(!inventory.location_tag_detected);
@@ -442,7 +458,7 @@ mod tests {
         assert!(verify_silence(&out, &[(8_000, 8_800)], false, &probe, &audit.streams[0]).is_err());
         // Primary audio ends at 4 s but the video continues to 5 s.
         let refused = dir.path().join("refused.mp4");
-        assert!(export(&media, &refused, None, &["3.9..4.1".parse().unwrap()], None, None).is_err());
+        assert!(export(&media, &refused, None, &["3.9..4.1".parse().unwrap()], None, None, ExportChecks::default()).is_err());
         assert!(!refused.exists());
     }
 
@@ -486,7 +502,7 @@ mod tests {
         let audit_end = audit.len() as f64 / 4000.0;
         for (file, end) in [("rounded-up.m4a", audit_end), ("rounded-down.m4a", 1.0)] {
             let out = dir.path().join(file);
-            export(&media, &out, None, &[SilenceRange::measured(0.5, end, true)], None, None).unwrap();
+            export(&media, &out, None, &[SilenceRange::measured(0.5, end, true)], None, None, ExportChecks::default()).unwrap();
             let native = audio::decode_with_selection(&out, 0.0, None, 8000, audio::AudioSelection::default()).unwrap();
             assert_eq!(native.len(), 8001);
             assert!(native[..4000].iter().all(|&v| v > 0.4));
@@ -498,7 +514,7 @@ mod tests {
         let refused = dir.path().join("refused.m4a");
         let manual = "0.5..1.00025".parse().unwrap();
         for range in [manual, SilenceRange::measured(0.5, 1.01, true)] {
-            let error = export(&media, &refused, None, &[range], None, None).unwrap_err();
+            let error = export(&media, &refused, None, &[range], None, None, ExportChecks::default()).unwrap_err();
             assert!(error.contains("extends beyond"), "{error}");
             assert!(!refused.exists());
         }
@@ -552,7 +568,7 @@ mod tests {
             assert!(!original.single_audio_without_chapters);
 
             let cut = ["0.250125..0.375375".parse().unwrap()];
-            export(&media, &out, None, &cut, None, None).unwrap();
+            export(&media, &out, None, &cut, None, None, ExportChecks::default()).unwrap();
             let audit = audio::probe_audio_inventory(&out).unwrap();
             assert!(audit.single_audio_without_chapters);
             assert!(!audit.location_tag_detected);
@@ -578,13 +594,13 @@ mod tests {
             assert!(span.iter().any(|&b| b != 0));
             span.fill(0);
             assert_eq!(samples(&out), expected);
-            assert!(export(&media, &out, None, &cut, None, None).is_err());
+            assert!(export(&media, &out, None, &cut, None, None, ExportChecks::default()).is_err());
         }
         let memo = dir.path().join("memo.mka");
         let refused = dir.path().join("refused.m4a");
-        assert!(export(&memo, &refused, None, &[], None, None).is_err());
-        assert!(export(&memo, &refused, Some(&memo), &[], None, None).is_err());
-        assert!(export(&memo, &refused, None, &["0.9..1.1".parse().unwrap()], None, None).is_err());
+        assert!(export(&memo, &refused, None, &[], None, None, ExportChecks::default()).is_err());
+        assert!(export(&memo, &refused, Some(&memo), &[], None, None, ExportChecks::default()).is_err());
+        assert!(export(&memo, &refused, None, &["0.9..1.1".parse().unwrap()], None, None, ExportChecks::default()).is_err());
         assert!(!refused.exists());
     }
 
@@ -606,7 +622,7 @@ mod tests {
         let cut = ["0.750125..0.875375".parse().unwrap()];
         for extension in ["mp4", "m4a"] {
             let out = media.with_extension(extension);
-            export(&media, &out, None, &cut, Some(1), None).unwrap();
+            export(&media, &out, None, &cut, Some(1), None, ExportChecks::default()).unwrap();
             let audit = audio::probe_audio_inventory(&out).unwrap();
             assert!(!audit.location_tag_detected);
             assert_eq!(audit.streams.len(), 1);
@@ -631,8 +647,8 @@ mod tests {
             }
         }
         let refused = dir.path().join("refused.mp4");
-        assert!(export(&media, &refused, None, &cut, Some(2), None).is_err());
-        assert!(export(&media, &refused, None, &[], Some(0), None).is_err());
+        assert!(export(&media, &refused, None, &cut, Some(2), None, ExportChecks::default()).is_err());
+        assert!(export(&media, &refused, None, &[], Some(0), None, ExportChecks::default()).is_err());
         assert!(!refused.exists());
     }
 
@@ -694,7 +710,7 @@ mod tests {
         assert_eq!(original.streams.len(), 2);
         assert!(original.location_tag_detected);
         let out = root.path().join("silent.mp4");
-        export(&media, &out, None, &[], None, None).unwrap();
+        export(&media, &out, None, &[], None, None, ExportChecks::default()).unwrap();
         let inspect = Command::new("ffprobe")
             .args([
                 "-v",
@@ -723,8 +739,8 @@ mod tests {
         // A second export cannot replace a completed output. Using the original
         // MP4 as its own destination also leaves its bytes untouched.
         let bytes = std::fs::read(&out).unwrap();
-        assert!(export(&media, &out, None, &[], None, None).is_err());
-        assert!(export(&out, &out, None, &[], None, None).is_err());
+        assert!(export(&media, &out, None, &[], None, None, ExportChecks::default()).is_err());
+        assert!(export(&out, &out, None, &[], None, None, ExportChecks::default()).is_err());
         assert_eq!(std::fs::read(&out).unwrap(), bytes);
     }
 
@@ -784,7 +800,7 @@ mod tests {
                 }]
             );
             let out = root.path().join(format!("{tag}-muted.mp4"));
-            export(&media, &out, None, &[], None, None).unwrap();
+            export(&media, &out, None, &[], None, None, ExportChecks::default()).unwrap();
             let checked = audio::probe_audio_inventory(&out).unwrap();
             assert!(checked.single_video_without_chapters);
             assert!(checked.possible_location_telemetry.is_empty());
@@ -824,7 +840,7 @@ mod tests {
                 .arg(&replacement).output().unwrap();
             assert!(soundtrack.status.success(), "{}", String::from_utf8_lossy(&soundtrack.stderr));
             let out = dir.path().join(format!("{label}.mp4"));
-            export(&media, &out, Some(&replacement), &[], None, None).unwrap();
+            export(&media, &out, Some(&replacement), &[], None, None, ExportChecks::default()).unwrap();
             assert_eq!(timing(&out), original_packets);
             assert_eq!(decoded_video_hash(&out), decoded_video_hash(&media));
             let inventory = audio::probe_audio_inventory(&out).unwrap();
@@ -858,17 +874,120 @@ mod tests {
             }
         }
         let refused = dir.path().join("refused.mp4");
-        assert!(export(&media, &refused, Some(&media), &[], None, None).is_err());
+        assert!(export(&media, &refused, Some(&media), &[], None, None, ExportChecks::default()).is_err());
         #[cfg(unix)]
         {
             let alias = dir.path().join("alias.mp4");
             std::fs::hard_link(&media, &alias).unwrap();
-            assert!(export(&media, &refused, Some(&alias), &[], None, None).is_err());
+            assert!(export(&media, &refused, Some(&alias), &[], None, None, ExportChecks::default()).is_err());
         }
         let silent = dir.path().join("silent.mp4");
-        export(&media, &silent, None, &[], None, None).unwrap();
-        assert!(export(&media, &refused, Some(&silent), &[], None, None).is_err());
+        export(&media, &silent, None, &[], None, None, ExportChecks::default()).unwrap();
+        assert!(export(&media, &refused, Some(&silent), &[], None, None, ExportChecks::default()).is_err());
         assert!(!refused.exists());
+    }
+
+    fn strip_sei() -> ExportChecks {
+        ExportChecks { strip_video_sei: true, ..Default::default() }
+    }
+
+    fn video_packet_times(path: &Path) -> Vec<u8> {
+        let out = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "V:0", "-show_packets",
+                "-show_entries", "packet=pts_time,dts_time,duration_time", "-of", "csv=p=0"])
+            .arg(path).output().unwrap();
+        assert!(out.status.success() && !out.stdout.is_empty());
+        out.stdout
+    }
+
+    fn contains_bytes(path: &Path, needle: &[u8]) -> bool {
+        std::fs::read(path).unwrap().windows(needle.len()).any(|s| s == needle)
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg with libx264 and ffprobe"]
+    fn strips_h264_sei_in_each_video_export_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("camera.mp4");
+        let marker = b"fdop-synthetic-camera-marker";
+        let made = ffmpeg().args(["-f", "lavfi", "-i", "testsrc2=s=64x48:r=8:d=1",
+            "-f", "lavfi", "-i", "sine=d=1:r=8000", "-c:v", "libx264", "-bf", "0", "-threads:v", "1",
+            "-bsf:v", "h264_metadata=sei_user_data=12345678-1234-1234-1234-123456789abc+fdop-synthetic-camera-marker",
+            "-c:a", "aac"]).arg(&media).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        assert!(contains_bytes(&media, marker));
+        let timing = video_packet_times(&media);
+        let frames = decoded_video_hash(&media);
+        let ordinary = dir.path().join("ordinary.mp4");
+        export(&media, &ordinary, None, &[], None, None, ExportChecks::default()).unwrap();
+        assert!(contains_bytes(&ordinary, marker));
+        let track = dir.path().join("narration.wav");
+        assert!(ffmpeg().args(["-f", "lavfi", "-i", "sine=d=1:r=16000"])
+            .arg(&track).status().unwrap().success());
+        let ranges = ["0.25..0.5".parse().unwrap()];
+        for (name, replacement, cuts) in [
+            ("silent", None, &[][..]), ("dubbed", Some(track.as_path()), &[][..]),
+            ("edited", None, &ranges[..]),
+        ] {
+            let out = dir.path().join(format!("{name}.mp4"));
+            export(&media, &out, replacement, cuts, None, None, strip_sei()).unwrap();
+            assert!(!contains_bytes(&out, marker), "{name}");
+            assert_eq!(video_packet_times(&out), timing, "{name}");
+            assert_eq!(decoded_video_hash(&out), frames, "{name}");
+            assert!(export(&media, &out, replacement, cuts, None, None, strip_sei()).is_err());
+        }
+        let refused = dir.path().join("audio.m4a");
+        assert!(export(&media, &refused, None, &ranges, None, None, strip_sei()).is_err());
+        assert!(!refused.exists());
+        let unsupported = dir.path().join("mpeg4.mp4");
+        assert!(ffmpeg().args(["-f", "lavfi", "-i", "color=s=32x24:d=1", "-c:v", "mpeg4"])
+            .arg(&unsupported).status().unwrap().success());
+        let refused = dir.path().join("refused.mp4");
+        assert!(export(&unsupported, &refused, None, &[], None, None, strip_sei())
+            .unwrap_err().contains("H.264 or HEVC"));
+        assert!(!refused.exists());
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg with libx265 and ffprobe"]
+    fn strips_packet_hevc_sei_and_refuses_sei_retained_in_decoder_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, format: &str| {
+            let path = dir.path().join(name);
+            let made = ffmpeg().args(["-f", "lavfi", "-i", "testsrc2=s=64x48:r=8:d=1",
+                "-c:v", "libx265", "-x265-params", "pools=none:frame-threads=1:log-level=error:info=1",
+                "-f", format]).arg(&path).output().unwrap();
+            assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            path
+        };
+        // x265's unregistered SEI includes its encoder information. With
+        // global headers the MP4 muxer carries that NAL in its hvcC record.
+        let marker = b"x265 (build";
+        let headers = make("headers.mp4", "mp4");
+        assert!(contains_bytes(&headers, marker));
+        let out = dir.path().join("headers-stripped.mp4");
+        match export(&headers, &out, None, &[], None, None, strip_sei()) {
+            Err(e) => {
+                assert!(e.contains("SEI"), "{e}");
+                assert!(!out.exists());
+            }
+            // A future FFmpeg may filter hvcC itself.
+            Ok(()) => assert!(!contains_bytes(&out, marker)),
+        }
+
+        // In a transport stream the encoder puts the same SEI in the coded
+        // packets. Remux it to MP4 to keep the input and output clocks comparable.
+        let transport = make("inband.ts", "mpegts");
+        let input = dir.path().join("inband.mp4");
+        let remuxed = ffmpeg().arg("-i").arg(&transport).args(["-c:v", "copy"])
+            .arg(&input).output().unwrap();
+        assert!(remuxed.status.success(), "{}", String::from_utf8_lossy(&remuxed.stderr));
+        assert!(contains_bytes(&input, marker));
+        let out = dir.path().join("inband-stripped.mp4");
+        export(&input, &out, None, &[], None, None, strip_sei()).unwrap();
+        assert!(!contains_bytes(&out, marker));
+        assert_eq!(decoded_video_hash(&out), decoded_video_hash(&input));
+        assert_eq!(video_packet_times(&out), video_packet_times(&input));
     }
 
     #[test]
@@ -885,7 +1004,7 @@ mod tests {
                 .success()
         );
         let out = root.path().join("silent.mp4");
-        assert!(export(&media, &out, None, &[], None, None).is_err());
+        assert!(export(&media, &out, None, &[], None, None, ExportChecks::default()).is_err());
         assert!(!out.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }

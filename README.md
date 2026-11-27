@@ -1071,9 +1071,24 @@ and no recognized location tags. An occupied output path is an error.
 The destination directory must already exist. MP4 output requires a video stream that
 FFmpeg can copy into the container. M4A output requires an audio track and either manual or detected intervals.
 
-Review the pictures and anything embedded in the encoded video, including in-band captions,
-before sharing. Those travel with the video stream. The replacement audio can carry its own
-location clues. Listen to it and audit the final export.
+Camera video can carry captions or private user data inside the encoded picture stream
+even after its other tracks and container tags have been removed. For H.264 or HEVC
+video, add `--strip-video-sei` to remove supplemental enhancement information (SEI)
+while copying the pictures. For example:
+
+```bash
+fdop mute camera.mp4 --strip-video-sei --out silent.mp4
+```
+
+The option works with silent, replacement-audio and interval-muted MP4 exports.
+It also removes SEI used for captions, timing or HDR display information, which can
+change playback on some displays. Before publication the exporter checks the staged
+video packets and the decoder configuration for remaining SEI and requires a decodable
+picture. It refuses unsupported codecs and files where FFmpeg retains SEI in the
+codec configuration, including some HEVC MP4 files.
+
+Review the visible pictures, other data embedded in the video and any replacement audio
+before sharing. The usual video-copy mode preserves in-band captions and SEI.
 
 ### `fdop fetch`: pre-download ADS-B
 
