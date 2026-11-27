@@ -72,6 +72,7 @@ fn get_cached_validated<T>(
     offline: bool,
     (timeout_s, max_age_s, retries): (u64, Option<f64>, u32),
     validate: impl Fn(serde_json::Value) -> Result<T, DataError>,
+    warnings: &mut Vec<String>,
 ) -> Result<T, DataError> {
     get_cached_recoverable(
         url,
@@ -80,6 +81,7 @@ fn get_cached_validated<T>(
         (timeout_s, max_age_s, retries),
         validate,
         |_| None,
+        warnings,
     )
 }
 
@@ -92,6 +94,7 @@ fn get_cached_recoverable<T>(
     (timeout_s, max_age_s, retries): (u64, Option<f64>, u32),
     validate: impl Fn(serde_json::Value) -> Result<T, DataError>,
     quality: impl Fn(&T) -> Option<usize>,
+    warnings: &mut Vec<String>,
 ) -> Result<T, DataError> {
     let dir = cache.join("weather");
     let path = dir.join(format!("{:016x}.json", fnv(url)));
@@ -166,7 +169,14 @@ fn get_cached_recoverable<T>(
     {
         return Ok(previous);
     }
-    fdop_http::write_atomic(&path, &body)?;
+    // The requested profile is already validated. Persistence only enables later
+    // reuse; losing that optimization must not replace valid weather by a fallback.
+    if let Err(error) = fdop_http::write_atomic(&path, &body) {
+        warnings.push(format!(
+            "weather response could not be cached at {} ({error}); using the validated response for this run",
+            path.display()
+        ));
+    }
     Ok(parsed)
 }
 
@@ -463,7 +473,8 @@ fn om_grid(
         date_str((t_end / 3600.0).ceil() * 3600.0),
         vars.join(",")
     );
-    get_cached_recoverable(
+    let mut cache_warnings = Vec::new();
+    let mut source = get_cached_recoverable(
         &url,
         cache,
         offline,
@@ -474,7 +485,10 @@ fn om_grid(
         ),
         |v| parse_om_grid(v, &lats, &lons, t_start, t_end, levels),
         |a| a.partial_cells,
-    )
+        &mut cache_warnings,
+    )?;
+    source.warnings.extend(cache_warnings);
+    Ok(source)
 }
 
 fn parse_om_grid(
@@ -643,8 +657,9 @@ fn raob_stations(
     cache: &Path,
     offline: bool,
     window: (f64, f64),
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<(String, f64, f64, f64)>, DataError> {
-    raob_stations_from(IEM_RAOB_NETWORK, cache, offline, window)
+    raob_stations_from(IEM_RAOB_NETWORK, cache, offline, window, warnings)
 }
 
 fn raob_stations_from(
@@ -652,6 +667,7 @@ fn raob_stations_from(
     cache: &Path,
     offline: bool,
     window: (f64, f64),
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<(String, f64, f64, f64)>, DataError> {
     let parse = |v| parse_raob_stations(v, window);
     get_cached_validated(
@@ -660,11 +676,12 @@ fn raob_stations_from(
         offline,
         (30, Some(30.0 * 86400.0), 1),
         parse,
+        warnings,
     )
     .or_else(|e| {
         // A valid stale index beats none, but an unusable refresh must not replace
         // it before this fallback gets to read the previously published bytes.
-        get_cached_validated(url, cache, true, (30, None, 0), parse).map_err(|_| e)
+        get_cached_validated(url, cache, true, (30, None, 0), parse, warnings).map_err(|_| e)
     })
 }
 
@@ -854,7 +871,8 @@ fn raob_atmosphere_with_progress(
     let t0 = (t_start / 43200.0).floor() * 43200.0;
     let t1 = (t_end / 43200.0).ceil() * 43200.0;
     let (clat, clon) = b.center();
-    let mut st = raob_stations(cache, offline, (t0, t1))?;
+    let mut cache_warnings = Vec::new();
+    let mut st = raob_stations(cache, offline, (t0, t1), &mut cache_warnings)?;
     st.sort_by(|x, y| {
         fdop_types::geo::haversine_m(clat, clon, x.1, x.2)
             .total_cmp(&fdop_types::geo::haversine_m(clat, clon, y.1, y.2))
@@ -885,14 +903,14 @@ fn raob_atmosphere_with_progress(
     let mut recovered = false;
     let (mut n_ok, mut n_tried) = (0, 0);
     let mut alias_recoveries = 0;
-    let profile_warnings = |count| {
-        if count == 0 {
-            Vec::new()
-        } else {
-            vec![format!(
+    let profile_warnings = |count, cache_warnings: &[String]| {
+        let mut warnings = cache_warnings.to_vec();
+        if count > 0 {
+            warnings.push(format!(
                 "radiosondes: recovered {count} sounding(s) from later returned profiles after incomplete aliases; profiles were not combined"
-            )]
+            ));
         }
+        warnings
     };
     for (id, la, lo, _) in &chosen {
         let outside_preferred =
@@ -911,6 +929,7 @@ fn raob_atmosphere_with_progress(
                 offline,
                 (20, None, 1),
                 select_raob_profile,
+                &mut cache_warnings,
             ) {
                 series.push((t, lv));
                 n_ok += 1;
@@ -930,7 +949,7 @@ fn raob_atmosphere_with_progress(
                     ),
                 ) {
                     let mut source = WeatherSource::complete(profile);
-                    source.warnings = profile_warnings(alias_recoveries);
+                    source.warnings = profile_warnings(alias_recoveries, &cache_warnings);
                     on_profile(source);
                 }
             }
@@ -972,7 +991,7 @@ fn raob_atmosphere_with_progress(
     )
     .map(|profile| {
         let mut source = WeatherSource::complete(profile);
-        source.warnings = profile_warnings(alias_recoveries);
+        source.warnings = profile_warnings(alias_recoveries, &cache_warnings);
         source
     })
     .map_err(DataError)
@@ -1827,9 +1846,15 @@ mod tests {
                 )
             };
             let read = |offline| {
-                get_cached_recoverable(&url, &dir, offline, (2, None, 0), parse, |a| {
-                    a.partial_cells
-                })
+                get_cached_recoverable(
+                    &url,
+                    &dir,
+                    offline,
+                    (2, None, 0),
+                    parse,
+                    |a| a.partial_cells,
+                    &mut Vec::new(),
+                )
             };
             let offline = read(true).unwrap();
             assert_eq!(offline.partial_cells, Some(1));
@@ -1872,9 +1897,15 @@ mod tests {
             )
         };
         let read = |offline| {
-            get_cached_recoverable(&url, &dir, offline, (2, None, 0), parse, |a| {
-                a.partial_cells
-            })
+            get_cached_recoverable(
+                &url,
+                &dir,
+                offline,
+                (2, None, 0),
+                parse,
+                |a| a.partial_cells,
+                &mut Vec::new(),
+            )
         };
         assert_eq!(read(false).unwrap().partial_cells, Some(1));
         server.join().unwrap();
@@ -1913,7 +1944,10 @@ mod tests {
                 socket.read_exact(&mut byte).unwrap();
                 request.push(byte[0]);
             }
-            assert!(request.starts_with(b"GET /weather HTTP/1.1\r\n"));
+            assert!(
+                request.starts_with(b"GET /weather HTTP/1.1\r\n")
+                    || request.starts_with(b"GET /weather?")
+            );
             write!(
                 socket,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1923,6 +1957,154 @@ mod tests {
             socket.write_all(&body).unwrap();
         });
         (url, server)
+    }
+
+    #[test]
+    fn fetched_weather_survives_cache_publication_failure() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (lat, lon) = (40.876466, -73.524951);
+        let bbox = BBox::new(lat, lon, lat, lon);
+        let (t0, t1) = (day + 4.25 * 3600.0, day + 5.75 * 3600.0);
+        for levels in [false, true] {
+            for usable in [false, true] {
+                let mut value = open_meteo_fixture(day as i64, 24);
+                if !usable {
+                    value["hourly"]["temperature_2m"][5] = serde_json::Value::Null;
+                }
+                let (url, server) = serve_weather_once(&value);
+                let (dir, _) = weather_test_cache(&url, "write-failure");
+                // A file where the cache directory belongs fails on every platform,
+                // without relying on user privileges or changing filesystem permissions.
+                let blocked = dir.join("blocked");
+                std::fs::create_dir(&blocked).unwrap();
+                let marker = blocked.join("weather");
+                std::fs::write(&marker, b"keep existing data").unwrap();
+                let fetched = om_grid(&url, &bbox, t0, t1, &blocked, false, levels);
+                server.join().unwrap();
+                assert_eq!(std::fs::read(&marker).unwrap(), b"keep existing data");
+                if !usable {
+                    assert!(
+                        fetched.is_err(),
+                        "cache recovery must still validate weather"
+                    );
+                    continue;
+                }
+                let source = fetched.expect("valid weather must survive a cache-write failure");
+                assert_eq!(source.warnings.len(), 1);
+                assert!(source.warnings[0].contains("could not be cached"));
+                let expected = parse_om_grid(value, &[lat], &[lon], t0, t1, levels).unwrap();
+                let weather = if levels {
+                    choose_atmosphere(Ok(source), |_| {
+                        panic!("usable pressure levels keep priority")
+                    })
+                } else {
+                    choose_atmosphere(Err(DataError::new("pressure levels unavailable")), |_| {
+                        (Ok(source), Err(DataError::new("soundings unavailable")))
+                    })
+                };
+                assert_eq!(weather.winds_aloft, levels);
+                assert!(
+                    weather
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("could not be cached"))
+                );
+                assert!(!weather.warnings.iter().any(|w| w.contains("using a 15 C")));
+                for time in [t0, (t0 + t1) / 2.0, t1] {
+                    for (za, zb) in [(30.0, 800.0), (1500.0, 5000.0)] {
+                        assert_eq!(
+                            weather.atmo.medium(lat, lon, time, za, zb),
+                            expected.medium(lat, lon, time, za, zb)
+                        );
+                    }
+                }
+                // Failure to persist does not create an offline cache or a cached error.
+                assert!(om_grid(&url, &bbox, t0, t1, &blocked, true, levels).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn radiosonde_cache_failures_keep_valid_station_and_sounding_data() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let (url, server) = serve_weather_once(&raob_station_index_fixture());
+        let (dir, _) = weather_test_cache(&url, "raob-write-failure");
+        let blocked = dir.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        let marker = blocked.join("weather");
+        std::fs::write(&marker, b"keep station and sounding caches").unwrap();
+        let mut warnings = Vec::new();
+        let stations =
+            raob_stations_from(&url, &blocked, false, (day, day + 43_200.0), &mut warnings)
+                .expect("a usable live index must remain available for sounding requests");
+        server.join().unwrap();
+        assert_eq!(stations.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        let profile: Vec<_> = (0..6)
+            .map(|i| {
+                serde_json::json!({
+                    "hght": 100.0 + 1200.0 * f64::from(i),
+                    "tmpc": 15.0 - 6.0 * f64::from(i),
+                    "dwpc": 5.0 - 6.0 * f64::from(i),
+                    "drct": 270.0, "sknt": 20.0,
+                })
+            })
+            .collect();
+        let value = serde_json::json!({"profiles": [{"profile": profile}]});
+        let (url, server) = serve_weather_once(&value);
+        let (levels, recovered) = get_cached_validated(
+            &url,
+            &blocked,
+            false,
+            (2, None, 0),
+            select_raob_profile,
+            &mut warnings,
+        )
+        .expect("a validated sounding must remain usable without persistence");
+        server.join().unwrap();
+        assert_eq!(recovered, 0);
+        assert_eq!(levels, parse_raob_response(value).unwrap());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().all(|w| w.contains("could not be cached")));
+        let (_, lat, lon, _) = stations[0];
+        let atmo = ScatteredAtmosphere::new(
+            vec![(lat, lon, vec![(day, levels)])],
+            "retained sounding".into(),
+        )
+        .unwrap();
+        let expected = atmo.medium(lat, lon, day, 30.0, 5000.0);
+        let mut source = WeatherSource::complete(atmo);
+        source.warnings = warnings;
+        let updates = std::cell::RefCell::new(Vec::new());
+        let source = publish_fallback(
+            Ok(source),
+            "pressure levels unavailable",
+            true,
+            &|weather| {
+                updates.borrow_mut().push(weather);
+            },
+        );
+        let weather = choose_atmosphere(Err(DataError::new("pressure levels unavailable")), |_| {
+            (Err(DataError::new("surface unavailable")), source)
+        });
+        let updates = updates.borrow();
+        assert_eq!(updates.len(), 1);
+        for result in [&updates[0], &weather] {
+            assert!(result.winds_aloft);
+            assert_eq!(result.atmo.medium(lat, lon, day, 30.0, 5000.0), expected);
+            assert_eq!(
+                result
+                    .warnings
+                    .iter()
+                    .filter(|w| w.contains("could not be cached"))
+                    .count(),
+                2
+            );
+        }
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"keep station and sounding caches"
+        );
     }
 
     #[test]
@@ -1948,7 +2130,7 @@ mod tests {
                 )
             };
             let read = |offline| {
-                get_cached_validated(&url, &dir, offline, (2, None, 0), parse)
+                get_cached_validated(&url, &dir, offline, (2, None, 0), parse, &mut Vec::new())
             };
             let error = read(true).err().expect("offline must refuse the missing hour");
             assert!(error.0.contains("missing surface temperature"), "{error}");
@@ -1987,16 +2169,30 @@ mod tests {
                 true,
             )
         };
-        let error = get_cached_validated(&url, &dir, false, (2, None, 0), |v| parse(v, 6.0))
-            .err()
-            .expect("an unusable replacement must fail");
+        let error = get_cached_validated(
+            &url,
+            &dir,
+            false,
+            (2, None, 0),
+            |v| parse(v, 6.0),
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("an unusable replacement must fail");
         server.join().unwrap();
         assert!(error.0.contains("no time axis"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), prior);
         assert!(!path.with_extension("fail").exists());
         // An error for one hour must not block the old response's usable hours.
-        let old = get_cached_validated(&url, &dir, false, (2, None, 0), |v| parse(v, 2.0))
-            .unwrap();
+        let old = get_cached_validated(
+            &url,
+            &dir,
+            false,
+            (2, None, 0),
+            |v| parse(v, 2.0),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             old.medium(lat, lon, day + 7200.0, 30.0, 5000.0),
             parse(partial, 2.0).unwrap().medium(lat, lon, day + 7200.0, 30.0, 5000.0)
@@ -2035,10 +2231,10 @@ mod tests {
             let (dir, path) = weather_test_cache(&url, "station-index");
             let prior = serde_json::to_vec(&incomplete).unwrap();
             std::fs::write(&path, &prior).unwrap();
-            assert!(raob_stations_from(&url, &dir, true, window).is_err());
+            assert!(raob_stations_from(&url, &dir, true, window, &mut Vec::new()).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), prior);
             assert_eq!(
-                raob_stations_from(&url, &dir, false, window).unwrap(),
+                raob_stations_from(&url, &dir, false, window, &mut Vec::new()).unwrap(),
                 expected
             );
             server.join().unwrap();
@@ -2056,12 +2252,13 @@ mod tests {
                         &dir,
                         offline,
                         (day + 86_400.0, day + 129_600.0),
+                        &mut Vec::new(),
                     )
                     .unwrap()
                     .is_empty()
                 );
                 assert_eq!(
-                    raob_stations_from(&url, &dir, offline, window).unwrap(),
+                    raob_stations_from(&url, &dir, offline, window, &mut Vec::new()).unwrap(),
                     expected
                 );
             }
@@ -2089,14 +2286,14 @@ mod tests {
                 .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
                 .unwrap();
             assert_eq!(
-                raob_stations_from(&url, &dir, false, window).unwrap(),
+                raob_stations_from(&url, &dir, false, window, &mut Vec::new()).unwrap(),
                 expected
             );
             server.join().unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), prior);
             assert!(!path.with_extension("fail").exists());
             assert_eq!(
-                raob_stations_from(&url, &dir, true, window).unwrap(),
+                raob_stations_from(&url, &dir, true, window, &mut Vec::new()).unwrap(),
                 expected
             );
         }
@@ -2273,7 +2470,14 @@ mod tests {
             let prior = serde_json::to_vec(&incomplete).unwrap();
             std::fs::write(&path, &prior).unwrap();
             let read = |offline| {
-                get_cached_validated(&url, &dir, offline, (2, None, 0), parse_raob_response)
+                get_cached_validated(
+                    &url,
+                    &dir,
+                    offline,
+                    (2, None, 0),
+                    parse_raob_response,
+                    &mut Vec::new(),
+                )
             };
             assert!(read(true).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), prior);
@@ -3417,7 +3621,7 @@ mod tests {
                 };
                 put(&url, serde_json::json!({"profiles": profiles}));
             }
-            let chosen = raob_stations(&dir, true, (day, day + 43_200.0)).unwrap();
+            let chosen = raob_stations(&dir, true, (day, day + 43_200.0), &mut Vec::new()).unwrap();
             assert_eq!(chosen.len(), 1, "{label}: {chosen:?}");
             assert_eq!(chosen[0].0, id);
             let weather = fetch_atmosphere(&bbox, day + 3600.0, day + 39_600.0, &dir, true);
@@ -3664,6 +3868,7 @@ mod tests {
                     (window.0 / 43_200.0).floor() * 43_200.0,
                     (window.1 / 43_200.0).ceil() * 43_200.0,
                 ),
+                &mut Vec::new(),
             )
             .unwrap();
             assert_eq!(chosen.len(), 1, "{label}: {chosen:?}");

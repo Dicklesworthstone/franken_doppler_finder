@@ -19,6 +19,15 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep validated weather after a cache publication failure
+
+- Use a validated live weather response even when its atomic cache write fails. Preserve
+  validated pressure-level and surface weather, radiosonde station discovery and individual
+  soundings, and carry the persistence warning through provisional and final profiles.
+- Add loopback regressions for valid and invalid responses, unwritable cache paths, unchanged
+  existing bytes, uncached offline requests and atmospheric values across times and heights.
+  Cache publication failures do not relax validation or create an offline cache.
+
 ### Retain flight pairs when quick samples miss a dense observed ridge
 
 - When every quick clock is unscorable, check the distinct physical CPA-implied clocks against

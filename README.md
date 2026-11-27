@@ -1451,6 +1451,12 @@ intact, including any hours it can still serve. Missing hours or an unusable pro
 a failure marker for the whole query; transport and provider errors retain the existing 30-minute
 backoff.
 
+A valid live weather response remains usable if its cache cannot be written. The run reports
+the persistence failure instead of discarding valid temperature or wind data. This applies to
+pressure-level and surface weather, radiosonde station listings and individual soundings;
+provisional and final weather profiles retain the warning. A failed write creates no offline
+cache, and invalid responses still follow the existing validation and fallback rules.
+
 For uncached multi-day searches, each UTC day is built and atomically cached as soon as all of its
 requested feeds finish, while the remaining days continue downloading. Completed raw feeds pass through
 a bounded queue instead of accumulating until the last download. If MLAT fails, a completed prod or
@@ -2485,6 +2491,17 @@ second weather wait; a larger footprint can require another archive download.
 ---
 
 ## Testing
+
+### Keep valid live weather when its cache cannot be published
+
+`fetched_weather_survives_cache_publication_failure` sends synthetic pressure-level and surface
+responses through the real loopback HTTP, parsing and atmosphere-selection paths. A regular file
+where the cache directory belongs forces a deterministic write failure. Valid responses remain
+the selected atmosphere, with a warning; unusable responses and uncached offline requests still
+fail. `radiosonde_cache_failures_keep_valid_station_and_sounding_data` covers station discovery,
+sounding retrieval and warning propagation through provisional and final weather selection.
+Both tests preserve the existing blocking file's bytes. These checks use synthetic weather;
+they do not measure location accuracy on real recordings.
 
 ### Keep dense observed ridges eligible when quick samples miss their flight support
 
