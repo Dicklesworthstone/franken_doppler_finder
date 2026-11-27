@@ -924,6 +924,12 @@ This can reveal a pass on a secondary track or on channels that cancel in the mi
 `audio_stream_count`, the file-wide `location_tag_detected` flag, and one entry in `sources` for each view. A muted video still receives a metadata check. With zero audio tracks the source list is empty. The tag check covers recognized location tags that FFprobe exposes on the container, streams, chapters and programs, including separate GPS latitude and longitude fields. An incomplete stream inventory fails the audit. Each entry has its own pass count,
 event IDs, warnings and `events_file` path (relative to the working directory for a relative output path).
 Each view's `measured_pass_spans` gives the event ID and the first and last measured trace points in recording seconds. The text summary prints these spans too. Use them to find the sound in an editor and listen on either side. A trace can cover only part of an audible flyover.
+The `tracks` list gives the union of these measurements for each audio stream. Each
+`measured_ranges` entry has a `start_s` (inclusive) and an `end_s` (exclusive) on the
+recording clock. The union includes the final observed 4 kHz sample and merges touching
+and overlapping spans across the mix and individual channels. The text report prints
+the same unpadded intervals. A track with no measured passes has an empty list.
+
 All views share one complete stream inventory. The first decode also checks ordinary stream discovery to preserve decoder priming and late-track timing. Adding channels requires additional decodes but no additional FFprobe runs.
 During a whole-file audit, the mix decode also checks for changes in channel count.
 `channels_in_stream` includes the widest layout observed for that track. Every channel

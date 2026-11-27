@@ -622,6 +622,92 @@ struct SourceAudit {
     events_file: PathBuf,
 }
 
+#[derive(Debug, PartialEq, serde::Serialize)]
+struct MeasuredRange {
+    start_s: f64,
+    end_s: f64,
+}
+
+#[derive(serde::Serialize)]
+struct TrackRanges {
+    audio_stream: usize,
+    measured_ranges: Vec<MeasuredRange>,
+}
+
+fn measured_ranges<'a>(
+    views: impl Iterator<Item = &'a AudioAuditSummary>,
+    padding_s: f64,
+) -> Result<Vec<MeasuredRange>, String> {
+    if !padding_s.is_finite() || padding_s < 0.0 {
+        return Err("padding must be a finite, nonnegative number of seconds".into());
+    }
+    let mut ranges = Vec::new();
+    for view in views {
+        let duration = view.decoded_duration_s;
+        if !duration.is_finite() || duration < 0.0
+            || view.measured_pass_spans.len() != view.independent_pass_count
+        {
+            return Err(format!("incomplete measured timeline for audio stream {}", view.audio_stream));
+        }
+        for span in &view.measured_pass_spans {
+            let first = span.first_trace_s;
+            let last = span.last_trace_s;
+            if !first.is_finite() || !last.is_finite() || first < 0.0 || last < first
+                || first >= duration || last > duration
+            {
+                return Err(format!("invalid measured span for stream {} event {}", view.audio_stream, span.event_id));
+            }
+            // Trace timestamps include the last observation. The export uses
+            // half-open intervals, so include its 4 kHz sample before padding.
+            ranges.push(MeasuredRange {
+                start_s: (first - padding_s).max(0.0),
+                end_s: (last + 1.0 / 4000.0 + padding_s).min(duration),
+            });
+        }
+    }
+    ranges.sort_unstable_by(|a, b| a.start_s.total_cmp(&b.start_s));
+    let mut merged = Vec::<MeasuredRange>::new();
+    for range in ranges {
+        if let Some(prev) = merged.last_mut() && range.start_s <= prev.end_s {
+            prev.end_s = prev.end_s.max(range.end_s);
+        } else {
+            merged.push(range);
+        }
+    }
+    Ok(merged)
+}
+
+fn measure_track_views(
+    probe: &audio::AudioProbe<'_>,
+    info: &audio::MediaInfo,
+    out: &std::path::Path,
+    log: &std::sync::Arc<Log>,
+) -> Result<Vec<(String, AudioAuditSummary)>, String> {
+    let mut views = Vec::new();
+    let mut visit = |channel: Option<usize>| -> Result<u32, String> {
+        let selection = AudioSelection { stream: info.audio_stream, channel };
+        let name = match channel {
+            Some(n) => format!("stream-{}-channel-{n}", selection.stream),
+            None => format!("stream-{}-mix", selection.stream),
+        };
+        let dir = out.join(&name);
+        let audit = measure_audio_source(probe, info, selection, &dir, log)
+            .map_err(|e| format!("incomplete audio audit at {name}: {e}"))?;
+        let channels = audit.summary.channels_in_stream;
+        views.push((name, audit.summary));
+        Ok(channels)
+    };
+    // The mix can cancel opposite-polarity channels. Its full decode also
+    // discovers channel layouts that only occur after the stream header.
+    let channels = visit(None)?;
+    if channels > 1 {
+        for channel in 0..channels as usize {
+            visit(Some(channel))?;
+        }
+    }
+    Ok(views)
+}
+
 fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
     let (probe, inventory) = if d.offline {
         audio::AudioProbe::for_offline_audit(&d.media)
@@ -635,39 +721,18 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
     let reservation = pipeline::reserve_output(d.out.as_deref(), &default)?;
     let out = &reservation.path;
     let mut sources = Vec::new();
+    let mut tracks = Vec::new();
     for info in &streams {
-        // The downmix can reinforce a coherent signal or cancel opposite-polarity channels.
-        // A mono stream's downmix already covers its only channel.
-        let mut audit_view = |channel: Option<usize>| -> Result<u32, String> {
-            let selection = AudioSelection {
-                stream: info.audio_stream,
-                channel,
-            };
-            let view = match channel {
-                Some(n) => format!("stream-{}-channel-{n}", selection.stream),
-                None => format!("stream-{}-mix", selection.stream),
-            };
-            let dir = out.join(&view);
-            let audit =
-                measure_audio_source(&probe, info, selection, &dir, &log).map_err(|e| {
-                    format!(
-                        "incomplete audio audit at {view}: {e} (partial outputs in {})",
-                        out.display()
-                    )
-                })?;
-            let channels = audit.summary.channels_in_stream;
-            sources.push(SourceAudit {
-                summary: audit.summary,
-                events_file: dir.join("events.json"),
-            });
-            Ok(channels)
-        };
-        let channels = audit_view(None)?;
-        if channels > 1 {
-            for channel in 0..channels as usize {
-                audit_view(Some(channel))?;
-            }
-        }
+        let views = measure_track_views(&probe, info, out, &log)
+            .map_err(|e| format!("{e} (partial outputs in {})", out.display()))?;
+        tracks.push(TrackRanges {
+            audio_stream: info.audio_stream,
+            measured_ranges: measured_ranges(views.iter().map(|(_, view)| view), 0.0)?,
+        });
+        sources.extend(views.into_iter().map(|(name, summary)| SourceAudit {
+            summary,
+            events_file: out.join(name).join("events.json"),
+        }));
     }
     if d.json {
         #[derive(serde::Serialize)]
@@ -675,12 +740,14 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
             audio_stream_count: usize,
             location_tag_detected: bool,
             possible_location_telemetry: Vec<audio::TelemetryTrack>,
+            tracks: Vec<TrackRanges>,
             sources: Vec<SourceAudit>,
         }
         let report = WholeFileAudit {
             audio_stream_count: streams.len(),
             location_tag_detected,
             possible_location_telemetry: inventory.possible_location_telemetry,
+            tracks,
             sources,
         };
         serde_json::to_writer_pretty(&mut stdout, &report).map_err(|e| e.to_string())?;
@@ -701,6 +768,13 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
                 track.stream_index, track.codec_tag
             )
             .map_err(|e| e.to_string())?;
+        }
+        for track in tracks {
+            writeln!(stdout, "stream {}: {} unpadded measured range(s) across all channels (start inclusive, end exclusive)",
+                track.audio_stream, track.measured_ranges.len()).map_err(|e| e.to_string())?;
+            for range in track.measured_ranges {
+                writeln!(stdout, "  {}..{} s", range.start_s, range.end_s).map_err(|e| e.to_string())?;
+            }
         }
         for source in sources {
             let s = source.summary;
@@ -1041,6 +1115,19 @@ mod tests {
         assert!(report.get("independent_pass_count").is_none());
         let views = report["sources"].as_array().unwrap();
         assert_eq!(views.len(), 4);
+        let tracks = report["tracks"].as_array().unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0], serde_json::json!({"audio_stream": 0, "measured_ranges": []}));
+        assert_eq!(tracks[1]["audio_stream"], 1);
+        let ranges = tracks[1]["measured_ranges"].as_array().unwrap();
+        assert_eq!(ranges.len(), 1, "one shared interval across opposite-polarity channels");
+        let observations = |k: &str| views[2..].iter()
+            .map(|view| view["measured_pass_spans"][0][k].as_f64().unwrap())
+            .collect::<Vec<_>>();
+        let first = observations("first_trace_s").into_iter().fold(f64::INFINITY, f64::min);
+        let last = observations("last_trace_s").into_iter().fold(0.0, f64::max);
+        assert!((ranges[0]["start_s"].as_f64().unwrap() - first).abs() < 1e-9);
+        assert!((ranges[0]["end_s"].as_f64().unwrap() - last - 1.0 / 4000.0).abs() < 1e-9);
         for (view, (stream, channel, passes, view_dir)) in views.iter().zip([
             (0, None, 0, "stream-0-mix"),
             (1, None, 0, "stream-1-mix"),
@@ -1149,6 +1236,7 @@ mod tests {
             assert_eq!(report["audio_stream_count"], 0);
             assert_eq!(report["possible_location_telemetry"], serde_json::json!([]));
             assert_eq!(report["sources"], serde_json::json!([]));
+            assert_eq!(report["tracks"], serde_json::json!([]));
             assert_eq!(report["location_tag_detected"], tagged);
             assert!(!stdout.contains("private-place-marker"));
             let (status, stdout) = run(&media, false, &root.join(format!("text-{tagged}")));
@@ -1162,6 +1250,43 @@ mod tests {
         let (status, stdout) = run(&bad, true, &root.join("failed"));
         assert!(status.is_err());
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn measured_ranges_merge_channel_observations_on_the_recording_clock() {
+        fn summary(spans: &[(f64, f64)]) -> AudioAuditSummary {
+            AudioAuditSummary {
+                audio_stream: 0,
+                audio_channel: None,
+                channels_in_stream: 1,
+                decoded_duration_s: 10.0,
+                location_tag_detected: false,
+                independent_pass_count: spans.len(),
+                independent_event_ids: vec![],
+                measured_pass_spans: spans.iter().map(|&(first_trace_s, last_trace_s)| MeasuredPassSpan {
+                    event_id: "e1".into(), first_trace_s, last_trace_s,
+                }).collect(),
+                warnings: vec![],
+            }
+        }
+        let views = [summary(&[]), summary(&[(6.5, 9.9), (0.5, 1.0)]), summary(&[(2.0, 3.0)])];
+        let ranges = measured_ranges(views.iter(), 1.0).unwrap();
+        assert_eq!(ranges, [
+            MeasuredRange { start_s: 0.0, end_s: 3.0 + 1.0 / 4000.0 + 1.0 },
+            MeasuredRange { start_s: 5.5, end_s: 10.0 },
+        ]);
+        let one = [summary(&[(2.0, 2.0)])];
+        let range = measured_ranges(one.iter(), 0.0).unwrap();
+        assert_eq!(range, [MeasuredRange { start_s: 2.0, end_s: 2.0 + 1.0 / 4000.0 }]);
+        for padding in [-0.01, f64::NAN, f64::INFINITY] {
+            assert!(measured_ranges(one.iter(), padding).is_err());
+        }
+        for invalid in [(0.2, 0.1), (0.1, f64::NAN), (8.0, 11.0)] {
+            assert!(measured_ranges([summary(&[invalid])].iter(), 0.0).is_err());
+        }
+        let mut incomplete = summary(&[]);
+        incomplete.independent_pass_count = 1;
+        assert!(measured_ranges([incomplete].iter(), 1.0).is_err());
     }
 
     #[test]

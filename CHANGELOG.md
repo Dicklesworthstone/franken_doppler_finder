@@ -19,6 +19,12 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Review measured flyover intervals across every channel of one track
+
+- `detect --all-audio` now reports merged, unpadded intervals for each audio track in
+  text and in the JSON `tracks[].measured_ranges` field. Per-view event IDs and
+  measurements remain available to inspect the evidence behind each interval.
+
 ### Keep validated weather after a cache publication failure
 
 - Use a validated live weather response even when its atomic cache write fails. Preserve
