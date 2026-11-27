@@ -19,6 +19,16 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Skip unsupported calibration clocks without changing their evidence
+
+- Avoid full trace fitting when the finite prediction envelope cannot cover the existing
+  five-point/60% minimum. Keep every original quarter-second clock, sampled hypothesis,
+  admissible score and confidence threshold; interior gaps still receive exact scoring.
+- Add boundary/fallback checks and a physical old-loop comparison for complete, partial
+  and gapped tracks. Independent floating-point arithmetic found no lost eligible clocks.
+  Native regressions, timing, release selftest and field replays are unrun after the
+  execution host became unavailable; the pre-change shared-types suite passed 39 tests.
+
 ### Mute measured passes directly on a retained audio track
 
 - `fdop mute --silence-detected PADDING_SECONDS` audits the selected track's mix

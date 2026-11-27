@@ -1784,10 +1784,57 @@ impl RatioGrid {
         }
         linear
     }
+
+    /// Hull of intervals whose bracketing predictions both exist. Internal gaps
+    /// stay inside the hull: it can rule out coverage, never establish a match.
+    fn support_hull(&self) -> Option<[f64; 2]> {
+        let supported = |pair: &[f64]| pair[0].is_finite() && pair[1].is_finite();
+        let first = self.r.windows(2).position(supported)?;
+        let last = self.r.windows(2).rposition(supported)?;
+        Some([first as f64, (last + 1) as f64])
+    }
 }
 
 /// Minimum fraction of trace points covered by a flight prediction used for a match.
 const MIN_TRACE_COVERAGE: f64 = 0.6;
+
+/// Retain the calibration's original quarter-second clocks and their arithmetic,
+/// but avoid a full trace fit when even the grid's support hull cannot cover 60%
+/// of the observations. The same normalized index expression as `RatioGrid::at`
+/// avoids rounding a received-time boundary inward at large Unix timestamps.
+fn supported_calibration_clocks(
+    grid: &RatioGrid,
+    times: &[f64],
+    lo: f64,
+    hi: f64,
+    mut score: impl FnMut(f64),
+) {
+    let sorted = grid.t0.is_finite()
+        && grid.dt.is_finite()
+        && grid.dt > 0.0
+        && times.iter().all(|t| t.is_finite())
+        && times.windows(2).all(|pair| pair[0] <= pair[1]);
+    let support = grid.support_hull();
+    // Use the actual coverage comparison instead of rounding 0.6*n. The trace
+    // scorer also needs five predictions before its chi can be finite.
+    let needed = (5..=times.len())
+        .find(|&count| count as f64 / times.len() as f64 >= MIN_TRACE_COVERAGE)
+        .unwrap_or(times.len().saturating_add(1));
+    let mut clock = lo;
+    while clock <= hi {
+        let possible = !sorted
+            || support.is_some_and(|[first, end]| {
+                let index = |t: f64| (clock + t - grid.t0) / grid.dt;
+                let left = times.partition_point(|&t| index(t) < first);
+                let right = times.partition_point(|&t| index(t) < end);
+                right.saturating_sub(left) >= needed
+            });
+        if possible {
+            score(clock);
+        }
+        clock += 0.25;
+    }
+}
 
 /// Fit of one event's trace against a model ratio curve at one clock.
 #[derive(Clone, Copy, Debug)]
@@ -3029,8 +3076,7 @@ fn calibrate(
                     0.2,
                     p.max_gap_s,
                 );
-                let mut ts = ts0 - w;
-                while ts <= ts0 + w {
+                supported_calibration_clocks(&g, &ev.tr_t, ts0 - w, ts0 + w, |ts| {
                     let r = trace_chi(
                         &ev.tr_t,
                         &ev.tr_f,
@@ -3046,8 +3092,7 @@ fn calibrate(
                     if r.cov >= MIN_TRACE_COVERAGE {
                         best = best.min(r.chi);
                     }
-                    ts += 0.25;
-                }
+                });
             }
             best.is_finite().then_some(best)
         })
@@ -9359,6 +9404,182 @@ mod tests {
             ],
             "another place, clock or flight is not a duplicate, and the order holds"
         );
+    }
+
+    #[test]
+    fn calibration_support_filter_preserves_coverage_boundaries_and_gaps() {
+        for epoch in [0.0, 1_788_895_000.0] {
+            for dt in [0.2, 0.5] {
+                let ratios = (0..40)
+                    .map(|i| {
+                        if (3..15).contains(&i) || (20..36).contains(&i) {
+                            1.2 - i as f64 * 0.002
+                        } else {
+                            f64::NAN
+                        }
+                    })
+                    .collect();
+                let grid = RatioGrid::from_samples(epoch, dt, ratios);
+                // Duplicate times are observations to the existing coverage rule.
+                // Six of ten supported observations meet its exact 60% boundary.
+                let times = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100.0, 100.0, 100.0, 100.0];
+                let mut supported = 0;
+                let mut rejected = 0;
+                for bin in [0.0, 3.0, 14.0, 15.0, 19.0, 20.0, 35.0, 36.0, 40.0] {
+                    let boundary = epoch + bin * dt;
+                    for clock in [boundary.next_down(), boundary, boundary.next_up()] {
+                        let covered = times
+                            .iter()
+                            .filter(|&&time| grid.at(clock + time).is_finite())
+                            .count();
+                        let mut retained = false;
+                        supported_calibration_clocks(&grid, &times, clock, clock, |actual| {
+                            assert_eq!(actual, clock);
+                            retained = true;
+                        });
+                        if covered as f64 / times.len() as f64 >= MIN_TRACE_COVERAGE {
+                            assert!(retained, "epoch={epoch}, dt={dt}, bin={bin}, clock={clock}");
+                            supported += 1;
+                        }
+                        rejected += usize::from(!retained);
+                    }
+                }
+                assert!(supported > 0 && rejected > 0);
+
+                // The hull does not certify a match across missing interior data.
+                let gap_clock = epoch + 17.0 * dt;
+                assert!(!grid.at(gap_clock).is_finite());
+                let mut retained = false;
+                supported_calibration_clocks(&grid, &times, gap_clock, gap_clock, |_| {
+                    retained = true;
+                });
+                assert!(retained);
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_support_filter_keeps_unknown_trace_order_and_empty_support_honest() {
+        let grid = RatioGrid::from_samples(0.0, 0.5, vec![1.0; 10]);
+        for times in [vec![3.0, 2.0, 1.0, 0.0], vec![0.0, f64::NAN, 2.0]] {
+            let mut clocks = Vec::new();
+            supported_calibration_clocks(&grid, &times, -2.0, 2.0, |t| clocks.push(t));
+            assert_eq!(
+                clocks,
+                (0..=16).map(|i| -2.0 + i as f64 * 0.25).collect::<Vec<_>>()
+            );
+        }
+        for dt in [0.0, -0.5, f64::NAN, f64::INFINITY] {
+            let grid = RatioGrid::from_samples(0.0, dt, vec![1.0; 10]);
+            let mut clocks = Vec::new();
+            supported_calibration_clocks(&grid, &[0.0; 10], -2.0, 2.0, |t| clocks.push(t));
+            assert_eq!(
+                clocks,
+                (0..=16).map(|i| -2.0 + i as f64 * 0.25).collect::<Vec<_>>()
+            );
+        }
+        for ratios in [vec![], vec![1.0], vec![f64::NAN, 1.0, f64::NAN]] {
+            let grid = RatioGrid::from_samples(0.0, 0.5, ratios);
+            let mut calls = 0;
+            supported_calibration_clocks(&grid, &[0.0; 10], -2.0, 2.0, |_| calls += 1);
+            assert_eq!(calls, 0);
+        }
+        let mut calls = 0;
+        supported_calibration_clocks(&grid, &[0.0; 4], 0.0, 1.0, |_| calls += 1);
+        assert_eq!(calls, 0, "four predictions cannot supply a finite trace fit");
+    }
+
+    #[test]
+    fn calibration_support_filter_preserves_physical_scores_at_broad_clocks() {
+        let dem = FlatElevation(0.0);
+        let prop = Prop::still(343.0);
+        let mut old_calls = 0;
+        let mut retained_calls = 0;
+        for epoch in [0.0, 1_788_895_000.0] {
+            let case = compact_fine_grid_case(epoch, false);
+            let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+            for (event, original_track) in case.events.iter().zip(&case.tracks) {
+                for mode in ["complete", "partial", "gap"] {
+                    let mut track = original_track.clone();
+                    if mode != "complete" {
+                        let centre = epoch + event.t_rec;
+                        let keep: Vec<_> = (0..track.t.len())
+                            .filter(|&i| {
+                                let offset = (track.t[i] - centre).abs();
+                                if mode == "partial" {
+                                    offset <= 25.0
+                                } else {
+                                    offset >= 55.0
+                                }
+                            })
+                            .collect();
+                        track.t = keep.iter().map(|&i| track.t[i]).collect();
+                        track.pos = keep.iter().map(|&i| track.pos[i]).collect();
+                        track.vel = keep.iter().map(|&i| track.vel[i]).collect();
+                    }
+                    for offset in [[0.0, 0.0, 0.0], [175.0, 0.0, 0.0], [-175.0, 175.0, 0.0]] {
+                        let (lat, lon, _) = enu.to_geodetic(offset);
+                        let o = observer(lat, lon, &dem);
+                        let (lo, hi) = (epoch - 180.125, epoch + 180.125);
+                        let grid = RatioGrid::build(
+                            &track,
+                            o.x,
+                            &prop,
+                            lo + event.tr_t[0] - 1.0,
+                            hi + event.tr_t.last().unwrap() + 1.0,
+                            0.2,
+                            case.p.max_gap_s,
+                        );
+                        let mut scratch = TraceScratch::default();
+                        let mut score = |clock| {
+                            let fit = trace_chi(
+                                &event.tr_t,
+                                &event.tr_f,
+                                &|t| grid.at(t),
+                                clock,
+                                event,
+                                1.0,
+                                event.sigma_hz,
+                                case.p.cap_sigma,
+                                true,
+                                &mut scratch,
+                            );
+                            (fit.cov >= MIN_TRACE_COVERAGE && fit.chi.is_finite())
+                                .then_some((clock.to_bits(), fit.chi.to_bits()))
+                        };
+                        // Independent replay of the previous calibration loop.
+                        let mut original = Vec::new();
+                        let mut clock = lo;
+                        let mut calls = 0;
+                        while clock <= hi {
+                            if let Some(scored) = score(clock) {
+                                original.push(scored);
+                            }
+                            calls += 1;
+                            clock += 0.25;
+                        }
+                        let mut optimized = Vec::new();
+                        let mut kept = 0;
+                        supported_calibration_clocks(&grid, &event.tr_t, lo, hi, |clock| {
+                            if let Some(scored) = score(clock) {
+                                optimized.push(scored);
+                            }
+                            kept += 1;
+                        });
+                        assert_eq!(optimized, original, "{mode}, epoch={epoch}, offset={offset:?}");
+                        if mode == "complete" {
+                            assert_eq!(kept, calls, "fully covered clocks must keep the original scan");
+                        } else if mode == "partial" {
+                            assert!(!original.is_empty());
+                            assert!(kept * 4 < calls, "a short track cannot cover most broad clocks");
+                            old_calls += calls;
+                            retained_calls += kept;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("partial-track calibration: {retained_calls}/{old_calls} full trace evaluations retained, identical eligible scores");
     }
 
     #[test]

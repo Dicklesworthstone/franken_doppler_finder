@@ -2521,6 +2521,22 @@ second weather wait; a larger footprint can require another archive download.
 
 ## Testing
 
+### Skip impossible clocks during chance-match calibration
+
+Calibration keeps its quarter-second clock scan and its existing five-prediction and 60% trace
+coverage requirements. It now omits full trace fits where the aircraft prediction cannot possibly
+cover enough observations. Internal gaps remain conservatively included for exact scoring;
+hypothesis samples, retained scores and confidence thresholds are unchanged.
+
+Three `calibration_support_filter_*` regressions cover exact and adjacent floating-point
+boundaries, repeated observations, missing predictions, invalid grids and trace ordering. A physical
+comparison replays the old and filtered loops over complete, partial and gapped tracks at three
+observers and two timestamp origins, requiring bitwise-identical eligible scores. Native execution,
+the release selftest, performance timings and real-recording replays remain pending: the execution
+host became unavailable after the baseline shared-types suite passed 39 tests. An independent
+IEEE-754 arithmetic check found no excluded eligible clocks; it does not establish native execution
+or an end-to-end speed improvement.
+
 ### Keep valid live weather when its cache cannot be published
 
 `fetched_weather_survives_cache_publication_failure` sends synthetic pressure-level and surface
