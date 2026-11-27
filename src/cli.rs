@@ -541,6 +541,24 @@ struct MeasuredPassSpan {
     last_trace_s: f64,
 }
 
+impl MeasuredPassSpan {
+    fn from_trace(event_id: &str, times: &[f64]) -> Result<Self, String> {
+        let mut first = f64::INFINITY;
+        let mut last = f64::NEG_INFINITY;
+        for &t in times {
+            if !t.is_finite() {
+                return Err(format!("nonfinite trace time for measured event {event_id}"));
+            }
+            first = first.min(t);
+            last = last.max(t);
+        }
+        if times.is_empty() {
+            return Err(format!("empty trace for measured event {event_id}"));
+        }
+        Ok(Self { event_id: event_id.to_owned(), first_trace_s: first, last_trace_s: last })
+    }
+}
+
 #[derive(serde::Serialize)]
 struct AudioAuditSummary {
     audio_stream: usize,
@@ -551,6 +569,7 @@ struct AudioAuditSummary {
     independent_pass_count: usize,
     independent_event_ids: Vec<String>,
     measured_pass_spans: Vec<MeasuredPassSpan>,
+    additional_measured_spans: Vec<MeasuredPassSpan>,
     warnings: Vec<String>,
 }
 
@@ -625,20 +644,10 @@ fn measure_audio_source(
     // Use the search's physical eligibility and grouping for the audit count.
     let passes = fdop_core::search::independent_measured_events(&evs, 0.0);
     let ids: Vec<_> = passes.iter().map(|p| p.id.clone()).collect();
-    let measured_pass_spans = passes
-        .iter()
-        .filter_map(|pass| {
-            // Search orders the observed points by time. These are the first and
-            // last observations, not estimates of when the aircraft became audible.
-            let first = *pass.tr_t.first()?;
-            let last = *pass.tr_t.last()?;
-            (first.is_finite() && last.is_finite()).then(|| MeasuredPassSpan {
-                event_id: pass.id.clone(),
-                first_trace_s: first,
-                last_trace_s: last,
-            })
-        })
-        .collect();
+    let measured_pass_spans = passes.iter()
+        .map(|pass| MeasuredPassSpan::from_trace(&pass.id, &pass.tr_t))
+        .collect::<Result<_, _>>()?;
+    let additional_measured_spans = additional_measured_spans(&evs, &ids)?;
     log.say(&format!(
         "{} independent aircraft passes on the selected audio{}",
         ids.len(),
@@ -658,10 +667,23 @@ fn measure_audio_source(
             independent_pass_count: ids.len(),
             independent_event_ids: ids,
             measured_pass_spans,
+            additional_measured_spans,
             warnings,
         },
         events: evs,
     })
+}
+
+// A harmonic or duplicate fit can trace the same aircraft beyond its highest-ranked
+// observation. Preserve that measured audio for editing without counting a new pass.
+fn additional_measured_spans(
+    events: &[fdop_core::measure::MeasuredEvent],
+    independent_ids: &[String],
+) -> Result<Vec<MeasuredPassSpan>, String> {
+    events.iter()
+        .filter(|event| event.is_aircraft_like() && !independent_ids.contains(&event.id))
+        .map(|event| MeasuredPassSpan::from_trace(&event.id, &event.trace.t))
+        .collect()
 }
 
 #[derive(serde::Serialize)]
@@ -698,7 +720,7 @@ fn measured_ranges<'a>(
         {
             return Err(format!("incomplete measured timeline for audio stream {}", view.audio_stream));
         }
-        for span in &view.measured_pass_spans {
+        for span in view.measured_pass_spans.iter().chain(&view.additional_measured_spans) {
             let first = span.first_trace_s;
             let last = span.last_trace_s;
             if !first.is_finite() || !last.is_finite() || first < 0.0 || last < first
@@ -1103,6 +1125,12 @@ mod tests {
             );
             let spans = audit["measured_pass_spans"].as_array().unwrap();
             assert_eq!(spans.len(), n_aircraft);
+            let expected_extra: Vec<_> = expected.events.iter()
+                .filter(|e| e.is_aircraft_like() && !selected.iter().any(|pass| pass.id == e.id))
+                .map(|e| e.id.as_str()).collect();
+            let extra: Vec<_> = audit["additional_measured_spans"].as_array().unwrap().iter()
+                .map(|span| span["event_id"].as_str().unwrap()).collect();
+            assert_eq!(extra, expected_extra, "refused fits must not extend redaction");
             for (span, pass) in spans.iter().zip(&selected) {
                 assert_eq!(span["event_id"], pass.id);
                 assert!((span["first_trace_s"].as_f64().unwrap() - pass.tr_t[0]).abs() < 1e-9);
@@ -1210,7 +1238,9 @@ mod tests {
         let ranges = tracks[1]["measured_ranges"].as_array().unwrap();
         assert_eq!(ranges.len(), 1, "one shared interval across opposite-polarity channels");
         let observations = |k: &str| views[2..].iter()
-            .map(|view| view["measured_pass_spans"][0][k].as_f64().unwrap())
+            .flat_map(|view| view["measured_pass_spans"].as_array().unwrap().iter()
+                .chain(view["additional_measured_spans"].as_array().unwrap()))
+            .map(|span| span[k].as_f64().unwrap())
             .collect::<Vec<_>>();
         let first = observations("first_trace_s").into_iter().fold(f64::INFINITY, f64::min);
         let last = observations("last_trace_s").into_iter().fold(0.0, f64::max);
@@ -1385,6 +1415,7 @@ mod tests {
                 measured_pass_spans: spans.iter().map(|&(first_trace_s, last_trace_s)| MeasuredPassSpan {
                     event_id: "e1".into(), first_trace_s, last_trace_s,
                 }).collect(),
+                additional_measured_spans: vec![],
                 warnings: vec![],
             }
         }
@@ -1397,6 +1428,15 @@ mod tests {
         let one = [summary(&[(2.0, 2.0)])];
         let range = measured_ranges(one.iter(), 0.0).unwrap();
         assert_eq!(range, [MeasuredRange { start_s: 2.0, end_s: 2.0 + 1.0 / 4000.0 }]);
+        let mut overlapping = summary(&[(3.0, 5.0)]);
+        overlapping.additional_measured_spans.push(
+            MeasuredPassSpan::from_trace("harmonic", &[8.0, 4.0, 2.0]).unwrap()
+        );
+        assert_eq!(overlapping.independent_pass_count, 1);
+        assert_eq!(measured_ranges([overlapping].iter(), 0.0).unwrap(),
+            [MeasuredRange { start_s: 2.0, end_s: 8.0 + 1.0 / 4000.0 }]);
+        assert!(MeasuredPassSpan::from_trace("missing", &[]).is_err());
+        assert!(MeasuredPassSpan::from_trace("invalid", &[1.0, f64::NAN]).is_err());
         for padding in [-0.01, f64::NAN, f64::INFINITY] {
             assert!(measured_ranges(one.iter(), padding).is_err());
         }

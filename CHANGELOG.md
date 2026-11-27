@@ -19,6 +19,13 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep measured harmonic tails inside automatic audio edits
+
+- The audit and `mute --silence-detected` include the observed span of every
+  eligible fit. A grouped harmonic can extend a cut even when it contributes
+  no additional independent aircraft. Per-view JSON identifies these traces
+  in `additional_measured_spans`.
+
 ### Recover aircraft from another recorded audio track
 
 - Add opt-in `locate --auto-audio`: assess each audio track's mix and, when needed,
