@@ -19,6 +19,12 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Verify redactions at their playback times in the finished export
+
+- The silence check decodes the staged file on its own container clock. A late audio
+  start or a gap can shift the samples a viewer hears relative to their position in
+  a raw PCM stream. An interval extending past the audio still fails verification.
+
 ### Review measured flyover intervals across every channel of one track
 
 - `detect --all-audio` now reports merged, unpadded intervals for each audio track in

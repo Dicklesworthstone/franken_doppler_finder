@@ -1008,7 +1008,9 @@ Each cut silences every channel of the chosen track. Other audio tracks are drop
 Intervals use the recording clock, including any delay before the chosen track starts and gaps in its timestamps.
 Ranges include their start and exclude their end, rounded outward to whole samples. Overlapping ranges merge.
 The output uses ALAC audio. Before publishing, `fdop` decodes the staged file and verifies digital silence
-in every channel throughout the chosen intervals. An interval past the end of the selected audio is an error.
+in every channel throughout the chosen intervals. This check uses the staged file's own
+playback clock, including packet gaps and a delayed audio start in the movie.
+An interval past the end of the selected audio is an error.
 Use range mode with a stable audio format on that track.
 
 `mute` works offline with FFmpeg and FFprobe. It copies the first video stream that is not

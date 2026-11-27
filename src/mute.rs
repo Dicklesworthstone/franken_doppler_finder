@@ -63,14 +63,25 @@ fn sample_intervals(ranges: &[SilenceRange], rate: u32) -> Result<Vec<(u64, u64)
 
 // Check the decoded export itself, including every channel, up to the last requested
 // sample. Stream through a fixed buffer even for multi-hour recordings.
-fn verify_silence(path: &Path, intervals: &[(u64, u64)], channels: u32) -> Result<(), String> {
+fn verify_silence(
+    path: &Path,
+    intervals: &[(u64, u64)],
+    probe: &audio::AudioProbe<'_>,
+    info: &audio::MediaInfo,
+) -> Result<(), String> {
+    let channels = info.channels;
     let frame_bytes = u64::from(channels) * 4;
     let end = intervals.last().expect("nonempty silence ranges").1;
     let extent = end.checked_mul(frame_bytes).filter(|_| channels != 0)
         .ok_or("invalid audio dimensions for silence verification")?;
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-nostdin", "-v", "error", "-xerror", "-protocol_whitelist", "file", "-i"])
-        .arg(path).args(["-map", "0:a:0", "-af", &format!("atrim=end_sample={end}"), "-f", "s32le", "-"])
+    // MP4 edit lists and packet gaps can put a decoded sample at a different
+    // playback time than its position in a raw PCM dump. Verify on the staged
+    // file's container-relative clock, including silence before the first packet.
+    let clock = probe.clock_resampler(info, info.sample_rate);
+    let filter = format!("asetpts=PTS-({})/TB,{clock},atrim=end_sample={end}", info.start_time_s);
+    cmd.args(["-nostdin", "-v", "error", "-xerror", "-copyts", "-protocol_whitelist", "file", "-i"])
+        .arg(path).args(["-map", "0:a:0", "-af", &filter, "-f", "s32le", "-"])
         .stdout(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("cannot verify redacted audio: {e}"))?;
     let mut pcm = child.stdout.take().unwrap();
@@ -254,7 +265,7 @@ pub(crate) fn export(
             String::from_utf8_lossy(&result.stderr).trim()
         ));
     }
-    let audit = audio::probe_audio_inventory(staged.path())?;
+    let (staged_probe, audit) = audio::AudioProbe::for_offline_audit(staged.path())?;
     let expected_layout = if audio_only {
         audit.single_audio_without_chapters
     } else if soundtrack.is_some() || redaction.is_some() {
@@ -270,7 +281,7 @@ pub(crate) fn export(
         if audio.audio_codec != "alac" || audio.channels != info.channels || audio.sample_rate != info.sample_rate {
             return Err("export verification found a changed audio format".into());
         }
-        verify_silence(staged.path(), &intervals, audio.channels)?;
+        verify_silence(staged.path(), &intervals, &staged_probe, audio)?;
     }
     staged
         .persist_noclobber(out)
@@ -332,11 +343,38 @@ mod tests {
         }
         // An unedited interval has signal. The publication check must notice it
         // even though the stereo pair cancels exactly when downmixed to mono.
-        assert!(verify_silence(&out, &[(8_000, 8_800)], 2).is_err());
+        let (probe, audit) = audio::AudioProbe::for_offline_audit(&out).unwrap();
+        assert!(verify_silence(&out, &[(8_000, 8_800)], &probe, &audit.streams[0]).is_err());
         // Primary audio ends at 4 s but the video continues to 5 s.
         let refused = dir.path().join("refused.mp4");
         assert!(export(&media, &refused, None, &["3.9..4.1".parse().unwrap()], None).is_err());
         assert!(!refused.exists());
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn verifies_staged_silence_on_the_movie_clock_when_audio_starts_late() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("delayed.mp4");
+        // The first 2000 audio samples have signal, the next 2000 are silent.
+        // Their movie times are 0.25..0.5 and 0.5..0.75 seconds respectively.
+        let made = ffmpeg()
+            .args(["-f", "lavfi", "-i", "color=s=32x24:r=8:d=1.5",
+                "-itsoffset", "0.25", "-f", "lavfi", "-i",
+                "aevalsrc=if(lt(n\\,2000)\\,0.5\\,0):s=8000:d=1",
+                "-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-c:a", "alac"])
+            .arg(&file).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let (probe, audit) = audio::AudioProbe::for_offline_audit(&file).unwrap();
+        let info = &audit.streams[0];
+        assert_eq!(info.sample_rate, 8000);
+        verify_silence(&file, &[(0, 2000), (4000, 6000)], &probe, info).unwrap();
+        let error = verify_silence(&file, &[(2000, 4000)], &probe, info).unwrap_err();
+        assert!(error.contains("found sound"), "{error}");
+        // The audio ends at 1.25 s and the video continues to 1.5 s. The
+        // verification timeline restores packet delays without padding the tail.
+        let tail = verify_silence(&file, &[(9600, 10400)], &probe, info).unwrap_err();
+        assert!(tail.contains("extends beyond"), "{tail}");
     }
 
     fn ffmpeg() -> Command {
