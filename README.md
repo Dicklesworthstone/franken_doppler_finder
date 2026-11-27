@@ -988,6 +988,27 @@ fdop mute clip.mov --silence-range 12.5..48 --silence-range 96..140 --out edited
 fdop detect edited.mp4 --all-audio --offline
 ```
 
+To mute measured passes directly, use `--silence-detected PADDING_SECONDS`. This
+example keeps the second audio track and adds ten seconds on each side of every
+measured trace. Choose the padding after listening to your recording.
+
+```bash
+fdop mute interviews.mkv --audio-stream 1 --silence-detected 10 --out edited.m4a
+fdop detect edited.m4a --all-audio --offline
+```
+
+The command measures the selected track's mix and each of its channels locally,
+merges overlapping cuts, and silences all retained channels during those intervals.
+It also works with an MP4 video destination. Padding that reaches a track boundary
+stops at the beginning or continues through the last native audio sample. Enter
+`0` for just the measured spans. A missing track, failed audit, or zero measured
+spans gives an error before publication. The command creates no audit directory.
+Use a finished local recording and keep it in place during the export.
+
+A measured trace may cover only part of a flyover, and the detector can miss one
+entirely. Listen to the finished export and audit it again. Use manual ranges for
+cuts you choose by ear, or remove the whole soundtrack when the audio is optional.
+
 For a voice memo or field recording, use an `.m4a` destination with the intervals to mute.
 This also works on a video when you want to share just its edited audio. The M4A contains
 one ALAC track and omits pictures, cover art, alternate tracks, chapters and copied metadata.
@@ -1021,7 +1042,7 @@ a long one ends with the video. FFprobe verifies the completed file has one non-
 track, the requested number of audio tracks (zero or one), zero chapters, no other streams
 and no recognized location tags. An occupied output path is an error.
 The destination directory must already exist. MP4 output requires a video stream that
-FFmpeg can copy into the container. M4A output requires an audio track and at least one silence range.
+FFmpeg can copy into the container. M4A output requires an audio track and either manual or detected intervals.
 
 Review the pictures and anything embedded in the encoded video, including in-band captions,
 before sharing. Those travel with the video stream. The replacement audio can carry its own
@@ -5851,6 +5872,8 @@ Review the visual content separately.
    - cutting or reordering the stretches between flyovers so their time gaps mean nothing;
    - spectral noise reduction tuned on the curve.
 
+   To apply padded intervals from the retained track’s channel measurements, use
+   `fdop mute your_file.mp4 --silence-detected 10 --out edited.mp4`, choosing the padding in seconds.
    Then run `fdop detect` again on the **final exported file**.
 
 ---

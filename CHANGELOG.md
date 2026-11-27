@@ -19,6 +19,15 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Mute measured passes directly on a retained audio track
+
+- `fdop mute --silence-detected PADDING_SECONDS` audits the selected track's mix
+  and channels offline, combines the padded measurements, and exports a verified MP4
+  or M4A. An empty or incomplete measurement stops the export. No intermediate
+  event files are needed. A measured trace may cover only part of the audible pass.
+- Padding can cover the actual final native sample when the 4 kHz audit duration
+  falls between samples. Manually specified end times keep their strict bounds.
+
 ### Verify redactions at their playback times in the finished export
 
 - The silence check decodes the staged file on its own container clock. A late audio

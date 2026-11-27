@@ -39,12 +39,15 @@ pub enum Cmd {
         #[arg(long)]
         soundtrack: Option<PathBuf>,
         /// Mute the selected audio track between START and END seconds on the recording clock (repeatable).
-        #[arg(long, value_name = "START..END", conflicts_with = "soundtrack")]
+        #[arg(long, group = "cut_mode", value_name = "START..END", conflicts_with = "soundtrack")]
         silence_range: Vec<crate::mute::SilenceRange>,
+        /// Detect flyovers on the retained track and mute each measured span with this much padding on both sides.
+        #[arg(long, group = "cut_mode", value_name = "PADDING_SECONDS", conflicts_with = "soundtrack", value_parser = parse_padding)]
+        silence_detected: Option<f64>,
         /// Original audio track to retain in range mode (zero-based, default 0).
-        #[arg(long, value_name = "N", requires = "silence_range")]
+        #[arg(long, value_name = "N", requires = "cut_mode")]
         audio_stream: Option<usize>,
-        /// New .mp4 file, or an audio-only .m4a file when using --silence-range.
+        /// New .mp4 file, or an audio-only .m4a file when muting intervals.
         #[arg(short, long)]
         out: PathBuf,
     },
@@ -225,6 +228,11 @@ pub fn main() -> i32 {
     }
 }
 
+fn parse_padding(value: &str) -> Result<f64, String> {
+    value.parse::<f64>().ok().filter(|p| p.is_finite() && *p >= 0.0)
+        .ok_or_else(|| "padding must be a finite, nonnegative number of seconds".to_owned())
+}
+
 fn run(cli: Cli) -> Result<i32, String> {
     match cli.cmd {
         Cmd::Locate(l) => {
@@ -346,11 +354,24 @@ fn run(cli: Cli) -> Result<i32, String> {
             media,
             soundtrack,
             silence_range,
+            silence_detected,
             audio_stream,
             out,
         } => {
-            crate::mute::export(&media, &out, soundtrack.as_deref(), &silence_range, audio_stream)?;
-            if !silence_range.is_empty() {
+            let selected = audio_stream.unwrap_or(0);
+            let mut media = media;
+            let mut ranges = silence_range;
+            let mut revision = None;
+            if let Some(padding) = silence_detected {
+                crate::mute::validate_destination(&out, true)?;
+                media = crate::mute::local_media(&media)?;
+                revision = Some(crate::mute::SourceRevision::read(&media)?);
+                ranges = audited_silence_ranges(&media, selected, padding)?;
+            }
+            crate::mute::export(&media, &out, soundtrack.as_deref(), &ranges, audio_stream, revision.as_ref())?;
+            if silence_detected.is_some() {
+                println!("Wrote {} with {} measured interval(s) muted on audio stream {selected}. Aircraft sound can extend beyond these cuts. Listen to the export before sharing.", out.display(), ranges.len());
+            } else if !ranges.is_empty() {
                 println!("Wrote {} with the requested intervals muted on audio stream {}. Review the final recording before sharing.", out.display(), audio_stream.unwrap_or(0));
             } else if soundtrack.is_some() {
                 println!("Wrote {} with one replacement soundtrack and no recognized location tags. Review the video and audit the replacement audio before sharing.", out.display());
@@ -521,7 +542,7 @@ fn measure_audio_source(
     probe: &audio::AudioProbe<'_>,
     info: &audio::MediaInfo,
     selection: AudioSelection,
-    out: &std::path::Path,
+    out: Option<&std::path::Path>,
     log: &std::sync::Arc<Log>,
 ) -> Result<DetectionAudit, String> {
     log.say(&format!(
@@ -534,7 +555,9 @@ fn measure_audio_source(
         info.sample_rate,
         info.channels
     ));
-    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    if let Some(dir) = out {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
     let x = audio::decode_probed(probe, 0.0, None, 4000, selection)?;
     let low_band = pipeline::low_band_warning(&x, 4000);
     if let Some(w) = &low_band {
@@ -542,7 +565,8 @@ fn measure_audio_source(
     }
     // Use exactly the observations `locate` would search, including its bounded
     // recovery after ordinary measurement finds no aircraft and its final event IDs.
-    let measured = pipeline::measure_recording(&x, 4000, log, Some(&out.join("survey.png")))?;
+    let survey = out.map(|dir| dir.join("survey.png"));
+    let measured = pipeline::measure_recording(&x, 4000, log, survey.as_deref())?;
     let decoded_duration_s = x.len() as f64 / 4000.0;
     drop(x);
     for warning in &measured.warnings {
@@ -557,20 +581,22 @@ fn measure_audio_source(
         warnings.push(note.to_string());
     }
     let evs = measured.events;
-    std::fs::write(
-        out.join("events.json"),
-        serde_json::to_string_pretty(&evs).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    for e in evs.iter().filter(|e| e.fit.is_some()) {
-        let _ = pipeline::event_png(
-            e,
-            fdop_types::C_SOUND,
-            &out.join(format!("{}.png", e.id)),
-            None,
-            "",
-        );
-        let _ = e.trace.write_csv(&out.join(format!("{}_trace.csv", e.id)));
+    if let Some(out) = out {
+        std::fs::write(
+            out.join("events.json"),
+            serde_json::to_string_pretty(&evs).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        for e in evs.iter().filter(|e| e.fit.is_some()) {
+            let _ = pipeline::event_png(
+                e,
+                fdop_types::C_SOUND,
+                &out.join(format!("{}.png", e.id)),
+                None,
+                "",
+            );
+            let _ = e.trace.write_csv(&out.join(format!("{}_trace.csv", e.id)));
+        }
     }
     // A fitted harmonic can pass quality alongside another fit of the same flyover.
     // Use the search's physical eligibility and grouping for the audit count.
@@ -680,7 +706,7 @@ fn measured_ranges<'a>(
 fn measure_track_views(
     probe: &audio::AudioProbe<'_>,
     info: &audio::MediaInfo,
-    out: &std::path::Path,
+    out: Option<&std::path::Path>,
     log: &std::sync::Arc<Log>,
 ) -> Result<Vec<(String, AudioAuditSummary)>, String> {
     let mut views = Vec::new();
@@ -690,8 +716,8 @@ fn measure_track_views(
             Some(n) => format!("stream-{}-channel-{n}", selection.stream),
             None => format!("stream-{}-mix", selection.stream),
         };
-        let dir = out.join(&name);
-        let audit = measure_audio_source(probe, info, selection, &dir, log)
+        let dir = out.map(|dir| dir.join(&name));
+        let audit = measure_audio_source(probe, info, selection, dir.as_deref(), log)
             .map_err(|e| format!("incomplete audio audit at {name}: {e}"))?;
         let channels = audit.summary.channels_in_stream;
         views.push((name, audit.summary));
@@ -706,6 +732,30 @@ fn measure_track_views(
         }
     }
     Ok(views)
+}
+
+/// Measure the exact local track that will be retained; all other original
+/// tracks are dropped by the exporter. Keep only one view's audio in memory.
+fn audited_silence_ranges(
+    media: &std::path::Path,
+    stream: usize,
+    padding_s: f64,
+) -> Result<Vec<crate::mute::SilenceRange>, String> {
+    if !padding_s.is_finite() || padding_s < 0.0 {
+        return Err("padding must be a finite, nonnegative number of seconds".into());
+    }
+    let (probe, inventory) = audio::AudioProbe::for_offline_audit(media)?;
+    let info = inventory.streams.get(stream)
+        .ok_or_else(|| format!("audio stream {stream} is absent ({} audio streams)", inventory.streams.len()))?;
+    let views = measure_track_views(&probe, info, None, &Log::new(false))?;
+    let ranges = measured_ranges(views.iter().map(|(_, view)| view), padding_s)?;
+    if ranges.is_empty() {
+        return Err(format!("no measured aircraft spans on audio stream {stream}; cannot select any intervals to mute"));
+    }
+    let duration = views.iter().map(|(_, v)| v.decoded_duration_s).fold(0.0, f64::max);
+    Ok(ranges.into_iter().map(|r| {
+        crate::mute::SilenceRange::measured(r.start_s, r.end_s, r.end_s == duration)
+    }).collect())
 }
 
 fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
@@ -723,7 +773,7 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
     let mut sources = Vec::new();
     let mut tracks = Vec::new();
     for info in &streams {
-        let views = measure_track_views(&probe, info, out, &log)
+        let views = measure_track_views(&probe, info, Some(out), &log)
             .map_err(|e| format!("{e} (partial outputs in {})", out.display()))?;
         tracks.push(TrackRanges {
             audio_stream: info.audio_stream,
@@ -817,7 +867,7 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
     let default = PathBuf::from("fdop_runs").join("detect");
     let reservation = pipeline::reserve_output(d.out.as_deref(), &default)?;
     let out = &reservation.path;
-    let audit = measure_audio_source(&probe, &info, selection, out, &log)?;
+    let audit = measure_audio_source(&probe, &info, selection, Some(out), &log)?;
     log.say(&format!("wrote {}", out.join("events.json").display()));
     if d.json {
         serde_json::to_writer_pretty(&mut stdout, &audit).map_err(|e| e.to_string())?;
@@ -1128,6 +1178,37 @@ mod tests {
         let last = observations("last_trace_s").into_iter().fold(0.0, f64::max);
         assert!((ranges[0]["start_s"].as_f64().unwrap() - first).abs() < 1e-9);
         assert!((ranges[0]["end_s"].as_f64().unwrap() - last - 1.0 / 4000.0).abs() < 1e-9);
+        // A live export audit sees the same antiphase-only observation on the retained
+        // track, applies padding on the recording clock and refuses an empty selection.
+        let edited = dir.join("measured.m4a");
+        let apply = |stream: &str, destination: &std::path::Path| {
+            run(Cli::try_parse_from([
+                "fdop", "mute", multi.to_str().unwrap(), "--silence-detected", "2",
+                "--audio-stream", stream, "-o", destination.to_str().unwrap(),
+            ]).unwrap())
+        };
+        assert_eq!(apply("1", &edited).unwrap(), 0);
+        let start = ((first - 2.0).max(0.0) * 4000.0).floor() as usize;
+        let end = ((last + 1.0 / 4000.0 + 2.0).min(30.0) * 4000.0).ceil() as usize;
+        for channel in [Some(0), Some(1)] {
+            let original = audio::decode_with_selection(&multi, 0.0, None, 4000,
+                AudioSelection { stream: 1, channel }).unwrap();
+            let actual = audio::decode_with_selection(&edited, 0.0, None, 4000,
+                AudioSelection { stream: 0, channel }).unwrap();
+            assert_eq!(actual.len(), original.len());
+            assert!(original[start..end].iter().any(|x| x.abs() > 0.001));
+            assert!(actual[start..end].iter().all(|&x| x == 0.0));
+            for (i, (&a, &b)) in actual.iter().zip(&original).enumerate() {
+                if !(start..end).contains(&i) {
+                    assert!((a - b.clamp(-1.0, 1.0)).abs() < 0.0001, "sample {i}");
+                }
+            }
+        }
+        let refused = dir.join("no-detection.m4a");
+        assert!(apply("0", &refused).unwrap_err().contains("no measured aircraft spans"));
+        assert!(!refused.exists());
+        assert!(apply("2", &refused).is_err());
+        assert!(!refused.exists());
         for (view, (stream, channel, passes, view_dir)) in views.iter().zip([
             (0, None, 0, "stream-0-mix"),
             (1, None, 0, "stream-1-mix"),
@@ -1309,6 +1390,18 @@ mod tests {
         ]).is_err());
         args.extend(["--soundtrack", "voice.wav"]);
         assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn detected_muting_requires_explicit_padding_and_accepts_one_track() {
+        let base = ["fdop", "mute", "source.mov", "-o", "out.m4a", "--silence-detected"];
+        let parse = |tail: &[&str]| Cli::try_parse_from(base.iter().chain(tail));
+        assert!(matches!(parse(&["0", "--audio-stream", "1"]).unwrap().cmd,
+            Cmd::Mute { silence_detected: Some(p), audio_stream: Some(1), .. } if p == 0.0));
+        for tail in [&[][..], &["NaN"], &["inf"], &["-1"], &["2", "--soundtrack", "voice.wav"],
+            &["2", "--silence-range", "1..3"]] {
+            assert!(parse(tail).is_err(), "{tail:?}");
+        }
     }
 
     #[test]
