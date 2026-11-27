@@ -18,6 +18,7 @@ use fdop_types::atmo::{
     ScatteredAtmosphere, StandardAtmosphere, standard_levels, wind_en,
 };
 use fdop_types::time::utc_date;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -180,8 +181,9 @@ fn get_cached_recoverable<T>(
     Ok(parsed)
 }
 
-/// A fetched atmosphere with source-specific recovery warnings. A partial grid retains
-/// complete hourly columns, never invented hours; its quality also requests cache repair.
+/// A fetched atmosphere with source-specific recovery warnings. Partial grids retain
+/// observed profiles; their quality also requests cache repair. Zero complete cells
+/// denotes recovery from complementary hourly slices, below any complete-column source.
 struct WeatherSource {
     atmo: Arc<dyn Atmosphere>,
     warnings: Vec<String>,
@@ -491,6 +493,143 @@ fn om_grid(
     Ok(source)
 }
 
+/// Spatially supported hourly slices, used only when no whole cell covers the window.
+/// Interpolate slowness and wind after spatial interpolation, never extend a cell's
+/// last valid sounding through its missing hours. The default unknown bounds keep
+/// search pruning conservative for this provider.
+struct HourlyPressureGrid {
+    slices: Vec<(f64, ScatteredAtmosphere)>,
+    source: String,
+}
+
+impl Atmosphere for HourlyPressureGrid {
+    fn medium(&self, lat: f64, lon: f64, t: f64, z_a: f64, z_b: f64) -> Medium {
+        let k = self.slices.partition_point(|s| s.0 <= t);
+        if !t.is_finite() || k == 0 || t > self.slices.last().unwrap().0 {
+            return Medium {
+                c: f64::NAN,
+                wind_e: f64::NAN,
+                wind_n: f64::NAN,
+            };
+        }
+        let (ta, a) = &self.slices[k - 1];
+        let ma = a.medium(lat, lon, *ta, z_a, z_b);
+        if t == *ta || k == self.slices.len() {
+            return ma;
+        }
+        let (tb, b) = &self.slices[k];
+        let mb = b.medium(lat, lon, *tb, z_a, z_b);
+        let w = (t - ta) / (tb - ta);
+        Medium {
+            c: 1.0 / ((1.0 - w) / ma.c + w / mb.c),
+            wind_e: (1.0 - w) * ma.wind_e + w * mb.wind_e,
+            wind_n: (1.0 - w) * ma.wind_n + w * mb.wind_n,
+        }
+    }
+
+    fn describe(&self) -> String {
+        self.source.clone()
+    }
+}
+
+fn pressure_grid_by_hour(
+    locs: &[serde_json::Value],
+    lats: &[f64],
+    lons: &[f64],
+    t_start: f64,
+    t_end: f64,
+    missing: &[String],
+) -> Option<WeatherSource> {
+    if !t_start.is_finite() || !t_end.is_finite() || t_start > t_end {
+        return None;
+    }
+    let mut hours: BTreeMap<i64, Vec<(usize, LocationProfiles)>> = BTreeMap::new();
+    for (cell, loc) in locs.iter().enumerate() {
+        let Ok(times) = times_of(&loc["hourly"]) else {
+            continue;
+        };
+        for (i, &t) in times.iter().enumerate() {
+            // At most the adjacent hourly brackets can contribute to this request.
+            if t < t_start - 3600.0 || t > t_end + 3600.0 {
+                continue;
+            }
+            if let Ok(profiles) = parse_location(loc, true, i..i + 1) {
+                hours.entry(t as i64).or_default().push((cell, profiles));
+            }
+        }
+    }
+    let times: Vec<_> = hours.keys().map(|&t| t as f64).collect();
+    if times.is_empty() {
+        return None;
+    }
+    let needed = hours_for_window(&times, t_start, t_end).ok()?;
+    // Missing interior hours and mismatched phases cannot establish hourly support.
+    if times[needed.clone()]
+        .windows(2)
+        .any(|pair| pair[1] - pair[0] != 3600.0)
+    {
+        return None;
+    }
+    let expected = needed.len() * locs.len();
+    let mut retained = 0;
+    let mut recoveries = [0; 3];
+    let mut slices = Vec::with_capacity(needed.len());
+    for (t, cells) in hours.into_iter().skip(needed.start).take(needed.len()) {
+        retained += cells.len();
+        let stations = cells
+            .into_iter()
+            .map(|(cell, mut p)| {
+                recoveries[0] += p.missing_surface_winds;
+                recoveries[1] += p.missing_aloft_winds;
+                recoveries[2] += p.wind_only_levels;
+                (
+                    lats[cell / lons.len()],
+                    lons[cell % lons.len()],
+                    vec![(t as f64, p.profiles.pop().unwrap())],
+                )
+            })
+            .collect();
+        slices.push((
+            t as f64,
+            ScatteredAtmosphere::new(stations, String::new()).ok()?,
+        ));
+    }
+    let source = "Open-Meteo historical forecast (pressure levels), partial hourly grid";
+    let mut warnings = vec![format!(
+        "{source}: no complete spatial cell covers the requested window; using {retained} of {expected} observed cell-hours with inverse-distance interpolation at each hour and slowness/wind interpolation between adjacent supported hours ({})",
+        missing.join("; ")
+    )];
+    warnings.extend(wind_recovery_warnings(source, recoveries));
+    Some(WeatherSource {
+        atmo: Arc::new(HourlyPressureGrid {
+            slices,
+            source: source.into(),
+        }),
+        warnings,
+        partial_cells: Some(0),
+    })
+}
+
+fn wind_recovery_warnings(src: &str, [surface, aloft, wind_only]: [usize; 3]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if surface > 0 {
+        warnings.push(format!(
+            "{src}: surface wind unavailable in {surface} retained cell-hours; extrapolating the nearest observed pressure-level wind to the surface"
+        ));
+    }
+    if aloft > 0 {
+        warnings.push(format!(
+            "{src}: {aloft} retained pressure-level winds unavailable; interpolating in height and extrapolating the nearest observed wind beyond the available levels"
+        ));
+    }
+    if wind_only > 0 {
+        warnings.push(format!(
+            "{src}: retained {wind_only} observed pressure-level winds without temperatures; heights interpolated in log pressure within observed thermodynamic layers, preserving their temperature and humidity profiles"
+        ));
+    }
+    warnings
+}
+
 fn parse_om_grid(
     v: serde_json::Value,
     lats: &[f64],
@@ -545,6 +684,11 @@ fn parse_om_grid(
         }
     }
     if per_loc.is_empty() {
+        if levels
+            && let Some(source) = pressure_grid_by_hour(&locs, lats, lons, t_start, t_end, &missing)
+        {
+            return Ok(source);
+        }
         return Err(DataError::new(format!(
             "open-meteo: no usable grid cells ({})",
             missing.join("; ")
@@ -555,22 +699,14 @@ fn parse_om_grid(
     } else {
         "Open-Meteo ERA5 archive (surface + standard lapse)"
     };
-    let mut wind_warnings = Vec::new();
-    if surface_wind_recoveries > 0 {
-        wind_warnings.push(format!(
-            "{src}: surface wind unavailable in {surface_wind_recoveries} retained cell-hours; extrapolating the nearest observed pressure-level wind to the surface"
-        ));
-    }
-    if aloft_wind_recoveries > 0 {
-        wind_warnings.push(format!(
-            "{src}: {aloft_wind_recoveries} retained pressure-level winds unavailable; interpolating in height and extrapolating the nearest observed wind beyond the available levels"
-        ));
-    }
-    if wind_only_recoveries > 0 {
-        wind_warnings.push(format!(
-            "{src}: retained {wind_only_recoveries} observed pressure-level winds without temperatures; heights interpolated in log pressure within observed thermodynamic layers, preserving their temperature and humidity profiles"
-        ));
-    }
+    let wind_warnings = wind_recovery_warnings(
+        src,
+        [
+            surface_wind_recoveries,
+            aloft_wind_recoveries,
+            wind_only_recoveries,
+        ],
+    );
     let partial = !missing.is_empty();
     let aligned = per_loc.windows(2).all(|p| p[0].1 == p[1].1);
     if partial || !aligned {
@@ -1705,12 +1841,16 @@ mod tests {
                     assert!((got.wind_n - (wa * a.wind_n + (1.0 - wa) * b.wind_n)).abs() < 1e-10);
                 }
             }
-            // A missing interpolation endpoint removes its entire cell; one intact
-            // cell remains usable, but there is no recovery when none covers the window.
+            // A complete column retains priority. Without one, complementary
+            // pressure-level cell-hours can still cover the whole interval.
             partial[2]["hourly"]["temperature_2m"][6] = serde_json::Value::Null;
             assert_eq!(parse(partial.clone()).unwrap().partial_cells, Some(1));
             partial[0]["hourly"]["temperature_2m"][4] = serde_json::Value::Null;
-            assert!(parse(partial).is_err());
+            if levels {
+                assert_eq!(parse(partial).unwrap().partial_cells, Some(0));
+            } else {
+                assert!(parse(partial).is_err());
+            }
             if levels {
                 let weather = fetch_with_fallbacks(
                     Ok(recovered),
@@ -1739,6 +1879,170 @@ mod tests {
                 assert!(provisional.warnings.contains(&warning));
             }
         }
+    }
+
+    fn staggered_pressure_grid(day: i64) -> serde_json::Value {
+        let cells: Vec<_> = (0..3)
+            .map(|cell| {
+                let mut loc = open_meteo_fixture(day, 3);
+                loc["hourly"]["relative_humidity_2m"] = serde_json::json!(vec![30.0; 3]);
+                // Constant temperature, humidity and wind with height give known
+                // column means, independent of the hypsometric height calculation.
+                for hour in 0..3 {
+                    let temp = 10.0 + 5.0 * cell as f64 + 7.0 * hour as f64;
+                    let speed = 12.0 + 6.0 * cell as f64 + 3.0 * hour as f64;
+                    loc["hourly"]["temperature_2m"][hour] = serde_json::json!(temp);
+                    for p in LEVELS_HPA {
+                        loc["hourly"][format!("temperature_{p}hPa")][hour] =
+                            serde_json::json!(temp);
+                    }
+                    for suffix in std::iter::once("10m".to_string())
+                        .chain(LEVELS_HPA.into_iter().map(|p| format!("{p}hPa")))
+                    {
+                        loc["hourly"][format!("wind_speed_{suffix}")][hour] =
+                            serde_json::json!(speed);
+                        loc["hourly"][format!("wind_direction_{suffix}")][hour] =
+                            serde_json::json!([270.0, 180.0, 90.0][hour]);
+                    }
+                }
+                match cell {
+                    0 => loc["hourly"]["temperature_2m"][0] = serde_json::Value::Null,
+                    1 => loc["hourly"]["surface_pressure"][1] = serde_json::Value::Null,
+                    _ => {
+                        for p in LEVELS_HPA {
+                            loc["hourly"][format!("wind_speed_{p}hPa")][2] =
+                                serde_json::Value::Null;
+                        }
+                    }
+                }
+                loc
+            })
+            .collect();
+        serde_json::json!(cells)
+    }
+
+    #[test]
+    fn complementary_cell_hours_recover_measured_pressure_weather() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let source = parse_om_grid(
+            staggered_pressure_grid(day as i64),
+            &[0.0],
+            &[0.0, 1.0, 2.0],
+            day + 900.0,
+            day + 6300.0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(source.partial_cells, Some(0));
+        assert_eq!(source.warnings.len(), 1);
+        assert!(source.warnings[0].contains("6 of 9 observed cell-hours"));
+        assert!(source.warnings[0].contains("no winds aloft"));
+        assert!(source.atmo.medium_bounds().is_none());
+        // At longitude 0.5 on the equator, the retained station distances
+        // independently give 9:1, 9:1 and 1:1 inverse-square weights by hour.
+        let support = [
+            [(1, 0.9), (2, 0.1)],
+            [(0, 0.9), (2, 0.1)],
+            [(0, 0.5), (1, 0.5)],
+        ];
+        let sounds: Vec<_> = support
+            .iter()
+            .enumerate()
+            .map(|(hour, cells)| {
+                1.0 / cells
+                    .iter()
+                    .map(|&(cell, w)| {
+                        w / fdop_types::atmo::sound_speed(
+                            10.0 + 5.0 * cell as f64 + 7.0 * hour as f64,
+                            0.3,
+                        )
+                    })
+                    .sum::<f64>()
+            })
+            .collect();
+        let winds = [[18.6, 0.0], [0.0, 16.2], [-21.0, 0.0]];
+        for hour in [0.0, 0.25, 0.5, 1.0, 1.75, 2.0] {
+            let a = (hour as usize).min(1);
+            let w = hour - a as f64;
+            let c = 1.0 / ((1.0 - w) / sounds[a] + w / sounds[a + 1]);
+            let wind_e = (1.0 - w) * winds[a][0] + w * winds[a + 1][0];
+            let wind_n = (1.0 - w) * winds[a][1] + w * winds[a + 1][1];
+            for (za, zb) in [
+                (30.0, 30.0),
+                (30.0, 5000.0),
+                (5000.0, 30.0),
+                (-300.0, 11000.0),
+            ] {
+                let m = source.medium(0.0, 0.5, day + hour * 3600.0, za, zb);
+                assert!((m.c - c).abs() < 1e-10, "{hour}: {m:?}, c={c}");
+                assert!((m.wind_e - wind_e).abs() < 1e-10);
+                assert!((m.wind_n - wind_n).abs() < 1e-10);
+            }
+        }
+        for t in [day - 1.0, day + 7201.0, f64::NAN, f64::INFINITY] {
+            let m = source.medium(0.0, 0.5, t, 30.0, 5000.0);
+            assert!(m.c.is_nan() && m.wind_e.is_nan() && m.wind_n.is_nan());
+        }
+        let weather = fetch_with_fallbacks(
+            Ok(source),
+            || panic!("supported pressure weather must not fetch surface data"),
+            || panic!("supported pressure weather must not fetch soundings"),
+            |_| panic!("supported pressure weather is final"),
+        );
+        assert!(weather.winds_aloft);
+        assert!(weather.atmo.describe().contains("partial hourly grid"));
+    }
+
+    #[test]
+    fn hourly_pressure_recovery_requires_every_requested_bracket() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let parse = |v| parse_om_grid(v, &[0.0], &[0.0, 1.0, 2.0], day + 900.0, day + 6300.0, true);
+        for hour in 0..3 {
+            let mut missing = staggered_pressure_grid(day as i64);
+            for cell in missing.as_array_mut().unwrap() {
+                cell["hourly"]["temperature_2m"][hour] = serde_json::Value::Null;
+            }
+            assert!(parse(missing).is_err(), "uncovered hour {hour}");
+        }
+        let mut shifted = staggered_pressure_grid(day as i64);
+        for t in shifted[0]["hourly"]["time"].as_array_mut().unwrap() {
+            *t = serde_json::json!(t.as_i64().unwrap() + 1800);
+        }
+        assert!(
+            parse(shifted).is_err(),
+            "incompatible partial hourly phases"
+        );
+    }
+
+    #[test]
+    fn complementary_pressure_weather_reuses_the_existing_offline_cache() {
+        let day = fdop_types::time::unix_from_utc(2026, 9, 8, 0, 0, 0.0);
+        let mut vars = "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,surface_pressure".to_string();
+        for p in LEVELS_HPA {
+            vars.push_str(&format!(
+                ",temperature_{p}hPa,wind_speed_{p}hPa,wind_direction_{p}hPa"
+            ));
+        }
+        let url = format!(
+            "{OM_HIST_FORECAST}?latitude=0.000,0.000,0.000&longitude=0.000,1.000,2.000&start_date=2026-09-08&end_date=2026-09-08&hourly={vars}&wind_speed_unit=ms&timeformat=unixtime&timezone=GMT"
+        );
+        let (dir, path) = weather_test_cache(&url, "complementary-hours");
+        let bytes = serde_json::to_vec(&staggered_pressure_grid(day as i64)).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let weather = fetch_atmosphere(
+            &BBox::new(0.0, 0.0, 0.0, 2.0),
+            day + 900.0,
+            day + 6300.0,
+            &dir,
+            true,
+        );
+        assert!(weather.winds_aloft);
+        assert!(weather.atmo.describe().contains("partial hourly grid"));
+        assert_eq!(weather.warnings.len(), 1);
+        let m = weather.atmo.medium(0.0, 0.5, day + 900.0, 30.0, 5000.0);
+        assert!((m.wind_e - 13.95).abs() < 1e-10);
+        assert!((m.wind_n - 4.05).abs() < 1e-10);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 
     #[test]

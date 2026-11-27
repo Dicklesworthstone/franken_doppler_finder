@@ -19,6 +19,19 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover measured weather across complementary missing cell-hours
+
+- When no Open-Meteo pressure-level grid cell covers the full request, combine valid
+  observations into hourly spatial slices and interpolate sound slowness and wind
+  between adjacent supported hours. Keep complete-column paths unchanged.
+- Require every requested hourly bracket, retain observed-wind validation and report
+  missing coverage. Reuse the existing offline cache and prefer complete cells when
+  refreshing; do not advertise sampled atmospheric bounds as certified limits.
+- Add regressions for independent spatial/time arithmetic, missing edge/interior
+  hours, incompatible phases, fallback selection and offline cache reuse. Pinned
+  formatting and source review passed; native tests and real-recording replays remain
+  unrun because of the execution-host and dependency limitations.
+
 ### Recover aircraft canceled by an audio track's mono mix
 
 - Add opt-in `locate --auto-channel`, scoped to the selected audio stream. Keep an

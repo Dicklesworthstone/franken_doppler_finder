@@ -1623,14 +1623,22 @@ and the existing constant extension outside the height grid remain in place.
 
 Weather profiles retain the original hourly rows that bracket the requested time window. Missing
 temperature, pressure or winds in unrelated hours no longer discard usable weather for a short recording.
-Every retained grid cell must have all required interpolation endpoints. A cell whose hourly
-coverage misses the requested window is omitted with a warning while complete cells remain usable.
+Complete grid cells keep priority: each must have all required interpolation endpoints. A cell whose
+hourly coverage misses the requested window is omitted with a warning while complete cells remain usable.
 Different leading or trailing rows are aligned by their selected UTC timestamps. Cells with matching
 selected timestamps keep regular-grid interpolation. When usable cells have different hourly phases,
 each retains its own temporal brackets and the existing inverse-distance-squared spatial interpolation
 and harmonic averaging of sound speed combine them. The report identifies that interpolation choice
-separately from missing cells; a fully covered grid remains complete for cache reuse. A wrong location
-count or no complete cell still invokes the existing fallback sources and warnings.
+separately from missing cells; a fully covered grid remains complete for cache reuse.
+
+If no cell has a complete pressure-level series, valid observations from different cells can instead
+supply the required hours. Each hour uses the same inverse-distance-squared spatial weighting, and
+adjacent hours interpolate sound slowness and wind vectors. Every requested hourly bracket must have
+observed support: an uncovered edge or interior hour, incompatible partial time axes, or an incorrect
+location count still invokes the existing fallback sources and warnings. The recovered profile does
+not extend beyond its supported times. Reports identify this partial hourly grid and count the
+retained cell-hours. Offline runs reuse the same cached response; online repair still prefers any
+usable source with complete cells. Surface-only weather retains its existing behavior.
 
 Pressure-level profiles distinguish missing wind observations from measured calm. A missing or
 invalid surface vector uses the nearest observed pressure-level wind through the existing height
