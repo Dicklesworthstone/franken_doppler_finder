@@ -132,6 +132,34 @@ impl<'a> AudioProbe<'a> {
         format!("aresample=async=1:first_pts=0{compensation}")
     }
 
+    /// Configure input discovery before FFmpeg opens the file. Rewind a full scan
+    /// to recover its discarded packets, but avoid seeking an ordinarily visible
+    /// compressed stream at zero so the decoder retains its priming samples.
+    pub fn configure_input_seek(&self, cmd: &mut Command, info: &MediaInfo, start: f64) {
+        let selection = AudioSelection {
+            stream: info.audio_stream,
+            channel: None,
+        };
+        let ordinary = self
+            .ordinary
+            .get_or_init(|| probe_document(self.path, false, false, self.access).ok());
+        let full_probe = ordinary
+            .as_ref()
+            .and_then(|doc| media_info(self.path, doc, selection).ok())
+            .is_none_or(|quick| {
+                quick.audio_codec != info.audio_codec
+                    || quick.channels != info.channels
+                    || quick.sample_rate != info.sample_rate
+                    || quick.start_time_s != info.start_time_s
+            });
+        if full_probe {
+            cmd.args(FULL_PROBE_ARGS);
+        }
+        if start > 0.0 || full_probe {
+            cmd.args(["-ss", &format!("{start:.3}")]);
+        }
+    }
+
     pub fn selected_info(&self, selection: AudioSelection) -> Result<MediaInfo, String> {
         media_info(self.path, &self.complete, selection)
     }
@@ -617,21 +645,6 @@ pub fn decode_probed(
     let path = probe.path;
     let info = probe.selected_info(selection)?;
     let clock_filter = probe.clock_resampler(&info, sr);
-    // Preserve ordinary decoder priming when the short probe already resolves the
-    // selected source. Rewinding a normally readable MP3/AAC at zero can skip priming.
-    // Keep the complete probe's container epoch whichever decoder path is used.
-    let ordinary = probe
-        .ordinary
-        .get_or_init(|| probe_document(path, false, false, probe.access).ok());
-    let full_probe = ordinary
-        .as_ref()
-        .and_then(|doc| media_info(path, doc, selection).ok())
-        .is_none_or(|quick| {
-            quick.audio_codec != info.audio_codec
-                || quick.channels != info.channels
-                || quick.sample_rate != info.sample_rate
-                || quick.start_time_s != info.start_time_s
-        });
     let start = start.max(0.0);
     let start_s = format!("{start:.3}");
     let stream = format!("0:a:{}", selection.stream);
@@ -653,7 +666,6 @@ pub fn decode_probed(
         format!("[fdop_normalized]{clock_filter}[fdop_clocked]");
     let mut cmd = probe.access.command("ffmpeg");
     // Preserve timestamp jumps, including MPEG-TS/HLS gaps over ten seconds.
-    // Full probing discards packets, so that path must rewind even at zero.
     cmd.args([
         "-nostdin",
         "-hide_banner",
@@ -664,12 +676,7 @@ pub fn decode_probed(
         "-xerror",
         "-copyts",
     ]);
-    if full_probe {
-        cmd.args(FULL_PROBE_ARGS);
-    }
-    if start > 0.0 || full_probe {
-        cmd.args(["-ss", &start_s]);
-    }
+    probe.configure_input_seek(&mut cmd, &info, start);
     cmd.arg("-i").arg(path);
     cmd.args([
         "-filter_complex",

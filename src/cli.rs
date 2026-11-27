@@ -38,9 +38,12 @@ pub enum Cmd {
         /// Use the first audio track of this separate local file as the only soundtrack.
         #[arg(long)]
         soundtrack: Option<PathBuf>,
-        /// Mute the first audio track between START and END seconds on the recording clock (repeatable).
+        /// Mute the selected audio track between START and END seconds on the recording clock (repeatable).
         #[arg(long, value_name = "START..END", conflicts_with = "soundtrack")]
         silence_range: Vec<crate::mute::SilenceRange>,
+        /// Original audio track to retain in range mode (zero-based, default 0).
+        #[arg(long, value_name = "N", requires = "silence_range")]
+        audio_stream: Option<usize>,
         /// New .mp4 file, or an audio-only .m4a file when using --silence-range.
         #[arg(short, long)]
         out: PathBuf,
@@ -343,11 +346,12 @@ fn run(cli: Cli) -> Result<i32, String> {
             media,
             soundtrack,
             silence_range,
+            audio_stream,
             out,
         } => {
-            crate::mute::export(&media, &out, soundtrack.as_deref(), &silence_range)?;
+            crate::mute::export(&media, &out, soundtrack.as_deref(), &silence_range, audio_stream)?;
             if !silence_range.is_empty() {
-                println!("Wrote {} with the requested intervals muted on the first audio track. Review the final recording before sharing.", out.display());
+                println!("Wrote {} with the requested intervals muted on audio stream {}. Review the final recording before sharing.", out.display(), audio_stream.unwrap_or(0));
             } else if soundtrack.is_some() {
                 println!("Wrote {} with one replacement soundtrack and no recognized location tags. Review the video and audit the replacement audio before sharing.", out.display());
             } else {
@@ -1108,6 +1112,14 @@ mod tests {
             panic!("expected mute command");
         };
         assert_eq!(silence_range.len(), 2);
+        args.extend(["--audio-stream", "1"]);
+        assert!(matches!(
+            Cli::try_parse_from(&args).unwrap().cmd,
+            Cmd::Mute { audio_stream: Some(1), .. }
+        ));
+        assert!(Cli::try_parse_from([
+            "fdop", "mute", "clip.mov", "-o", "out.mp4", "--audio-stream", "1",
+        ]).is_err());
         args.extend(["--soundtrack", "voice.wav"]);
         assert!(Cli::try_parse_from(args).is_err());
     }

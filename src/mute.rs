@@ -97,7 +97,7 @@ fn verify_silence(path: &Path, intervals: &[(u64, u64)], channels: u32) -> Resul
             offset = limit;
         }
         if offset < extent {
-            return Err("silence range extends beyond the primary audio timeline".into());
+            return Err("silence range extends beyond the selected audio timeline".into());
         }
         Ok(())
     })();
@@ -118,9 +118,13 @@ pub(crate) fn export(
     out: &Path,
     soundtrack: Option<&Path>,
     silence_ranges: &[SilenceRange],
+    audio_stream: Option<usize>,
 ) -> Result<(), String> {
     if soundtrack.is_some() && !silence_ranges.is_empty() {
         return Err("choose a replacement soundtrack or silence ranges".into());
+    }
+    if audio_stream.is_some() && silence_ranges.is_empty() {
+        return Err("--audio-stream requires at least one --silence-range".into());
     }
     let extension = out.extension().unwrap_or_default();
     let audio_only = extension.eq_ignore_ascii_case("m4a");
@@ -162,7 +166,11 @@ pub(crate) fn export(
     let mut cmd = Command::new("ffmpeg");
     if !silence_ranges.is_empty() {
         let probe = audio::AudioProbe::open_offline(&media)?;
-        let info = probe.selected_info(audio::AudioSelection::default())?;
+        let stream = audio_stream.unwrap_or(0);
+        let info = probe.selected_info(audio::AudioSelection {
+            stream,
+            channel: None,
+        })?;
         let intervals = sample_intervals(silence_ranges, info.sample_rate)?;
         let clock = probe.clock_resampler(&info, info.sample_rate);
         // Shift every stream by the same epoch; the video is still packet-copied.
@@ -170,7 +178,8 @@ pub(crate) fn export(
         // move the requested cuts. With reinitialization disabled FFmpeg rejects
         // audio frames that no longer match its configured input.
         cmd.args(["-copyts", "-itsoffset", &format!("{:.6}", -info.start_time_s),
-            "-reinit_filter:a:0", "0"]);
+            &format!("-reinit_filter:a:{stream}"), "0"]);
+        probe.configure_input_seek(&mut cmd, &info, 0.0);
         redaction = Some((info, clock, intervals));
     }
     cmd.args([
@@ -208,12 +217,12 @@ pub(crate) fn export(
             "asetpts=PTS-STARTPTS,apad",
             "-shortest",
         ]);
-    } else if let Some((_, clock, intervals)) = &redaction {
+    } else if let Some((info, clock, intervals)) = &redaction {
         let ranges = intervals.iter().map(|(start, end)| format!("gte(n,{start})*lt(n,{end})"))
             .collect::<Vec<_>>().join("+");
         // ALAC keeps silence exact at a cut, without ringing or encoder delay.
         let silence = format!("{clock},aeval='if({ranges},0,val(ch))':c=same");
-        cmd.args(["-map", "0:a:0", "-af", &silence, "-c:a", "alac"]);
+        cmd.args(["-map", &format!("0:a:{}", info.audio_stream), "-af", &silence, "-c:a", "alac"]);
     } else {
         cmd.arg("-an");
     }
@@ -301,7 +310,7 @@ mod tests {
         assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
         let ranges = ["2.650875..2.778", "0.750125..0.875"];
         let out = dir.path().join("redacted.mp4");
-        export(&media, &out, None, &ranges.map(|s| s.parse().unwrap())).unwrap();
+        export(&media, &out, None, &ranges.map(|s| s.parse().unwrap()), None).unwrap();
         let inventory = audio::probe_audio_inventory(&out).unwrap();
         assert!(inventory.video_with_soundtrack_without_chapters);
         assert!(!inventory.location_tag_detected);
@@ -326,7 +335,7 @@ mod tests {
         assert!(verify_silence(&out, &[(8_000, 8_800)], 2).is_err());
         // Primary audio ends at 4 s but the video continues to 5 s.
         let refused = dir.path().join("refused.mp4");
-        assert!(export(&media, &refused, None, &["3.9..4.1".parse().unwrap()]).is_err());
+        assert!(export(&media, &refused, None, &["3.9..4.1".parse().unwrap()], None).is_err());
         assert!(!refused.exists());
     }
 
@@ -378,7 +387,7 @@ mod tests {
             assert!(!original.single_audio_without_chapters);
 
             let cut = ["0.250125..0.375375".parse().unwrap()];
-            export(&media, &out, None, &cut).unwrap();
+            export(&media, &out, None, &cut, None).unwrap();
             let audit = audio::probe_audio_inventory(&out).unwrap();
             assert!(audit.single_audio_without_chapters);
             assert!(!audit.location_tag_detected);
@@ -404,13 +413,61 @@ mod tests {
             assert!(span.iter().any(|&b| b != 0));
             span.fill(0);
             assert_eq!(samples(&out), expected);
-            assert!(export(&media, &out, None, &cut).is_err());
+            assert!(export(&media, &out, None, &cut, None).is_err());
         }
         let memo = dir.path().join("memo.mka");
         let refused = dir.path().join("refused.m4a");
-        assert!(export(&memo, &refused, None, &[]).is_err());
-        assert!(export(&memo, &refused, Some(&memo), &[]).is_err());
-        assert!(export(&memo, &refused, None, &["0.9..1.1".parse().unwrap()]).is_err());
+        assert!(export(&memo, &refused, None, &[], None).is_err());
+        assert!(export(&memo, &refused, Some(&memo), &[], None).is_err());
+        assert!(export(&memo, &refused, None, &["0.9..1.1".parse().unwrap()], None).is_err());
+        assert!(!refused.exists());
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn mutes_only_the_selected_delayed_microphone_on_the_recording_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("microphones.mkv");
+        let made = ffmpeg()
+            .args(["-f", "lavfi", "-i", "testsrc2=s=32x24:r=4:d=2",
+                "-f", "lavfi", "-i", "sine=frequency=955:sample_rate=16000:duration=2",
+                "-itsoffset", "0.5", "-f", "lavfi", "-i",
+                "aevalsrc=0.5*sin(2*PI*320*t)|0.5*cos(2*PI*440*t):s=8000:d=1",
+                "-map", "0:v", "-map", "1:a", "-map", "2:a",
+                "-metadata:s:a:1", "location=private-microphone-marker",
+                "-c:v", "mpeg4", "-c:a", "pcm_s16le", "-output_ts_offset", "3"])
+            .arg(&media).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let cut = ["0.750125..0.875375".parse().unwrap()];
+        for extension in ["mp4", "m4a"] {
+            let out = media.with_extension(extension);
+            export(&media, &out, None, &cut, Some(1)).unwrap();
+            let audit = audio::probe_audio_inventory(&out).unwrap();
+            assert!(!audit.location_tag_detected);
+            assert_eq!(audit.streams.len(), 1);
+            assert_eq!(audit.streams[0].sample_rate, 8000);
+            assert_eq!(audit.streams[0].channels, 2);
+            if extension == "mp4" {
+                assert!(audit.video_with_soundtrack_without_chapters);
+                assert_eq!(decoded_video_hash(&out), decoded_video_hash(&media));
+            } else {
+                assert!(audit.single_audio_without_chapters);
+            }
+            for channel in [Some(0), Some(1)] {
+                let mut expected = audio::decode_with_selection(&media, 0.0, None, 8000,
+                    audio::AudioSelection { stream: 1, channel }).unwrap();
+                assert_eq!(expected.len(), 12_000);
+                assert!(expected[..4000].iter().all(|&s| s == 0.0));
+                assert!(expected[6001..7003].iter().any(|s| s.abs() > 0.1));
+                expected[6001..7003].fill(0.0);
+                let actual = audio::decode_with_selection(&out, 0.0, None, 8000,
+                    audio::AudioSelection { stream: 0, channel }).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+        let refused = dir.path().join("refused.mp4");
+        assert!(export(&media, &refused, None, &cut, Some(2)).is_err());
+        assert!(export(&media, &refused, None, &[], Some(0)).is_err());
         assert!(!refused.exists());
     }
 
@@ -472,7 +529,7 @@ mod tests {
         assert_eq!(original.streams.len(), 2);
         assert!(original.location_tag_detected);
         let out = root.path().join("silent.mp4");
-        export(&media, &out, None, &[]).unwrap();
+        export(&media, &out, None, &[], None).unwrap();
         let inspect = Command::new("ffprobe")
             .args([
                 "-v",
@@ -501,8 +558,8 @@ mod tests {
         // A second export cannot replace a completed output. Using the original
         // MP4 as its own destination also leaves its bytes untouched.
         let bytes = std::fs::read(&out).unwrap();
-        assert!(export(&media, &out, None, &[]).is_err());
-        assert!(export(&out, &out, None, &[]).is_err());
+        assert!(export(&media, &out, None, &[], None).is_err());
+        assert!(export(&out, &out, None, &[], None).is_err());
         assert_eq!(std::fs::read(&out).unwrap(), bytes);
     }
 
@@ -562,7 +619,7 @@ mod tests {
                 }]
             );
             let out = root.path().join(format!("{tag}-muted.mp4"));
-            export(&media, &out, None, &[]).unwrap();
+            export(&media, &out, None, &[], None).unwrap();
             let checked = audio::probe_audio_inventory(&out).unwrap();
             assert!(checked.single_video_without_chapters);
             assert!(checked.possible_location_telemetry.is_empty());
@@ -602,7 +659,7 @@ mod tests {
                 .arg(&replacement).output().unwrap();
             assert!(soundtrack.status.success(), "{}", String::from_utf8_lossy(&soundtrack.stderr));
             let out = dir.path().join(format!("{label}.mp4"));
-            export(&media, &out, Some(&replacement), &[]).unwrap();
+            export(&media, &out, Some(&replacement), &[], None).unwrap();
             assert_eq!(timing(&out), original_packets);
             assert_eq!(decoded_video_hash(&out), decoded_video_hash(&media));
             let inventory = audio::probe_audio_inventory(&out).unwrap();
@@ -636,16 +693,16 @@ mod tests {
             }
         }
         let refused = dir.path().join("refused.mp4");
-        assert!(export(&media, &refused, Some(&media), &[]).is_err());
+        assert!(export(&media, &refused, Some(&media), &[], None).is_err());
         #[cfg(unix)]
         {
             let alias = dir.path().join("alias.mp4");
             std::fs::hard_link(&media, &alias).unwrap();
-            assert!(export(&media, &refused, Some(&alias), &[]).is_err());
+            assert!(export(&media, &refused, Some(&alias), &[], None).is_err());
         }
         let silent = dir.path().join("silent.mp4");
-        export(&media, &silent, None, &[]).unwrap();
-        assert!(export(&media, &refused, Some(&silent), &[]).is_err());
+        export(&media, &silent, None, &[], None).unwrap();
+        assert!(export(&media, &refused, Some(&silent), &[], None).is_err());
         assert!(!refused.exists());
     }
 
@@ -663,7 +720,7 @@ mod tests {
                 .success()
         );
         let out = root.path().join("silent.mp4");
-        assert!(export(&media, &out, None, &[]).is_err());
+        assert!(export(&media, &out, None, &[], None).is_err());
         assert!(!out.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }

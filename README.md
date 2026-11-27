@@ -987,7 +987,19 @@ fdop mute field.wav --silence-range 12.5..48 --out edited.m4a
 fdop detect edited.m4a --all-audio --offline
 ```
 
-Range mode keeps every channel of the first audio track, applies each cut across those channels, and drops the alternate tracks. The recording clock includes any delay before the primary audio begins and gaps in its timestamps. Ranges include their start and exclude their end, rounded outward to whole samples. Overlapping ranges merge. The output uses ALAC audio. Before publishing, `fdop` decodes the staged file and checks every channel for digital silence throughout the chosen intervals. An interval past the end of primary audio is an error. Use range mode with a stable primary audio format and choose either ranges or a replacement soundtrack.
+Range mode keeps one original audio track. It defaults to the first. Use the zero-based
+`--audio-stream` index from `detect --all-audio` to retain another track. For example:
+
+```bash
+fdop mute interviews.mkv --audio-stream 1 --silence-range 40..64 --out edited.m4a
+```
+
+Each cut silences every channel of the chosen track. Other audio tracks are dropped.
+Intervals use the recording clock, including any delay before the chosen track starts and gaps in its timestamps.
+Ranges include their start and exclude their end, rounded outward to whole samples. Overlapping ranges merge.
+The output uses ALAC audio. Before publishing, `fdop` decodes the staged file and verifies digital silence
+in every channel throughout the chosen intervals. An interval past the end of the selected audio is an error.
+Use range mode with a stable audio format on that track.
 
 `mute` works offline with FFmpeg and FFprobe. It copies the first video stream that is not
 cover art into a new MP4, without re-encoding. It drops additional video streams, subtitles, data tracks, attachments and chapters, and disables copying container
@@ -997,7 +1009,7 @@ a long one ends with the video. FFprobe verifies the completed file has one non-
 track, the requested number of audio tracks (zero or one), zero chapters, no other streams
 and no recognized location tags. An occupied output path is an error.
 The destination directory must already exist. MP4 output requires a video stream that
-FFmpeg can copy into the container. M4A output requires primary audio and at least one silence range.
+FFmpeg can copy into the container. M4A output requires an audio track and at least one silence range.
 
 Review the pictures and anything embedded in the encoded video, including in-band captions,
 before sharing. Those travel with the video stream. The replacement audio can carry its own
