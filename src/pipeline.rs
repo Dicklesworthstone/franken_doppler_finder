@@ -24,6 +24,8 @@ pub struct LocateArgs {
     pub audio_selection: audio::AudioSelection,
     /// Recover a single usable channel before searching, if the downmix has fewer than two aircraft.
     pub auto_channel: bool,
+    /// Recover one complete audio source across tracks and channels before searching.
+    pub auto_audio: bool,
     /// "YYYY-MM-DD" or "YYYY-MM-DD..YYYY-MM-DD" (local dates at the region).
     pub dates: String,
     /// Coarse region: state, "City, ST", county, ZIP, "lat,lon[,km]", "S,W,N,E", "CONUS".
@@ -1907,25 +1909,38 @@ fn locate_with_clock(
     if a.auto_channel && a.audio_selection.channel.is_some() {
         return Err("--auto-channel cannot be combined with --audio-channel".into());
     }
+    if a.auto_audio && (a.auto_channel || a.audio_selection != audio::AudioSelection::default()) {
+        return Err(
+            "--auto-audio cannot be combined with --audio-stream, --audio-channel or --auto-channel"
+                .into(),
+        );
+    }
     if !a.media.is_file() {
         return Err(format!("{}: not a file", a.media.display()));
     }
-    let (mut info, probe) = match recording {
-        Some(r) => (r.info.clone(), None),
+    let (mut info, probe, audio_streams) = match recording {
+        Some(r) => (r.info.clone(), None, 0),
         None => {
-            let probe = if a.auto_channel {
-                if a.offline {
+            let (probe, streams) = if a.auto_channel || a.auto_audio {
+                let (probe, inventory) = if a.offline {
                     audio::AudioProbe::for_offline_audit(&a.media)
                 } else {
                     audio::AudioProbe::for_audit(&a.media)
-                }
-                .map(|(probe, _)| probe)
-            } else if a.offline {
-                audio::AudioProbe::open_offline(&a.media)
+                }?;
+                (probe, inventory.streams.len())
             } else {
-                audio::AudioProbe::open(&a.media)
-            }?;
-            (probe.selected_info(a.audio_selection)?, Some(probe))
+                let probe = if a.offline {
+                    audio::AudioProbe::open_offline(&a.media)
+                } else {
+                    audio::AudioProbe::open(&a.media)
+                }?;
+                (probe, 0)
+            };
+            (
+                probe.selected_info(a.audio_selection)?,
+                Some(probe),
+                streams,
+            )
         }
     };
     log.say(&format!(
@@ -1972,26 +1987,39 @@ fn locate_with_clock(
     // overlaps detection and measurement. Metadata retains both start/end conventions.
     let t = Instant::now();
     let mut x = match probe.as_ref() {
-        Some(probe) => audio::decode_probed(probe, 0.0, None, a.sr, a.audio_selection)?,
-        None => Vec::new(),
+        Some(probe) if !a.auto_audio => {
+            audio::decode_probed(probe, 0.0, None, a.sr, a.audio_selection)?
+        }
+        // Whole-source recovery records decode failures and can continue to another track.
+        _ => Vec::new(),
     };
     let decode_s = t.elapsed().as_secs_f64();
-    let mut channel_measurements = None;
-    let mut channel_trials = Vec::new();
-    if a.auto_channel
+    let mut source_measurements = None;
+    let mut source_trials = Vec::new();
+    if (a.auto_channel || a.auto_audio)
         && let Some(probe) = probe.as_ref()
     {
         let started = Instant::now();
-        let chosen = crate::audio_source::recover_channels(probe, x, a.audio_selection, a.sr, log)?;
+        let chosen = if a.auto_audio {
+            crate::audio_source::recover_audio(probe, audio_streams, a.sr, log)?
+        } else {
+            crate::audio_source::recover_channels(probe, x, a.audio_selection, a.sr, log)?
+        };
         x = chosen.pcm;
         info = chosen.info;
-        channel_measurements = Some(chosen.measurements);
-        channel_trials = chosen.trials;
+        source_measurements = Some(chosen.measurements);
+        source_trials = chosen.trials;
         warnings.extend(chosen.warnings);
-        // This includes every trial's measurements and additional channel decodes.
+        // This includes every trial's measurements and additional source decodes.
+        // With --auto-audio it also includes the first source decode.
         // The later detection/measurement stage reuses the selected observations.
         timings.insert(
-            "audio_channel_selection_s".into(),
+            if a.auto_audio {
+                "audio_source_selection_s"
+            } else {
+                "audio_channel_selection_s"
+            }
+            .into(),
             json!(started.elapsed().as_secs_f64()),
         );
         log.say(&format!(
@@ -2099,7 +2127,7 @@ fn locate_with_clock(
     let curve_image_s = t.elapsed().as_secs_f64();
     // ---- detection and measurement: one immutable observation set for every clock ---------
     let measured;
-    let measurements = match (recording, channel_measurements.as_ref()) {
+    let measurements = match (recording, source_measurements.as_ref()) {
         (Some(r), _) => r.measurements,
         (None, Some(measurements)) => {
             if extras {
@@ -2129,7 +2157,7 @@ fn locate_with_clock(
     warnings.extend(measurements.warnings.iter().cloned());
     timings.insert(
         "detect_s".into(),
-        json!(if recording.is_some() || channel_measurements.is_some() {
+        json!(if recording.is_some() || source_measurements.is_some() {
             0.0
         } else {
             measurements.detect_s
@@ -2137,7 +2165,7 @@ fn locate_with_clock(
     );
     timings.insert(
         "measure_s".into(),
-        json!(if recording.is_some() || channel_measurements.is_some() {
+        json!(if recording.is_some() || source_measurements.is_some() {
             0.0
         } else {
             measurements.measure_s
@@ -3269,9 +3297,14 @@ fn locate_with_clock(
         })),
         "log": log.lines(),
     });
-    if a.auto_channel {
-        report.extra["audio_channel_selection"] = json!({
-            "trials": channel_trials,
+    if a.auto_channel || a.auto_audio {
+        let selection_key = if a.auto_audio {
+            "audio_source_selection"
+        } else {
+            "audio_channel_selection"
+        };
+        report.extra[selection_key] = json!({
+            "trials": source_trials,
             "analysis_reused": recording.is_some(),
         });
     }
@@ -4682,6 +4715,7 @@ mod tests {
             media: dir.join("recording.mka"),
             audio_selection: audio::AudioSelection::default(),
             auto_channel: false,
+            auto_audio: false,
             dates: "2026-09-07..2026-09-09".into(),
             near: "40.8765,-73.5250,20".into(),
             out: Some(dir.join("run")),

@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover aircraft from another recorded audio track
+
+- Add opt-in `locate --auto-audio`: assess each audio track's mix and, when needed,
+  individual channels in container order. Keep the first source with two independent
+  measured aircraft, or the earliest source with the best count when none reaches two.
+- Keep the selected source's recording clock, metadata and measurements together through
+  both searches, metadata retries and decoy clocks. Never combine observations across
+  sources. Record attempted sources and failed trials in `extra.audio_source_selection`.
+- Preserve explicit source selection and existing `--auto-channel` behavior. Add synthetic
+  multitrack regressions for delayed canceled aircraft, usable first tracks, duplicate
+  passes, an invalid PCM source and a healthy channel beside a corrupt channel. Native CLI
+  and FFmpeg tests are pending dependency compilation; field validation remains unrun.
+  Complete, clean stream discovery is currently required before trying sources.
+
 ### Strip embedded captions and other SEI from H.264 and HEVC video exports
 
 - `mute --strip-video-sei` removes SEI during MP4 packet copy, then checks the
@@ -34,8 +48,9 @@ at that commit, not per-change commits.
   original assignments, same-pass exclusions and confirmation-budget scope; do not
   revive a candidate reduced to one event.
 - Add three physical/control regressions covering competing flights, local and Unix
-  timestamps, unchanged successful paths and rejected alternatives. Native execution,
-  release selftest and reference/field validation remain unrun after host outages.
+  timestamps, unchanged successful paths and rejected alternatives. All three new native
+  tests and eight existing confirmer controls pass. Release selftest and field validation
+  remain unrun.
 
 ### Skip Doppler prediction solves outside certified arrival-time support
 
@@ -99,7 +114,8 @@ at that commit, not per-change commits.
 - Add synthetic regression cases at 215, 245 and 270 m/s, two epochs, and one or many
   rejected reports. Check unchanged models, analytic Doppler on restored segments and
   retained-report controls, including a later two-knot model and unmatched source samples.
-  Native execution and field replays are pending after repeated execution-host outages.
+  Both new native regressions and both existing `corrected_fast_*` controls pass;
+  the release selftest and field replays remain unrun.
 
 ### Skip unsupported calibration clocks without changing their evidence
 
@@ -108,8 +124,9 @@ at that commit, not per-change commits.
   admissible score and confidence threshold; interior gaps still receive exact scoring.
 - Add boundary/fallback checks and a physical old-loop comparison for complete, partial
   and gapped tracks. Independent floating-point arithmetic found no lost eligible clocks.
-  Native regressions, timing, release selftest and field replays are unrun after the
-  execution host became unavailable; the pre-change shared-types suite passed 39 tests.
+  All three native regressions pass; the partial-track fixture reduces full trace evaluations
+  from 17,304 to 2,018 with identical eligible scores. End-to-end timing, release selftest
+  and field replays remain unrun.
 
 ### Mute measured passes directly on a retained audio track
 

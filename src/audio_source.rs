@@ -1,12 +1,14 @@
-//! Choose one observed audio channel before any flight or location search.
+//! Choose one observed audio source before any flight or location search.
 //!
-//! The downmix keeps priority. Only a downmix with fewer than two independent measured
-//! aircraft tries individual channels, in their original order. No observations are pooled.
+//! A stream's downmix keeps priority. Only a downmix with fewer than two independent
+//! measured aircraft tries individual channels. Whole-file recovery applies the same rule
+//! to each audio stream in order. No observations are pooled or ranked by search results.
 
 use crate::pipeline::{AudioMeasurements, Log, measure_recording};
 use fdop_core::audio::{self, AudioProbe, AudioSelection, MediaInfo};
 use fdop_core::search;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
@@ -72,12 +74,7 @@ pub(crate) fn recover_channels(
             stream: selection.stream,
             channel: Some(channel),
         };
-        let candidate = (|| {
-            let pcm = audio::decode_probed(probe, 0.0, None, sr, source)?;
-            let info = probe.selected_info(source)?;
-            let measurements = measure_recording(&pcm, sr, log, None)?;
-            Ok::<_, String>((pcm, info, measurements))
-        })();
+        let candidate = decode_and_measure(probe, source, sr, log);
         let (pcm, info, measurements) = match candidate {
             Ok(candidate) => candidate,
             Err(error) => {
@@ -128,6 +125,142 @@ pub(crate) fn recover_channels(
     Ok(chosen)
 }
 
+fn decode_and_measure(
+    probe: &AudioProbe<'_>,
+    selection: AudioSelection,
+    sr: u32,
+    log: &Arc<Log>,
+) -> Result<(Vec<f32>, MediaInfo, AudioMeasurements), String> {
+    let pcm = audio::decode_probed(probe, 0.0, None, sr, selection)?;
+    // A full downmix decode discovers channels that appear later in the recording.
+    let info = probe.selected_info(selection)?;
+    let measurements = measure_recording(&pcm, sr, log, None)?;
+    Ok((pcm, info, measurements))
+}
+
+fn queue_recovery_channels(
+    sources: &mut VecDeque<AudioSelection>,
+    selection: AudioSelection,
+    channels: usize,
+) {
+    if selection.channel.is_none() && channels > 1 {
+        // The current stream's channels immediately follow its insufficient or failed
+        // downmix. Reversing insertion preserves channel order.
+        for channel in (0..channels).rev() {
+            sources.push_front(AudioSelection {
+                stream: selection.stream,
+                channel: Some(channel),
+            });
+        }
+    }
+}
+
+/// Assess whole audio streams in their original order before any flight search.
+///
+/// Each downmix gets the same channel recovery as `--auto-channel`. Keep the first
+/// complete source with two independent aircraft, or the earliest source with the largest
+/// count if none reaches two. A failed source is recorded separately from a silent one.
+/// The chosen waveform, measurements and stream-specific metadata always travel together.
+/// At most the global incumbent and one candidate waveform/measurement set are held at once.
+pub(crate) fn recover_audio(
+    probe: &AudioProbe<'_>,
+    streams: usize,
+    sr: u32,
+    log: &Arc<Log>,
+) -> Result<SelectedAudio, String> {
+    let mut sources: VecDeque<_> = (0..streams)
+        .map(|stream| AudioSelection {
+            stream,
+            channel: None,
+        })
+        .collect();
+    let mut chosen = None;
+    let mut best_count = 0;
+    let mut trials = Vec::new();
+    let mut warnings = Vec::new();
+    while let Some(selection) = sources.pop_front() {
+        let channel = selection
+            .channel
+            .map_or_else(|| "downmix".into(), |channel| format!("channel {channel}"));
+        let (pcm, info, measurements) = match decode_and_measure(probe, selection, sr, log) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                let warning = format!(
+                    "automatic audio recovery could not assess stream {} {channel}: {error}",
+                    selection.stream
+                );
+                log.say(&warning);
+                warnings.push(warning);
+                trials.push(AudioSourceTrial {
+                    audio_stream: selection.stream,
+                    audio_channel: selection.channel,
+                    independent_events: None,
+                    error: Some(error),
+                });
+                // One corrupt channel can poison a mix while another remains usable.
+                // Keep the probe's known width, including any completed decode audit.
+                if selection.channel.is_none()
+                    && let Ok(info) = probe.selected_info(selection)
+                {
+                    queue_recovery_channels(&mut sources, selection, info.channels as usize);
+                }
+                continue;
+            }
+        };
+        let channels = info.channels as usize;
+        let count = search::independent_measured_events(&measurements.events, 0.0).len();
+        log.say(&format!(
+            "automatic audio recovery: stream {} {channel} has {count} independent measured aircraft",
+            selection.stream
+        ));
+        trials.push(AudioSourceTrial {
+            audio_stream: selection.stream,
+            audio_channel: selection.channel,
+            independent_events: Some(count),
+            error: None,
+        });
+        if chosen.is_none() || count > best_count {
+            chosen = Some(SelectedAudio {
+                pcm,
+                info,
+                measurements,
+                trials: Vec::new(),
+                warnings: Vec::new(),
+            });
+            best_count = count;
+        }
+        if count >= 2 {
+            break;
+        }
+        queue_recovery_channels(&mut sources, selection, channels);
+    }
+    let mut chosen = chosen.ok_or_else(|| {
+        if trials.is_empty() {
+            "--auto-audio: the file has no audio streams".to_string()
+        } else {
+            format!(
+                "--auto-audio could not decode and measure any audio stream: {}",
+                warnings.join("; ")
+            )
+        }
+    })?;
+    chosen.trials = trials;
+    chosen.warnings = warnings;
+    if chosen.info.audio_stream != 0 || chosen.info.audio_channel.is_some() {
+        let channel = chosen
+            .info
+            .audio_channel
+            .map_or_else(|| "mix".into(), |channel| channel.to_string());
+        let warning = format!(
+            "automatic audio recovery selected stream {} channel {channel} with {best_count} independent measured aircraft; all subsequent searches use this one audio view",
+            chosen.info.audio_stream
+        );
+        log.say(&warning);
+        chosen.warnings.push(warning);
+    }
+    Ok(chosen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +296,16 @@ mod tests {
     }
 
     fn stereo_wav(path: &Path, samples: &[f32], antiphase: bool) {
+        stereo_wav_other_channel(
+            path,
+            samples,
+            |sample| {
+                if antiphase { -sample } else { sample }
+            },
+        );
+    }
+
+    fn stereo_wav_other_channel(path: &Path, samples: &[f32], other: impl Fn(f32) -> f32) {
         // IEEE float WAV preserves the established fixture exactly on channel zero.
         let bytes = u32::try_from(samples.len() * 8).unwrap();
         let mut out = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
@@ -180,8 +323,8 @@ mod tests {
         out.write_all(&bytes.to_le_bytes()).unwrap();
         for &sample in samples {
             out.write_all(&sample.to_le_bytes()).unwrap();
-            let other = if antiphase { -sample } else { sample };
-            out.write_all(&other.to_le_bytes()).unwrap();
+            let other_sample = other(sample);
+            out.write_all(&other_sample.to_le_bytes()).unwrap();
         }
         out.flush().unwrap();
     }
@@ -196,6 +339,247 @@ mod tests {
         assert_eq!(initial.len(), samples.len());
         assert!(initial.iter().all(|x| x.abs() < 1e-7));
         recover_channels(&probe, initial, selection, 4000, &Log::new(true)).unwrap()
+    }
+
+    fn two_track_media(path: &Path, first: &Path, second: &Path, delay_s: u32) {
+        let encoded = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(first)
+            .arg("-itsoffset")
+            .arg(delay_s.to_string())
+            .arg("-i")
+            .arg(second)
+            .args([
+                "-map",
+                "0:a:0",
+                "-map",
+                "1:a:0",
+                "-map_metadata",
+                "-1",
+                "-c:a",
+                "copy",
+                "-metadata:s:a:0",
+                "creation_time=2026-09-08T00:00:00Z",
+                "-metadata:s:a:1",
+                "creation_time=2026-09-08T12:00:00Z",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            encoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg 7.1+ and ffprobe"]
+    fn automatic_audio_recovery_restores_a_delayed_antiphase_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("silent.wav");
+        let second = dir.path().join("aircraft.wav");
+        let path = dir.path().join("multitrack.mka");
+        let samples = recording(true);
+        stereo_wav(&first, &vec![0.0; samples.len()], false);
+        stereo_wav(&second, &samples, true);
+        two_track_media(&path, &first, &second, 5);
+        let (probe, inventory) = AudioProbe::for_offline_audit(&path).unwrap();
+        assert_eq!(inventory.streams.len(), 2);
+        let result = recover_audio(&probe, inventory.streams.len(), 4000, &Log::new(true)).unwrap();
+
+        assert_eq!(result.info.audio_stream, 1);
+        assert_eq!(result.info.audio_channel, Some(0));
+        assert_eq!(result.pcm.len(), samples.len() + 20_000);
+        assert!(result.pcm[..20_000].iter().all(|&sample| sample == 0.0));
+        assert_eq!(&result.pcm[20_000..], samples.as_slice());
+        assert_eq!(
+            result.info.creation_unix,
+            Some(fdop_types::time::parse_iso_utc("2026-09-08T12:00:00Z").unwrap()),
+            "the unrelated first stream must not supply the recording clock"
+        );
+        assert_eq!(
+            result
+                .trials
+                .iter()
+                .map(|trial| (
+                    trial.audio_stream,
+                    trial.audio_channel,
+                    trial.independent_events,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (0, None, Some(0)),
+                (0, Some(0), Some(0)),
+                (0, Some(1), Some(0)),
+                (1, None, Some(0)),
+                (1, Some(0), Some(2)),
+            ]
+        );
+        assert!(result.trials.iter().all(|trial| trial.error.is_none()));
+        let events = search::independent_measured_events(&result.measurements.events, 0.0);
+        assert_eq!(events.len(), 2);
+        for (tone, heard) in [(83.0, 24.37), (450.0, 14.13)] {
+            let event = events
+                .iter()
+                .find(|event| (event.f0 - tone).abs() < 0.3)
+                .expect("both physical aircraft must survive source selection");
+            assert!(
+                (event.t_rec - heard).abs() < 0.3,
+                "track delay must remain on the container recording clock: {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg 7.1+ and ffprobe"]
+    fn automatic_audio_recovery_preserves_a_usable_first_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.wav");
+        let second = dir.path().join("second.wav");
+        let path = dir.path().join("multitrack.mka");
+        let samples = recording(true);
+        stereo_wav(&first, &samples, false);
+        stereo_wav(&second, &samples, true);
+        two_track_media(&path, &first, &second, 5);
+        let (probe, inventory) = AudioProbe::for_offline_audit(&path).unwrap();
+        let expected =
+            audio::decode_probed(&probe, 0.0, None, 4000, AudioSelection::default()).unwrap();
+        let result = recover_audio(&probe, inventory.streams.len(), 4000, &Log::new(true)).unwrap();
+        assert_eq!(result.info.audio_stream, 0);
+        assert_eq!(result.info.audio_channel, None);
+        assert_eq!(result.pcm, expected);
+        assert_eq!(result.pcm.len(), samples.len());
+        assert_eq!(
+            result.trials.len(),
+            1,
+            "a complete first source stops selection"
+        );
+        assert_eq!(result.trials[0].independent_events, Some(2));
+        assert!(result.trials[0].error.is_none());
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            result.info.creation_unix,
+            Some(fdop_types::time::parse_iso_utc("2026-09-08T00:00:00Z").unwrap())
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg 7.1+ and ffprobe"]
+    fn automatic_audio_recovery_never_pools_tracks_or_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.wav");
+        let second = dir.path().join("second.wav");
+        let path = dir.path().join("duplicates.mka");
+        let samples = recording(false);
+        stereo_wav(&first, &samples, true);
+        stereo_wav(&second, &samples, true);
+        two_track_media(&path, &first, &second, 0);
+        let (probe, inventory) = AudioProbe::for_offline_audit(&path).unwrap();
+        let result = recover_audio(&probe, inventory.streams.len(), 4000, &Log::new(true)).unwrap();
+        assert_eq!(result.info.audio_stream, 0);
+        assert_eq!(
+            result.info.audio_channel,
+            Some(0),
+            "ties keep the first view"
+        );
+        assert_eq!(result.pcm, samples);
+        assert_eq!(
+            result
+                .trials
+                .iter()
+                .map(|trial| (
+                    trial.audio_stream,
+                    trial.audio_channel,
+                    trial.independent_events,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (0, None, Some(0)),
+                (0, Some(0), Some(1)),
+                (0, Some(1), Some(1)),
+                (1, None, Some(0)),
+                (1, Some(0), Some(1)),
+                (1, Some(1), Some(1)),
+            ]
+        );
+        assert!(result.trials.iter().all(|trial| trial.error.is_none()));
+        assert_eq!(
+            search::independent_measured_events(&result.measurements.events, 0.0).len(),
+            1,
+            "duplicate views of one pass cannot manufacture a second aircraft"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg 7.1+ and ffprobe"]
+    fn automatic_audio_recovery_restores_a_healthy_channel_after_mix_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partly-invalid.wav");
+        let samples = recording(true);
+        stereo_wav_other_channel(&path, &samples, |_| f32::NAN);
+        let (probe, inventory) = AudioProbe::for_offline_audit(&path).unwrap();
+        let result = recover_audio(&probe, inventory.streams.len(), 4000, &Log::new(true)).unwrap();
+        assert_eq!(result.info.audio_stream, 0);
+        assert_eq!(result.info.audio_channel, Some(0));
+        assert_eq!(result.pcm, samples);
+        assert_eq!(result.trials.len(), 2);
+        assert_eq!(result.trials[0].audio_channel, None);
+        assert_eq!(result.trials[0].independent_events, None);
+        assert!(result.trials[0].error.is_some());
+        assert_eq!(result.trials[1].audio_channel, Some(0));
+        assert_eq!(result.trials[1].independent_events, Some(2));
+        assert!(result.trials[1].error.is_none());
+        assert_eq!(
+            search::independent_measured_events(&result.measurements.events, 0.0).len(),
+            2
+        );
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg 7.1+ and ffprobe"]
+    fn automatic_audio_recovery_skips_a_failed_earlier_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("invalid-pcm.wav");
+        let second = dir.path().join("aircraft.wav");
+        let path = dir.path().join("recoverable.mka");
+        let samples = recording(true);
+        // The inventory remains valid, but actual decoding must reject non-finite PCM.
+        stereo_wav(&first, &vec![f32::NAN; samples.len()], false);
+        stereo_wav(&second, &samples, false);
+        two_track_media(&path, &first, &second, 0);
+        let (probe, inventory) = AudioProbe::for_offline_audit(&path).unwrap();
+        let result = recover_audio(&probe, inventory.streams.len(), 4000, &Log::new(true)).unwrap();
+        assert_eq!(result.info.audio_stream, 1);
+        assert_eq!(result.info.audio_channel, None);
+        assert_eq!(result.trials.len(), 4);
+        for (trial, channel) in result.trials[..3].iter().zip([None, Some(0), Some(1)]) {
+            assert_eq!(trial.audio_stream, 0);
+            assert_eq!(trial.audio_channel, channel);
+            assert_eq!(trial.independent_events, None);
+            assert!(trial.error.is_some());
+        }
+        assert_eq!(result.trials[3].audio_stream, 1);
+        assert_eq!(result.trials[3].audio_channel, None);
+        assert_eq!(result.trials[3].independent_events, Some(2));
+        assert!(result.trials[3].error.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("could not assess stream 0 downmix") })
+        );
+
+        let (bad_probe, bad_inventory) = AudioProbe::for_offline_audit(&first).unwrap();
+        let error = recover_audio(
+            &bad_probe,
+            bad_inventory.streams.len(),
+            4000,
+            &Log::new(true),
+        )
+        .err()
+        .expect("a file with no completed source must still fail");
+        assert!(error.contains("could not decode and measure any audio stream"));
     }
 
     #[test]

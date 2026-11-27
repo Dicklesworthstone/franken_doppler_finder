@@ -124,6 +124,12 @@ pub struct LocateCli {
     /// Try individual channels when the selected track's mono mix has fewer than two measured aircraft.
     #[arg(long, conflicts_with = "audio_channel")]
     pub auto_channel: bool,
+    /// Recover one audio source across tracks and channels when the first mix lacks two measured aircraft.
+    #[arg(
+        long,
+        conflicts_with_all = ["audio_stream", "audio_channel", "auto_channel"]
+    )]
+    pub auto_audio: bool,
     /// Local date(s) of the recording: YYYY-MM-DD, or a range YYYY-MM-DD..YYYY-MM-DD (also "D0 to D1" or "D0,D1"; YYYY/MM/DD and YYYYMMDD work too). At most 15 days.
     #[arg(long)]
     pub dates: String,
@@ -251,6 +257,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 media: l.media.clone(),
                 audio_selection: l.audio.selection(),
                 auto_channel: l.auto_channel,
+                auto_audio: l.auto_audio,
                 dates: l.dates.clone(),
                 near: l.near.clone(),
                 out: l.out.clone(),
@@ -1443,6 +1450,40 @@ mod tests {
                 Cli::try_parse_from(["fdop", "detect", "clip.mkv", "--all-audio", flag, "0"])
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn automatic_audio_recovery_is_explicit_and_excludes_source_overrides() {
+        let mut args = vec![
+            "fdop",
+            "locate",
+            "clip.mkv",
+            "--dates",
+            "2026-09-08",
+            "--near",
+            "NY",
+        ];
+        let Cmd::Locate(default) = Cli::try_parse_from(&args).unwrap().cmd else {
+            panic!("expected locate");
+        };
+        assert!(!default.auto_audio);
+        assert!(!default.auto_channel);
+        args.push("--auto-audio");
+        let Cmd::Locate(selected) = Cli::try_parse_from(&args).unwrap().cmd else {
+            panic!("expected locate");
+        };
+        assert!(selected.auto_audio);
+        assert_eq!(selected.audio.selection(), AudioSelection::default());
+        for flags in [
+            &["--audio-stream", "0"][..],
+            &["--audio-stream", "1"][..],
+            &["--audio-channel", "0"][..],
+            &["--auto-channel"][..],
+        ] {
+            let mut conflicting = args.clone();
+            conflicting.extend_from_slice(flags);
+            assert!(Cli::try_parse_from(conflicting).is_err(), "{flags:?}");
         }
     }
 

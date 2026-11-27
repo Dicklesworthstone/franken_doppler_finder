@@ -810,6 +810,7 @@ much later than the video. Ordinary compressed audio retains its original decode
 | `--audio-stream <N>` | `0` | Audio track to analyse, counted from 0 among audio streams |
 | `--audio-channel <N>` | mono mix | One channel of that audio track, counted from 0; avoids mixing other microphone channels |
 | `--auto-channel` | off | If the selected track's mono mix has fewer than two independent measured aircraft, try its channels in order and select one source before the flight search |
+| `--auto-audio` | off | Find one usable audio source across all tracks and their channels before the flight search; incompatible with explicit stream/channel selection |
 | `--dates <D>` | required | Local date(s) of the recording: `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD` (also `D0 to D1`, `D0,D1`, `YYYY/MM/DD`, `YYYYMMDD`). The year comes first: `09/08/2026` is refused as ambiguous. At most 15 days |
 | `--near <REGION>` | required | Coarse US region; see [Region syntax](#region-syntax) |
 | `-o, --out <DIR>` | `fdop_runs/<name>_<unix time>` | New or empty output directory |
@@ -830,6 +831,7 @@ fdop locate clip.m4a --dates 2026-09-08 --near NY --offline        # cached data
 fdop locate clip.mov --dates 2026-09-08 --near NY --audio-stream 1 --audio-channel 0
 fdop locate clip.wav --dates 2026-09-08 --near NY --include-jets
 fdop locate clip.mov --dates 2026-09-08 --near NY --audio-stream 1 --auto-channel
+fdop locate clip.mov --dates 2026-09-08 --near NY --auto-audio
 ```
 
 **Automatic channel recovery is opt-in.** `--auto-channel` addresses aircraft tones canceled
@@ -851,6 +853,31 @@ the later `detect_s` and `measure_s` are zero because those stages reuse the sel
 measurements. This can take longer than one explicitly selected channel. Synthetic
 regressions cover canceled aircraft, duplicate observations and an already usable downmix;
 native tests and reference/field replays for this option have not yet run.
+
+**Automatic audio-track recovery is opt-in.** `--auto-audio` also checks later audio
+tracks when the first track cannot supply two independent measured aircraft. It examines
+each track's mono mix, then its individual channels when needed, in container order.
+The first source with at least two independent aircraft wins. If none reaches two, the
+earliest successfully assessed source with the greatest independent count is retained.
+Decoding or measurement failures are recorded and the next source remains eligible;
+an error is returned if no source can be assessed. Complete, clean stream discovery is
+required before source trials.
+
+This option conflicts with explicit `--audio-stream`, `--audio-channel`, and
+`--auto-channel` selections. Observations from different tracks or channels are never
+combined. The selected waveform, track metadata, container-relative timing, and measured
+events supply the trace search, curve match, metadata retries, and every decoy clock.
+`extra.media.audio_stream` and `audio_channel` identify the source.
+`extra.audio_source_selection.trials` records each attempt; a failed attempt has a null
+independent-event count and an error, while a successfully assessed silent source has zero.
+`timings.audio_source_selection_s` includes every trial's decoding and measurement.
+Later detection and measurement reuse the selected observations.
+
+Synthetic FFmpeg regressions cover a delayed antiphase aircraft track behind a silent
+first track, an already usable first source, duplicate observations, recovery after
+an invalid PCM source, and a healthy channel beside a corrupt channel. Native CLI and
+FFmpeg execution are pending while the root crate's dependencies compile. Reference/field
+replays have not been run for this option.
 
 **Jet matching is opt-in.** `--include-jets` retains known jets through archive parsing,
 cross-feed and cross-day reconciliation, trace hypotheses and confirmation, and the
@@ -2621,8 +2648,8 @@ Three synthetic regressions cover a physical competing-flight case at local and 
 timestamps, unchanged successful and unconfirmed candidates, collapsed locating pairs,
 and rejected speed, range, coverage and clock alternatives. They also require the retained
 locating matches to remain unchanged and the successful retry to be stable on another
-finalization. Native execution, the release selftest and reference/field replays remain
-unrun after the execution host disconnected during dependency compilation.
+finalization. All three new regressions and eight existing confirmer controls pass in native
+Rust. The release selftest and reference/field replays have not been run for this change.
 
 ### Retain supported fast flights despite discarded speed reports
 
@@ -2637,9 +2664,9 @@ unchanged retained geometry, restoration of both supported segments, analytic re
 controls with valid, zero or infinite speeds on retained samples.
 `corrected_speed_recovery_checks_every_retained_model` keeps the reported guard when a later
 two-knot model has speed reports or its original samples cannot be identified. Existing physical-reach
-tests continue to require rejection of unreachable segments and insufficient support. These native
-regressions and the release selftest remain unrun: the execution host disconnected during compilation
-and again after recovery. Reference, wrong-date and field-recording accuracy have not been remeasured.
+tests continue to require rejection of unreachable segments and insufficient support. Both new native
+regressions and both existing `corrected_fast_*` controls pass. The release selftest remains unrun;
+reference, wrong-date and field-recording accuracy have not been remeasured.
 
 ### Skip impossible clocks during chance-match calibration
 
@@ -2651,11 +2678,11 @@ hypothesis samples, retained scores and confidence thresholds are unchanged.
 Three `calibration_support_filter_*` regressions cover exact and adjacent floating-point
 boundaries, repeated observations, missing predictions, invalid grids and trace ordering. A physical
 comparison replays the old and filtered loops over complete, partial and gapped tracks at three
-observers and two timestamp origins, requiring bitwise-identical eligible scores. Native execution,
-the release selftest, performance timings and real-recording replays remain pending: the execution
-host became unavailable after the baseline shared-types suite passed 39 tests. An independent
-IEEE-754 arithmetic check found no excluded eligible clocks; it does not establish native execution
-or an end-to-end speed improvement.
+observers and two timestamp origins, requiring bitwise-identical eligible scores. All three native
+regressions pass. The physical partial-track fixture reduces full trace evaluations from 17,304 to
+2,018 while retaining identical eligible scores. This work-count reduction does not establish an
+end-to-end runtime improvement; performance timings, the release selftest and real-recording replays
+remain unrun.
 
 ### Keep valid live weather when its cache cannot be published
 
