@@ -123,6 +123,130 @@ fn day_dir(cache: &Path, (y, m, d): (i64, u32, u32)) -> PathBuf {
     cache.join("adsb").join(format!("{y:04}-{m:02}-{d:02}"))
 }
 
+/// Prime the ordinary day cache from complete local adsb.lol archives, without HTTP.
+/// A path names one canonical tar/split family, or a directory of release families.
+/// Only requested UTC days and enabled feeds are imported; complete processed cache
+/// hits are reused just as in `fetch_window`. Returns the number of newly ingested feeds.
+///
+/// Imports retain the full padded UTC day and raw feed reports, so later offline
+/// requests use the same cross-feed, midnight and altitude reconciliation as downloads.
+/// A failed archive never publishes a checkpoint; earlier completed imports survive.
+pub fn import_archives(
+    paths: &[PathBuf],
+    spec: &IngestSpec,
+    cache_dir: &Path,
+    opts: &FetchOptions,
+) -> Result<usize, DataError> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let days = utc_days(spec.t_start, spec.t_end);
+    let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for archive in crate::archive::local_releases(paths)? {
+        if days.contains(&archive.day)
+            && (opts.include_mlat || archive.release.feed != Feed::Mlatonly)
+        {
+            groups.entry(archive.day).or_default().push(archive);
+        }
+    }
+    if groups.is_empty() {
+        return Err(DataError(
+            "no local archives match the requested UTC days and enabled feeds".into(),
+        ));
+    }
+    let (bbox, key) = bbox_key(&spec.bbox);
+    let desired = if opts.include_mlat { "prod+mlatonly" } else { "prod" };
+    let mut imported = 0;
+    for (day, archives) in groups {
+        let label = format!("{:04}-{:02}-{:02}", day.0, day.1, day.2);
+        let dir = day_dir(cache_dir, day);
+        let context = day_context(day);
+        let sp = IngestSpec {
+            bbox,
+            t_start: context.day_start - DAY_CACHE_PAD_S,
+            t_end: context.day_start + 86_400.0 + DAY_CACHE_PAD_S,
+            keep_unknown: true,
+            ..*spec
+        };
+        if let Some((_, cached)) = find_cached(&dir, desired, &sp, &label, opts, Some(context))
+            && DayContext::from_stats(&cached.meta.stats)
+                .is_some_and(|coverage| coverage.includes(context))
+        {
+            opts.say(&format!(
+                "[adsb] {label}: complete {desired} catalogue already cached; local archives not read"
+            ));
+            continue;
+        }
+        let mut releases = Vec::new();
+        for archive in archives {
+            let rel = &archive.release;
+            let cached = match crate::raw_cache::load(&dir, rel, &sp, context) {
+                Ok(part) => part.is_some(),
+                Err(error) => {
+                    opts.say(&format!(
+                        "[adsb] WARNING {}: raw checkpoint unreadable ({error}); importing local archive",
+                        rel.tag
+                    ));
+                    false
+                }
+            };
+            if cached {
+                opts.say(&format!("[adsb] {}: reused completed raw feed", rel.tag));
+            } else {
+                opts.say(&format!(
+                    "[adsb] importing {} from local archives ({:.0} MiB)",
+                    rel.tag,
+                    mib(rel.total_bytes())
+                ));
+                let progress = |p: &IngestProgress| {
+                    opts.say(&format!(
+                        "[adsb] {}: {:.0}/{:.0} MiB, {} members, {} kept, {:.0}s",
+                        rel.tag,
+                        mib(p.bytes),
+                        mib(rel.total_bytes()),
+                        p.members,
+                        p.kept_aircraft,
+                        p.elapsed_s
+                    ));
+                };
+                let part = archive.ingest(&sp, context, &progress)
+                    .map_err(|error| DataError(format!("{}: {error}", rel.tag)))?;
+                // Unlike a streaming fetch, the caller will subsequently reload these
+                // reports. A checkpoint failure must not claim the import succeeded.
+                crate::raw_cache::save(&dir, rel, &sp, context, &part)
+                    .map_err(|error| DataError(format!("{}: saving imported feed: {error}", rel.tag)))?;
+                imported += 1;
+            }
+            releases.push(archive.release);
+        }
+        let recovered = crate::raw_cache::recovery_releases(
+            &dir, &releases, context, opts.include_mlat,
+        );
+        releases.extend(recovered);
+        if let Some((main, mlat, store)) = crate::raw_cache::rebuild_day(
+            &dir,
+            &releases,
+            &sp,
+            context,
+            opts.include_mlat,
+            None,
+            |rel, error| opts.say(&format!(
+                "[adsb] WARNING {}: completed raw feed unavailable during import assembly ({error})",
+                rel.tag
+            )),
+        ) {
+            let feedset = feedset_name(main, mlat);
+            let path = dir.join(format!("{}_{key}.fdtrk", cache_feedset(&feedset, spec.include_jets)));
+            publish_day(store, &path, &label, opts)?;
+        } else {
+            opts.say(&format!(
+                "[adsb] {label}: saved MLAT-only reports; a complete prod or staging raw feed is still needed to build a day catalogue"
+            ));
+        }
+    }
+    Ok(imported)
+}
+
 /// A conservative envelope of every report for one aircraft. Whole-aircraft selection
 /// preserves leg joins and key counters, including legs outside the final requested slice.
 #[derive(Clone, Copy)]
@@ -1533,6 +1657,139 @@ mod tests {
             for (j, (a, b)) in a.points.iter().zip(&b.points).enumerate() {
                 assert_eq!(bits(a), bits(b), "leg {i} point {j}");
             }
+        }
+    }
+
+    fn local_archive_fixture_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "fdop-local-import-{label}-{}-{nonce}", std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn local_archive_tar(day: (i64, u32, u32), feed: Feed, traces: &[(&str, String)]) -> Vec<u8> {
+        use crate::ingest::tests::{gz, tar_of};
+        let (y, m, d) = day;
+        let tag = crate::adsblol::tag_for(y, m, d, feed, 0);
+        let readme = format!(
+            "This is a database for the day of {y:04}-{m:02}-{d:02} of all aircraft known to adsb.lol.\nGitHub Release: {tag}\nOriginal Path: /var/globe_history/{y:04}/{m:02}/{d:02}\nPod of origin: planes-readsb-{}-0\n",
+            feed.tag_word(),
+        );
+        let mut members = vec![("./README.txt", readme.into_bytes())];
+        members.extend(traces.iter().map(|(name, text)| (*name, gz(text))));
+        tar_of(&members)
+    }
+
+    #[test]
+    fn local_split_archives_build_the_normal_offline_day_cache() {
+        use crate::ingest::tests::{T0, pc12_json, spec};
+        let dir = local_archive_fixture_dir("split");
+        let cache = dir.join("cache");
+        let day = (2026, 9, 8);
+        let full = spec();
+        let narrow = IngestSpec { t_start: T0 + 70_030.0, t_end: T0 + 70_035.0, ..full };
+        let opts = FetchOptions { offline: true, ..Default::default() };
+        let mut direct = Vec::new();
+        let mut tags = Vec::new();
+        let context = day_context(day);
+        let sp = IngestSpec {
+            t_start: T0 - DAY_CACHE_PAD_S, t_end: T0 + 86_400.0 + DAY_CACHE_PAD_S,
+            ..full
+        };
+        for feed in [Feed::Prod, Feed::Mlatonly] {
+            let trace = if feed == Feed::Prod { pc12_json() } else {
+                pc12_json().replace("A1B2C3", "D4E5F6").replace("PC12", "C208")
+            };
+            let bytes = local_archive_tar(day, feed, &[("trace_full_synthetic.json", trace)]);
+            let tag = crate::adsblol::tag_for(day.0, day.1, day.2, feed, 0);
+            if feed == Feed::Prod {
+                // Split through headers and compressed members, not only tar block boundaries.
+                for (i, chunk) in bytes.chunks(777).enumerate() {
+                    let suffix = format!("{}{}", char::from(b'a' + (i / 26) as u8), char::from(b'a' + (i % 26) as u8));
+                    std::fs::write(dir.join(format!("{tag}.tar.{suffix}")), chunk).unwrap();
+                }
+            } else {
+                std::fs::write(dir.join(format!("{tag}.tar")), &bytes).unwrap();
+            }
+            direct.push(ingest_day_reader(bytes.as_slice(), feed.label(), &sp, &|_| {}, context).unwrap());
+            tags.push(tag);
+        }
+        assert_eq!(import_archives(std::slice::from_ref(&dir), &narrow, &cache, &opts).unwrap(), 2);
+        let got = fetch_window(&full, &cache, &opts).unwrap();
+        let expected = merge_stores(vec![build_day_store(direct, &sp, tags, context)], DAY_JOIN_GAP_S)
+            .into_filtered(&full.bbox, full.t_start, full.t_end);
+        assert!(!expected.legs.is_empty());
+        assert_same_legs(&got.legs, &expected.legs);
+        assert_eq!(got.meta.stats["cache_hits"], 1);
+        assert!(got.meta.stats["notes"].as_array().unwrap().is_empty());
+        assert_eq!(got.legs.iter().map(|leg| &leg.icao).collect::<HashSet<_>>().len(), 2);
+        assert!(!day_dir(&cache, day).join("releases.json").exists());
+        assert!(got.n_points() > fetch_window(&narrow, &cache, &opts).unwrap().n_points());
+        assert_eq!(import_archives(std::slice::from_ref(&dir), &full, &cache, &opts).unwrap(), 0);
+
+        // Importing one UTC day cannot certify the adjoining local-date day.
+        let missing_day = IngestSpec { t_end: T0 + 86_410.0, ..full };
+        let error = fetch_window(&missing_day, &cache, &opts).unwrap_err().to_string();
+        assert!(error.contains("2026-09-09") && error.contains("offline, not cached"));
+    }
+
+    #[test]
+    fn importing_mlat_upgrades_main_reports_and_preserves_jet_policy() {
+        use crate::ingest::tests::{pc12_json, spec};
+        let dir = local_archive_fixture_dir("feeds");
+        let cache = dir.join("cache");
+        let day = (2026, 9, 8);
+        let spec = spec();
+        let opts = FetchOptions { offline: true, ..Default::default() };
+        let main = dir.join("v2026.09.08-planes-readsb-prod-0.tar");
+        let mlat = dir.join("v2026.09.08-planes-readsb-mlatonly-0.tar");
+        std::fs::write(&main, local_archive_tar(day, Feed::Prod, &[
+            ("trace_full_a1b2c3.json", pc12_json()),
+            ("trace_full_000001.json", pc12_json().replace("A1B2C3", "000001").replace("PC12", "B738")),
+        ])).unwrap();
+        std::fs::write(&mlat, local_archive_tar(day, Feed::Mlatonly, &[
+            ("trace_full_d4e5f6.json", pc12_json().replace("A1B2C3", "D4E5F6").replace("PC12", "C208")),
+        ])).unwrap();
+        assert_eq!(import_archives(std::slice::from_ref(&main), &spec, &cache, &opts).unwrap(), 1);
+        let main_only = fetch_window(&spec, &cache, &opts).unwrap();
+        assert!(main_only.meta.stats["notes"].as_array().unwrap().iter().any(|note|
+            note.as_str().unwrap().contains(NO_MLATONLY)));
+        assert_eq!(import_archives(std::slice::from_ref(&mlat), &spec, &cache, &opts).unwrap(), 1);
+        let both = fetch_window(&spec, &cache, &opts).unwrap();
+        assert!(both.n_points() > main_only.n_points());
+        assert!(both.meta.stats["notes"].as_array().unwrap().is_empty());
+        assert!(both.legs.iter().all(|leg| leg.engine != EngineClass::Jet));
+
+        let jets = IngestSpec { include_jets: true, ..spec };
+        assert!(fetch_window(&jets, &cache, &opts).is_err());
+        assert_eq!(import_archives(&[main, mlat], &jets, &cache, &opts).unwrap(), 2);
+        let expanded = fetch_window(&jets, &cache, &opts).unwrap();
+        assert!(expanded.legs.iter().any(|leg| leg.engine == EngineClass::Jet));
+        assert!(expanded.n_points() > both.n_points());
+        assert_same_legs(&fetch_window(&spec, &cache, &opts).unwrap().legs, &both.legs);
+    }
+
+    #[test]
+    fn failed_local_archives_never_publish_raw_or_processed_day_coverage() {
+        use crate::ingest::tests::{pc12_json, spec};
+        let spec = spec();
+        let opts = FetchOptions { offline: true, ..Default::default() };
+        for (label, day, missing_trailer) in [
+            ("wrong-day", (2026, 9, 9), false),
+            ("truncated", (2026, 9, 8), true),
+        ] {
+            let dir = local_archive_fixture_dir(label);
+            let cache = dir.join("cache");
+            let path = dir.join("v2026.09.08-planes-readsb-prod-0.tar");
+            let mut bytes = local_archive_tar(day, Feed::Prod, &[("trace_full_a1b2c3.json", pc12_json())]);
+            if missing_trailer { bytes.truncate(bytes.len() - 512); }
+            std::fs::write(&path, bytes).unwrap();
+            assert!(import_archives(&[path], &spec, &cache, &opts).is_err());
+            assert!(!day_dir(&cache, (2026, 9, 8)).exists());
+            assert!(fetch_window(&spec, &cache, &opts).is_err());
         }
     }
 

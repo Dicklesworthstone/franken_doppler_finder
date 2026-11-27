@@ -9,6 +9,7 @@
 //! `.fdtrk` -> [`build::merge_stores`] across days -> `TrackStore::filtered` to the window.
 
 pub mod adsblol;
+mod archive;
 pub mod build;
 pub mod fetch;
 pub mod geoid;

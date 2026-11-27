@@ -860,7 +860,7 @@ pub fn ingest_reader<R: Read + Send>(
     spec: &IngestSpec,
     progress: &(dyn Fn(&IngestProgress) + Sync),
 ) -> Result<(Vec<RawAircraft>, IngestStats), DataError> {
-    ingest_reader_inner(r, feed, spec, progress, None)
+    ingest_reader_inner(r, feed, spec, progress, None, None)
 }
 
 pub(crate) fn ingest_day_reader<R: Read + Send>(
@@ -870,7 +870,18 @@ pub(crate) fn ingest_day_reader<R: Read + Send>(
     progress: &(dyn Fn(&IngestProgress) + Sync),
     context: DayContext,
 ) -> Result<(Vec<RawAircraft>, IngestStats), DataError> {
-    ingest_reader_inner(r, feed, spec, progress, Some(context))
+    ingest_reader_inner(r, feed, spec, progress, Some(context), None)
+}
+
+pub(crate) fn ingest_local_day_reader<R: Read + Send>(
+    r: R,
+    feed: &str,
+    spec: &IngestSpec,
+    progress: &(dyn Fn(&IngestProgress) + Sync),
+    context: DayContext,
+    provenance: crate::archive::ArchiveProvenance,
+) -> Result<(Vec<RawAircraft>, IngestStats), DataError> {
+    ingest_reader_inner(r, feed, spec, progress, Some(context), Some(provenance))
 }
 
 fn ingest_reader_inner<R: Read + Send>(
@@ -879,6 +890,7 @@ fn ingest_reader_inner<R: Read + Send>(
     spec: &IngestSpec,
     progress: &(dyn Fn(&IngestProgress) + Sync),
     context: Option<DayContext>,
+    mut provenance: Option<crate::archive::ArchiveProvenance>,
 ) -> Result<(Vec<RawAircraft>, IngestStats), DataError> {
     let count = Arc::new(AtomicU64::new(0));
     let reader = CountingReader {
@@ -908,6 +920,9 @@ fn ingest_reader_inner<R: Read + Send>(
                     .path()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                if let Some(provenance) = &mut provenance {
+                    provenance.check_member(&name, e.size(), &mut e)?;
+                }
                 if !name.contains("trace_full_") {
                     continue;
                 }
@@ -926,6 +941,9 @@ fn ingest_reader_inner<R: Read + Send>(
                 }
             }
             archive.into_inner().finish_tar()?;
+            if let Some(provenance) = provenance {
+                provenance.finish()?;
+            }
             if !batch.is_empty() {
                 let _ = tx.send(batch);
             }

@@ -51,7 +51,7 @@ pub enum Cmd {
         #[arg(short, long)]
         out: PathBuf,
     },
-    /// Pre-download and cache ADS-B tracks for dates + region.
+    /// Download or import and cache ADS-B tracks for dates + region.
     Fetch(FetchCli),
     /// List past `locate` runs from the run ledger.
     Runs {
@@ -189,6 +189,9 @@ pub struct FetchCli {
     /// Extra padding around the region (km).
     #[arg(long, default_value_t = 30.0)]
     pub pad_km: f64,
+    /// Import local adsb.lol .tar / split-part archives, or a directory of them, for uncached days (repeatable).
+    #[arg(long, value_name = "PATH")]
+    pub archive: Vec<PathBuf>,
     #[command(flatten)]
     pub common: Common,
 }
@@ -416,6 +419,16 @@ fn run(cli: Cli) -> Result<i32, String> {
                 keep_unknown: true,
                 include_jets: f.common.include_jets,
             };
+            let lg = log.clone();
+            let opts = fdop_data::FetchOptions {
+                offline: f.common.offline,
+                progress: Some(std::sync::Arc::new(move |s: &str| lg.say(s))),
+                ..Default::default()
+            };
+            if !f.archive.is_empty() {
+                fdop_data::fetch::import_archives(&f.archive, &spec, &cache, &opts)
+                    .map_err(|e| format!("ADS-B archive import: {e}"))?;
+            }
             // as in `locate`: fetch the published part, name the UTC days still pending
             let (until, pending) = fdop_data::published_until(
                 spec.t_start,
@@ -447,12 +460,6 @@ fn run(cli: Cli) -> Result<i32, String> {
                 ));
                 spec.t_end = until - 1.0;
             }
-            let lg = log.clone();
-            let opts = fdop_data::FetchOptions {
-                offline: f.common.offline,
-                progress: Some(std::sync::Arc::new(move |s: &str| lg.say(s))),
-                ..Default::default()
-            };
             let st = fdop_data::fetch_window(&spec, &cache, &opts).map_err(|e| e.to_string())?;
             println!(
                 "{} legs, {} points cached under {}",
@@ -919,6 +926,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn fetch_accepts_repeatable_local_archives_without_network() {
+        let Cmd::Fetch(f) = Cli::try_parse_from([
+            "fdop", "fetch", "--dates", "2026-09-08", "--near", "NY",
+            "--archive", "downloads", "--archive", "v2026.09.08-planes-readsb-prod-0.tar.aa",
+            "--offline", "--include-jets",
+        ]).unwrap().cmd else { panic!("expected fetch") };
+        assert_eq!(f.archive, [
+            PathBuf::from("downloads"),
+            PathBuf::from("v2026.09.08-planes-readsb-prod-0.tar.aa"),
+        ]);
+        assert!(f.common.offline && f.common.include_jets);
+        assert_eq!(f.dates, "2026-09-08");
+    }
 
     #[test]
     fn jet_catalogue_is_explicit_for_locate_and_fetch() {

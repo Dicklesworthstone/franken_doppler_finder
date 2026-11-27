@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Import downloaded ADS-B archives into the offline search cache
+
+- Add repeatable `fetch --archive PATH` for whole tar archives, split-part families
+  and directories, with `--offline` support and the ordinary date/region/jet policy.
+  Stream parts without extracting or concatenating them; validate canonical names,
+  sizes, complete tar termination and the embedded release/day/feed provenance.
+- Preserve completed raw feeds and build the normal padded UTC day stores, including
+  main/MLAT reconciliation and later offline reuse without release metadata. Reuse
+  complete cache hits and retain missing-day errors and missing-feed warnings.
+- Add regressions for split/full ingestion, provenance and incomplete input,
+  ordinary offline cache reuse, wider time requests, MLAT upgrades and separate jet
+  catalogues. Native workspace tests, Clippy and release selftest remain unrun:
+  the execution host has restarted repeatedly and RCH is unavailable.
+
 ### Recover measured weather across complementary missing cell-hours
 
 - When no Open-Meteo pressure-level grid cell covers the full request, combine valid

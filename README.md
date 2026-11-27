@@ -1091,6 +1091,39 @@ Use matching aircraft flags for offline work: `fetch --include-jets` primes
 `locate --include-jets --offline`, while ordinary `fetch` primes ordinary `locate --offline`.
 The two cache populations are separate; neither silently substitutes for the other.
 
+To use adsb.lol archives already downloaded to disk:
+
+```bash
+fdop fetch --dates 2026-09-08 --near NY --archive ./downloads --offline
+```
+
+`--archive PATH` accepts a canonical release `.tar`, any member of a split
+`.tar.aa`, `.tar.ab`, ... family, or a directory containing those files. A file
+selects its matching siblings; a directory selects the families immediately inside
+it. Repeat the flag for separate files or directories. The importer streams the
+pieces in order without extracting or writing a concatenated copy. It requires a
+complete tar, consecutive nonempty parts with consistent sizes, and an embedded
+adsb.lol README whose release, UTC date and originating feed match the filenames.
+Keep the original filenames and README; renamed, ambiguous or incomplete families
+fail before they can certify day coverage.
+
+Dates still refer to the recording's local dates, while release filenames name
+**UTC days**. Supply every UTC day needed by the padded request, usually two for
+one local date. Only matching days and enabled feeds are imported. With
+`--offline`, remaining uncached days fail normally and missing MLAT-only coverage
+keeps its usual warning. Omit `--offline` to let ordinary fetch download missing
+data. Place names and other offline services still need their normal caches;
+state abbreviations and numeric regions can be resolved locally.
+
+Imports retain the full padded UTC day and the original filtered raw feed reports,
+then use the ordinary altitude, cross-feed and midnight reconciliation. A later
+`locate --offline` can use them without the original archives or a cached release
+listing. A separate MLAT-only import can upgrade a main-feed cache when its complete
+raw main feed is available; MLAT alone never certifies a day. Complete processed
+cache hits are reused, with progress explaining that their local archives were
+not read; this flag does not force replacement of existing complete catalogues.
+The same `--pad-km` and `--include-jets` considerations above apply.
+
 ### `fdop runs`: the run ledger
 
 ```bash
