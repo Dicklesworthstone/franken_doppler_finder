@@ -199,9 +199,12 @@ pub(crate) fn validate_destination(out: &Path, has_ranges: bool) -> Result<bool,
     Ok(audio_only)
 }
 
+type AudioAudit = fn(&audio::AudioProbe<'_>, &[audio::MediaInfo]) -> Result<(), String>;
+
 #[derive(Default)]
 pub(crate) struct ExportChecks {
     pub strip_video_sei: bool,
+    pub audio_audit: Option<AudioAudit>,
 }
 
 pub(crate) fn export(
@@ -376,6 +379,9 @@ pub(crate) fn export(
             return Err("export verification found a changed audio format".into());
         }
         verify_silence(staged.path(), &intervals, through_end, &staged_probe, audio)?;
+    }
+    if let Some(check) = checks.audio_audit {
+        check(&staged_probe, &audit.streams)?;
     }
     if let Some(source) = audited_source {
         source.check(&media)?;
@@ -885,6 +891,41 @@ mod tests {
         export(&media, &silent, None, &[], None, None, ExportChecks::default()).unwrap();
         assert!(export(&media, &refused, Some(&silent), &[], None, None, ExportChecks::default()).is_err());
         assert!(!refused.exists());
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn audio_publication_check_reads_the_staged_channels_before_install() {
+        // This policy checks digital silence in each channel of the *finished* file.
+        // The source always has sound, including when the second export passes.
+        fn require_silent_channels(probe: &audio::AudioProbe<'_>, streams: &[audio::MediaInfo]) -> Result<(), String> {
+            assert_eq!(streams.len(), 1);
+            let info = &streams[0];
+            assert_eq!(info.audio_codec, "alac");
+            assert_eq!(info.channels, 2);
+            for ch in 0..2 {
+                let selection = audio::AudioSelection { stream: 0, channel: Some(ch) };
+                let pcm = audio::decode_probed(probe, 0.0, None, info.sample_rate, selection)?;
+                assert_eq!(pcm.len(), 8000);
+                if pcm.iter().any(|&s| s != 0.0) {
+                    return Err(format!("sound remains in staged channel {ch}"));
+                }
+            }
+            Ok(())
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("two-channels.wav");
+        let generated = ffmpeg().args(["-f", "lavfi", "-i",
+            "aevalsrc=0|0.25*cos(2*PI*400*t):s=8000:d=1", "-c:a", "pcm_s16le"])
+            .arg(&media).output().unwrap();
+        assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+        let dest = dir.path().join("checked.m4a");
+        let apply = |span: &str| export(&media, &dest, None, &[span.parse().unwrap()],
+            None, None, ExportChecks { audio_audit: Some(require_silent_channels), ..Default::default() });
+        assert_eq!(apply("0..0.25").unwrap_err(), "sound remains in staged channel 1");
+        assert!(!dest.exists());
+        apply("0..1").unwrap();
+        assert!(audio::probe_audio_inventory(&dest).unwrap().single_audio_without_chapters);
     }
 
     fn strip_sei() -> ExportChecks {

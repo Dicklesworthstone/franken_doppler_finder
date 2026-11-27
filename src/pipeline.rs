@@ -1479,6 +1479,8 @@ struct PreparedRecording<'a> {
 pub(crate) struct AudioMeasurements {
     detections: Vec<Detection>,
     pub(crate) events: Vec<MeasuredEvent>,
+    /// A work budget or a recoverable scan error prevented a complete audio audit.
+    pub(crate) audit_limited: bool,
     added: std::collections::HashSet<String>,
     pub(crate) warnings: Vec<String>,
     detect_s: f64,
@@ -1584,6 +1586,7 @@ pub(crate) fn measure_recording(
         },
         |events| search::independent_measured_events(events, 0.0).len(),
     );
+    let mut audit_limited = det_cut > 0 || prim.len() > events.len();
     if prim.len() > events.len() {
         warnings.push(format!(
             "measured the {} strongest of {} flyover detections, reaching the limit of {max_measured} independent aircraft events; the rest neither drive nor confirm the answer, though they still count as heard",
@@ -1605,6 +1608,10 @@ pub(crate) fn measure_recording(
     // A location needs two independent passes. Preserve the observed ridges of any accepted
     // aircraft so another fit of that same sound cannot manufacture the missing second event.
     let ordinary_aircraft = search::independent_measured_events(&events, 0.0).len();
+    if ordinary_aircraft < 2 && dets.len() >= dp.max_detections {
+        audit_limited = true;
+        warnings.push("short-window recovery skipped because the detection slots are full".into());
+    }
     if ordinary_aircraft < 2 && dets.len() < dp.max_detections && remaining_candidates > 0 {
         log.say(&format!(
             "{ordinary_aircraft} independent aircraft measured; checking unclaimed recording edges, refused detections and brief interior passes with shorter surveys"
@@ -1706,6 +1713,7 @@ pub(crate) fn measure_recording(
                         |events| search::independent_measured_events(events, 0.0).len(),
                     );
                     if recovery_prim.len() > recovered_events.len() {
+                        audit_limited = true;
                         warnings.push(format!(
                         "short-window recovery measured {} of {} families, reaching the limit of {max_measured} independent aircraft events; the rest only mark passes as heard",
                         recovered_events.len(), recovery_prim.len(),
@@ -1727,6 +1735,7 @@ pub(crate) fn measure_recording(
                     added_ranks.extend(events[siblings].iter().map(|e| e.id.clone()));
                 }
                 Err(error) => {
+                    audit_limited = true;
                     warnings.push(format!(
                     "short-window recovery failed: {error}; retaining the measurements collected so far",
                 ));
@@ -1742,6 +1751,7 @@ pub(crate) fn measure_recording(
                 "short-window recovery: ordinary measurement found {ordinary_aircraft} independent aircraft; the recording's fast edges and refused detections, followed by brief fast and ordinary-speed interior passes, ordinary-speed true edges and short contrast curves through the interior and true edges as needed, supplied {recovered_count} candidates within the remaining detection budget; only accepted measured ridges and harmonic families own evidence between stages; all use the existing measurement gates and count as measured past the old line",
             ));
         }
+        audit_limited |= interior_incomplete || recovery_cut > 0;
         if interior_incomplete {
             warnings.push(
                 "short-window recovery could not confirm complete coverage within the existing candidate allowance or detection slots; other flyovers may remain undetected".into(),
@@ -1752,6 +1762,10 @@ pub(crate) fn measure_recording(
                 "short-window recovery discarded at least {recovery_cut} candidate curves at the remaining detection limit; discarded curves neither explain events nor mark passes as heard",
             ));
         }
+    }
+    if remaining_candidates == 0 {
+        audit_limited = true;
+        warnings.push("the audio detector exhausted its candidate-cell budget; additional flyovers may remain unmeasured".into());
     }
     if sibling_measurements > 0 {
         warnings.push(format!(
@@ -1806,6 +1820,7 @@ pub(crate) fn measure_recording(
         log.say(&format!("survey.png: {error}"));
     }
     Ok(AudioMeasurements {
+        audit_limited,
         detections: dets,
         events,
         added,

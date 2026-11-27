@@ -1077,6 +1077,20 @@ stops at the beginning or continues through the last native audio sample. Enter
 spans gives an error before publication. The command creates no audit directory.
 Use a finished local recording and keep it in place during the export.
 
+Add `--check-audio` to audit the encoded output before it can appear at the destination.
+It works with manual cuts, detected cuts and replacement soundtracks. For example:
+
+```bash
+fdop mute clip.mp4 --soundtrack narration.wav --check-audio --out narrated.mp4
+```
+
+The check measures the finished track's mix and every channel offline. If it finds
+a flyover, the error identifies the output view and measured time intervals. If a
+view cannot be read, a scan fails, or a detector budget prevents a complete check,
+the command withholds the file. The same budget or scan limitation appears as
+`audit_limited` in each `detect --json` view. This check adds an analysis of the
+finished audio and can take about as long as running `detect --all-audio` on it.
+
 A measured trace may cover only part of a flyover, and the detector can miss one
 entirely. Listen to the finished export and audit it again. Use manual ranges for
 cuts you choose by ear, or remove the whole soundtrack when the audio is optional.

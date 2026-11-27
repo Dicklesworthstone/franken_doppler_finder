@@ -19,6 +19,14 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Check encoded audio for remaining measured flyovers before publication
+
+- Add `mute --check-audio` for MP4 and M4A exports. The staged audio must
+  finish its offline mix and channel checks with no measured flyovers. A
+  residual observation reports its output view and recording times.
+- Expose `audit_limited` in audio audit JSON so callers can distinguish a
+  completed measurement from one constrained by work budgets or scan errors.
+
 ### Recover healthy audio beside damaged track metadata
 
 - Use recovery-specific whole-file discovery for `locate --auto-audio`, allowing errors

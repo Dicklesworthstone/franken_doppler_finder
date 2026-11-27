@@ -50,6 +50,9 @@ pub enum Cmd {
         /// Strip H.264/HEVC SEI (including in-band captions and display metadata) from the copied MP4 video.
         #[arg(long)]
         strip_video_sei: bool,
+        /// Re-audit the finished audio and publish only if every view completes with no measured flyovers.
+        #[arg(long)]
+        check_audio: bool,
         /// New .mp4 file, or an audio-only .m4a file when muting intervals.
         #[arg(short, long)]
         out: PathBuf,
@@ -372,6 +375,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             soundtrack,
             silence_range,
             silence_detected,
+            check_audio,
             strip_video_sei,
             audio_stream,
             out,
@@ -387,7 +391,13 @@ fn run(cli: Cli) -> Result<i32, String> {
                 ranges = audited_silence_ranges(&media, selected, padding)?;
             }
             crate::mute::export(&media, &out, soundtrack.as_deref(), &ranges, audio_stream, revision.as_ref(),
-                crate::mute::ExportChecks { strip_video_sei, ..Default::default() })?;
+                crate::mute::ExportChecks {
+                    strip_video_sei,
+                    audio_audit: check_audio.then_some(check_exported_audio),
+                })?;
+            if check_audio {
+                println!("Finished audio check passed: no flyovers measured in the exported audio.");
+            }
             if silence_detected.is_some() {
                 println!("Wrote {} with {} measured interval(s) muted on audio stream {selected}. Aircraft sound can extend beyond these cuts. Listen to the export before sharing.", out.display(), ranges.len());
             } else if !ranges.is_empty() {
@@ -564,6 +574,7 @@ struct AudioAuditSummary {
     audio_stream: usize,
     audio_channel: Option<usize>,
     channels_in_stream: u32,
+    audit_limited: bool,
     decoded_duration_s: f64,
     location_tag_detected: bool,
     independent_pass_count: usize,
@@ -662,6 +673,7 @@ fn measure_audio_source(
             audio_stream: selection.stream,
             audio_channel: selection.channel,
             channels_in_stream: probe.selected_info(selection)?.channels,
+            audit_limited: measured.audit_limited,
             decoded_duration_s,
             location_tag_detected,
             independent_pass_count: ids.len(),
@@ -801,6 +813,35 @@ fn audited_silence_ranges(
     Ok(ranges.into_iter().map(|r| {
         crate::mute::SilenceRange::measured(r.start_s, r.end_s, r.end_s == duration)
     }).collect())
+}
+
+/// Apply the same measurement and channel coverage as the publication audit to the
+/// staged, encoded file. Its stream IDs start at zero regardless of the source track.
+fn check_exported_audio(
+    probe: &audio::AudioProbe<'_>,
+    streams: &[audio::MediaInfo],
+) -> Result<(), String> {
+    let log = Log::new(false);
+    for info in streams {
+        for (name, view) in measure_track_views(probe, info, None, &log)? {
+            require_clear_audio_view(&name, &view)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_clear_audio_view(name: &str, view: &AudioAuditSummary) -> Result<(), String> {
+    let ranges = measured_ranges(std::iter::once(view), 0.0)?;
+    if !ranges.is_empty() {
+        let times = ranges.iter()
+            .map(|r| format!("{}..{}", r.start_s, r.end_s))
+            .collect::<Vec<_>>().join(", ");
+        return Err(format!("finished audio still contains measured flyover sound in {name} at {times} seconds; export withheld"));
+    }
+    if view.audit_limited {
+        return Err(format!("incomplete flyover check of {name} in finished audio; see measurement warnings; export withheld"));
+    }
+    Ok(())
 }
 
 fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, String> {
@@ -1248,6 +1289,20 @@ mod tests {
         assert!((ranges[0]["end_s"].as_f64().unwrap() - last - 1.0 / 4000.0).abs() < 1e-9);
         // A live export audit sees the same antiphase-only observation on the retained
         // track, applies padding on the recording clock and refuses an empty selection.
+        let checked = dir.join("checked.m4a");
+        let check_cut = |range: &str| {
+            run(Cli::try_parse_from([
+                "fdop", "mute", multi.to_str().unwrap(), "--audio-stream", "1",
+                "--silence-range", range, "--check-audio", "-o", checked.to_str().unwrap(),
+            ]).unwrap())
+        };
+        let remaining = check_cut("0..0.1").unwrap_err();
+        assert!(remaining.contains("finished audio still contains measured flyover"), "{remaining}");
+        assert!(remaining.contains("stream-0-channel-"), "{remaining}");
+        assert!(!checked.exists());
+        assert_eq!(check_cut("0..30").unwrap(), 0);
+        assert!(audio::probe_audio_inventory(&checked).unwrap().single_audio_without_chapters);
+
         let edited = dir.join("measured.m4a");
         let apply = |stream: &str, destination: &std::path::Path| {
             run(Cli::try_parse_from([
@@ -1408,6 +1463,7 @@ mod tests {
                 audio_stream: 0,
                 audio_channel: None,
                 channels_in_stream: 1,
+                audit_limited: false,
                 decoded_duration_s: 10.0,
                 location_tag_detected: false,
                 independent_pass_count: spans.len(),
@@ -1420,6 +1476,14 @@ mod tests {
             }
         }
         let views = [summary(&[]), summary(&[(6.5, 9.9), (0.5, 1.0)]), summary(&[(2.0, 3.0)])];
+        require_clear_audio_view("stream-0-mix", &views[0]).unwrap();
+        let residual = require_clear_audio_view("stream-0-channel-1", &views[1]).unwrap_err();
+        assert!(residual.contains("stream-0-channel-1") && residual.contains("0.5..1.00025"));
+
+        let mut limited = summary(&[]);
+        limited.audit_limited = true;
+        assert!(require_clear_audio_view("stream-0-mix", &limited).unwrap_err()
+            .contains("incomplete flyover check"));
         let ranges = measured_ranges(views.iter(), 1.0).unwrap();
         assert_eq!(ranges, [
             MeasuredRange { start_s: 0.0, end_s: 3.0 + 1.0 / 4000.0 + 1.0 },
