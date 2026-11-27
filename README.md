@@ -2589,6 +2589,26 @@ second weather wait; a larger footprint can require another archive download.
 
 ## Testing
 
+### Keep a qualifying confirming flight after the first choice fails its clock check
+
+A candidate could lose an additional measured aircraft when the flight with the lowest
+shared-clock trace loss failed the independent clock check, even though another flight
+passed both checks. After the original pruning leaves at least two distinct matched events,
+the search now retries only previously selected confirmers that were removed. It keeps the
+best remaining fit that also passes the existing independent-clock limit.
+
+The retry uses the same catalogue, pass exclusions, physical gates, trace coverage and
+scoring. It keeps the surviving candidate's position and recording clock fixed and cannot
+restore a candidate reduced to one event. Candidates outside the confirmation budget do
+not gain a new catalogue search, and successful original assignments keep their path.
+
+Three synthetic regressions cover a physical competing-flight case at local and Unix
+timestamps, unchanged successful and unconfirmed candidates, collapsed locating pairs,
+and rejected speed, range, coverage and clock alternatives. They also require the retained
+locating matches to remain unchanged and the successful retry to be stable on another
+finalization. Native execution, the release selftest and reference/field replays remain
+unrun after the execution host disconnected during dependency compilation.
+
 ### Retain supported fast flights despite discarded speed reports
 
 A speed attached to a rejected GNSS position could prevent separately supported, corrected-height

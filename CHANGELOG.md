@@ -19,6 +19,18 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain a clock-consistent alternative for a pruned confirmer
+
+- After ordinary clock pruning, retry a removed confirmer only when two distinct matched
+  events still support the candidate. Select the best qualifying alternative with the
+  existing independent-clock, geometry, coverage and trace gates.
+- Keep the retained position, shared clock and locating matches fixed. Preserve successful
+  original assignments, same-pass exclusions and confirmation-budget scope; do not
+  revive a candidate reduced to one event.
+- Add three physical/control regressions covering competing flights, local and Unix
+  timestamps, unchanged successful paths and rejected alternatives. Native execution,
+  release selftest and reference/field validation remain unrun after host outages.
+
 ### Skip Doppler prediction solves outside certified arrival-time support
 
 - Enclose interpolated flight positions and bound their maximum travel time using

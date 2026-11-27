@@ -3347,6 +3347,22 @@ fn best_confirmer_with_geometry(
     atmo: &dyn Atmosphere,
     exclude: &[(u32, f64)],
 ) -> Option<(f64, EventMatch, u32)> {
+    best_confirmer_with_clock_gate(geometry, t_start, ev, tix, p, atmo, exclude, false)
+}
+
+/// A retry after clock pruning uses the same catalogue and exact gates, but a
+/// lower shared-clock loss cannot displace a match whose independent clock locks.
+#[allow(clippy::too_many_arguments)]
+fn best_confirmer_with_clock_gate(
+    geometry: &mut ConfirmationGeometry<'_>,
+    t_start: f64,
+    ev: &SearchEvent,
+    tix: &TimeIndex,
+    p: &SearchParams,
+    atmo: &dyn Atmosphere,
+    exclude: &[(u32, f64)],
+    require_lock: bool,
+) -> Option<(f64, EventMatch, u32)> {
     let (o, tracks) = (geometry.observer, geometry.tracks);
     let c = p.c;
     let t_heard = t_start + ev.t_rec;
@@ -3433,11 +3449,18 @@ fn best_confirmer_with_geometry(
                 && chi.cov >= MIN_TRACE_COVERAGE
                 && best.as_ref().is_none_or(|b| chi.chi < b.0)
             {
-                best = Some((
-                    chi.chi,
-                    make_match(ev, tr, &cpa, chi, &prop, "confirmer"),
-                    ti,
-                ));
+                let mut matched = make_match(ev, tr, &cpa, chi, &prop, "confirmer");
+                if require_lock {
+                    matched.dt_free =
+                        free_clock(o, t_start, ev, tr, matched.cpa_emission_utc(), p, atmo);
+                    if !matched
+                        .dt_free
+                        .is_some_and(|dt| dt.is_finite() && dt.abs() <= lock_tol(ev))
+                    {
+                        continue;
+                    }
+                }
+                best = Some((chi.chi, matched, ti));
             }
         }
     }
@@ -4238,7 +4261,7 @@ pub fn run(inp: &SearchInputs, p: &SearchParams, progress: &(dyn Fn(&str) + Sync
     // A coincidence can lose a match at the clock check. Remove candidates that no longer
     // explain two distinct events and check every newly promoted leader before choosing it.
     let check_candidate = |cand: &mut Candidate| {
-        lock_prune(cand, &evs, tracks, p, atmo, inp.fine_dem);
+        lock_prune_with_confirmer_recovery(cand, &evs, tracks, p, atmo, inp.fine_dem, &tix);
         let o = observer(cand.lat, cand.lon, inp.fine_dem);
         cand.fit_score = fit_score(&cand.events, &evs, p.kappa);
         cand.unheard_close_passes = unheard_passes(cand, &o, tracks, &tix, heard, p, atmo);
@@ -4626,6 +4649,66 @@ fn unheard_passes(
 }
 
 /// Each event's own best clock (relative to the joint clock) at the candidate's place.
+/// An event's own preferred clock under the same fixed-clock scoring and
+/// quarter-second scan used for every locating match.
+fn free_clock(
+    o: &Obs,
+    t_start: f64,
+    ev: &SearchEvent,
+    tr: &TrackModel,
+    t_e_guess: f64,
+    p: &SearchParams,
+    atmo: &dyn Atmosphere,
+) -> Option<f64> {
+    if ev.tr_t.len() != ev.tr_f.len() || !t_start.is_finite() {
+        return None;
+    }
+    let (&first, &last) = (ev.tr_t.first()?, ev.tr_t.last()?);
+    if !first.is_finite() || !last.is_finite() {
+        return None;
+    }
+    let cpa = tr.cpa_nearest_time(o.x, t_e_guess, 30.0)?;
+    let prop = prop_for(atmo, o, tr, cpa.t_e);
+    let (lo, hi) = (t_start - 30.0, t_start + 30.0);
+    let g = RatioGrid::build(
+        tr,
+        o.x,
+        &prop,
+        lo + first - 1.0,
+        hi + last + 1.0,
+        0.2,
+        p.max_gap_s,
+    );
+    let mut best_offset = None;
+    let mut best_chi = f64::INFINITY;
+    let mut scratch = TraceScratch::default();
+    for quarter_seconds in -120..=120 {
+        let ts = t_start + f64::from(quarter_seconds) * 0.25;
+        let r = trace_chi(
+            &ev.tr_t,
+            &ev.tr_f,
+            &|tu| g.at(tu),
+            ts,
+            ev,
+            prop.source_tone_scale(cpa.vel),
+            ev.sigma_hz,
+            p.cap_sigma,
+            true,
+            &mut scratch,
+        );
+        if r.cov >= MIN_TRACE_COVERAGE
+            && r.f0.is_finite()
+            && r.rms.is_finite()
+            && r.chi.is_finite()
+            && r.chi < best_chi
+        {
+            best_chi = r.chi;
+            best_offset = Some(ts - t_start);
+        }
+    }
+    best_offset
+}
+
 fn free_clocks(
     cand: &Candidate,
     o: &Obs,
@@ -4638,55 +4721,15 @@ fn free_clocks(
         .iter()
         .zip(&cand.events)
         .map(|(&(ei, ti), m)| {
-            let ev = &evs[ei];
-            if ev.tr_t.len() != ev.tr_f.len() || !cand.t_start_utc.is_finite() {
-                return None;
-            }
-            let (&first, &last) = (ev.tr_t.first()?, ev.tr_t.last()?);
-            if !first.is_finite() || !last.is_finite() {
-                return None;
-            }
-            let tr = &tracks[ti as usize];
-            let cpa = tr.cpa_nearest_time(o.x, m.cpa_emission_utc(), 30.0)?;
-            let prop = prop_for(atmo, o, tr, cpa.t_e);
-            let (lo, hi) = (cand.t_start_utc - 30.0, cand.t_start_utc + 30.0);
-            let g = RatioGrid::build(
-                tr,
-                o.x,
-                &prop,
-                lo + first - 1.0,
-                hi + last + 1.0,
-                0.2,
-                p.max_gap_s,
-            );
-            let mut best_offset = None;
-            let mut best_chi = f64::INFINITY;
-            let mut scratch = TraceScratch::default();
-            for quarter_seconds in -120..=120 {
-                let ts = cand.t_start_utc + f64::from(quarter_seconds) * 0.25;
-                let r = trace_chi(
-                    &ev.tr_t,
-                    &ev.tr_f,
-                    &|tu| g.at(tu),
-                    ts,
-                    ev,
-                    prop.source_tone_scale(cpa.vel),
-                    ev.sigma_hz,
-                    p.cap_sigma,
-                    true,
-                    &mut scratch,
-                );
-                if r.cov >= MIN_TRACE_COVERAGE
-                    && r.f0.is_finite()
-                    && r.rms.is_finite()
-                    && r.chi.is_finite()
-                    && r.chi < best_chi
-                {
-                    best_chi = r.chi;
-                    best_offset = Some(ts - cand.t_start_utc);
-                }
-            }
-            best_offset
+            free_clock(
+                o,
+                cand.t_start_utc,
+                &evs[ei],
+                &tracks[ti as usize],
+                m.cpa_emission_utc(),
+                p,
+                atmo,
+            )
         })
         .collect()
 }
@@ -4875,6 +4918,64 @@ fn lock_prune(
             .collect();
         cand.t_start_utc = pe.t_s;
     }
+}
+
+/// Restore confirmation lost only because the initially best flight failed its
+/// independent clock. Keep the original pruning and its final shared clock; a
+/// replacement never refits that clock or revives a collapsed locating candidate.
+/// Only previously selected confirmers can retry, so candidates outside the
+/// confirmation budget do not acquire a new catalogue search here.
+fn lock_prune_with_confirmer_recovery(
+    cand: &mut Candidate,
+    evs: &[SearchEvent],
+    tracks: &[TrackModel],
+    p: &SearchParams,
+    atmo: &dyn Atmosphere,
+    dem: &dyn Elevation,
+    tix: &TimeIndex,
+) {
+    let previous: Vec<usize> = cand
+        .trk
+        .iter()
+        .zip(&cand.events)
+        .filter(|(_, matched)| matched.role == "confirmer")
+        .map(|(&(ei, _), _)| ei)
+        .collect();
+    lock_prune(cand, evs, tracks, p, atmo, dem);
+    if !has_distinct_events(cand) {
+        return;
+    }
+    let missing: Vec<usize> = previous
+        .into_iter()
+        .filter(|ei| !cand.trk.iter().any(|&(used, _)| used == *ei))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let o = observer(cand.lat, cand.lon, dem);
+    let mut geometry = ConfirmationGeometry::new(&o, tracks);
+    for ei in missing {
+        let exclude: Vec<(u32, f64)> = cand
+            .trk
+            .iter()
+            .zip(&cand.events)
+            .map(|(&(_, ti), matched)| (ti, matched.cpa_emission_utc()))
+            .collect();
+        if let Some((_, matched, ti)) = best_confirmer_with_clock_gate(
+            &mut geometry,
+            cand.t_start_utc,
+            &evs[ei],
+            tix,
+            p,
+            atmo,
+            &exclude,
+            true,
+        ) {
+            cand.events.push(matched);
+            cand.trk.push((ei, ti));
+        }
+    }
+    cand.n_explained = cand.events.len();
 }
 
 /// Score named (event id, track key) pairs at one observer point with the full search model
@@ -9133,6 +9234,344 @@ mod tests {
         assert_eq!(top.events[1].event, "e3");
         assert!(top.events.iter().all(|m| m.core));
         assert!((top.t_start_utc - true_clock).abs() < 1.0);
+    }
+
+    /// A third measured curve has two plausible archived explanations. A smooth
+    /// time-displaced flight fits slightly better at the shared clock, but only
+    /// the alternative with a small speed/range discrepancy locks to that clock.
+    /// Frequencies come from the analytic retarded-time model, not either fit.
+    fn confirmer_clock_case(epoch: f64) -> (TwoCase, Candidate) {
+        let mut case = compact_fine_grid_case(epoch, false);
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let enu = Enu::new(case.obs.0, case.obs.1, 0.0);
+        let (c, when, tone, distance) = (343.0, 700.0, 120.0, 5000.0);
+        let mut event = plain_event(tone, false);
+        event.id = "C".into();
+        event.t_rec = when + distance / c;
+        event.t_tol = 12.0;
+        event.v_gate = [72.0, 88.0];
+        event.d_gate = [4000.0, 6250.0];
+        event.f0_tol = 4.0;
+        // Measurement uncertainty is an input, within the existing measurement
+        // RMS allowance. Neither the trace nor the clock acceptance line changes.
+        event.sigma_hz = 0.6;
+        event.tr_t = (0..=240)
+            .map(|i| event.t_rec - 60.0 + i as f64 * 0.5)
+            .collect();
+        event.tr_f = event
+            .tr_t
+            .iter()
+            .map(|&t| cv_curve(t, tone, 80.0, distance, when, c))
+            .collect();
+        (event.q_t, event.q_f) = subsample(&event.tr_t, &event.tr_f, 40);
+        for (key, speed, range, heard_shift) in [
+            ("mislocked-C", 80.0, 5000.0_f64, 7.0),
+            ("locked-C", 84.0, 5200.0_f64, -2.0),
+        ] {
+            let emission = epoch + when + heard_shift + (distance - range) / c;
+            let mut track = straight_track(
+                &enu,
+                [
+                    0.0,
+                    (range * range - 1_000_000.0).sqrt(),
+                    1000.0 + MIC_HEIGHT_M,
+                ],
+                [speed, 0.0, 0.0],
+                emission,
+                emission - 300.0,
+                emission + 300.0,
+                5.0,
+            );
+            track.key = key.into();
+            case.tracks.push(track);
+        }
+        case.events.push(event);
+        case.p.duration = 1200.0;
+        let inp = SearchInputs {
+            events: case.events.clone(),
+            tracks: &case.tracks,
+            heard_times: vec![],
+            coarse_dem: &dem,
+            fine_dem: &dem,
+            atmo: &atmo,
+        };
+        let mut candidate = explain_at(
+            &inp,
+            &case.p,
+            case.obs.0,
+            case.obs.1,
+            epoch,
+            0.0,
+            &[("A".into(), "A".into()), ("B".into(), "B".into())],
+        )
+        .unwrap();
+        for matched in &mut candidate.events {
+            matched.role = "pair".into();
+        }
+        let o = observer(case.obs.0, case.obs.1, &dem);
+        let tix = TimeIndex::with_atmosphere(&case.tracks, &atmo);
+        let exclude: Vec<_> = candidate
+            .trk
+            .iter()
+            .zip(&candidate.events)
+            .map(|(&(_, ti), matched)| (ti, matched.cpa_emission_utc()))
+            .collect();
+        let (_, selected, ti) = best_confirmer(
+            &o,
+            candidate.t_start_utc,
+            &case.events[2],
+            &case.tracks,
+            &tix,
+            &case.p,
+            &atmo,
+            &exclude,
+        )
+        .unwrap();
+        assert_eq!(selected.flight, "mislocked-C");
+        candidate.events.push(selected);
+        candidate.trk.push((2, ti));
+        candidate.n_explained = candidate.events.len();
+        (case, candidate)
+    }
+
+    #[test]
+    fn pruned_confirmer_recovers_a_clock_consistent_physical_alternative() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        for epoch in [0.0, 1_788_895_000.0] {
+            let (case, candidate) = confirmer_clock_case(epoch);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let event = &case.events[2];
+            let selected = &candidate.events[2];
+            let selected_clock = free_clock(
+                &o,
+                candidate.t_start_utc,
+                event,
+                &case.tracks[2],
+                selected.cpa_emission_utc(),
+                &case.p,
+                &atmo,
+            )
+            .unwrap();
+            assert!(selected_clock > lock_tol(event));
+            assert!((selected_clock - 7.0).abs() <= 0.25);
+            // Independently query the compatible flight with the original scorer,
+            // without the retry's clock gate or either other catalogue flight.
+            let alternatives = &case.tracks[3..];
+            let alternative_index = TimeIndex::with_atmosphere(alternatives, &atmo);
+            let (_, alternative, _) = best_confirmer(
+                &o,
+                candidate.t_start_utc,
+                event,
+                alternatives,
+                &alternative_index,
+                &case.p,
+                &atmo,
+                &[],
+            )
+            .unwrap();
+            let alternative_clock = free_clock(
+                &o,
+                candidate.t_start_utc,
+                event,
+                &alternatives[0],
+                alternative.cpa_emission_utc(),
+                &case.p,
+                &atmo,
+            )
+            .unwrap();
+            assert!(selected.chi < alternative.chi && alternative.chi < 2.0);
+            assert!(alternative_clock.abs() <= 0.5);
+
+            let mut pruned = candidate.clone();
+            lock_prune(
+                &mut pruned,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                &dem,
+            );
+            assert_eq!(
+                pruned.events.len(),
+                2,
+                "the original single-choice path loses C"
+            );
+            let tix = TimeIndex::with_atmosphere(&case.tracks, &atmo);
+            let mut recovered = candidate;
+            lock_prune_with_confirmer_recovery(
+                &mut recovered,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                &dem,
+                &tix,
+            );
+            assert_eq!(recovered.n_explained, 3);
+            assert_eq!(recovered.trk, [(0, 0), (1, 1), (2, 3)]);
+            assert_eq!(
+                recovered.t_start_utc.to_bits(),
+                pruned.t_start_utc.to_bits()
+            );
+            assert_eq!((recovered.lat, recovered.lon), (pruned.lat, pruned.lon));
+            assert_eq!(
+                serde_json::to_value(&recovered.events[..2]).unwrap(),
+                serde_json::to_value(&pruned.events).unwrap(),
+                "recovery cannot refit the retained locating matches",
+            );
+            let matched = &recovered.events[2];
+            assert_eq!(matched.flight, "locked-C");
+            assert_eq!(matched.role, "confirmer");
+            assert!(matched.chi < 2.0 && matched.coverage >= MIN_TRACE_COVERAGE);
+            assert!(matched.dt_free.is_some_and(|dt| dt.abs() <= 0.5));
+            // A second finalization keeps the successful replacement unchanged.
+            let snapshot = serde_json::to_value(&recovered).unwrap();
+            lock_prune_with_confirmer_recovery(
+                &mut recovered,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                &dem,
+                &tix,
+            );
+            assert_eq!(serde_json::to_value(&recovered).unwrap(), snapshot);
+            evidence(&mut recovered.events, &[], 0);
+            assert!(
+                recovered.events[2].core,
+                "the existing thin-null core rule is satisfied"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmer_recovery_preserves_successes_and_does_not_expand_pair_search() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let (case, candidate) = confirmer_clock_case(1_788_895_000.0);
+        let o = observer(case.obs.0, case.obs.1, &dem);
+        let tix = TimeIndex::with_atmosphere(&case.tracks, &atmo);
+        let mut geometry = ConfirmationGeometry::new(&o, &case.tracks);
+        let (_, locked, ti) = best_confirmer_with_clock_gate(
+            &mut geometry,
+            candidate.t_start_utc,
+            &case.events[2],
+            &tix,
+            &case.p,
+            &atmo,
+            &[],
+            true,
+        )
+        .unwrap();
+        assert_eq!(ti, 3);
+        for mode in [
+            "already locked",
+            "not confirmed",
+            "pair role",
+            "collapsed pair",
+        ] {
+            let mut input = candidate.clone();
+            match mode {
+                "already locked" => {
+                    input.events[2] = locked.clone();
+                    input.trk[2].1 = ti;
+                }
+                "not confirmed" => {
+                    input.events.pop();
+                    input.trk.pop();
+                }
+                "pair role" => input.events[2].role = "pair".into(),
+                "collapsed pair" => {
+                    input.events.remove(0);
+                    input.trk.remove(0);
+                }
+                _ => unreachable!(),
+            }
+            input.n_explained = input.events.len();
+            let mut expected = input.clone();
+            lock_prune(
+                &mut expected,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                &dem,
+            );
+            lock_prune_with_confirmer_recovery(
+                &mut input,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                &dem,
+                &tix,
+            );
+            assert_eq!(input.trk, expected.trk, "{mode}");
+            assert_eq!(
+                serde_json::to_value(&input).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "{mode}",
+            );
+        }
+    }
+
+    #[test]
+    fn confirmer_recovery_keeps_range_speed_coverage_and_clock_gates() {
+        let dem = FlatElevation(0.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(fdop_types::atmo::Medium::still(343.0));
+        let (case, candidate) = confirmer_clock_case(0.0);
+        for rejected_by in ["speed", "range", "coverage", "clock"] {
+            let mut events = case.events.clone();
+            let mut tracks = case.tracks.clone();
+            match rejected_by {
+                "speed" => events[2].v_gate[1] = 82.0,
+                "range" => events[2].d_gate[1] = 5100.0,
+                "coverage" => {
+                    let centre = tracks[3]
+                        .cpa_near(observer(case.obs.0, case.obs.1, &dem).x, 700.0, 30.0)
+                        .unwrap()
+                        .t_e;
+                    let kept: Vec<_> = tracks[3]
+                        .t
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &t)| (t - centre).abs() <= 15.0)
+                        .map(|(i, _)| i)
+                        .collect();
+                    tracks[3].t = kept.iter().map(|&i| tracks[3].t[i]).collect();
+                    tracks[3].pos = kept.iter().map(|&i| tracks[3].pos[i]).collect();
+                    tracks[3].vel = kept.iter().map(|&i| tracks[3].vel[i]).collect();
+                }
+                "clock" => {
+                    for t in &mut tracks[3].t {
+                        *t += 8.0;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let tix = TimeIndex::with_atmosphere(&tracks, &atmo);
+            let mut expected = candidate.clone();
+            lock_prune(&mut expected, &events, &tracks, &case.p, &atmo, &dem);
+            let mut actual = candidate.clone();
+            lock_prune_with_confirmer_recovery(
+                &mut actual,
+                &events,
+                &tracks,
+                &case.p,
+                &atmo,
+                &dem,
+                &tix,
+            );
+            assert_eq!(actual.events.len(), 2, "{rejected_by}");
+            assert_eq!(actual.trk, expected.trk, "{rejected_by}");
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "{rejected_by}",
+            );
+        }
     }
 
     // The pre-index implementation is an independent oracle for greedy representative
