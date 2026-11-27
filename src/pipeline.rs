@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 pub struct LocateArgs {
     pub media: PathBuf,
     pub audio_selection: audio::AudioSelection,
+    /// Recover a single usable channel before searching, if the downmix has fewer than two aircraft.
+    pub auto_channel: bool,
     /// "YYYY-MM-DD" or "YYYY-MM-DD..YYYY-MM-DD" (local dates at the region).
     pub dates: String,
     /// Coarse region: state, "City, ST", county, ZIP, "lat,lon[,km]", "S,W,N,E", "CONUS".
@@ -1902,13 +1904,23 @@ fn locate_with_clock(
     // and requests no tiles or place names for a place nobody asked about.
     let extras = !decoy;
     // ---- inputs -------------------------------------------------------------------------
+    if a.auto_channel && a.audio_selection.channel.is_some() {
+        return Err("--auto-channel cannot be combined with --audio-channel".into());
+    }
     if !a.media.is_file() {
         return Err(format!("{}: not a file", a.media.display()));
     }
-    let (info, probe) = match recording {
+    let (mut info, probe) = match recording {
         Some(r) => (r.info.clone(), None),
         None => {
-            let probe = if a.offline {
+            let probe = if a.auto_channel {
+                if a.offline {
+                    audio::AudioProbe::for_offline_audit(&a.media)
+                } else {
+                    audio::AudioProbe::for_audit(&a.media)
+                }
+                .map(|(probe, _)| probe)
+            } else if a.offline {
                 audio::AudioProbe::open_offline(&a.media)
             } else {
                 audio::AudioProbe::open(&a.media)
@@ -1959,10 +1971,36 @@ fn locate_with_clock(
     // missing/incorrect duration tag. Decode before publication clipping; weather still
     // overlaps detection and measurement. Metadata retains both start/end conventions.
     let t = Instant::now();
-    let x = match probe {
-        Some(probe) => audio::decode_probed(&probe, 0.0, None, a.sr, a.audio_selection)?,
+    let mut x = match probe.as_ref() {
+        Some(probe) => audio::decode_probed(probe, 0.0, None, a.sr, a.audio_selection)?,
         None => Vec::new(),
     };
+    let decode_s = t.elapsed().as_secs_f64();
+    let mut channel_measurements = None;
+    let mut channel_trials = Vec::new();
+    if a.auto_channel
+        && let Some(probe) = probe.as_ref()
+    {
+        let started = Instant::now();
+        let chosen = crate::audio_source::recover_channels(probe, x, a.audio_selection, a.sr, log)?;
+        x = chosen.pcm;
+        info = chosen.info;
+        channel_measurements = Some(chosen.measurements);
+        channel_trials = chosen.trials;
+        warnings.extend(chosen.warnings);
+        // This includes every trial's measurements and additional channel decodes.
+        // The later detection/measurement stage reuses the selected observations.
+        timings.insert(
+            "audio_channel_selection_s".into(),
+            json!(started.elapsed().as_secs_f64()),
+        );
+        log.say(&format!(
+            "selected audio stream {}, channel {} for the flight search",
+            info.audio_stream,
+            info.audio_channel
+                .map_or_else(|| "mix".into(), |c| c.to_string()),
+        ));
+    }
     let dur = recording.map_or_else(|| x.len() as f64 / a.sr as f64, |r| r.duration_s);
     let low_band = match recording {
         Some(r) => r.low_band_warning.map(str::to_owned),
@@ -1974,7 +2012,7 @@ fn locate_with_clock(
         timings.insert("decode_s".into(), json!(0.0));
     } else {
         log.say(&format!("decoded {:.1} s at {} Hz", dur, a.sr));
-        timings.insert("decode_s".into(), json!(t.elapsed().as_secs_f64()));
+        timings.insert("decode_s".into(), json!(decode_s));
     }
     let metadata_window = if given_start.is_none() && !a.ignore_metadata_time {
         media_metadata_start_window(full_window, &info, dur, a.clock_tol_s)
@@ -2061,9 +2099,27 @@ fn locate_with_clock(
     let curve_image_s = t.elapsed().as_secs_f64();
     // ---- detection and measurement: one immutable observation set for every clock ---------
     let measured;
-    let measurements = match recording {
-        Some(r) => r.measurements,
-        None => {
+    let measurements = match (recording, channel_measurements.as_ref()) {
+        (Some(r), _) => r.measurements,
+        (None, Some(measurements)) => {
+            if extras {
+                let rendered =
+                    detect::survey(&x, a.sr, &DetectParams::default()).and_then(|(ls, lin)| {
+                        survey_png(
+                            &ls,
+                            &lin,
+                            &measurements.detections,
+                            &measurements.events,
+                            &run_dir.join("survey.png"),
+                        )
+                    });
+                if let Err(error) = rendered {
+                    log.say(&format!("survey.png: {error}"));
+                }
+            }
+            measurements
+        }
+        (None, None) => {
             let survey_path = run_dir.join("survey.png");
             measured = measure_recording(&x, a.sr, log, extras.then_some(survey_path.as_path()))?;
             &measured
@@ -2073,7 +2129,7 @@ fn locate_with_clock(
     warnings.extend(measurements.warnings.iter().cloned());
     timings.insert(
         "detect_s".into(),
-        json!(if recording.is_some() {
+        json!(if recording.is_some() || channel_measurements.is_some() {
             0.0
         } else {
             measurements.detect_s
@@ -2081,7 +2137,7 @@ fn locate_with_clock(
     );
     timings.insert(
         "measure_s".into(),
-        json!(if recording.is_some() {
+        json!(if recording.is_some() || channel_measurements.is_some() {
             0.0
         } else {
             measurements.measure_s
@@ -3213,6 +3269,12 @@ fn locate_with_clock(
         })),
         "log": log.lines(),
     });
+    if a.auto_channel {
+        report.extra["audio_channel_selection"] = json!({
+            "trials": channel_trials,
+            "analysis_reused": recording.is_some(),
+        });
+    }
     publish_report(&run_dir, &report)?;
     log.say(&format!("report: {}", run_dir.join("report.html").display()));
     Ok(LocateOutcome {
@@ -4619,6 +4681,7 @@ mod tests {
         LocateArgs {
             media: dir.join("recording.mka"),
             audio_selection: audio::AudioSelection::default(),
+            auto_channel: false,
             dates: "2026-09-07..2026-09-09".into(),
             near: "40.8765,-73.5250,20".into(),
             out: Some(dir.join("run")),

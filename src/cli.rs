@@ -118,6 +118,9 @@ impl AudioCli {
 pub struct LocateCli {
     /// Audio or video file (anything ffmpeg reads).
     pub media: PathBuf,
+    /// Try individual channels when the selected track's mono mix has fewer than two measured aircraft.
+    #[arg(long, conflicts_with = "audio_channel")]
+    pub auto_channel: bool,
     /// Local date(s) of the recording: YYYY-MM-DD, or a range YYYY-MM-DD..YYYY-MM-DD (also "D0 to D1" or "D0,D1"; YYYY/MM/DD and YYYYMMDD work too). At most 15 days.
     #[arg(long)]
     pub dates: String,
@@ -241,6 +244,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             let args = LocateArgs {
                 media: l.media.clone(),
                 audio_selection: l.audio.selection(),
+                auto_channel: l.auto_channel,
                 dates: l.dates.clone(),
                 near: l.near.clone(),
                 out: l.out.clone(),
@@ -1413,6 +1417,37 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn automatic_channel_recovery_is_explicit_and_keeps_track_selection() {
+        let mut args = vec![
+            "fdop",
+            "locate",
+            "clip.mkv",
+            "--dates",
+            "2026-09-08",
+            "--near",
+            "NY",
+        ];
+        let Cmd::Locate(default) = Cli::try_parse_from(&args).unwrap().cmd else {
+            panic!("expected locate");
+        };
+        assert!(!default.auto_channel);
+        args.extend(["--auto-channel", "--audio-stream", "1"]);
+        let Cmd::Locate(selected) = Cli::try_parse_from(&args).unwrap().cmd else {
+            panic!("expected locate");
+        };
+        assert!(selected.auto_channel);
+        assert_eq!(
+            selected.audio.selection(),
+            AudioSelection {
+                stream: 1,
+                channel: None
+            }
+        );
+        args.extend(["--audio-channel", "0"]);
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]

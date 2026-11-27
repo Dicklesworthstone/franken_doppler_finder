@@ -19,6 +19,18 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover aircraft canceled by an audio track's mono mix
+
+- Add opt-in `locate --auto-channel`, scoped to the selected audio stream. Keep an
+  already usable downmix; otherwise select one original channel using independent
+  acoustic measurements before searching flights. Reuse that source for the curve
+  match, metadata retries and decoy clocks, with the existing evidence gates and caps.
+- Report source trials and failures, preserve the recording clock, and never combine
+  duplicate observations from different channels into extra aircraft.
+- Add CLI coverage and synthetic float-PCM media regressions for two canceled aircraft,
+  one duplicated aircraft and an already usable downmix. Native tests, release selftest
+  and reference/field replays remain unrun while the build environment is unavailable.
+
 ### Recover supported flight segments beside discarded speed reports
 
 - Decide missing-speed eligibility from all retained preferred track samples, so a speed

@@ -804,6 +804,7 @@ much later than the video. Ordinary compressed audio retains its original decode
 | `<MEDIA>` | required | Audio or video file, anything ffmpeg reads |
 | `--audio-stream <N>` | `0` | Audio track to analyse, counted from 0 among audio streams |
 | `--audio-channel <N>` | mono mix | One channel of that audio track, counted from 0; avoids mixing other microphone channels |
+| `--auto-channel` | off | If the selected track's mono mix has fewer than two independent measured aircraft, try its channels in order and select one source before the flight search |
 | `--dates <D>` | required | Local date(s) of the recording: `YYYY-MM-DD` or `YYYY-MM-DD..YYYY-MM-DD` (also `D0 to D1`, `D0,D1`, `YYYY/MM/DD`, `YYYYMMDD`). The year comes first: `09/08/2026` is refused as ambiguous. At most 15 days |
 | `--near <REGION>` | required | Coarse US region; see [Region syntax](#region-syntax) |
 | `-o, --out <DIR>` | `fdop_runs/<name>_<unix time>` | New or empty output directory |
@@ -823,7 +824,28 @@ fdop locate clip.m4a --dates 2026-09-08 --near CONUS --json > result.json
 fdop locate clip.m4a --dates 2026-09-08 --near NY --offline        # cached data only
 fdop locate clip.mov --dates 2026-09-08 --near NY --audio-stream 1 --audio-channel 0
 fdop locate clip.wav --dates 2026-09-08 --near NY --include-jets
+fdop locate clip.mov --dates 2026-09-08 --near NY --audio-stream 1 --auto-channel
 ```
+
+**Automatic channel recovery is opt-in.** `--auto-channel` addresses aircraft tones canceled
+or masked by a track's mono mix. It measures the mix first and keeps it when two independent
+aircraft are already available. Otherwise it tries the original channels in order and stops
+at the first one with two independent measured aircraft. If none reaches two, it retains a
+channel only when its independent count improves on the previous source; ties keep the
+earlier source. It stays within the selected `--audio-stream` and conflicts with an explicit
+`--audio-channel`.
+
+Selection uses the existing acoustic measurement and independence rules before any flight
+search. It never pools observations across channels. The chosen source supplies the trace
+search, curve match, metadata retries and all decoy clocks, on its original recording
+timeline. The report's `extra.media.audio_channel` identifies the choice;
+`extra.audio_channel_selection.trials` records each attempted source, its independent-event
+count and any decoding or measurement error. A changed source or failed trial adds a warning.
+`timings.audio_channel_selection_s` includes all trial measurements and additional decodes;
+the later `detect_s` and `measure_s` are zero because those stages reuse the selected
+measurements. This can take longer than one explicitly selected channel. Synthetic
+regressions cover canceled aircraft, duplicate observations and an already usable downmix;
+native tests and reference/field replays for this option have not yet run.
 
 **Jet matching is opt-in.** `--include-jets` retains known jets through archive parsing,
 cross-feed and cross-day reconciliation, trace hypotheses and confirmation, and the

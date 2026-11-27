@@ -8,6 +8,7 @@
 //! scoring, confirmers, unheard close passes) -> 25 m refinement and chi-square radius ->
 //! reverse geocode -> report and map.
 
+mod audio_source;
 pub mod cli;
 pub mod doctor;
 pub mod ledger;
