@@ -860,8 +860,11 @@ each track's mono mix, then its individual channels when needed, in container or
 The first source with at least two independent aircraft wins. If none reaches two, the
 earliest successfully assessed source with the greatest independent count is retained.
 Decoding or measurement failures are recorded and the next source remains eligible;
-an error is returned if no source can be assessed. Complete, clean stream discovery is
-required before source trials.
+an error is returned if no source can be assessed. Errors from a damaged or unsupported
+ancillary track during probing do not prevent trying another usable audio track. Unknown
+channel counts are resolved by each source's decode. If a failed mix has already revealed
+additional channels, those channels remain available for individual recovery. Publication
+audits keep their existing strict discovery and decoding requirements.
 
 This option conflicts with explicit `--audio-stream`, `--audio-channel`, and
 `--auto-channel` selections. Observations from different tracks or channels are never
@@ -875,9 +878,20 @@ Later detection and measurement reuse the selected observations.
 
 Synthetic FFmpeg regressions cover a delayed antiphase aircraft track behind a silent
 first track, an already usable first source, duplicate observations, recovery after
-an invalid PCM source, and a healthy channel beside a corrupt channel. Native CLI and
-FFmpeg execution are pending while the root crate's dependencies compile. Reference/field
-replays have not been run for this option.
+an invalid PCM source, a healthy channel beside a corrupt channel, and damaged codec
+metadata on either the first or a later track. Core regressions also check unknown source
+metadata, discovered channels retained after a failed mix, and rejection of missing or
+invalid decoded layouts. Native validation results are recorded in the changelog;
+reference/field replays have not been run for this option.
+
+The existing detector can remain sensitive to a short recording's boundaries. In one
+30-second synthetic fast/weak pair, a five-second zero prefix reduced independent measured
+aircraft from two to one even though decoded PCM and container timing were exact. The
+missing pass and the cause of this change have not been isolated. Source selection retains
+one assessed view and reports its measured support; it cannot restore a pass the measurement
+pipeline does not accept. The delayed-source positive test uses two clearly audible,
+ordinary-speed interior passes to test source and clock recovery separately. That revised
+fixture still needs native execution after the execution host became unavailable.
 
 **Jet matching is opt-in.** `--include-jets` retains known jets through archive parsing,
 cross-feed and cross-day reconciliation, trace hypotheses and confirmation, and the

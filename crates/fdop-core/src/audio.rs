@@ -121,6 +121,40 @@ impl<'a> AudioProbe<'a> {
         Self::audit(path, InputAccess::Offline)
     }
 
+    /// Discover recoverable sources without requiring every ancillary stream to decode.
+    /// Each downmix still has to complete decoding and measurement before it can be used.
+    /// Publication audits retain their separate strict inventory and clean-probe checks.
+    pub fn for_recovery(path: &'a Path) -> Result<(Self, usize), String> {
+        Self::read(path, false, InputAccess::Default)?.recovery()
+    }
+
+    /// Discover recoverable sources with the same local-only policy as offline decoding.
+    pub fn for_offline_recovery(path: &'a Path) -> Result<(Self, usize), String> {
+        Self::read(path, false, InputAccess::Offline)?.recovery()
+    }
+
+    fn recovery(mut self) -> Result<(Self, usize), String> {
+        let streams = self.complete["streams"]
+            .as_array()
+            .ok_or("ffprobe returned no stream inventory")?;
+        // Unknown widths belong to individual source trials. A full downmix observes
+        // its actual layouts; a broken unrelated stream cannot suppress a healthy one.
+        self.audit_widths = streams
+            .iter()
+            .filter(|stream| stream["codec_type"] == "audio")
+            .map(|stream| {
+                Cell::new(
+                    stream["channels"]
+                        .as_u64()
+                        .and_then(|channels| u32::try_from(channels).ok())
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
+        let count = self.audit_widths.len();
+        Ok((self, count))
+    }
+
     fn audit(path: &'a Path, access: InputAccess) -> Result<(Self, AudioInventory), String> {
         let mut probe = Self::read(path, true, access)?;
         let inventory = audit_inventory(path, &probe.complete)?;
@@ -595,7 +629,11 @@ fn read_audit_log(input: impl Read) -> io::Result<(String, u32)> {
     Ok((String::from_utf8_lossy(&errors).trim().to_owned(), width))
 }
 
-fn decode_command(mut cmd: Command, observe_layouts: bool) -> Result<(Vec<f32>, u32), String> {
+fn decode_command(
+    mut cmd: Command,
+    observed_width: Option<&Cell<u32>>,
+) -> Result<(Vec<f32>, u32), String> {
+    let observe_layouts = observed_width.is_some();
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -632,6 +670,15 @@ fn decode_command(mut cmd: Command, observe_layouts: bool) -> Result<(Vec<f32>, 
         .join()
         .map_err(|_| "ffmpeg error reader panicked".to_string())?
         .map_err(|e| format!("ffmpeg error output: {e}"))?;
+    if let Some(slot) = observed_width
+        && width > 0
+    {
+        // A failed downmix may already have revealed a healthy additional channel.
+        // Retain validated layouts before returning the PCM/status error, without
+        // shrinking a known width based on an incomplete decode. Successful callers
+        // replace this with the exact widest layout from their completed audit.
+        slot.set(slot.get().max(width));
+    }
     let samples = samples.map_err(|e| {
         if errors.is_empty() {
             format!("ffmpeg PCM output: {e}")
@@ -770,7 +817,7 @@ pub fn decode_probed(
         cmd.args(["-t", &format!("{d:.3}")]);
     }
     cmd.args(["-f", "f32le", "-"]);
-    let (samples, width) = decode_command(cmd, audit_width.is_some()).map_err(|error| {
+    let (samples, width) = decode_command(cmd, audit_width).map_err(|error| {
         if error.contains("fdop_normalized")
             && (error.contains("Invalid stream specifier") || error.contains("matches no streams"))
         {
@@ -796,6 +843,116 @@ mod tests {
             let args: Vec<_> = offline.get_args().filter_map(|arg| arg.to_str()).collect();
             assert_eq!(args, ["-protocol_whitelist", "file,crypto,data"]);
             assert_eq!(InputAccess::Default.command(program).get_args().count(), 0);
+        }
+    }
+
+    fn recovery_test_probe(complete: serde_json::Value) -> (AudioProbe<'static>, usize) {
+        AudioProbe {
+            path: Path::new("recoverable.mkv"),
+            complete,
+            ordinary: OnceCell::new(),
+            audit_widths: Vec::new(),
+            access: InputAccess::Offline,
+        }
+        .recovery()
+        .unwrap()
+    }
+
+    #[test]
+    fn recovery_inventory_keeps_unknown_sources_out_of_healthy_trials() {
+        let doc = serde_json::json!({
+            "format": {"format_name": "matroska", "nb_streams": 3},
+            "streams": [
+                {"codec_type": "audio", "channels": "unknown", "sample_rate": "unknown"},
+                {"codec_type": "audio", "channels": 2, "sample_rate": "48000"},
+                {"codec_type": "unknown"}
+            ]
+        });
+        let path = Path::new("recoverable.mkv");
+        assert!(audit_inventory(path, &doc).is_err());
+        assert!(all_stream_info(path, &doc).is_err());
+        let (probe, count) = recovery_test_probe(doc);
+        assert_eq!(count, 2);
+        assert!(matches!(probe.access, InputAccess::Offline));
+        let first = probe.selected_info(AudioSelection::default()).unwrap();
+        assert_eq!((first.channels, first.sample_rate), (0, 0));
+        assert!(
+            probe
+                .selected_info(AudioSelection {
+                    stream: 0,
+                    channel: Some(0)
+                })
+                .is_err()
+        );
+        let healthy = probe
+            .selected_info(AudioSelection {
+                stream: 1,
+                channel: Some(1),
+            })
+            .unwrap();
+        assert_eq!((healthy.channels, healthy.sample_rate), (2, 48_000));
+        assert_eq!(healthy.audio_stream, 1);
+        assert_eq!(
+            probe.audit_widths.iter().map(Cell::get).collect::<Vec<_>>(),
+            [0, 2]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_retains_observed_width_after_failed_pcm_or_decoder_status() {
+        for (known, bytes, status, expected, diagnostic) in [
+            (1, "\\000\\000\\300\\177", 0, 3, "non-finite decoded PCM"),
+            (4, "\\000\\000\\000\\000", 7, 4, "ffmpeg decode failed"),
+        ] {
+            let (probe, _) = recovery_test_probe(serde_json::json!({
+                "streams": [{"codec_type": "audio", "channels": known}]
+            }));
+            let slot = &probe.audit_widths[0];
+            let script = format!(
+                "printf '%s\\n' '[ashowinfo@fdop_layout @ 0x1] [info] n:0 pts:0 channels:3' >&2; printf '{bytes}'; exit {status}"
+            );
+            let mut command = Command::new("sh");
+            command.args(["-c", &script]);
+            let error = decode_command(command, Some(slot)).unwrap_err();
+            assert!(error.contains(diagnostic), "{error}");
+            assert_eq!(slot.get(), expected);
+            assert!(
+                probe
+                    .selected_info(AudioSelection {
+                        stream: 0,
+                        channel: Some(expected as usize - 1),
+                    })
+                    .is_ok()
+            );
+            assert!(
+                probe
+                    .selected_info(AudioSelection {
+                        stream: 0,
+                        channel: Some(expected as usize),
+                    })
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_never_accepts_absent_or_invalid_layout_audits() {
+        for layout in [
+            "",
+            "[ashowinfo@fdop_layout @ 0x1] [info] n:0 pts:0 channels:unknown",
+        ] {
+            let slot = Cell::new(1);
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "printf '%s\\n' \"$1\" >&2; printf '\\000\\000\\000\\000'",
+                "fdop-layout-control",
+                layout,
+            ]);
+            assert!(decode_command(command, Some(&slot)).is_err());
+            assert_eq!(slot.get(), 1);
         }
     }
 
@@ -1014,7 +1171,7 @@ mod tests {
         };
         let expected = command().output().unwrap();
         assert!(expected.status.success());
-        let actual = decode_command(command(), false).unwrap().0;
+        let actual = decode_command(command(), None).unwrap().0;
         assert_eq!(actual.len() * 4, expected.stdout.len());
         assert!(
             actual
@@ -1035,7 +1192,7 @@ mod tests {
             "f32le",
             "-",
         ]);
-        let error = decode_command(invalid, false).unwrap_err();
+        let error = decode_command(invalid, None).unwrap_err();
         assert!(error.contains("ffmpeg decode failed"), "{error}");
         assert!(error.contains("fdop_filter_that_does_not_exist"), "{error}");
     }

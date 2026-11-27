@@ -295,6 +295,38 @@ mod tests {
             .collect()
     }
 
+    // Keep source/timestamp recovery independent of the compact fast-edge fixture's
+    // recovery boundaries: both ordinary-speed passes have clear interior flanks.
+    fn clear_two_aircraft_recording() -> Vec<f32> {
+        let mut seed = 4242_u64;
+        (0..65 * 4000)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let t = i as f64 / 4000.0;
+                let mut sample = 0.08 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0)
+                    + 0.01 * (std::f64::consts::TAU * 250.0 * t).sin();
+                for (tone, speed, distance, heard) in [
+                    (83.0, 88.0, 1000.0, 20.13),
+                    (450.0, 96.0, 1100.0, 44.37),
+                ] {
+                    let tau = physics::retarded_tau(
+                        t,
+                        heard - distance / 343.0,
+                        speed,
+                        distance,
+                        343.0,
+                    );
+                    let range = physics::cv_radial(tau, speed, distance).0;
+                    sample += 0.30 * distance / range
+                        * (std::f64::consts::TAU * tone * tau).sin();
+                }
+                sample as f32
+            })
+            .collect()
+    }
+
     fn stereo_wav(path: &Path, samples: &[f32], antiphase: bool) {
         stereo_wav_other_channel(
             path,
@@ -342,6 +374,7 @@ mod tests {
     }
 
     fn two_track_media(path: &Path, first: &Path, second: &Path, delay_s: u32) {
+        // NUT preserves per-track creation tags; FFmpeg drops them in Matroska and MOV.
         let encoded = std::process::Command::new("ffmpeg")
             .args(["-nostdin", "-v", "error", "-i"])
             .arg(first)
@@ -379,8 +412,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("silent.wav");
         let second = dir.path().join("aircraft.wav");
-        let path = dir.path().join("multitrack.mka");
-        let samples = recording(true);
+        let path = dir.path().join("multitrack.nut");
+        let samples = clear_two_aircraft_recording();
         stereo_wav(&first, &vec![0.0; samples.len()], false);
         stereo_wav(&second, &samples, true);
         two_track_media(&path, &first, &second, 5);
@@ -419,7 +452,7 @@ mod tests {
         assert!(result.trials.iter().all(|trial| trial.error.is_none()));
         let events = search::independent_measured_events(&result.measurements.events, 0.0);
         assert_eq!(events.len(), 2);
-        for (tone, heard) in [(83.0, 24.37), (450.0, 14.13)] {
+        for (tone, heard) in [(83.0, 25.13), (450.0, 49.37)] {
             let event = events
                 .iter()
                 .find(|event| (event.f0 - tone).abs() < 0.3)
@@ -437,7 +470,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.wav");
         let second = dir.path().join("second.wav");
-        let path = dir.path().join("multitrack.mka");
+        let path = dir.path().join("multitrack.nut");
         let samples = recording(true);
         stereo_wav(&first, &samples, false);
         stereo_wav(&second, &samples, true);
@@ -534,6 +567,83 @@ mod tests {
             search::independent_measured_events(&result.measurements.events, 0.0).len(),
             2
         );
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg 7.1+ and ffprobe"]
+    fn automatic_audio_recovery_keeps_healthy_tracks_despite_probe_decode_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.wav");
+        let second = dir.path().join("second.wav");
+        let samples = recording(true);
+        stereo_wav(&first, &samples, false);
+        stereo_wav(&second, &samples, false);
+        for damaged in [0, 1] {
+            let path = dir.path().join(format!("damaged-track-{damaged}.mka"));
+            two_track_media(&path, &first, &second, 0);
+            // Change one track's codec declaration without touching its packets,
+            // offsets, sibling audio or metadata. The invalid AAC packets make
+            // FFprobe report decoder errors while the healthy PCM track remains usable.
+            let mut bytes = std::fs::read(&path).unwrap();
+            let codec = b"A_PCM/FLOAT/IEEE";
+            let offset = bytes
+                .windows(codec.len())
+                .enumerate()
+                .filter_map(|(i, value)| (value == codec).then_some(i))
+                .nth(damaged)
+                .expect("both PCM track headers must be present");
+            let mut invalid = [0; 16];
+            invalid[..5].copy_from_slice(b"A_AAC");
+            bytes[offset..offset + codec.len()].copy_from_slice(&invalid);
+            std::fs::write(&path, bytes).unwrap();
+            assert!(AudioProbe::for_offline_audit(&path).is_err());
+
+            let reference = AudioProbe::open_offline(&path).unwrap();
+            let expected = audio::decode_probed(
+                &reference,
+                0.0,
+                None,
+                4000,
+                AudioSelection {
+                    stream: 1 - damaged,
+                    channel: None,
+                },
+            )
+            .unwrap();
+            let (probe, streams) = AudioProbe::for_offline_recovery(&path).unwrap();
+            assert_eq!(streams, 2);
+            // The pipeline's initial default metadata read must not suppress the
+            // later per-source recovery, even when the first source is damaged.
+            assert!(probe.selected_info(AudioSelection::default()).is_ok());
+            let result = recover_audio(&probe, streams, 4000, &Log::new(true)).unwrap();
+            assert_eq!(result.info.audio_stream, 1 - damaged);
+            assert_eq!(result.info.audio_channel, None);
+            assert_eq!(result.pcm, expected);
+            assert_eq!(result.pcm.len(), samples.len());
+            assert_eq!(
+                search::independent_measured_events(&result.measurements.events, 0.0).len(),
+                2
+            );
+            if damaged == 0 {
+                assert!(result.trials.len() >= 2);
+                let (accepted, failed) = result.trials.split_last().unwrap();
+                assert!(failed.iter().all(|trial| {
+                    trial.audio_stream == 0
+                        && trial.error.is_some()
+                        && trial.independent_events.is_none()
+                }));
+                assert_eq!((accepted.audio_stream, accepted.audio_channel), (1, None));
+                assert_eq!(accepted.independent_events, Some(2));
+                assert!(accepted.error.is_none());
+            } else {
+                assert_eq!(
+                    result.trials.len(),
+                    1,
+                    "a healthy first source still keeps priority"
+                );
+                assert!(result.trials[0].error.is_none());
+            }
+        }
     }
 
     #[test]

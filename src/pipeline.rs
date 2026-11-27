@@ -1921,7 +1921,13 @@ fn locate_with_clock(
     let (mut info, probe, audio_streams) = match recording {
         Some(r) => (r.info.clone(), None, 0),
         None => {
-            let (probe, streams) = if a.auto_channel || a.auto_audio {
+            let (probe, streams) = if a.auto_audio {
+                if a.offline {
+                    audio::AudioProbe::for_offline_recovery(&a.media)
+                } else {
+                    audio::AudioProbe::for_recovery(&a.media)
+                }?
+            } else if a.auto_channel {
                 let (probe, inventory) = if a.offline {
                     audio::AudioProbe::for_offline_audit(&a.media)
                 } else {

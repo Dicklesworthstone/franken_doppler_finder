@@ -19,6 +19,34 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover healthy audio beside damaged track metadata
+
+- Use recovery-specific whole-file discovery for `locate --auto-audio`, allowing errors
+  from ancillary tracks and unknown channel counts to remain individual source failures.
+  Each accepted source must still complete decoding and measurement. Publication audits
+  retain their strict inventory, layout and decode checks.
+- Retain validated channel layouts observed before a downmix fails, so a later healthy
+  channel can still be tried. Partial failed decoding cannot shrink the known channel
+  count, and invalid PCM or decoder status still fails its trial.
+- Add a real FFmpeg regression for damaged codec declarations on the first or later
+  track, plus controls for unknown metadata, failed PCM/status and missing/invalid layouts.
+  Use NUT for the two per-track-clock fixtures because the tested FFmpeg muxers omit
+  those stream creation tags from Matroska and MOV.
+- The final production core library builds. Focused native harnesses compile the actual
+  decoder and source-selection modules, verbatim measurement/rendering functions, and
+  the Locate argument definitions. Three new decoder tests, the existing streamed-FFmpeg
+  control, the new CLI conflict test and five source-recovery tests pass with FFmpeg 7.1.5.
+  These are source-level checks, not a completed root/workspace test run.
+- The original short fast/weak pair loses one measured pass after a five-second zero prefix,
+  despite exact PCM and recording time; the missing pass and cause remain unidentified.
+  Keep that fixture unchanged for the other controls, and separate the delayed-source
+  positive test with two clear interior ordinary-speed passes and the same strict source,
+  sample, clock and two-aircraft assertions. This revised fixture is unrun after the host
+  became unavailable. No detector or confidence threshold changed.
+- Existing channel-control reruns, Clippy, workspace tests, the release CLI selftest and
+  field replays remain incomplete. The repository-wide formatting check reports differences
+  in 21 files; no broad formatting cleanup was mixed into the feature.
+
 ### Keep measured harmonic tails inside automatic audio edits
 
 - The audit and `mute --silence-detected` include the observed span of every
@@ -37,8 +65,9 @@ at that commit, not per-change commits.
 - Preserve explicit source selection and existing `--auto-channel` behavior. Add synthetic
   multitrack regressions for delayed canceled aircraft, usable first tracks, duplicate
   passes, an invalid PCM source and a healthy channel beside a corrupt channel. Native CLI
-  and FFmpeg tests are pending dependency compilation; field validation remains unrun.
-  Complete, clean stream discovery is currently required before trying sources.
+  and FFmpeg validation results are recorded in the recovery follow-up; field
+  validation remains unrun.
+  Recovery-specific discovery also permits healthy tracks beside damaged ancillary metadata.
 
 ### Strip embedded captions and other SEI from H.264 and HEVC video exports
 
