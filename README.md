@@ -2290,6 +2290,14 @@ last prepared worker batch still require work. Hypothesis clouds are released be
 and fine-grid input seeds before confirmation and refinement. Already checked survivors remain
 eligible for later stages, with an incomplete-comparison warning when the join was cut.
 
+If the quick trace has too few supported observations to score any recording clock, the search
+also checks each distinct clock implied by the assigned aircraft's closest approach against the
+full retained traces. This recovers dense observed ridges whose sparse tails dominate the quick
+time-uniform sample. Every recovered pair must pass the existing fine trace and 60% coverage
+gates before entering the fine stage. Scorable quick searches keep their original result; the
+fallback adds at most three full-trace evaluations for a pair, including restoring the winner.
+It does not expand the retained trace sample or establish complete recovery for uneven coverage.
+
 A rejected representative no longer discards its entire 600 m / 20 s flight-pair cell. After
 all original event-pair passes finish without a cut, a recovery pass tries
 other compatible seeds in rejected cells. Successful first representatives keep their cells;
@@ -2477,6 +2485,18 @@ second weather wait; a larger footprint can require another archive download.
 ---
 
 ## Testing
+
+### Keep dense observed ridges eligible when quick samples miss their flight support
+
+`quick_clock_retains_dense_physical_ridges_with_sparse_tails` synthesizes two flight trajectories
+at local and Unix epochs. Each observed trace has 81 central points and 40 sparse tail points.
+The retained ADS-B segments support more than 60% of the full trace, but the quick sample keeps
+only four supported points and cannot fit a tone. The regression follows recovery through the
+quick check, exact trace scoring and a two-aircraft fine candidate, and rejects a control with
+insufficient full-trace coverage. `quick_clock_recovery_preserves_successes_and_bounds_full_trace_work`
+checks unchanged successful scans, duplicate/invalid seed handling and the additional work bound.
+These are synthetic checks; reference, wrong-date and field-recording grades have not been replayed
+for this change.
 
 ### Keep weather-supported fast passes in the curve match
 

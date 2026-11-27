@@ -2462,13 +2462,13 @@ fn eval_point_weighted(
     let mut scratch = TraceScratch::default();
     let mut chis = Vec::with_capacity(assign.len());
     let mut last_profile = None;
-    let mut cost = |t_s: f64| -> (f64, bool) {
+    let mut cost = |t_s: f64, full_trace: bool| -> (f64, bool) {
         let mut tot = 0.0;
         chis.clear();
         for (k, &(ei, _, _)) in assign.iter().enumerate() {
             let ev = &evs[ei];
             let g = &grids[k];
-            let r = if quick {
+            let r = if quick && !full_trace {
                 trace_chi(
                     &ev.q_t,
                     &ev.q_f,
@@ -2503,11 +2503,11 @@ fn eval_point_weighted(
         (tot, eligible)
     };
     let profiled = if gates != PointGates::Off && !quick {
-        profile_valid_clock_seeded(lo, hi, &ts_imp, cost)
+        profile_valid_clock_seeded(lo, hi, &ts_imp, |ts| cost(ts, true))
     } else if !quick {
-        profile_clock_seeded(lo, hi, &ts_imp, |ts| cost(ts).0)
+        profile_clock_seeded(lo, hi, &ts_imp, |ts| cost(ts, true).0)
     } else {
-        profile_clock(lo, hi, quick, |ts| cost(ts).0)
+        profile_quick_clock(lo, hi, &ts_imp, cost)
     };
     // A failed fine-grid trace fit still supplies an exact objective for looking
     // between grid nodes. Its geometry, coverage, clock and observations stay intact;
@@ -2525,6 +2525,36 @@ fn eval_point_weighted(
         props,
         total,
     })
+}
+
+/// Time-uniform quick subsampling can leave fewer than five supported observations
+/// from a dense ridge that the full trace still covers. Preserve every scorable
+/// quick scan; only an unscorable one tries the physical CPA clocks on the full
+/// observations, with the original fine trace and coverage gates. This costs at
+/// most one full evaluation per distinct seed plus restoring the accepted winner.
+fn profile_quick_clock(
+    lo: f64,
+    hi: f64,
+    seeds: &[f64],
+    mut cost: impl FnMut(f64, bool) -> (f64, bool),
+) -> Option<(f64, f64)> {
+    let original = profile_clock(lo, hi, true, |t| cost(t, false).0);
+    if original.is_some() {
+        return original;
+    }
+    let mut best: Option<(f64, f64)> = None;
+    for (i, &seed) in seeds.iter().enumerate() {
+        if !seed.is_finite() || seed < lo || seed > hi || seeds[..i].contains(&seed) {
+            continue;
+        }
+        let (value, valid) = cost(seed, true);
+        if valid && value.is_finite() && best.is_none_or(|old| value < old.1) {
+            best = Some((seed, value));
+        }
+    }
+    let (clock, _) = best?;
+    let (value, valid) = cost(clock, true);
+    (valid && value.is_finite()).then_some((clock, value))
 }
 
 /// Scan the shared recording clock, then polish its best interval. The last objective
@@ -7122,6 +7152,198 @@ mod tests {
             Some((12.0, 7.0))
         );
         assert_eq!(last, 12.0);
+    }
+
+    #[test]
+    fn quick_clock_recovery_preserves_successes_and_bounds_full_trace_work() {
+        let mut expected = Vec::new();
+        let original = profile_clock(-1.0, 1.0, true, |t| {
+            expected.push(t);
+            t * t
+        });
+        let mut actual = Vec::new();
+        let kept = profile_quick_clock(-1.0, 1.0, &[0.0], |t, full| {
+            assert!(!full, "a scorable quick scan must not run the fallback");
+            actual.push(t);
+            (t * t, false)
+        });
+        assert_eq!(kept, original);
+        assert_eq!(actual, expected);
+
+        for valid in [false, true] {
+            let mut full_calls = Vec::new();
+            let recovered =
+                profile_quick_clock(-1.0, 1.0, &[0.1, 0.1, f64::NAN, 2.0, -0.2], |t, full| {
+                    if full {
+                        full_calls.push(t);
+                        (t * t, valid)
+                    } else {
+                        (f64::INFINITY, false)
+                    }
+                });
+            if valid {
+                assert_eq!(recovered, Some((0.1, 0.1 * 0.1)));
+                assert_eq!(full_calls, [0.1, -0.2, 0.1]);
+            } else {
+                assert!(recovered.is_none());
+                assert_eq!(full_calls, [0.1, -0.2]);
+            }
+        }
+    }
+
+    #[test]
+    fn quick_clock_retains_dense_physical_ridges_with_sparse_tails() {
+        let dem = FlatElevation(0.0);
+        let medium = fdop_types::atmo::Medium::still(343.0);
+        let atmo = fdop_types::atmo::UniformAtmosphere(medium);
+        let prop = Prop::still(medium.c);
+        for start in [0.0, 1_788_895_000.0] {
+            let mut case = compact_fine_grid_case(start, false);
+            let o = observer(case.obs.0, case.obs.1, &dem);
+            let assignments = [(0, 0, start + 120.0), (1, 1, start + 360.0)];
+            for ((event, track), when) in case
+                .events
+                .iter_mut()
+                .zip(&mut case.tracks)
+                .zip([120.0, 360.0])
+            {
+                // The measured ridge has a dense physical centre and sparse observed
+                // tails. All frequencies come from the complete trajectory, before
+                // retaining only its central ADS-B coverage.
+                let offsets = (0..20)
+                    .map(|i| -150.0 + i as f64 * 5.0)
+                    .chain((0..=80).map(|i| -9.6 + i as f64 * 0.24))
+                    .chain((0..20).map(|i| 55.0 + i as f64 * 5.0));
+                event.tr_t.clear();
+                event.tr_f.clear();
+                for offset in offsets {
+                    let t = start + event.t_rec + offset;
+                    let (_, _, ratio) = track.solve_emission_p(t, o.x, &prop, None).unwrap();
+                    event.tr_t.push(t - start);
+                    event.tr_f.push(event.f0 * ratio);
+                }
+                (event.q_t, event.q_f) = subsample(&event.tr_t, &event.tr_f, 40);
+                event.t_tol = 1.0;
+                let keep: Vec<_> = (0..track.t.len())
+                    .filter(|&i| (track.t[i] - start - when).abs() <= 15.0)
+                    .collect();
+                track.t = keep.iter().map(|&i| track.t[i]).collect();
+                track.pos = keep.iter().map(|&i| track.pos[i]).collect();
+                track.vel = keep.iter().map(|&i| track.vel[i]).collect();
+
+                let grid = RatioGrid::build(
+                    track,
+                    o.x,
+                    &prop,
+                    start + event.q_t[0] - 2.0,
+                    start + event.q_t.last().unwrap() + 2.0,
+                    0.5,
+                    case.p.max_gap_s,
+                );
+                // Every original quick clock fails its five-observation minimum,
+                // despite the full trace retaining the existing 60% coverage.
+                for shift in [-1.0, 0.0, 1.0] {
+                    let fit = trace_chi(
+                        &event.q_t,
+                        &event.q_f,
+                        &|t| grid.at(t),
+                        start + shift,
+                        event,
+                        1.0,
+                        event.sigma_hz.max(0.6),
+                        case.p.cap_sigma,
+                        false,
+                        &mut TraceScratch::default(),
+                    );
+                    assert!(
+                        fit.chi.is_infinite(),
+                        "start={start}, shift={shift}: {fit:?}"
+                    );
+                }
+            }
+            let quick = eval_point(
+                &o,
+                &assignments,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                true,
+                true,
+                true,
+            )
+            .expect("a supported full ridge must reach the fine stage");
+            assert!(
+                quick
+                    .chis
+                    .iter()
+                    .all(|fit| fit.cov >= 0.6 && fit.chi < 10.0)
+            );
+            assert!((quick.t_s - start).abs() < 0.01);
+            let fine = eval_point(
+                &o,
+                &assignments,
+                &case.events,
+                &case.tracks,
+                &case.p,
+                &atmo,
+                true,
+                true,
+                false,
+            )
+            .expect("the same pair must pass the unchanged exact trace gates");
+            assert!(fine.chis.iter().all(|fit| fit.cov >= 0.6 && fit.chi < 10.0));
+
+            let frame = Frame::new(&case.p.region);
+            let (east, north) = frame.en(case.obs.0, case.obs.1);
+            let seed = Joined {
+                ei: 0,
+                ej: 1,
+                ti: 0,
+                tj: 1,
+                te_i: start + 120.0,
+                te_j: start + 360.0,
+                e: east,
+                n: north,
+                t_s: quick.t_s,
+            };
+            let inp = SearchInputs {
+                heard_times: case.events.iter().map(|event| event.t_rec).collect(),
+                events: case.events.clone(),
+                tracks: &case.tracks,
+                coarse_dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            case.p.fine_half_m = 0.0;
+            let candidate = fine_candidate(&seed, &frame, &case.events, &inp, &case.p, &[])
+                .expect("the retained join must produce a two-aircraft candidate");
+            assert_eq!(candidate.events.len(), 2);
+            assert!((candidate.t_start_utc - start).abs() < 0.05);
+
+            // Keep the same observations, but remove most of one track's archive
+            // support. A few central points alone cannot use this recovery.
+            let track = &mut case.tracks[0];
+            let middle = track.t.len() / 2;
+            track.t = track.t[middle - 1..=middle + 1].to_vec();
+            track.pos = track.pos[middle - 1..=middle + 1].to_vec();
+            track.vel = track.vel[middle - 1..=middle + 1].to_vec();
+            assert!(
+                eval_point(
+                    &o,
+                    &assignments,
+                    &case.events,
+                    &case.tracks,
+                    &case.p,
+                    &atmo,
+                    true,
+                    true,
+                    true,
+                )
+                .is_none(),
+                "insufficient full-trace coverage must remain refused"
+            );
+        }
     }
 
     #[test]

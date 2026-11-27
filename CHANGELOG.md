@@ -19,6 +19,16 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Retain flight pairs when quick samples miss a dense observed ridge
+
+- When every quick clock is unscorable, check the distinct physical CPA-implied clocks against
+  the full retained traces. Require the existing fine trace and 60% coverage gates; preserve
+  every scorable quick result and bound pair recovery to at most three full-trace evaluations.
+- Add synthetic trajectory regressions at local and Unix epochs where the full trace retains
+  81 supported central observations but the quick sample retains only four. Check recovery
+  through exact scoring and a two-aircraft fine candidate, insufficient-coverage refusal and
+  unchanged successful scans. Reference, wrong-date and field-recording replays remain unrun.
+
 ### Audit channels that appear during a recording
 
 - `fdop detect --all-audio` now uses decoded channel counts as well as the stream inventory. It audits individual channels that appear only after a format change, including when opposite-polarity sound cancels in the mono mix. Each channel's timeline stays aligned with the original recording.
