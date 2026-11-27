@@ -19,6 +19,10 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Keep previous recording audits intact
+
+- Single-source `fdop detect` now reserves a fresh output directory just as `--all-audio` does. Repeated default runs get separate directories, and an occupied explicit destination is refused before any output is written.
+
 ### Check each ADS-B archive part before caching a day
 
 - Streamed ingestion now compares each part's delivered bytes with the size published in the release listing. A partial response or an oversized part invalidates the download even if the combined stream contains a complete tar. A retry can build the cache from the corrected source.

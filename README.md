@@ -910,8 +910,10 @@ including duplicates and unrecovered refusals. A warning on stderr says when eit
 looks high-passed, or when the survey image was raised because its spread was under 0.5. A detection found
 only on the contrast image of such a recording has `"from_contrast": true` in `events.json`. The command
 writes `events.json`, `survey.png`, and `e<N>.png` plus `e<N>_trace.csv` for every fitted event, using
-those final event IDs consistently. The default
-output directory is `fdop_runs/detect`.
+those final event IDs consistently. The default output directory is `fdop_runs/detect`.
+Later audits use `detect-2`, `detect-3`, and so on when the earlier directory is occupied,
+so the event list, figures and traces in each directory belong to one recording.
+An explicit `-o` directory must be new or empty.
 
 `--audio-stream N` and `--audio-channel N` select the same source as in `locate`. For example,
 `fdop detect clip.mov --audio-stream 1 --audio-channel 0` measures the first channel of the second audio track.

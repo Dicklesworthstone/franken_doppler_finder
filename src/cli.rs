@@ -159,7 +159,7 @@ pub struct DetectCli {
     /// Print the recording audit as JSON on stdout.
     #[arg(long)]
     pub json: bool,
-    /// Output directory (default fdop_runs/detect, or a fresh fdop_runs/detect-all for --all-audio).
+    /// New or empty output directory (default: a fresh fdop_runs/detect or fdop_runs/detect-all).
     #[arg(short, long)]
     pub out: Option<PathBuf>,
     /// Less progress output on stderr.
@@ -731,10 +731,10 @@ fn run_detect(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, Stri
         audio::AudioProbe::open(&d.media)
     }?;
     let info = probe.selected_info(selection)?;
-    let out = d
-        .out
-        .unwrap_or_else(|| PathBuf::from("fdop_runs").join("detect"));
-    let audit = measure_audio_source(&probe, &info, selection, &out, &log)?;
+    let default = PathBuf::from("fdop_runs").join("detect");
+    let reservation = pipeline::reserve_output(d.out.as_deref(), &default)?;
+    let out = &reservation.path;
+    let audit = measure_audio_source(&probe, &info, selection, out, &log)?;
     log.say(&format!("wrote {}", out.join("events.json").display()));
     if d.json {
         serde_json::to_writer_pretty(&mut stdout, &audit).map_err(|e| e.to_string())?;
@@ -967,6 +967,21 @@ mod tests {
                 assert!(out.join(format!("{}_trace.csv", event.id)).is_file());
             }
         }
+
+        // Reusing the positive recording's directory for a different recording would
+        // leave old event figures and traces beside the new recording's event list.
+        let occupied = dir.join("fast");
+        let before = std::fs::read(occupied.join("events.json")).unwrap();
+        let second_media = dir.join("noise.mka");
+        let cli = Cli::try_parse_from([
+            "fdop", "detect", second_media.to_str().unwrap(),
+            "-o", occupied.to_str().unwrap(), "--json",
+        ]).unwrap();
+        let Cmd::Detect(d) = cli.cmd else { unreachable!() };
+        let mut output = Vec::new();
+        assert!(run_detect(d, &mut output).unwrap_err().contains("occupied"));
+        assert!(output.is_empty());
+        assert_eq!(std::fs::read(occupied.join("events.json")).unwrap(), before);
 
         // The first track is the negative control. The second contains the known pass
         // on both channels with opposite polarity, so it disappears in a mono mix.
