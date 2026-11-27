@@ -2,6 +2,10 @@
 
 use std::process::Command;
 
+fn healthy_http_status(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
 fn tool(name: &str) -> (bool, String) {
     match Command::new(name).arg("-version").output() {
         Ok(o) if o.status.success() => (
@@ -116,7 +120,7 @@ pub fn run(network: bool, cache: &std::path::Path) -> i32 {
                 for (name, url) in probes {
                     match net.get(&url, &[]) {
                         Ok(r) => line(
-                            true,
+                            healthy_http_status(r.status),
                             name,
                             &format!("HTTP {} ({} bytes)", r.status, r.body.len()),
                         ),
@@ -136,4 +140,19 @@ pub fn run(network: bool, cache: &std::path::Path) -> i32 {
         }
     );
     i32::from(bad > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::healthy_http_status;
+
+    #[test]
+    fn health_checks_reject_http_errors_and_redirects() {
+        for status in [200, 201, 204, 206, 299] {
+            assert!(healthy_http_status(status), "HTTP {status} should pass");
+        }
+        for status in [100, 301, 302, 304, 400, 401, 403, 404, 429, 500, 503] {
+            assert!(!healthy_http_status(status), "HTTP {status} must fail");
+        }
+    }
 }
