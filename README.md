@@ -925,6 +925,10 @@ This can reveal a pass on a secondary track or on channels that cancel in the mi
 event IDs, warnings and `events_file` path (relative to the working directory for a relative output path).
 Each view's `measured_pass_spans` gives the event ID and the first and last measured trace points in recording seconds. The text summary prints these spans too. Use them to find the sound in an editor and listen on either side. A trace can cover only part of an audible flyover.
 All views share one complete stream inventory. The first decode also checks ordinary stream discovery to preserve decoder priming and late-track timing. Adding channels requires additional decodes but no additional FFprobe runs.
+During a whole-file audit, the mix decode also checks for changes in channel count.
+`channels_in_stream` includes the widest layout observed for that track. Every channel
+present in that layout gets its own view when the track has multiple channels. A channel
+that is absent during part of the recording has silence there on the original recording clock.
 The same aircraft can appear in several views, so compare their counts individually.
 The file-wide `possible_location_telemetry` list identifies data streams whose format can
 carry GPS samples. Each entry gives the FFprobe `stream_index` and `codec_tag`. The text

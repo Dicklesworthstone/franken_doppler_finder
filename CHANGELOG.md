@@ -19,6 +19,10 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Audit channels that appear during a recording
+
+- `fdop detect --all-audio` now uses decoded channel counts as well as the stream inventory. It audits individual channels that appear only after a format change, including when opposite-polarity sound cancels in the mono mix. Each channel's timeline stays aligned with the original recording.
+
 ### Redact the audio track selected in a recording audit
 
 - `fdop mute --audio-stream N --silence-range` retains the selected original track in either an MP4 or an audio-only M4A. It uses the same zero-based stream numbering and recording clock as `fdop detect`, including for an audio track introduced late in the recording.

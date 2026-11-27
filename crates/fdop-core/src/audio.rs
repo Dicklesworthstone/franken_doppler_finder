@@ -1,8 +1,8 @@
 //! Media probing (ffprobe) and decoding to mono f32 PCM (ffmpeg).
 
 use serde::Serialize;
-use std::cell::OnceCell;
-use std::io::{self, Read};
+use std::cell::{Cell, OnceCell};
+use std::io::{self, BufRead, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -85,6 +85,8 @@ pub struct AudioProbe<'a> {
     path: &'a Path,
     complete: serde_json::Value,
     ordinary: OnceCell<Option<serde_json::Value>>,
+    // Input channel counts observed during whole-file audits.
+    audit_widths: Vec<Cell<u32>>,
     access: InputAccess,
 }
 
@@ -95,6 +97,7 @@ impl<'a> AudioProbe<'a> {
             complete: probe_document(path, require_clean_probe, true, access)?,
             access,
             ordinary: OnceCell::new(),
+            audit_widths: Vec::new(),
         })
     }
 
@@ -119,8 +122,9 @@ impl<'a> AudioProbe<'a> {
     }
 
     fn audit(path: &'a Path, access: InputAccess) -> Result<(Self, AudioInventory), String> {
-        let probe = Self::read(path, true, access)?;
+        let mut probe = Self::read(path, true, access)?;
         let inventory = audit_inventory(path, &probe.complete)?;
+        probe.audit_widths = inventory.streams.iter().map(|s| Cell::new(s.channels)).collect();
         Ok((probe, inventory))
     }
 
@@ -143,12 +147,15 @@ impl<'a> AudioProbe<'a> {
         let ordinary = self
             .ordinary
             .get_or_init(|| probe_document(self.path, false, false, self.access).ok());
+        let header_channels = self.complete["streams"].as_array()
+            .and_then(|s| s.iter().filter(|s| s["codec_type"] == "audio").nth(info.audio_stream))
+            .and_then(|s| s["channels"].as_u64()).unwrap_or(0);
         let full_probe = ordinary
             .as_ref()
             .and_then(|doc| media_info(self.path, doc, selection).ok())
             .is_none_or(|quick| {
                 quick.audio_codec != info.audio_codec
-                    || quick.channels != info.channels
+                    || u64::from(quick.channels) != header_channels
                     || quick.sample_rate != info.sample_rate
                     || quick.start_time_s != info.start_time_s
             });
@@ -161,7 +168,7 @@ impl<'a> AudioProbe<'a> {
     }
 
     pub fn selected_info(&self, selection: AudioSelection) -> Result<MediaInfo, String> {
-        media_info(self.path, &self.complete, selection)
+        media_info_with_width(self.path, &self.complete, selection, self.audit_widths.get(selection.stream).map(Cell::get))
     }
 }
 
@@ -317,6 +324,15 @@ fn media_info(
     j: &serde_json::Value,
     selection: AudioSelection,
 ) -> Result<MediaInfo, String> {
+    media_info_with_width(path, j, selection, None)
+}
+
+fn media_info_with_width(
+    path: &Path,
+    j: &serde_json::Value,
+    selection: AudioSelection,
+    observed_width: Option<u32>,
+) -> Result<MediaInfo, String> {
     let streams = j["streams"]
         .as_array()
         .ok_or_else(|| format!("{} has no audio stream", path.display()))?;
@@ -357,7 +373,7 @@ fn media_info(
         .as_str()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    info.channels = a["channels"].as_u64().unwrap_or(0) as u32;
+    info.channels = observed_width.unwrap_or_else(|| a["channels"].as_u64().unwrap_or(0) as u32);
     if let Some(channel) = selection.channel
         && channel >= info.channels as usize
     {
@@ -544,7 +560,42 @@ fn read_decoder_errors(mut input: impl Read) -> io::Result<String> {
     Ok(text)
 }
 
-fn decode_command(mut cmd: Command) -> Result<Vec<f32>, String> {
+// Drain every record, retaining only the widest decoded frame layout and bounded errors.
+fn read_audit_log(input: impl Read) -> io::Result<(String, u32)> {
+    let mut input = io::BufReader::new(input);
+    let mut line = Vec::new();
+    let mut errors = Vec::new();
+    let mut width = 0;
+    let mut invalid_layout = false;
+    loop {
+        line.clear();
+        if input.by_ref().take(DECODE_BUFFER_BYTES as u64).read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.len() == DECODE_BUFFER_BYTES && line.last() != Some(&b'\n') {
+            input.skip_until(b'\n')?;
+        }
+        let text = String::from_utf8_lossy(&line);
+        if text.starts_with("[ashowinfo@fdop_layout @ ") && text.contains("] [info] n:") {
+            let count = text.split_ascii_whitespace()
+                .find_map(|field| field.strip_prefix("channels:"))
+                .and_then(|value| value.parse::<u32>().ok());
+            match count {
+                Some(n) if n > 0 => width = width.max(n),
+                _ => invalid_layout = true,
+            }
+        } else if ["[error]", "[fatal]", "[panic]"].iter().any(|level| text.contains(level)) {
+            let n = (DECODE_BUFFER_BYTES - errors.len()).min(line.len());
+            errors.extend_from_slice(&line[..n]);
+        }
+    }
+    if invalid_layout {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unreadable FFmpeg audit channel count"));
+    }
+    Ok((String::from_utf8_lossy(&errors).trim().to_owned(), width))
+}
+
+fn decode_command(mut cmd: Command, observe_layouts: bool) -> Result<(Vec<f32>, u32), String> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -552,7 +603,13 @@ fn decode_command(mut cmd: Command) -> Result<Vec<f32>, String> {
         .spawn()
         .map_err(|e| format!("ffmpeg not runnable ({e}); install ffmpeg"))?;
     let stderr = child.stderr.take().expect("piped ffmpeg stderr");
-    let errors = match std::thread::Builder::new().spawn(move || read_decoder_errors(stderr)) {
+    let errors = match std::thread::Builder::new().spawn(move || {
+        if observe_layouts {
+            read_audit_log(stderr)
+        } else {
+            read_decoder_errors(stderr).map(|errors| (errors, 0))
+        }
+    }) {
         Ok(reader) => reader,
         Err(e) => {
             let _ = child.kill();
@@ -571,7 +628,7 @@ fn decode_command(mut cmd: Command) -> Result<Vec<f32>, String> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let errors = errors
+    let (errors, width) = errors
         .join()
         .map_err(|_| "ffmpeg error reader panicked".to_string())?
         .map_err(|e| format!("ffmpeg error output: {e}"))?;
@@ -586,7 +643,10 @@ fn decode_command(mut cmd: Command) -> Result<Vec<f32>, String> {
     if !status.success() {
         return Err(format!("ffmpeg decode failed ({status}): {errors}"));
     }
-    Ok(samples)
+    if observe_layouts && width == 0 {
+        return Err("FFmpeg reported no decoded audio channel layout for the whole-file audit".into());
+    }
+    Ok((samples, width))
 }
 
 // Timestamp and sample clocks quantize each packet boundary. Keep one tick of each
@@ -658,19 +718,31 @@ pub fn decode_probed(
     // separate graph so the clock resampler keeps its state instead of inserting
     // the elapsed recording time as silence again at every format change.
     // Shift timestamps before normalization to preserve compressed-audio priming.
+    // Observe one original frame at each format change before downmixing.
+    let audit_width = probe.audit_widths.get(selection.stream)
+        .filter(|_| selection.channel.is_none() && start == 0.0 && dur.is_none());
+    let input = if audit_width.is_some() {
+        format!("[{stream}]asplit[fdop_src][fdop_layout];[fdop_layout]aselect='eq(n,0)',ashowinfo@fdop_layout,anullsink;[fdop_src]")
+    } else {
+        format!("[{stream}]")
+    };
     let normalize = format!(
-        "[{stream}]{channel}asetpts=PTS-({})/TB-{start_s}/TB,aformat=sample_fmts=flt:sample_rates={sr}:channel_layouts=mono[fdop_normalized]",
+        "{input}{channel}asetpts=PTS-({})/TB-{start_s}/TB,aformat=sample_fmts=flt:sample_rates={sr}:channel_layouts=mono[fdop_normalized]",
         info.start_time_s
     );
     let clock =
         format!("[fdop_normalized]{clock_filter}[fdop_clocked]");
     let mut cmd = probe.access.command("ffmpeg");
+    if audit_width.is_some() {
+        cmd.env("AV_LOG_FORCE_NOCOLOR", "1");
+    }
     // Preserve timestamp jumps, including MPEG-TS/HLS gaps over ten seconds.
     cmd.args([
         "-nostdin",
         "-hide_banner",
+        "-nostats",
         "-loglevel",
-        "error",
+        if audit_width.is_some() { "repeat+level+info" } else { "error" },
         // By default FFmpeg can emit partial PCM and exit successfully after corrupt
         // packets. The sample count is used as the recording duration downstream.
         "-xerror",
@@ -698,7 +770,7 @@ pub fn decode_probed(
         cmd.args(["-t", &format!("{d:.3}")]);
     }
     cmd.args(["-f", "f32le", "-"]);
-    decode_command(cmd).map_err(|error| {
+    let (samples, width) = decode_command(cmd, audit_width.is_some()).map_err(|error| {
         if error.contains("fdop_normalized")
             && (error.contains("Invalid stream specifier") || error.contains("matches no streams"))
         {
@@ -706,7 +778,11 @@ pub fn decode_probed(
         } else {
             error
         }
-    })
+    })?;
+    if let Some(slot) = audit_width {
+        slot.set(width);
+    }
+    Ok(samples)
 }
 
 #[cfg(test)]
@@ -887,6 +963,18 @@ mod tests {
     }
 
     #[test]
+    fn audit_log_finds_late_widths_after_large_diagnostics_and_rejects_unknown_layouts() {
+        let prefix = "[ashowinfo@fdop_layout @ 0x1] [info] n:0 pts:0";
+        let mut log = format!("{prefix} channels:1\n[error] {}\n", "x".repeat(DECODE_BUFFER_BYTES * 2));
+        log.push_str(&format!("{prefix} channels:6\n{prefix} channels:2\n"));
+        let (errors, width) = read_audit_log(log.as_bytes()).unwrap();
+        assert_eq!(width, 6);
+        assert_eq!(errors.len(), DECODE_BUFFER_BYTES);
+        log.push_str(&format!("{prefix} channels:unknown\n"));
+        assert!(read_audit_log(log.as_bytes()).is_err());
+    }
+
+    #[test]
     fn decoder_errors_are_bounded_and_fully_drained() {
         let bytes = vec![b'x'; DECODE_BUFFER_BYTES * 3 + 7];
         let mut cursor = io::Cursor::new(&bytes);
@@ -926,7 +1014,7 @@ mod tests {
         };
         let expected = command().output().unwrap();
         assert!(expected.status.success());
-        let actual = decode_command(command()).unwrap();
+        let actual = decode_command(command(), false).unwrap().0;
         assert_eq!(actual.len() * 4, expected.stdout.len());
         assert!(
             actual
@@ -947,7 +1035,7 @@ mod tests {
             "f32le",
             "-",
         ]);
-        let error = decode_command(invalid).unwrap_err();
+        let error = decode_command(invalid, false).unwrap_err();
         assert!(error.contains("ffmpeg decode failed"), "{error}");
         assert!(error.contains("fdop_filter_that_does_not_exist"), "{error}");
     }

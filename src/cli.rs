@@ -603,7 +603,7 @@ fn measure_audio_source(
         summary: AudioAuditSummary {
             audio_stream: selection.stream,
             audio_channel: selection.channel,
-            channels_in_stream: info.channels,
+            channels_in_stream: probe.selected_info(selection)?.channels,
             decoded_duration_s,
             location_tag_detected,
             independent_pass_count: ids.len(),
@@ -638,10 +638,7 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
     for info in &streams {
         // The downmix can reinforce a coherent signal or cancel opposite-polarity channels.
         // A mono stream's downmix already covers its only channel.
-        let channels = (0..info.channels as usize)
-            .filter(|_| info.channels > 1)
-            .map(Some);
-        for channel in std::iter::once(None).chain(channels) {
+        let mut audit_view = |channel: Option<usize>| -> Result<u32, String> {
             let selection = AudioSelection {
                 stream: info.audio_stream,
                 channel,
@@ -658,10 +655,18 @@ fn run_all_audio(d: DetectCli, mut stdout: impl std::io::Write) -> Result<i32, S
                         out.display()
                     )
                 })?;
+            let channels = audit.summary.channels_in_stream;
             sources.push(SourceAudit {
                 summary: audit.summary,
                 events_file: dir.join("events.json"),
             });
+            Ok(channels)
+        };
+        let channels = audit_view(None)?;
+        if channels > 1 {
+            for channel in 0..channels as usize {
+                audit_view(Some(channel))?;
+            }
         }
     }
     if d.json {
@@ -1054,6 +1059,63 @@ mod tests {
             let events_path = output.join(view_dir).join("events.json");
             assert_eq!(view["events_file"], events_path.to_str().unwrap());
             assert!(events_path.is_file());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ffmpeg 7.1+ and ffprobe"]
+    fn whole_file_audit_covers_a_stereo_interval_between_mono_sections() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        let mono = "anullsrc=r=48000:cl=mono";
+        let stereo = "aevalsrc=0.25*sin(2*PI*220*t)|-0.25*sin(2*PI*220*t):s=48000";
+        for (index, source) in [mono, stereo, mono].iter().enumerate() {
+            let part = dir.path().join(format!("part-{index}.ts"));
+            let encoded = Command::new("ffmpeg")
+                .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i", source])
+                .args(["-frames:a", "500", "-c:a", "mp2", "-threads", "1", "-b:a", "384k"])
+                .args(["-mpegts_flags", "+initial_discontinuity", "-muxdelay", "0"])
+                .arg("-output_ts_offset")
+                .arg((12 + 12 * index).to_string())
+                .arg(&part)
+                .output().unwrap();
+            assert!(encoded.status.success(), "{}", String::from_utf8_lossy(&encoded.stderr));
+            bytes.extend(std::fs::read(part).unwrap());
+        }
+        let path = dir.path().join("changing.ts");
+        std::fs::write(&path, bytes).unwrap();
+        let (probe, inventory) = audio::AudioProbe::for_offline_audit(&path).unwrap();
+        assert_eq!(inventory.streams[0].channels, 1, "stream descriptor misses the stereo interval");
+        let mut length = None;
+        for channel in [None, Some(0), Some(1)] {
+            let selection = AudioSelection { stream: 0, channel };
+            let pcm = audio::decode_probed(&probe, 0.0, None, 4000, selection).unwrap();
+            assert_eq!(pcm.len(), *length.get_or_insert(pcm.len()));
+            let peak = |range: std::ops::Range<usize>| pcm[range].iter()
+                .map(|x| x.abs()).fold(0.0_f32, f32::max);
+            assert!(peak(8_000..40_000) < 0.001 && peak(104_000..120_000) < 0.001);
+            if channel.is_some() {
+                assert!(peak(60_000..80_000) > 0.2);
+            } else {
+                assert!(peak(60_000..80_000) < 0.01, "antiphase audio should cancel in the mix");
+            }
+        }
+
+        let output = dir.path().join("audit");
+        let args = ["fdop", "detect", path.to_str().unwrap(), "--all-audio", "--offline",
+                    "--quiet", "--json", "-o", output.to_str().unwrap()];
+        let Cmd::Detect(opts) = Cli::try_parse_from(args).unwrap().cmd else { unreachable!() };
+        let mut stdout = Vec::new();
+        assert_eq!(run_detect(opts, &mut stdout).unwrap(), 0);
+        let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let views = report["sources"].as_array().unwrap();
+        assert_eq!(views.len(), 3);
+        for (view, channel) in views.iter().zip([None, Some(0), Some(1)]) {
+            assert_eq!(view["audio_channel"], serde_json::json!(channel));
+            assert_eq!(view["channels_in_stream"], 2);
+            assert_eq!(view["decoded_duration_s"], length.unwrap() as f64 / 4000.0);
         }
     }
 
