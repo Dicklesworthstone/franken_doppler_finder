@@ -19,6 +19,10 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Check each ADS-B archive part before caching a day
+
+- Streamed ingestion now compares each part's delivered bytes with the size published in the release listing. A partial response or an oversized part invalidates the download even if the combined stream contains a complete tar. A retry can build the cache from the corrected source.
+
 ### Redact selected passages in audio-only recordings
 
 - `fdop mute --silence-range` accepts an `.m4a` destination for voice memos, field recordings, or the audio from a video. The export contains one ALAC track. Verification checks its stream layout, channels, sample rate and digital silence before publishing the file.

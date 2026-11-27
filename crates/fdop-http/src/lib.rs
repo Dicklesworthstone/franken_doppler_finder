@@ -697,6 +697,16 @@ pub struct StreamReader {
 
 impl StreamReader {
     pub fn open(urls: Vec<String>) -> Self {
+        Self::open_parts(urls.into_iter().map(|url| (url, None)).collect())
+    }
+
+    /// Concatenate assets only when each response delivers its listed representation
+    /// length. Check each part independently, including bytes received after a resume.
+    pub fn open_sized(parts: Vec<(String, u64)>) -> Self {
+        Self::open_parts(parts.into_iter().map(|(url, size)| (url, Some(size))).collect())
+    }
+
+    fn open_parts(parts: Vec<(String, Option<u64>)>) -> Self {
         let (tx, rx): (SyncSender<Result<Vec<u8>, String>>, _) = sync_channel(32);
         let progress = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -713,8 +723,14 @@ impl StreamReader {
                 };
                 const BATCH: usize = 1 << 20;
                 let mut buf: Vec<u8> = Vec::with_capacity(BATCH);
-                for url in urls {
+                for (url, size) in parts {
+                    let mut remaining = size;
                     let res = net.stream(&url, &[], &c2, &mut |chunk| {
+                        if let Some(left) = &mut remaining {
+                            *left = left.checked_sub(chunk.len() as u64).ok_or_else(|| {
+                                "response exceeds the asset size in the release listing".to_string()
+                            })?;
+                        }
                         buf.extend_from_slice(chunk);
                         p2.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                         if buf.len() >= BATCH {
@@ -724,14 +740,26 @@ impl StreamReader {
                         }
                         Ok(())
                     });
-                    if let Err(e) = res {
-                        let _ = tx.send(Err(e.to_string()));
-                        return;
+                    match res {
+                        Err(e) => {
+                            let _ = tx.send(Err(e.to_string()));
+                            return;
+                        }
+                        Ok(n) if remaining.is_some_and(|left| left > 0) => {
+                            let _ = tx.send(Err(format!(
+                                "{url}: received {n} bytes, fewer than the asset size in the release listing"
+                            )));
+                            return;
+                        }
+                        Ok(_) => {}
                     }
                 }
                 if !buf.is_empty() {
                     let _ = tx.send(Ok(buf));
                 }
+                // Only normal completion has verified every asset. A worker that
+                // exits unexpectedly must not look like transport EOF to a tar reader.
+                let _ = tx.send(Ok(Vec::new()));
             })
             .expect("spawn download thread");
         Self {
@@ -764,6 +792,10 @@ impl Read for StreamReader {
                 return Ok(0);
             }
             match self.rx.recv() {
+                Ok(Ok(v)) if v.is_empty() => {
+                    self.finished = true;
+                    return Ok(0);
+                }
                 Ok(Ok(v)) => {
                     self.cur = v;
                     self.pos = 0;
@@ -774,7 +806,10 @@ impl Read for StreamReader {
                 }
                 Err(_) => {
                     self.finished = true;
-                    return Ok(0);
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "download worker exited before transport completion",
+                    ));
                 }
             }
         }

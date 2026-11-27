@@ -777,7 +777,9 @@ fn fetch_window_with_discovery(
         opts,
         discover,
         |rel, sp, context, progress| {
-            let reader = crate::stream::BigStreamReader::open(rel.urls());
+            let reader = crate::stream::BigStreamReader::open_sized(
+                rel.parts.iter().map(|p| (p.url.clone(), p.size)).collect(),
+            );
             ingest_day_reader(reader, rel.feed.label(), sp, progress, context)
         },
         staging,
@@ -2497,6 +2499,95 @@ mod tests {
             parts,
             archives,
         }
+    }
+
+    #[test]
+    fn release_part_lengths_are_verified_before_cache_publication() {
+        use crate::adsblol::{AssetPart, ReleaseDiscovery};
+        use crate::ingest::tests::{gz, pc12_json, tar_of};
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let mut archive = tar_of(&[("trace_full_a1b2c3.json", gz(&pc12_json()))]);
+        // A complete tar fits in part one. Even a discrepancy in subsequent zero
+        // padding must prevent publication of a checkpoint or processed day.
+        archive.resize(2 << 20, 0); // flush the reader's 1 MiB batch before the final part
+        let split = archive.len();
+        archive.extend_from_slice(&[0; 512]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let mut sock = connection.unwrap();
+                let mut request = BufReader::new(&sock);
+                let mut line = String::new();
+                if request.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let body = match line.split_whitespace().nth(1) {
+                    Some("/aa") => &archive[..split],
+                    Some("/ab") => &archive[split..],
+                    _ => panic!("unexpected request: {line}"),
+                };
+                loop {
+                    line.clear();
+                    if request.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(sock, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", body.len()).unwrap();
+                sock.write_all(body).unwrap();
+                sock.write_all(b"\r\n0\r\n\r\n").unwrap();
+            }
+        });
+
+        let f = offline_raw_fixture(Feed::Prod, false);
+        let mut release = f.releases[0].clone();
+        let split = split as u64;
+        let (_, key) = bbox_key(&f.want.bbox);
+        let processed = f.dir.join(format!("prod_{key}.fdtrk"));
+        for (sizes, error) in [
+            ([split, 513], Some("fewer than the asset size")),
+            ([split, 511], Some("exceeds the asset size")),
+            // The total and concatenated bytes match, but the part boundary is wrong.
+            ([split + 1, 511], Some("fewer than the asset size")),
+            ([split, 512], None),
+        ] {
+            release.parts = ["aa", "ab"]
+                .into_iter()
+                .zip(sizes)
+                .map(|(suffix, size)| AssetPart {
+                    name: format!("{}.tar.{suffix}", release.tag),
+                    url: format!("http://{addr}/{suffix}"),
+                    size,
+                })
+                .collect();
+            let raw = crate::raw_cache::path(&f.dir, &release, &f.spec);
+            let got = fetch_window_with_discovery(
+                &f.want,
+                &f.cache,
+                &FetchOptions {
+                    include_mlat: false,
+                    ..Default::default()
+                },
+                |_, _, _, _, _, _, _| Ok(ReleaseDiscovery {
+                    releases: vec![release.clone()],
+                    prod_error: None,
+                    mlat_error: None,
+                }),
+                |_, _, _, _, _| Ok(None),
+            );
+            if let Some(expected) = error {
+                let message = got.unwrap_err().to_string();
+                assert!(message.contains(expected), "{message}");
+                assert!(!raw.exists() && !processed.exists());
+            } else {
+                assert!(got.unwrap().n_points() > 0);
+                assert!(raw.is_file() && processed.is_file());
+            }
+        }
+        drop(TcpStream::connect(addr).unwrap());
+        server.join().unwrap();
     }
 
     #[test]

@@ -1457,8 +1457,10 @@ tar or a contiguous split sequence; checksum sidecars are ignored, and missing, 
 unfinished parts are rejected. Offline runs use valid cached listings and retain missing-feed warnings.
 
 An ingested archive is complete only after both tar end blocks and the entire transport have been
-read. Missing end blocks, a late download failure or nonzero trailing data prevent that feed's day
-store from being published; ordinary zero padding is consumed. This also catches a missing final split
+read. Each downloaded part must deliver exactly the byte count in the release listing, including
+any resumed transfer and zero padding. A size mismatch prevents publication of the raw feed checkpoint
+and day store, even when the concatenated byte count matches. Missing end blocks, a late download
+failure or nonzero trailing data also prevent publication. This catches a missing final split
 part even if every listed part downloaded successfully. Existing day stores cannot reveal whether an
 older ingester accepted an incomplete source archive; recovering such missing data requires fresh
 ingestion.
