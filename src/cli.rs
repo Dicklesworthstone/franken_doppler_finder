@@ -1457,6 +1457,71 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    fn measured_muting_covers_a_longer_harmonic_without_counting_another_pass() {
+        use fdop_core::physics;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("tones.f32");
+        let media = dir.path().join("tones.wav");
+        let mut seed = 4242_u64;
+        let samples: Vec<f32> = (0..30 * 4000).map(|i| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let t = i as f64 / 4000.0;
+            let tau = physics::retarded_tau(t, 9.13 - 900.0 / 343.0, 90.0, 900.0, 343.0);
+            let range = physics::cv_radial(tau, 90.0, 900.0).0;
+            let phase = std::f64::consts::TAU * 150.0 * tau;
+            // The stronger fundamental fades first on the receding side. Its
+            // second harmonic continues on the same Doppler curve to the end.
+            let fade = (22.0 - t).clamp(0.0, 1.0);
+            let noise = 0.3 * (2.0 * seed as f64 / u64::MAX as f64 - 1.0);
+            (900.0 / range * (0.32 * fade * phase.sin() + 0.09 * (2.0 * phase).sin())
+                + noise + 0.03 * (std::f64::consts::TAU * 250.0 * t).sin()) as f32
+        }).collect();
+        std::fs::write(&raw, samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        assert!(Command::new("ffmpeg").args(["-nostdin", "-v", "error", "-f", "f32le",
+            "-ar", "4000", "-ac", "1", "-i"]).arg(raw).args(["-c:a", "pcm_f32le"])
+            .arg(&media).status().unwrap().success());
+
+        let audit_dir = dir.path().join("audit");
+        let Cmd::Detect(args) = Cli::try_parse_from(["fdop", "detect", media.to_str().unwrap(),
+            "--all-audio", "--offline", "--quiet", "--json", "-o", audit_dir.to_str().unwrap()
+        ]).unwrap().cmd else { unreachable!() };
+        let mut json = Vec::new();
+        run_detect(args, &mut json).unwrap();
+        let audit: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let view = &audit["sources"][0];
+        assert_eq!(view["independent_pass_count"], 1);
+        let primary = &view["measured_pass_spans"][0];
+        let observations = view["additional_measured_spans"].as_array().unwrap();
+        let last = observations.iter().map(|p| p["last_trace_s"].as_f64().unwrap())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let primary_end = primary["last_trace_s"].as_f64().unwrap();
+        assert!(last > primary_end + 1.0, "primary {primary}, additional {observations:?}");
+        let ranges = audit["tracks"][0]["measured_ranges"].as_array().unwrap();
+        assert_eq!(ranges.len(), 1);
+        let start = ranges[0]["start_s"].as_f64().unwrap();
+        let end = ranges[0]["end_s"].as_f64().unwrap();
+        assert!((end - last - 1.0 / 4000.0).abs() < 1e-9);
+
+        let out = dir.path().join("redacted.m4a");
+        run(Cli::try_parse_from(["fdop", "mute", media.to_str().unwrap(),
+            "--silence-detected", "0", "-o", out.to_str().unwrap()]).unwrap()).unwrap();
+        let edited = audio::decode(&out, 0.0, None, 4000).unwrap();
+        let lo = (start * 4000.0).floor() as usize;
+        let hi = (end * 4000.0).ceil() as usize;
+        assert_eq!(edited.len(), samples.len());
+        assert!(samples[(primary_end * 4000.0).ceil() as usize + 1..hi].iter().any(|x| x.abs() > 0.05));
+        assert!(edited[lo..hi].iter().all(|&x| x == 0.0));
+        for i in (0..lo).chain(hi..samples.len()) {
+            assert!((edited[i] - samples[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
     fn measured_ranges_merge_channel_observations_on_the_recording_clock() {
         fn summary(spans: &[(f64, f64)]) -> AudioAuditSummary {
             AudioAuditSummary {
