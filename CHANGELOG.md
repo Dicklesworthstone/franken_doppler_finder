@@ -19,6 +19,20 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Skip Doppler prediction solves outside certified arrival-time support
+
+- Enclose interpolated flight positions and bound their maximum travel time using
+  the same calm/windy wavefront arithmetic with outward rounding. Skip grid solves
+  before the first possible arrival and beyond that upper bound, including the
+  existing emission-residual allowance; keep the full solver when uncertifiable.
+- Preserve original grid nodes, missing samples, interpolation, scoring, candidate
+  limits and confidence thresholds. Avoid the upper-bound traversal when the grid
+  already ends within the flight's emission interval.
+- Add bound regressions and exact comparisons against the previous unscreened loop
+  across calm/windy media, Unix epochs, bowed tracks, gaps and invalid media.
+  Native tests, release selftest, field replays and timing remain unrun because
+  RCH is unavailable and the execution host disconnected.
+
 ### Import downloaded ADS-B archives into the offline search cache
 
 - Add repeatable `fetch --archive PATH` for whole tar archives, split-part families

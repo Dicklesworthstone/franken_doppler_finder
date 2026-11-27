@@ -369,6 +369,11 @@ fallback; missing bracketing samples remain missing.
 Each prediction grid now prepares its monotone intervals and cubic differences once, then reuses them
 through the repeated recording-clock fits. This costs 16 extra bytes per interval and preserves the
 original interpolation values and fallback rules; it does not change the search grid or scoring model.
+When a recording-clock window extends beyond a flight's possible arrival times, grid construction
+skips emission solves outside conservative support bounds. The upper travel-time bound encloses the
+interpolated trajectory and follows the same wind propagation calculation; both ends include the
+solver's existing residual allowance. Uncertifiable bounds retain the ordinary solver. The original
+grid nodes, missing samples and interpolation rules remain unchanged.
 
 The reported candidate is regenerated at the refined position and its fitted recording clock: terrain
 elevation, trace fits, independent clock checks, core matches, unheard close passes, evidence and the final

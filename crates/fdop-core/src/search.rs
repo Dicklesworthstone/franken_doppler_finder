@@ -19,7 +19,7 @@
 //! refinement with a chi-square confidence region.
 
 use crate::measure::MeasuredEvent;
-use crate::track::{Prop, TrackBounds, TrackModel};
+use crate::track::{EMISSION_RESIDUAL_S, Prop, TrackBounds, TrackModel};
 use fdop_types::atmo::Atmosphere;
 use fdop_types::geo::{Enu, V3, dot, ecef_to_geodetic, geodetic_to_ecef, haversine_m, norm, sub};
 use fdop_types::{BBox, Elevation, MIC_HEIGHT_M};
@@ -1723,11 +1723,30 @@ impl RatioGrid {
     #[allow(clippy::too_many_arguments)]
     fn build(tr: &TrackModel, x: V3, m: &Prop, lo: f64, hi: f64, dt: f64, max_gap: f64) -> Self {
         let n = (((hi - lo) / dt).ceil() as usize + 1).max(2);
+        // No source can arrive before emission or later than the padded Hermite
+        // hull's maximum travel time. Include the solver's accepted residual.
+        // Retain the original sample origin and NaNs so every supported ratio,
+        // interpolation interval and downstream score stays unchanged.
+        let earliest = (tr.t0() - EMISSION_RESIDUAL_S).next_down();
+        // An interval ending within emission coverage cannot benefit from an
+        // upper bound. Avoid traversing long tracks for those ordinary grids.
+        let latest = if hi > tr.t1() {
+            tr.bounds()
+                .and_then(|bounds| bounds.max_travel_s(x, m))
+                .map(|travel| ((tr.t1() + travel).next_up() + EMISSION_RESIDUAL_S).next_up())
+        } else {
+            None
+        };
         let mut r = Vec::with_capacity(n);
         let mut warm: Option<f64> = None;
         let mut hint = 0;
         for k in 0..n {
             let tu = lo + k as f64 * dt;
+            if tu < earliest || latest.is_some_and(|last| tu > last) {
+                warm = None;
+                r.push(f64::NAN);
+                continue;
+            }
             match tr.solve_emission_sweep(tu, x, m, warm, &mut hint, RATIO_GRID_TOL_S) {
                 Some((te, _, ratio)) if tr.gap_of(hint) <= max_gap => {
                     warm = Some(te);
@@ -9764,6 +9783,168 @@ mod tests {
             solved > 2000 && refused > 1000,
             "{solved} solved, {refused} refused"
         );
+    }
+
+    // The original unscreened loop is an exact oracle for the entire grid, including
+    // warm starts, support holes and interpolation coefficients.
+    fn unscreened_ratio_grid(
+        tr: &TrackModel,
+        x: V3,
+        m: &Prop,
+        lo: f64,
+        hi: f64,
+        dt: f64,
+        max_gap: f64,
+    ) -> RatioGrid {
+        let n = (((hi - lo) / dt).ceil() as usize + 1).max(2);
+        let mut r = Vec::with_capacity(n);
+        let mut warm: Option<f64> = None;
+        let mut hint = 0;
+        for k in 0..n {
+            let tu = lo + k as f64 * dt;
+            match tr.solve_emission_sweep(tu, x, m, warm, &mut hint, RATIO_GRID_TOL_S) {
+                Some((te, _, ratio)) if tr.gap_of(hint) <= max_gap => {
+                    warm = Some(te);
+                    r.push(ratio);
+                }
+                _ => {
+                    warm = None;
+                    r.push(f64::NAN);
+                }
+            }
+        }
+        RatioGrid::from_samples(lo, dt, r)
+    }
+
+    fn assert_identical_ratio_grids(actual: &RatioGrid, expected: &RatioGrid) {
+        assert_eq!(actual.t0.to_bits(), expected.t0.to_bits());
+        assert_eq!(actual.dt.to_bits(), expected.dt.to_bits());
+        assert_eq!(actual.r.len(), expected.r.len());
+        assert_eq!(actual.cubic.len(), expected.cubic.len());
+        for (i, (&a, &b)) in actual.r.iter().zip(&expected.r).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "ratio node {i}: {a} vs {b}");
+        }
+        for (i, (a, b)) in actual.cubic.iter().zip(&expected.cubic).enumerate() {
+            for k in 0..2 {
+                assert_eq!(a[k].to_bits(), b[k].to_bits(), "cubic interval {i}, order {k}");
+            }
+            let t = actual.t0 + (i as f64 + 0.37) * actual.dt;
+            assert_eq!(
+                actual.at(t).to_bits(),
+                expected.at(t).to_bits(),
+                "interpolation at {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn ratio_grid_support_clipping_preserves_every_sample_and_interpolation() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let x = enu.to_ecef([0.0; 3]);
+        for epoch in [0.0, 1_788_895_000.0] {
+            for gap in [false, true] {
+                let mut tr = straight_track(
+                    &enu,
+                    [0.0, 3000.0, 1200.0],
+                    [130.0, 0.0, 0.0],
+                    epoch + 140.0,
+                    epoch + 80.0,
+                    epoch + 200.0,
+                    10.0,
+                );
+                if gap {
+                    let keep: Vec<usize> = (0..tr.t.len())
+                        .filter(|&k| !(tr.t[k] > epoch + 110.0 && tr.t[k] < epoch + 180.0))
+                        .collect();
+                    tr.pos = keep.iter().map(|&k| tr.pos[k]).collect();
+                    tr.vel = keep.iter().map(|&k| tr.vel[k]).collect();
+                    tr.t = keep.iter().map(|&k| tr.t[k]).collect();
+                }
+                for wind in [[0.0; 3], [20.0, -15.0, 0.0], [-35.0, 28.0, 0.0]] {
+                    let m = Prop {
+                        c: 343.0,
+                        w: enu.vec_to_ecef(wind),
+                    };
+                    let (lo, hi, dt) = (epoch - 400.0, epoch + 500.0, 0.5);
+                    let expected = unscreened_ratio_grid(&tr, x, &m, lo, hi, dt, 45.0);
+                    let actual = RatioGrid::build(&tr, x, &m, lo, hi, dt, 45.0);
+                    assert_identical_ratio_grids(&actual, &expected);
+                    assert!(actual.r.iter().filter(|r| r.is_finite()).count() > 30);
+                    // These wide scans are mostly outside the clipped track's
+                    // arrival support. Every certified skipped solve was absent
+                    // in the original grid, including both sides of the track.
+                    let earliest = (tr.t0() - EMISSION_RESIDUAL_S).next_down();
+                    let latest = ((tr.t1() + tr.bounds().unwrap().max_travel_s(x, &m).unwrap())
+                        .next_up()
+                        + EMISSION_RESIDUAL_S)
+                        .next_up();
+                    let mut skipped = 0;
+                    for (k, r) in expected.r.iter().enumerate() {
+                        let t = lo + k as f64 * dt;
+                        if t < earliest || t > latest {
+                            assert!(r.is_nan(), "certified unsupported arrival {t}");
+                            skipped += 1;
+                        }
+                    }
+                    assert!(skipped > expected.r.len() / 2);
+                    assert!(
+                        latest < hi - 50.0,
+                        "the trailing support also prunes: {latest} >= {hi}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ratio_grid_support_clipping_keeps_uncertain_and_fully_covered_grids() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let tr = straight_track(
+            &enu,
+            [0.0, 3000.0, 1200.0],
+            [130.0, 0.0, 0.0],
+            1000.0,
+            920.0,
+            1080.0,
+            10.0,
+        );
+        let m = Prop {
+            c: 343.0,
+            w: enu.vec_to_ecef([20.0, -15.0, 0.0]),
+        };
+        // Inside the ECEF hull, wind cannot certify the negative-root denominator.
+        // The ordinary solver still handles every possible received time.
+        let x = tr.pos_at(1000.0);
+        assert!(tr.bounds().unwrap().max_travel_s(x, &m).is_none());
+        let expected = unscreened_ratio_grid(&tr, x, &m, 800.0, 1200.0, 0.2, 60.0);
+        let actual = RatioGrid::build(&tr, x, &m, 800.0, 1200.0, 0.2, 60.0);
+        assert_identical_ratio_grids(&actual, &expected);
+        // An ordinary interior grid requires no hull traversal or upper screening.
+        let x = enu.to_ecef([0.0; 3]);
+        let expected = unscreened_ratio_grid(&tr, x, &m, 990.0, 1030.0, 0.2, 60.0);
+        let actual = RatioGrid::build(&tr, x, &m, 990.0, 1030.0, 0.2, 60.0);
+        assert_identical_ratio_grids(&actual, &expected);
+        assert!(actual.r.iter().all(|r| r.is_finite()));
+        // Prop rejects invalid media before its calm-air division; even with
+        // no upper bound they cannot produce an arrival before emission.
+        for m in [
+            Prop::still(-343.0),
+            Prop::still(0.0),
+            Prop::still(f64::NAN),
+            Prop {
+                c: 343.0,
+                w: [343.0, 0.0, 0.0],
+            },
+            Prop {
+                c: 343.0,
+                w: [400.0, 0.0, 0.0],
+            },
+        ] {
+            let expected = unscreened_ratio_grid(&tr, x, &m, 800.0, 1200.0, 0.2, 60.0);
+            let actual = RatioGrid::build(&tr, x, &m, 800.0, 1200.0, 0.2, 60.0);
+            assert_identical_ratio_grids(&actual, &expected);
+            assert!(actual.r.iter().all(|r| r.is_nan()));
+        }
     }
 
     #[test]

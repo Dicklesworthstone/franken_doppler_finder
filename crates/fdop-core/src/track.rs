@@ -61,6 +61,70 @@ impl TrackBounds {
         let radius = distance_m.next_up();
         distance2 <= (radius * radius).next_up()
     }
+
+    /// Upper travel time from any interpolated position in this box. Outward rounding
+    /// follows `Prop::travel_root`, including its cancellation-safe negative-dot branch.
+    /// This does not require the source's reception clock to be monotone. Unknown bounds
+    /// return `None`, so callers retain their ordinary emission solves.
+    pub(crate) fn max_travel_s(&self, x: V3, m: &Prop) -> Option<f64> {
+        if !m.c.is_finite()
+            || m.c <= 0.0
+            || x.iter().chain(&m.w).any(|v| !v.is_finite())
+            || (0..3).any(|k| {
+                !self.lo[k].is_finite()
+                    || !self.hi[k].is_finite()
+                    || self.lo[k] > self.hi[k]
+            })
+        {
+            return None;
+        }
+        // Use the same rounded denominator as the propagation calculation.
+        let a = m.c * m.c - dot(m.w, m.w);
+        if !a.is_finite() || a <= 0.0 {
+            return None;
+        }
+        let (mut distance2_lo, mut distance2_hi, mut dot_hi) = (0.0, 0.0, 0.0);
+        for (k, &v) in x.iter().enumerate() {
+            let gap = (self.lo[k] - v).max(v - self.hi[k]).max(0.0);
+            let lower = gap.next_down().max(0.0);
+            distance2_lo = (distance2_lo + (lower * lower).next_down().max(0.0))
+                .next_down()
+                .max(0.0);
+            let upper = (self.lo[k] - v)
+                .abs()
+                .max((self.hi[k] - v).abs())
+                .next_up();
+            distance2_hi = (distance2_hi + (upper * upper).next_up()).next_up();
+            dot_hi = (dot_hi + (m.w[k].abs() * upper).next_up()).next_up();
+        }
+        let r_hi = distance2_hi.sqrt().next_up();
+        let upper = if m.w == [0.0; 3] {
+            (r_hi / m.c).next_up()
+        } else {
+            let r_lo = distance2_lo.sqrt().next_down().max(0.0);
+            let q_hi = ((dot_hi * dot_hi).next_up()
+                + ((a * r_hi).next_up() * r_hi).next_up())
+            .next_up()
+            .sqrt()
+            .next_up();
+            let positive = ((dot_hi + q_hi).next_up() / a).next_up();
+            // For a negative wind dot product, q - b >= q >= sqrt(a * r_lo²).
+            // A box containing the observer cannot certify this denominator; keep
+            // the full solve instead of assuming a particular source direction.
+            let q_lo = ((a * r_lo).next_down().max(0.0) * r_lo)
+                .next_down()
+                .max(0.0)
+                .sqrt()
+                .next_down()
+                .max(0.0);
+            if q_lo <= 0.0 {
+                return None;
+            }
+            let negative = ((r_hi * r_hi).next_up() / q_lo).next_up();
+            positive.max(negative)
+        };
+        (upper.is_finite() && upper >= 0.0).then_some(upper)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1497,7 +1561,7 @@ impl TrackModel {
         let r = norm(rv);
         let vr = dot(rv, v) / r;
         let g = te + r / c - t_r;
-        if g.abs() < 1e-3 && te > t0 && te < t1 {
+        if g.abs() < EMISSION_RESIDUAL_S && te > t0 && te < t1 {
             return Some((te, r, vr));
         }
         if !c.is_finite() || c <= 0.0 {
@@ -1574,7 +1638,7 @@ impl TrackModel {
         let (travel, rate) = m.travel_and_rate(rv, r, v);
         let g = te + travel - t_r;
         let ratio = 1.0 / (1.0 + rate);
-        if g.abs() < 1e-3 && te > t0 && te < t1 && ratio.is_finite() && ratio > 0.0 {
+        if g.abs() < EMISSION_RESIDUAL_S && te > t0 && te < t1 && ratio.is_finite() && ratio > 0.0 {
             return Some((te, r, ratio));
         }
         bracketed_emission(t0, t1, tol, |t| {
@@ -1828,6 +1892,9 @@ impl TrackModel {
     }
 }
 
+/// Existing maximum accepted reception residual, shared with conservative search bounds.
+pub(crate) const EMISSION_RESIDUAL_S: f64 = 1e-3;
+
 /// Newton can alternate between distant turns even when reception time increases everywhere.
 /// Preserve its converged answers; only a failed solve pays for this bounded signed bracket.
 /// Callers reject invalid propagation or nonpositive reception derivatives at every probe.
@@ -1852,7 +1919,7 @@ fn bracketed_emission<T>(
         }
         // At UNIX-epoch magnitudes the representable time spacing can exceed `tol`.
         // A stalled bracket still has to meet the same reception residual as Newton.
-        if g.abs() < 1e-3 && (hi - lo <= tol || t == lo || t == hi || g == 0.0) {
+        if g.abs() < EMISSION_RESIDUAL_S && (hi - lo <= tol || t == lo || t == hi || g == 0.0) {
             return (t > start && t < end).then_some((t, value));
         }
         if g > 0.0 {
@@ -3798,6 +3865,99 @@ mod tests {
                 assert!(!bounds.may_reach(far, 8000.0));
             }
         }
+    }
+
+    #[test]
+    fn travel_bounds_cover_hermite_excursions_with_and_without_wind() {
+        let enu = Enu::new(40.876466, -73.524951, 0.0);
+        let base = straight_track(
+            &enu,
+            [0.0; 3],
+            [50.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+        );
+        for magnitude in [0.0, 6_000_000.0, 6_000_000_000_000.0] {
+            let offset = [magnitude, -magnitude, magnitude];
+            let mut tr = base.clone();
+            tr.t = vec![10.0, 30.0, 55.0];
+            tr.pos = [
+                [-500.0, 0.0, -300.0],
+                [500.0, 0.0, 100.0],
+                [900.0, 700.0, 900.0],
+            ]
+            .map(|p| add(offset, p))
+            .to_vec();
+            tr.vel = vec![
+                [50.0, 300.0, 100.0],
+                [50.0, -300.0, -100.0],
+                [30.0, 40.0, 50.0],
+            ];
+            let x = add(offset, [0.0, -5000.0, -3000.0]);
+            let bounds = tr.bounds().unwrap();
+            assert!(
+                tr.pos_at(20.0)[1]
+                    > tr.pos
+                        .iter()
+                        .map(|p| p[1])
+                        .fold(f64::NEG_INFINITY, f64::max)
+            );
+            for w in [
+                [0.0; 3],
+                [25.0, -15.0, 5.0],
+                [-25.0, 15.0, -5.0],
+                [343.0 * (1.0 - 1e-9), 0.0, 0.0],
+            ] {
+                let m = Prop { c: 343.0, w };
+                let upper = bounds.max_travel_s(x, &m).unwrap();
+                for i in 0..=400 {
+                    let p = tr.pos_at(10.0 + 45.0 * i as f64 / 400.0);
+                    let rv = sub(p, x);
+                    let actual = m.travel(rv, norm(rv));
+                    assert!(
+                        actual.is_finite() && actual <= upper,
+                        "offset {magnitude}, wind {w:?}, sample {i}: {actual} > {upper}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_travel_bounds_keep_the_emission_solver() {
+        let bounds = TrackBounds {
+            lo: [-10.0; 3],
+            hi: [10.0; 3],
+        };
+        let wind = Prop {
+            c: 343.0,
+            w: [20.0, -10.0, 0.0],
+        };
+        assert!(bounds.max_travel_s([0.0; 3], &Prop::still(343.0)).is_some());
+        assert!(bounds.max_travel_s([0.0; 3], &wind).is_none());
+        assert!(bounds.max_travel_s([0.0, 0.0, 100.0], &wind).is_some());
+        for m in [
+            Prop::still(0.0),
+            Prop::still(f64::NAN),
+            Prop {
+                c: 343.0,
+                w: [343.0, 0.0, 0.0],
+            },
+            Prop {
+                c: 343.0,
+                w: [f64::NAN, 0.0, 0.0],
+            },
+        ] {
+            assert!(bounds.max_travel_s([0.0, 0.0, 100.0], &m).is_none());
+        }
+        assert!(bounds.max_travel_s([f64::NAN, 0.0, 100.0], &wind).is_none());
+        let overflow = TrackBounds {
+            lo: [-f64::MAX; 3],
+            hi: [f64::MAX; 3],
+        };
+        assert!(overflow.max_travel_s([0.0; 3], &Prop::still(343.0)).is_none());
     }
 
     #[test]
