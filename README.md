@@ -2521,6 +2521,23 @@ second weather wait; a larger footprint can require another archive download.
 
 ## Testing
 
+### Retain supported fast flights despite discarded speed reports
+
+A speed attached to a rejected GNSS position could prevent separately supported, corrected-height
+approach and departure segments from entering the search. Missing-speed recovery now checks all
+retained preferred samples instead. Any speed report on retained support still keeps the original
+reported envelope; inferred speed uses the same checked positions and reachability limits.
+
+`rejected_speed_reports_do_not_erase_supported_corrected_height_tracks` exercises 215, 245 and
+270 m/s synthetic flights at local and Unix timestamps with one or many discarded reports. It checks
+unchanged retained geometry, restoration of both supported segments, analytic received Doppler and
+controls with valid, zero or infinite speeds on retained samples.
+`corrected_speed_recovery_checks_every_retained_model` keeps the reported guard when a later
+two-knot model has speed reports or its original samples cannot be identified. Existing physical-reach
+tests continue to require rejection of unreachable segments and insufficient support. These native
+regressions and the release selftest remain unrun: the execution host disconnected during compilation
+and again after recovery. Reference, wrong-date and field-recording accuracy have not been remeasured.
+
 ### Skip impossible clocks during chance-match calibration
 
 Calibration keeps its quarter-second clock scan and its existing five-prediction and 60% trace

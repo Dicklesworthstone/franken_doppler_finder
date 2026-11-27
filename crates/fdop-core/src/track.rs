@@ -1058,20 +1058,18 @@ fn recover_velocity_component(
     }
 }
 
-/// A missing speed report must not reinstate the 200 m/s default between models whose
-/// retained positions already support faster motion. Only literal NaNs permit this retry;
-/// finite or invalid non-NaN reports retain the reported envelope. Rejected GNSS positions
-/// cannot set the limit: use the same checked secants on the preferred models' own samples.
+/// Missing speed reports must not reinstate a slower envelope between models whose
+/// retained positions already support faster motion. Every retained preferred sample must
+/// lack a speed report; finite or invalid non-NaN reports keep the original envelope.
+/// Discarded GNSS reports cannot disable this retry or supply its inferred speed.
 fn corrected_recovery_speed_limit(
     pts: &[fdop_types::store::TrackPoint],
     preferred: &[TrackModel],
     bp: &BuildParams,
 ) -> f64 {
-    let mut limit = reported_speed_limit(pts);
-    if pts.iter().any(|p| !p.gs_mps.is_nan()) {
-        return limit;
-    }
-    for model in preferred.iter().filter(|model| model.t.len() >= 3) {
+    let reported = reported_speed_limit(pts);
+    let mut limit = reported;
+    for model in preferred {
         // The builder supplies its sorted, bridge-filtered points. Each model time
         // names exactly one of them; no chord crosses into a rejected report.
         let support: Vec<_> = model
@@ -1084,6 +1082,15 @@ fn corrected_recovery_speed_limit(
             })
             .collect();
         if support.len() != model.t.len() {
+            // Unknown retained samples cannot establish missing-speed eligibility.
+            return reported;
+        }
+        // A report on any retained model keeps the original guard, including
+        // two-knot models that cannot independently infer a faster envelope.
+        if support.iter().any(|p| !p.gs_mps.is_nan()) {
+            return reported;
+        }
+        if support.len() < 3 {
             continue;
         }
         let enu = Enu::new(support[0].lat, support[0].lon, 0.0);
@@ -7216,6 +7223,152 @@ mod tests {
                 let rms = doppler_rms_hz(actual, observer, span, state);
                 assert!(rms < 1e-4, "{speed} m/s recovered Doppler RMS {rms} Hz");
             }
+        }
+    }
+
+    #[test]
+    fn rejected_speed_reports_do_not_erase_supported_corrected_height_tracks() {
+        let bp = BuildParams::default();
+        for speed in [215.0, 245.0, 270.0] {
+            for epoch in [0.0, 1_700_000_000.0] {
+                let (mut clean, enu) = partial_gnss_missing_speed_leg(speed);
+                for p in &mut clean.points {
+                    p.t += epoch;
+                }
+                let expected = build(&clean, &bp);
+                assert_eq!(expected.len(), 3);
+                for all_rejected in [false, true] {
+                    let mut dirty = clean.clone();
+                    let reported = ((speed - 40.0) / 1.5) as f32;
+                    let mut changed = 0;
+                    for p in &mut dirty.points {
+                        let t = p.t - epoch - 1000.0;
+                        if p.alt_src == alt_src::GEOM
+                            && !(480.0..=520.0).contains(&t)
+                            && (all_rejected || changed == 0)
+                        {
+                            p.gs_mps = reported;
+                            changed += 1;
+                        }
+                    }
+                    assert!(changed > 0);
+                    let mut gnss = dirty.clone();
+                    gnss.points.retain(|p| p.alt_src == alt_src::GEOM);
+                    let preferred = build(&gnss, &NO_BRIDGE);
+                    assert_eq!(preferred.len(), 1);
+                    assert_same_gap_model(&preferred[0], &expected[0]);
+                    let old_limit = reported_speed_limit(&gnss.points);
+                    assert!(old_limit < speed);
+                    assert!(!separated_models_reachable(
+                        &expected[1],
+                        &preferred[0],
+                        old_limit,
+                        &bp
+                    ));
+                    assert!(!separated_models_reachable(
+                        &preferred[0],
+                        &expected[2],
+                        old_limit,
+                        &bp
+                    ));
+
+                    let actual = build(&dirty, &bp);
+                    assert_eq!(
+                        actual.len(),
+                        3,
+                        "discarded reports erased supported flanks: {speed} m/s, epoch={epoch}, all={all_rejected}"
+                    );
+                    for (actual, expected) in actual.iter().zip(&expected) {
+                        assert_same_gap_model(actual, expected);
+                    }
+                    // Check received sound against analytic constant-velocity Doppler,
+                    // independently of the spline's own propagation prediction.
+                    let velocity = enu.vec_to_ecef([speed, 0.0, 0.0]);
+                    let prop = Prop::still(C_MPS);
+                    for model in &actual[1..] {
+                        let centre = 0.5 * (model.t0() + model.t1()) - epoch - 1000.0;
+                        let observer = enu.to_ecef([speed * centre, 1500.0, 0.0]);
+                        for fraction in [0.2, 0.5, 0.8] {
+                            let te = model.t0() + fraction * (model.t1() - model.t0());
+                            let q = te - epoch - 1000.0;
+                            let position = enu.to_ecef([speed * q, 0.0, 1200.0]);
+                            let rv = sub(position, observer);
+                            let range = norm(rv);
+                            let ratio = 1.0 / (1.0 + dot(rv, velocity) / (C_MPS * range));
+                            let received = te + range / C_MPS;
+                            let (actual_te, _, actual_ratio) = model
+                                .solve_emission_p(received, observer, &prop, None)
+                                .expect("a restored flank must predict its received sound");
+                            assert!((actual_te - te).abs() < 1e-3);
+                            assert!(
+                                (F0_HZ * (actual_ratio - ratio)).abs() < 1e-4,
+                                "restored Doppler differs from truth at {speed} m/s"
+                            );
+                        }
+                    }
+
+                    if all_rejected {
+                        // Any retained report still governs the retry, including a
+                        // valid speed and a non-NaN invalid report. The junk majority
+                        // leaves the original reported envelope below the true speed.
+                        for report in [0.0, speed as f32, f32::INFINITY] {
+                            let mut limited = dirty.clone();
+                            let retained = limited
+                                .points
+                                .iter_mut()
+                                .find(|p| p.t == epoch + 1500.0)
+                                .unwrap();
+                            retained.gs_mps = report;
+                            let mut support = limited.clone();
+                            support.points.retain(|p| p.alt_src == alt_src::GEOM);
+                            let preferred = build(&support, &NO_BRIDGE);
+                            assert_eq!(preferred.len(), 1);
+                            assert_eq!(
+                                corrected_recovery_speed_limit(&support.points, &preferred, &bp),
+                                reported_speed_limit(&support.points)
+                            );
+                            let actual = build(&limited, &bp);
+                            assert_eq!(actual.len(), 1);
+                            assert_same_gap_model(&actual[0], &preferred[0]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corrected_speed_recovery_checks_every_retained_model() {
+        let bp = BuildParams::default();
+        let (mut gnss, enu) = partial_gnss_missing_speed_leg(245.0);
+        gnss.points.retain(|p| p.alt_src == alt_src::GEOM);
+        let preferred = build(&gnss, &NO_BRIDGE);
+        assert_eq!(preferred.len(), 1);
+        assert_eq!(preferred[0].t.len(), 3);
+        let short_leg = leg_from_states(&[2000.0, 2020.0], |t| {
+            (
+                enu.to_ecef([140.0 * (t - 2000.0), 0.0, 1200.0]),
+                enu.vec_to_ecef([140.0, 0.0, 0.0]),
+            )
+        });
+        let short = build(&short_leg, &NO_BRIDGE);
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].t.len(), 2);
+        gnss.points.extend(short_leg.points);
+        gnss.points.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let reported = reported_speed_limit(&gnss.points);
+        assert!(corrected_recovery_speed_limit(&gnss.points, &preferred, &bp) > reported);
+        for unmatched in [false, true] {
+            let mut tail = short[0].clone();
+            if unmatched {
+                tail.t[0] += 0.125;
+            }
+            let models = [preferred[0].clone(), tail];
+            assert_eq!(
+                corrected_recovery_speed_limit(&gnss.points, &models, &bp),
+                reported,
+                "a later retained model must keep the guard: unmatched={unmatched}"
+            );
         }
     }
 

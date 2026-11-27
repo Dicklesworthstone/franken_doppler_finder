@@ -19,6 +19,17 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover supported flight segments beside discarded speed reports
+
+- Decide missing-speed eligibility from all retained preferred track samples, so a speed
+  attached to a rejected GNSS position cannot suppress independently supported approach
+  and departure segments. Retained speed reports, including zero and invalid non-NaN
+  values, preserve the original guard; interpolation and reachability checks are unchanged.
+- Add synthetic regression cases at 215, 245 and 270 m/s, two epochs, and one or many
+  rejected reports. Check unchanged models, analytic Doppler on restored segments and
+  retained-report controls, including a later two-knot model and unmatched source samples.
+  Native execution and field replays are pending after repeated execution-host outages.
+
 ### Skip unsupported calibration clocks without changing their evidence
 
 - Avoid full trace fitting when the finite prediction envelope cannot cover the existing
