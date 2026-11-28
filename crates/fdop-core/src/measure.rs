@@ -3453,51 +3453,50 @@ mod tests {
     fn fitted_continuation_preserves_accepted_short_events() {
         let dp = DetectParams::default();
         let p = MeasureParams::default();
-        // The early 3 dB pass already succeeds through free tracing. Some accepted late-pass
-        // fits still have the wrong geometry: this recovery cannot replace accepted results,
-        // and must not claim to fix those distinct failures.
-        for (pass, attenuation) in [
-            ((118.0, 215.0, 900.0, 10.13), 3),
-            ((83.0, 245.0, 700.0, 19.37), 3),
-            ((83.0, 245.0, 700.0, 19.37), 6),
-        ] {
-            let mut x = crate::detect::fast_pass_scene(
-                pass,
-                0.32 * 10.0f64.powf(-f64::from(attenuation) / 20.0),
+        // This early 3 dB pass already succeeds through free tracing. Preserve
+        // that accepted result and require its independently known geometry.
+        let pass = (118.0, 215.0, 900.0, 10.13);
+        let attenuation = 3;
+        let mut x = crate::detect::fast_pass_scene(
+            pass,
+            0.32 * 10.0f64.powf(-f64::from(attenuation) / 20.0),
+        );
+        x.truncate(30 * 4000);
+        let (_, events) = survey_measure_families(&x, &dp);
+        assert_eq!(
+            crate::search::independent_measured_events(&events, 0.0).len(),
+            1
+        );
+        let mut preserved = 0;
+        for new in events {
+            let old = measure_with_fit(
+                &x,
+                4000,
+                &new.detection,
+                &new.id,
+                &p,
+                false,
+                prepare_constant_velocity,
             );
-            x.truncate(30 * 4000);
-            let (_, events) = survey_measure_families(&x, &dp);
-            assert_eq!(
-                crate::search::independent_measured_events(&events, 0.0).len(),
-                1
-            );
-            let mut preserved = 0;
-            for new in events {
-                let old = measure_with_fit(
-                    &x,
-                    4000,
-                    &new.detection,
-                    &new.id,
-                    &p,
-                    false,
-                    prepare_constant_velocity,
+            assert_same_measurement(&old, &new);
+            if old.is_aircraft_like() {
+                preserved += 1;
+                let best = new.fit.as_ref().unwrap().best;
+                assert!((best.f0 - pass.0).abs() < 0.3, "{best:?}");
+                assert!((best.v - pass.1).abs() < 4.0, "{best:?}");
+                assert!((best.d / pass.2 - 1.0).abs() < 0.08, "{best:?}");
+                assert!((best.t0r - pass.3).abs() < 0.3, "{best:?}");
+                eprintln!(
+                    "unchanged accepted short pass v={} {attenuation} dB: {best:?}",
+                    pass.1,
                 );
-                assert_same_measurement(&old, &new);
-                if old.is_aircraft_like() {
-                    preserved += 1;
-                    eprintln!(
-                        "unchanged accepted short pass v={} {attenuation} dB: {:?}",
-                        pass.1,
-                        new.fit.as_ref().unwrap().best
-                    );
-                }
             }
-            assert!(
-                preserved > 0,
-                "v={} {attenuation} dB: no accepted control",
-                pass.1
-            );
         }
+        assert!(
+            preserved > 0,
+            "v={} {attenuation} dB: no accepted control",
+            pass.1
+        );
     }
 
     #[test]
@@ -3507,10 +3506,11 @@ mod tests {
         let p = MeasureParams::default();
         // A generic steep-ridge continuation promoted the 9 dB refusal to a wrong 159 m/s fit.
         // Its original fit was inside the primary bank's domain, so it did not establish the
-        // missing-fast-bank failure this continuation repairs. The incoming retained-support
-        // gates also refuse the 12 dB row. Keep all three outputs unchanged; the already
-        // accepted late rows are checked separately above.
-        for attenuation in [0, 9, 12] {
+        // missing-fast-bank failure this continuation repairs. The continuous-support gate
+        // also refuses the 3/6 dB rows: their former 61-71 Hz, 80-149 m/s fits borrowed an
+        // approach from disconnected points. Keep every output unchanged with and without
+        // the bounded continuation, including the existing 0/9/12 dB refusals.
+        for attenuation in [0, 3, 6, 9, 12] {
             let mut x = crate::detect::fast_pass_scene(
                 pass,
                 0.32 * 10.0f64.powf(-f64::from(attenuation) / 20.0),
@@ -3540,6 +3540,17 @@ mod tests {
                     event.quality
                 );
                 assert_same_measurement(&old, &event);
+                if matches!(attenuation, 3 | 6) {
+                    assert!(old.quality.span_approach_s < p.min_side_s);
+                    assert!(
+                        old.quality
+                            .reasons
+                            .iter()
+                            .any(|reason| reason.starts_with("one-sided trace")),
+                        "{attenuation} dB: {:?}",
+                        old.quality,
+                    );
+                }
                 eprintln!(
                     "unchanged refused late pass {attenuation} dB: {:?}; {:?}",
                     event.fit.as_ref().map(|f| f.best),

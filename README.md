@@ -2702,9 +2702,24 @@ provenance and an untruncated measurement. These new tests pass in normal core C
 and a native source harness for the pipeline; its existing noise/steady/reversed controls
 also pass. The actual measurement/search/refinement path on the padded pair matches both
 known flights, with 1.82585 m position error and -0.006578 s recording-start error and no
-audit or search truncation. These are focused native checks. Full-workspace and release-CLI
-validation remain incomplete; reference, wrong-date and field-recording results have not
-been remeasured.
+audit or search truncation.
+
+Compatibility checks also preserve the correct early 215 m/s pass at 3 dB attenuation
+and the four existing positive recoveries at 0/6/9/12 dB. The late 245 m/s recordings at
+3 and 6 dB now belong to the refusal controls: their 61-71 Hz, 80-149 m/s tail fits have
+only 0.93-1.27 seconds of continuous approach. Every original waveform is retained, with
+explicit physical bounds for the positive case and full continuation-off/on equality.
+All six automatic audio-track and three automatic-channel FFmpeg integration tests pass.
+
+The unchanged selftest module also passes against the normal optimized development core
+library. It synthesizes and decodes 1,300 seconds of audio, searches a wide area and a
+clock window spanning six hours on either side, and matches both expected flights with 1.52067 m
+position error inside the 75 m radius and +0.014271 s clock error. This is production-module
+validation. Full-workspace Clippy is killed with SIGKILL while compiling metadata for the
+pinned `asupersync 0.5.0` dependency, before reaching workspace crates; workspace tests and
+release-CLI validation remain incomplete. A separate core-only Clippy attempt stops on the
+existing `manual_range_contains` lint in `fdop-types/src/atmo.rs` before checking the core.
+Reference, wrong-date and field-recording results have not been remeasured.
 
 ### Keep a qualifying confirming flight after the first choice fails its clock check
 

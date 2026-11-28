@@ -19,6 +19,28 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Require physical correctness in short-pass compatibility controls
+
+- Keep the unchanged early 215 m/s, 3 dB recording and require its known frequency,
+  speed, distance and arrival time as well as complete continuation-off/on equality.
+- Move the unchanged late 245 m/s recordings at 3 and 6 dB into the refusal controls.
+  Their measured tail fits are about 61-71 Hz and 80-149 m/s against an 83 Hz, 245 m/s
+  source, with only 0.93-1.27 seconds of continuous approach. The old accepted-count
+  expectation explicitly preserved incorrect geometry. Require the short-side refusal
+  and retain all existing 0/9/12 dB controls and physical tolerances. Both updated native
+  regression tests pass.
+- The four existing 0/6/9/12 dB positive fast-pass recoveries pass, as do all six
+  automatic audio-track and three automatic channel FFmpeg integration controls.
+  The unchanged selftest module also passes using the normal optimized development
+  core library: 1,300 seconds of synthesized/decoded audio, both expected flights,
+  1.52067 m position error inside the 75 m radius and +0.014271 s clock error.
+- Full-workspace Clippy stops in the pinned `asupersync 0.5.0` metadata compiler with
+  SIGKILL before reaching workspace crates. Workspace tests and the release CLI remain
+  incomplete; the source-module selftest is separate validation. The formatter's
+  differences are pre-existing, with none on the newly changed Rust spans.
+  A separate core-only Clippy attempt stops on the existing `manual_range_contains`
+  lint in `fdop-types/src/atmo.rs` before checking `fdop-core`.
+
 ### Recover physical aircraft through digital silence
 
 - Exclude wholly zero PCM windows from survey row medians, row spreads and global image
