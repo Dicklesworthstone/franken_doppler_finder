@@ -884,14 +884,15 @@ metadata, discovered channels retained after a failed mix, and rejection of miss
 invalid decoded layouts. Native validation results are recorded in the changelog;
 reference/field replays have not been run for this option.
 
-The existing detector can remain sensitive to a short recording's boundaries. In one
-30-second synthetic fast/weak pair, a five-second zero prefix reduced independent measured
-aircraft from two to one even though decoded PCM and container timing were exact. The
-missing pass and the cause of this change have not been isolated. Source selection retains
-one assessed view and reports its measured support; it cannot restore a pass the measurement
-pipeline does not accept. The delayed-source positive test uses two clearly audible,
-ordinary-speed interior passes to test source and clock recovery separately. That revised
-fixture still needs native execution after the execution host became unavailable.
+Detection and measurement exclude wholly zero PCM windows from their background statistics,
+so a delayed track's silent lead-in does not dilute the normalization of its audible frames.
+Empty frames retain their original recording times and contribute zero detector evidence;
+template coverage requirements remain in force. The original 30-second fast/weak pair and its exact
+five-second zero prefix are covered by a physical two-aircraft regression. This does not
+make detection invariant to every change of recording boundaries or STFT alignment. Source
+selection still retains one assessed view and cannot invent a pass that fails measurement.
+The separate delayed-source test uses two clearly audible ordinary-speed interior passes
+to check source identity, exact samples, metadata and container-relative clocks.
 
 **Jet matching is opt-in.** `--include-jets` retains known jets through archive parsing,
 cross-feed and cross-day reconciliation, trace hypotheses and confirmation, and the
@@ -2261,14 +2262,15 @@ Design notes:
   and its retained observations cover less than 8 s on either side, the ridge is followed by its own slope from that trace's
   first, strongest and last points, inside the event's analysis window. The free trace is fitted, and the guided
   rounds start again from that fit if it is plausible. The second attempt replaces the first only if every gate
-  accepts it; `reseeded` in `events.json` marks it. Side coverage uses the fitter's existing retained timestamps;
-  discarded frequency outliers cannot create apparent approach/recede support or block this retry.
+  accepts it; `reseeded` in `events.json` marks it. Side coverage uses the continuous stretch of the fitter's
+  retained timestamps through the fitted closest approach. Discarded frequency outliers or retained points
+  beyond a gap longer than three seconds cannot create apparent side support or block this retry.
   A recovery starting from fewer than 20 points must also retain a continuous ridge through its fitted
   closest approach, with the existing eight seconds on each side and three-second maximum gap.
   Isolated noise points beyond an unobserved side cannot supply that support. Optional raw-frequency
   calibration must preserve it; otherwise the supported recovered fit remains available.
-  Raw trace points, SNR and central-drop accounting remain unchanged. Accepted fits, and refusals whose retained trace held both sides, are
-  measured exactly as before. A wrong fit can pass this way too: a climbing pass in a clip that starts mid-drop
+  Trace SNR and central-drop accounting remain separate quality requirements.
+  A wrong fit can pass this way too: a climbing pass in a clip that starts mid-drop
   trades speed against distance, and the retry accepts the wrong pair.
 - **A fast fitted ridge can regain missing side or central-drop coverage.** When the fitted speed is
   already beyond the primary bank's 175 m/s limit and a steep fitted ridge fails only the required
@@ -2287,7 +2289,7 @@ Design notes:
 - **A primary that lost its ridge can yield to a usable harmonic.** A bright harmonic may lose its ridge
   through the drop while another tone from the same pass remains measurable. Both `locate` and `detect`
   try the primary first, then its detected siblings in score order only if the primary has no fit, fewer
-  than 80 trace points, less than 8 s of trace on either side of the closest approach, or less than 15 %
+  than 80 trace points, less than 8 s of continuous retained support on either side of the closest approach, or less than 15 %
   of its frequency drop followed. A primary that was traced but refused for another reason (such as its
   fit RMS) or measured below the aircraft limits keeps its own result: on the recordings
   checked, every sibling chosen over such a primary measured the pass worse. The first usable sibling
@@ -2662,6 +2664,47 @@ second weather wait; a larger footprint can require another archive download.
 ---
 
 ## Testing
+
+### Keep aircraft evidence when a recording contains digital silence
+
+A native reproduction isolated the loss of the fast 83 Hz pass in a 30-second synthetic
+two-aircraft recording. Adding exactly five seconds of zero PCM lowered its short-survey
+template score from 4.689313 to 3.684540, below the unchanged 4.5 recovery line. Both template
+halves still had all five samples, and the original seed, shifted by five seconds, passed
+the real measurement gates. The loss came from background normalization, not decoding,
+recording-clock handling or insufficient physical support.
+
+Survey normalization now computes its row medians, row spreads and image scale from STFT
+windows containing PCM. Main, short and renewed measurement spectra use the same supported
+background rule while retaining their raw offsets for peak calibration. Wholly empty survey
+windows stay at zero evidence without disappearing from the time grid or template denominators.
+Fully supported and entirely silent recordings retain the previous normalization arithmetic;
+there is no amplitude cutoff or new detector bank.
+
+The same fixture exposed a second defect: one retained noise point, separated from the ridge
+by 14.5 seconds, supplied a false fit's apparent approach. Ordinary measurement now checks
+the continuous retained stretch through the fitted closest approach, using the existing
+three-second gap rule and eight-second requirement on each side. A detached point cannot
+turn an observed tail into a complete aircraft pass or block recovery of the real ridge.
+The existing bounded fast-ridge continuation remains available when the side and central-drop
+checks both expose that incomplete ridge. A missing drop keeps the original spectrum and
+narrowed band; every final quality requirement still applies. The existing long-tail physical
+regression passes with continuous support on both sides and its original accuracy bounds.
+
+Three detector regressions cover exact PCM-window support, aligned leading/trailing/interior
+silence under both normalization orders, and empty/noise/steady-tone controls. A measurement
+regression preserves refusal of the actual partial-tail seed before and after padding. An
+actual-solver regression rejects isolated retained points on either side while preserving
+complete ridges and short dropouts. A pipeline regression uses the unchanged fast/weak samples
+and requires two independent aircraft,
+their known frequencies, speeds and distances, their shifted arrival times, recovery
+provenance and an untruncated measurement. These new tests pass in normal core Cargo tests
+and a native source harness for the pipeline; its existing noise/steady/reversed controls
+also pass. The actual measurement/search/refinement path on the padded pair matches both
+known flights, with 1.82585 m position error and -0.006578 s recording-start error and no
+audit or search truncation. These are focused native checks. Full-workspace and release-CLI
+validation remain incomplete; reference, wrong-date and field-recording results have not
+been remeasured.
 
 ### Keep a qualifying confirming flight after the first choice fails its clock check
 

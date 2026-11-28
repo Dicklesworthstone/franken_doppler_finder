@@ -29,6 +29,29 @@ pub struct Spec {
     pub meta: SpecMeta,
 }
 
+/// Digitally empty STFT windows carry no background observation. Preserve the
+/// full grid, including partially supported windows and nonfinite PCM. Complete
+/// and wholly empty recordings need no mask and keep their original arithmetic.
+pub(crate) fn pcm_frame_support(
+    x: &[f32],
+    sr: u32,
+    win_s: f64,
+    hop_s: f64,
+    frames: usize,
+) -> Option<Vec<bool>> {
+    let win = (win_s * f64::from(sr)).round() as usize;
+    let hop = ((hop_s * f64::from(sr)).round() as usize).max(1);
+    let support: Vec<_> = (0..frames)
+        .map(|i| {
+            x[i * hop..i * hop + win]
+                .iter()
+                .any(|&sample| sample != 0.0)
+        })
+        .collect();
+    let present = support.iter().filter(|&&observed| observed).count();
+    (present > 0 && present < frames).then_some(support)
+}
+
 /// The time half of bilinear interpolation, reused while sampling many frequencies
 /// along one integration frame. Keep the scalar sampler's f32 arithmetic and edge clamp.
 #[derive(Clone, Copy)]
@@ -165,6 +188,37 @@ impl Spec {
             "row-median over t=[{:.1},{:.1}]",
             self.t[a],
             self.t[b.saturating_sub(1)]
+        );
+        offsets
+    }
+
+    /// The same row median and raw offsets, using only windows containing PCM
+    /// when an exact support mask is available. Empty frames keep their raw floor
+    /// relative to that background; they are not replaced with observations.
+    pub(crate) fn normalize_rows_with_support(&mut self, support: Option<&[bool]>) -> Vec<f32> {
+        let Some(support) = support else {
+            return self.normalize_rows_with_offsets(None);
+        };
+        let offsets = self
+            .db
+            .par_chunks_mut(support.len())
+            .map(|row| {
+                let mut observed: Vec<_> = row
+                    .iter()
+                    .zip(support)
+                    .filter_map(|(&value, &present)| present.then_some(value))
+                    .collect();
+                let median = median_f32(&mut observed);
+                for value in row {
+                    *value -= median;
+                }
+                median
+            })
+            .collect();
+        self.meta.norm = format!(
+            "row-median over {} nonzero PCM frames of {}",
+            support.iter().filter(|&&present| present).count(),
+            support.len(),
         );
         offsets
     }

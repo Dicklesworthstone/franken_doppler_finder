@@ -3851,6 +3851,57 @@ mod tests {
     }
 
     #[test]
+    fn leading_digital_silence_preserves_two_physical_aircraft() {
+        let mut samples = fast_recording(30, (83.0, 245.0, 700.0, 19.37), 0.32);
+        for (i, sample) in samples.iter_mut().enumerate() {
+            let t = i as f64 / 4000.0;
+            let tau = physics::retarded_tau(t, 9.13 - 900.0 / 343.0, 90.0, 900.0, 343.0);
+            let range = physics::cv_radial(tau, 90.0, 900.0).0;
+            *sample += (0.08 * 900.0 / range * (std::f64::consts::TAU * 450.0 * tau).sin()) as f32;
+        }
+        // This is the unchanged compact fast/weak pair. Add only exact digital silence,
+        // as the decoder does for a delayed track; retain its original recording clock.
+        for prefix_s in [0, 5] {
+            let mut pcm = vec![0.0_f32; prefix_s * 4000];
+            pcm.extend_from_slice(&samples);
+            let log = Log::new(true);
+            let measured = measure_recording(&pcm, 4000, &log, None).unwrap();
+            let independent = search::independent_measured_events(&measured.events, 0.0);
+            assert_eq!(independent.len(), 2, "prefix {prefix_s}: {:?}", log.lines());
+            assert!(!measured.audit_limited, "{:?}", measured.warnings);
+            for (tone, speed, distance, heard) in
+                [(83.0, 245.0, 700.0, 19.37), (450.0, 90.0, 900.0, 9.13)]
+            {
+                let selected = independent
+                    .iter()
+                    .find(|event| (event.f0 - tone).abs() < 0.3)
+                    .expect("both original physical aircraft must remain independent");
+                let event = measured
+                    .events
+                    .iter()
+                    .find(|event| event.id == selected.id)
+                    .unwrap();
+                let best = event.fit.as_ref().unwrap().best;
+                assert!((best.f0 - tone).abs() < 0.3, "{best:?}");
+                assert!((best.v - speed).abs() < 4.0, "{best:?}");
+                assert!((best.d / distance - 1.0).abs() < 0.08, "{best:?}");
+                assert!(
+                    (best.t0r - heard - prefix_s as f64).abs() < 0.3,
+                    "prefix {prefix_s} changed the container-relative clock: {best:?}"
+                );
+                let seed = &measured.detections[event.detection.id];
+                if seed.v > detect::PRIMARY_MAX_SPEED_MPS
+                    || seed.from_contrast
+                    || event.detection.harmonic_of.is_some()
+                {
+                    assert!(measured.added.contains(&event.id));
+                }
+            }
+            assert_measurement_bookkeeping(&measured);
+        }
+    }
+
+    #[test]
     fn short_window_recovery_supplies_a_missing_second_aircraft() {
         let dp = DetectParams::default();
         let mp = MeasureParams::default();

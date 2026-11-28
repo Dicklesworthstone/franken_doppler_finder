@@ -126,11 +126,41 @@ pub struct LogSpec {
 /// 1.4826 x the median absolute deviation from the median, over every value.
 fn robust_scale(v: &[f32], tmp: &mut [f32]) -> f64 {
     tmp.copy_from_slice(v);
+    robust_scale_in_place(tmp)
+}
+
+fn robust_scale_in_place(tmp: &mut [f32]) -> f64 {
     let m = crate::spectro::median_f32(tmp);
     for x in tmp.iter_mut() {
         *x = (*x - m).abs();
     }
     1.4826 * crate::spectro::median_f32(tmp) as f64
+}
+
+/// Digitally empty STFT windows carry no background-noise observation. Keep their
+/// frames and times, but do not let padding or gaps change the statistics of sound
+/// elsewhere. A nonfinite sample remains supported, preserving its existing handling.
+/// Complete and wholly empty recordings take the original arithmetic unchanged.
+fn survey_frame_support(x: &[f32], sr: u32, p: &DetectParams, frames: usize) -> Option<Vec<bool>> {
+    crate::spectro::pcm_frame_support(x, sr, p.win_s, p.hop_s, frames)
+}
+
+/// The same image MAD as `robust_scale`, sampled only at windows containing PCM.
+/// Reuse the transposed scratch allocation rather than retaining another image.
+fn supported_image_scale(v: &[f32], tmp: &mut [f32], support: Option<&[bool]>) -> f64 {
+    let Some(support) = support else {
+        return robust_scale(v, tmp);
+    };
+    let mut kept = 0;
+    for row in v.chunks_exact(support.len()) {
+        for (&value, &observed) in row.iter().zip(support) {
+            if observed {
+                tmp[kept] = value;
+                kept += 1;
+            }
+        }
+    }
+    robust_scale_in_place(&mut tmp[..kept])
 }
 
 /// Gain that brings an image of robust spread `scale` up to `floor`: 1 at or above it, and at
@@ -164,7 +194,8 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
         1.0,
         0.0,
     )?;
-    lin.normalize_rows(None);
+    let support = survey_frame_support(x, sr, p, lin.nt());
+    lin.normalize_rows_with_support(support.as_deref());
     for v in lin.db.iter_mut() {
         *v = v.clamp(-6.0, 20.0);
     }
@@ -198,7 +229,12 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
     let pooled = data.clone();
     // Max-pooling k linear bins raises the noise floor by an amount that grows with k (i.e. with
     // frequency), so put every log row on a common robust z scale before matched filtering.
-    data.par_chunks_mut(nt).for_each(robust_z_row);
+    if let Some(support) = support.as_deref() {
+        data.par_chunks_mut(nt)
+            .for_each(|row| supported_z_row(row, support));
+    } else {
+        data.par_chunks_mut(nt).for_each(robust_z_row);
+    }
     // Broadband events (traffic, wind gusts, handling noise) raise whole columns; a Doppler ridge
     // is 1-3 log-rows wide. Subtract each frame's running median across +-1/3 octave so only
     // narrowband structure survives.
@@ -208,14 +244,22 @@ pub fn survey(x: &[f32], sr: u32, p: &DetectParams) -> Result<(LogSpec, Spec), S
     // Put a compressed image back on the spread the detection lines were set at (see
     // `DetectParams::min_image_scale`). Noise and ridge scale together, so this changes the
     // lines' meaning, not the evidence; an image at or above the floor is untouched.
-    let scale = robust_scale(&data, &mut cols);
+    let scale = supported_image_scale(&data, &mut cols, support.as_deref());
     let gain = image_gain(scale, p.min_image_scale);
     raise(&mut data, gain);
     let contrast = (gain > 1.0).then(|| {
         let mut c = pooled;
         subtract_frequency_background(&mut c, &mut cols, nt, half_w, false);
-        c.par_chunks_mut(nt).for_each(robust_z_row);
-        let g = image_gain(robust_scale(&c, &mut cols), p.min_image_scale);
+        if let Some(support) = support.as_deref() {
+            c.par_chunks_mut(nt)
+                .for_each(|row| supported_z_row(row, support));
+        } else {
+            c.par_chunks_mut(nt).for_each(robust_z_row);
+        }
+        let g = image_gain(
+            supported_image_scale(&c, &mut cols, support.as_deref()),
+            p.min_image_scale,
+        );
         raise(&mut c, g);
         c
     });
@@ -244,6 +288,29 @@ fn robust_z_row(row: &mut [f32]) {
     let mad = 1.4826 * crate::spectro::median_f32(&mut tmp) + 0.05;
     for v in row.iter_mut() {
         *v = ((*v - med) / mad).clamp(-3.0, 8.0);
+    }
+}
+
+/// Preserve the row's ordinary median/MAD arithmetic on supported observations.
+/// Empty windows remain zero evidence, including in the contrast image, and still
+/// count toward template coverage and score denominators in the unchanged bank.
+fn supported_z_row(row: &mut [f32], support: &[bool]) {
+    let mut observed: Vec<_> = row
+        .iter()
+        .zip(support)
+        .filter_map(|(&value, &present)| present.then_some(value))
+        .collect();
+    let median = crate::spectro::median_f32(&mut observed);
+    for value in &mut observed {
+        *value = (*value - median).abs();
+    }
+    let mad = 1.4826 * crate::spectro::median_f32(&mut observed) + 0.05;
+    for (value, &present) in row.iter_mut().zip(support) {
+        *value = if present {
+            ((*value - median) / mad).clamp(-3.0, 8.0)
+        } else {
+            0.0
+        };
     }
 }
 
@@ -4603,6 +4670,185 @@ mod tests {
                     "{name}: the fast stage displaced a kept detection"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn survey_digital_support_uses_exact_pcm_windows() {
+        let p = DetectParams {
+            win_s: 0.5,
+            hop_s: 0.25,
+            ..DetectParams::default()
+        };
+        let mut x = vec![0.0; 20];
+        assert!(survey_frame_support(&x, 16, &p, 4).is_none());
+        x.fill(-0.0);
+        assert!(survey_frame_support(&x, 16, &p, 4).is_none());
+        for value in [
+            f32::MIN_POSITIVE,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            x.fill(0.0);
+            x[0] = value;
+            x[11] = f32::MIN_POSITIVE;
+            assert_eq!(
+                survey_frame_support(&x, 16, &p, 4),
+                Some(vec![true, true, true, false]),
+                "eight-sample windows start at 0, 4, 8 and 12; no amplitude cutoff",
+            );
+        }
+        x.fill(1.0);
+        assert!(survey_frame_support(&x, 16, &p, 4).is_none());
+    }
+
+    #[test]
+    fn survey_digital_silence_preserves_supported_columns_and_statistics() {
+        let sr = 4000;
+        let mut saw_contrast = false;
+        for swell_db in [0.0, 25.0] {
+            let x = swell_scene(0.16, swell_db);
+            for cadence in [1.0, 0.5] {
+                let p = DetectParams {
+                    win_s: cadence,
+                    hop_s: cadence,
+                    // Every pool must contain a linear bin: otherwise the existing
+                    // bilinear last-frame epsilon changes when a suffix makes that
+                    // frame interior, independently of background normalization.
+                    bins_per_octave: 24,
+                    ..DetectParams::default()
+                };
+                let (reference, linear) = survey(&x, sr, &p).unwrap();
+                assert!(reference.freqs.iter().all(|&center| {
+                    let half_bin = 0.5 / p.bins_per_octave as f64;
+                    let lo = center * 2f64.powf(-half_bin);
+                    let hi = center * 2f64.powf(half_bin);
+                    linear
+                        .f
+                        .iter()
+                        .any(|&frequency| lo <= frequency && frequency <= hi)
+                }));
+                assert!(survey_frame_support(&x, sr, &p, reference.nt()).is_none());
+                saw_contrast |= reference.contrast.is_some();
+                let hop = (cadence * f64::from(sr)) as usize;
+                for (label, gaps) in [
+                    ("prefix", vec![(0, 5 * sr as usize)]),
+                    ("suffix", vec![(x.len(), 7 * sr as usize)]),
+                    ("internal", vec![(18 * sr as usize, 4 * sr as usize)]),
+                    (
+                        "combined",
+                        vec![
+                            (0, 5 * sr as usize),
+                            (18 * sr as usize, 4 * sr as usize),
+                            (x.len(), 7 * sr as usize),
+                        ],
+                    ),
+                ] {
+                    let mut padded = Vec::new();
+                    let mut from = 0;
+                    for &(at, count) in &gaps {
+                        padded.extend_from_slice(&x[from..at]);
+                        padded.resize(padded.len() + count, 0.0);
+                        from = at;
+                    }
+                    padded.extend_from_slice(&x[from..]);
+                    let (actual, actual_linear) = survey(&padded, sr, &p).unwrap();
+                    assert_eq!(actual.freqs, reference.freqs);
+                    assert_eq!(actual_linear.f, linear.f);
+                    assert_eq!(actual.scale.to_bits(), reference.scale.to_bits(), "{label}");
+                    assert_eq!(actual.gain.to_bits(), reference.gain.to_bits(), "{label}");
+                    assert_eq!(actual.contrast.is_some(), reference.contrast.is_some());
+                    for i in 0..reference.nt() {
+                        let added: usize = gaps
+                            .iter()
+                            .filter(|&&(at, _)| at <= i * hop)
+                            .map(|&(_, count)| count)
+                            .sum();
+                        let shifted = i + added / hop;
+                        assert_eq!(
+                            actual.t[shifted],
+                            reference.t[i] + added as f64 / f64::from(sr)
+                        );
+                        for row in 0..reference.nr() {
+                            assert_eq!(
+                                actual.data[row * actual.nt() + shifted].to_bits(),
+                                reference.data[row * reference.nt() + i].to_bits(),
+                                "{label}, swell {swell_db}, cadence {cadence}, row {row}, frame {i}",
+                            );
+                            if let (Some(actual_image), Some(reference_image)) =
+                                (&actual.contrast, &reference.contrast)
+                            {
+                                assert_eq!(
+                                    actual_image[row * actual.nt() + shifted].to_bits(),
+                                    reference_image[row * reference.nt() + i].to_bits(),
+                                    "contrast {label}, row {row}, frame {i}",
+                                );
+                            }
+                        }
+                        for row in 0..linear.nf() {
+                            assert_eq!(
+                                actual_linear.at(row, shifted).to_bits(),
+                                linear.at(row, i).to_bits(),
+                                "linear {label}, row {row}, frame {i}",
+                            );
+                        }
+                    }
+                    let support = survey_frame_support(&padded, sr, &p, actual.nt()).unwrap();
+                    assert_eq!(
+                        support.iter().filter(|&&present| present).count(),
+                        reference.nt()
+                    );
+                    for image in std::iter::once(&actual.data).chain(actual.contrast.iter()) {
+                        for row in image.chunks_exact(actual.nt()) {
+                            assert!(
+                                row.iter()
+                                    .zip(&support)
+                                    .all(|(&value, &present)| present || value == 0.0)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_contrast,
+            "both survey normalization orders must be exercised"
+        );
+    }
+
+    #[test]
+    fn survey_digital_silence_keeps_empty_noise_and_steady_controls_below_the_strong_line() {
+        let sr = 4000;
+        let noise = swell_scene(0.0, 0.0);
+        let mut steady = noise.clone();
+        for (i, sample) in steady.iter_mut().enumerate() {
+            *sample +=
+                (0.8 * (std::f64::consts::TAU * 118.0 * i as f64 / f64::from(sr)).sin()) as f32;
+        }
+        let p = DetectParams::default();
+        for (label, x) in [
+            ("empty", vec![0.0; noise.len()]),
+            ("noise", noise),
+            ("steady", steady),
+        ] {
+            let mut padded = vec![0.0; 5 * sr as usize];
+            padded.extend_from_slice(&x);
+            padded.resize(padded.len() + 7 * sr as usize, 0.0);
+            let (ls, linear) = survey(&padded, sr, &p).unwrap();
+            assert_eq!(ls.nt(), 60);
+            assert_eq!((ls.t[0], ls.t[59]), (0.5, 59.5));
+            if label == "empty" {
+                assert!(ls.data.iter().all(|&value| value == 0.0));
+                assert!(linear.db.iter().all(|&value| value == 0.0));
+                assert_eq!((ls.scale, ls.gain), (0.0, 1.0));
+                assert!(ls.contrast.is_none());
+            }
+            let detections = detect(&ls, &p);
+            assert!(
+                detections.iter().all(|d| d.score < p.thr_db),
+                "{label}: {detections:?}",
+            );
         }
     }
 

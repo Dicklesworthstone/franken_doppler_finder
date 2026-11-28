@@ -19,6 +19,37 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Recover physical aircraft through digital silence
+
+- Exclude wholly zero PCM windows from survey row medians, row spreads and global image
+  scale. Keep their times and template denominators, with zero evidence in both detector
+  images. Main, cached short and renewed measurement spectra use the same supported
+  background rule and retain raw peak-calibration offsets. Fully supported and wholly
+  empty recordings keep the previous normalization arithmetic.
+- Isolate the original delayed fast/weak-pair failure: a five-second zero prefix previously
+  lowered the fast template's score from 4.689313 to 3.684540 despite complete two-sided
+  support. The corrected score is 4.689313 in both recordings, and the shifted original
+  seed passes measurement. No numeric detection, measurement
+  or confidence threshold, recovery budget or provenance rule changes.
+- Stop a detached retained point from supplying a false fit's approach or recede span.
+  Ordinary measurement now uses the existing continuous-support rule through the fitted
+  closest approach. The observed false 64 Hz fit had only about 1.2 seconds of continuous
+  approach; one noise point across a 14.5-second gap had made it appear to have 15.7 seconds.
+- Keep the bounded fast-ridge continuation available when both existing coverage checks
+  expose the same incomplete ridge. Other quality failures still exclude it, and a missing
+  central drop keeps the original spectrum and narrowed band. The existing long-tail
+  physical regression passes with continuous support on both sides and unchanged bounds.
+- Add three detector regressions for PCM support, aligned gaps under both normalization
+  orders and null controls, a measurement regression for the actual false partial tail,
+  an actual-solver regression for isolated points on either side, and a pipeline regression
+  requiring both physical aircraft and correct container-relative times from the unchanged
+  compact waveform. These new tests pass in normal core Cargo tests and a native source
+  harness for the pipeline. The existing pipeline noise/steady/reversed controls pass too.
+- The actual measurement/search/refinement path on the padded pair retains both known
+  core matches, with 1.82585 m position error and -0.006578 s recording-start error, without
+  audit or search truncation. These are focused native checks; full-workspace and release-CLI
+  validation remain incomplete, and reference, wrong-date and field replays remain unrun.
+
 ### Check encoded audio for remaining measured flyovers before publication
 
 - Add `mute --check-audio` for MP4 and M4A exports. The staged audio must
@@ -45,12 +76,12 @@ at that commit, not per-change commits.
   the Locate argument definitions. Three new decoder tests, the existing streamed-FFmpeg
   control, the new CLI conflict test and five source-recovery tests pass with FFmpeg 7.1.5.
   These are source-level checks, not a completed root/workspace test run.
-- The original short fast/weak pair loses one measured pass after a five-second zero prefix,
-  despite exact PCM and recording time; the missing pass and cause remain unidentified.
-  Keep that fixture unchanged for the other controls, and separate the delayed-source
-  positive test with two clear interior ordinary-speed passes and the same strict source,
-  sample, clock and two-aircraft assertions. This revised fixture is unrun after the host
-  became unavailable. No detector or confidence threshold changed.
+- At this stage, the original short fast/weak pair lost one measured pass after a five-second
+  zero prefix despite exact PCM and recording time. The detector and disconnected-support
+  causes are isolated and repaired in the digital-silence follow-up above, using the unchanged
+  compact waveform. The separate delayed-source positive test retains two clear interior
+  ordinary-speed passes and the same strict source, sample, clock and two-aircraft assertions.
+  That revised fixture subsequently passed natively with FFmpeg 7.1.5.
 - Existing channel-control reruns, Clippy, workspace tests, the release CLI selftest and
   field replays remain incomplete. The repository-wide formatting check reports differences
   in 21 files; no broad formatting cleanup was mixed into the feature.
