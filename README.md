@@ -494,12 +494,16 @@ in `crates/fdop-core/src/curvematch.rs`:
 
 - **Image.** A 1 s STFT at 0.5 s hops on 48 rows per octave, each row standardised against its own running low
   quantile over 60 s and clipped, then a weighted comb over the first six harmonics.
+  Wholly zero PCM windows do not enter the running background floor or row spread and carry
+  zero curve evidence. Partial windows remain observations, and no recording time is removed.
   The comb retains the full analysed received-frequency band. An approaching high-tone fast pass is
   no longer cropped merely because its received frequency exceeds 2.2 times the maximum emitted tone.
 - **Bank of curves.** On a log-frequency axis a constant-speed pass is one fixed path for each (speed, distance),
   and the emitted tone is only a row shift, so one sweep per path scores every arrival time and tone. That
-  path's scores at all times of the recording are its null: a lookup becomes a p-value, then an e-value. Both
-  halves of a pass must light up.
+  path's scores at observed arrival centres are its null: a lookup becomes a p-value, then an e-value.
+  Wholly zero PCM centres supply neither null samples nor chance-tone counts, so an empty lead-in
+  or tail cannot dilute those distributions. Every frame remains available to the actual scorer,
+  with its original coverage and normalization. Both halves of a pass must light up.
   The default speed bank keeps its original eleven rows and adds two 20% steps, about 208 and
   250 m/s. The existing 15% trajectory allowance then includes the detector's 215–263 m/s fast
   passes in both coarse voting and exact scoring. Each emitted-tone hypothesis independently
@@ -2668,6 +2672,43 @@ second weather wait; a larger footprint can require another archive download.
 
 ## Testing
 
+### Preserve direct curve matching through digital silence
+
+The curve matcher had a separate missing-background problem from the detector's
+digital-silence correction below. On an unchanged 900-second physical two-aircraft
+recording, adding 900 seconds of silence before and after the sound reduced two heard
+flights to zero: their evidence fell to 6.15 and 5.98 nats under the existing 6.9 line.
+Whitening only the observed PCM windows restored the flights, but the empty arrival
+centres still distorted the empirical null and chance-tone prior. Both stages now use
+the same exact support, with no amplitude cutoff, time cropping or threshold change.
+
+`digital_silence_keeps_curve_images_empty_and_physical_passes_heard` retains both known
+flight identities, source tones and emission times after 64, 180 and 900 seconds of
+padding. It checks correctly shifted recording times, nonempty partial windows, zero
+evidence in wholly empty windows, and unpadded/padded noise and steady-tone controls.
+The 180- and 900-second pads both contain every bank path; their null quantiles, tail
+scales and chance-tone priors must be bitwise identical. This does not require identical
+scores after changing short-boundary coverage, analysis phase or internal gaps.
+`observed_curve_whitening_preserves_original_arithmetic` compares the unmasked path
+bitwise with the preceding algorithm. `digital_silence_keeps_the_physical_curve_location`
+uses the existing coarse search, exact scoring and refinement to require both physical
+flights and the original 200 m synthetic location bound through the long padding.
+All three native tests pass. The complete curve search recovers both known flights
+35.43 m from the synthetic observer and retains the supplied shifted recording clock.
+An entirely silent recording supplies zero comb evidence and no heard aircraft. These
+results establish synthetic recovery and background consistency, not field accuracy or
+a calibrated confidence rate.
+
+The existing comb/scalar-equivalence, fast physical bank-path and clipped-coverage tests
+also pass. With both the curve and track corrections, the unchanged production selftest
+module passes on a freshly built normal development core: 1,300 seconds of synthesized
+audio through WAV/FFmpeg decoding, measurement and a +/-6-hour clock search/refinement,
+both expected flights, 1.52067 m position error inside its 75 m radius, and +0.014271 s
+clock error. This is actual-source integration, not a release-CLI run. An optional long
+legacy noise-versus-decoy test was interrupted and is not counted as passing. Full-workspace
+and release-CLI checks remain blocked or incomplete in this environment as recorded below;
+reference, wrong-date and field recordings have not been replayed for these changes.
+
 ### Keep corrected-height flight coverage when accurate speed telemetry returns
 
 `accurate_retained_speed_cannot_erase_supported_corrected_height_segments` reproduces a
@@ -2684,7 +2725,8 @@ wrong or invalid headings and stale reports retain the refusal. All three existi
 `corrected_` controls and the discarded-speed regression also pass, including unknown and
 two-point support, invalid speeds and unreachable segments. No threshold, interpolation,
 confidence rule or corrected-source eligibility changes. These are synthetic native track
-results; release-CLI selftest and reference/field validation have not been rerun for this change.
+results; the shared production-module selftest above also passes. Release-CLI selftest and
+reference/field validation have not been rerun for this change.
 
 ### Keep aircraft evidence when a recording contains digital silence
 

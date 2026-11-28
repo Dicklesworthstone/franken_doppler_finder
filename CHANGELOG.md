@@ -19,6 +19,38 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve direct curve matching through digital silence
+
+- Keep wholly zero PCM windows out of the curve image's running background floor and
+  robust row statistics, with zero evidence in those columns. Retain every original
+  time, partial window, curve sample, coverage weight and scoring denominator.
+- Carry exact PCM support into the curve bank. Empty arrival centres supply neither
+  empirical-null samples nor chance-tone counts; long silent tails cannot add artificial
+  zero-score and first-row observations. The null formula, hearing threshold, curve
+  templates, exact scorer, candidate searches and decoy rules remain unchanged.
+- Reproduce the functional failure on an unchanged 900-second physical two-aircraft
+  recording: 900 seconds of silence on each side previously reduced two heard flights
+  to zero, at 6.15/5.98 nats below the existing 6.9 line. Fixing image whitening alone
+  restored the flights but inflated their evidence, so both background stages are fixed.
+- Add native regressions for the physical passes, tones and recording times; original
+  whitening arithmetic; partial and empty windows; padded noise and steady tones; and
+  the complete curve-location path. Padding of 180 and 900 seconds must leave every
+  bank null and chance-tone prior bitwise equal once both contain every path's support.
+  Shorter pads, analysis-phase changes and internal gaps need not be exactly invariant.
+- All three new native tests pass. The full curve search recovers both expected flights
+  35.43 m from the synthetic observer while retaining the supplied shifted clock.
+  Entirely silent PCM now has a locally explicit empty mask, so interpolation roundoff
+  cannot supply curve evidence or empirical samples; its exact-score control hears no
+  aircraft. The shared detector support helper remains unchanged.
+- Three existing comb/bank/coverage tests pass. The unchanged actual-source selftest also
+  passes on a fresh normal development core containing both this and the track fix:
+  1,300 seconds of synthesized/decoded audio, +/-6-hour clock search, both expected flights,
+  1.52067 m position error within the 75 m radius and +0.014271 s clock error. This is
+  production-module integration rather than a release-CLI run. An optional long legacy
+  noise/decoy test was interrupted, not passed. Full-workspace/release-CLI and reference,
+  wrong-date and field validation remain incomplete. No changed Rust span introduces
+  formatting drift; pre-existing repository differences remain untouched.
+
 ### Preserve corrected-height flight segments beside accurate speed reports
 
 - Keep separately supported approach and departure models when accurate speed telemetry

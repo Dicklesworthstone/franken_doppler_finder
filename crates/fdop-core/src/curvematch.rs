@@ -214,6 +214,10 @@ pub struct CombImage {
     pub nt: usize,
     pub nu: usize,
     pub comb: Vec<f32>,
+    /// Exact PCM-window support for background calibration. Empty windows keep their
+    /// time and scoring weights, but supply no empirical null or chance-tone samples.
+    /// Complete recordings retain the original path with `None`.
+    pub frame_support: Option<Vec<bool>>,
     /// Whitened, neighbour-expanded samples before harmonic summation, `[row][frame]`.
     /// Retaining the existing allocation costs one additional `nt * nu` f32 image. Manual
     /// images may omit it; without these samples, collided tones cannot gain independent credit.
@@ -228,43 +232,74 @@ impl CombImage {
 
 /// Whitening after dopplerprint's `audio/whiten.rs`: each row less a running low-quantile floor (a
 /// tone may hold a bin for most of the window and survive), then a robust z-score, then each frame
-/// less its median, then clipping.
-fn whiten_rows(rows: &mut [f32], nt: usize, nr: usize, p: &MatchParams, dt: f64) {
+/// less its median, then clipping. Wholly empty PCM windows supply neither a background
+/// observation nor curve evidence; their original frames remain in every scoring denominator.
+fn whiten_rows(
+    rows: &mut [f32],
+    nt: usize,
+    nr: usize,
+    p: &MatchParams,
+    dt: f64,
+    support: Option<&[bool]>,
+) {
     let half = ((0.5 * p.floor_window_s / dt).round() as usize).max(1);
     let stride = ((p.floor_stride_s / dt).round() as usize).max(1);
     let knots: Vec<usize> = (0..nt).step_by(stride).collect();
     rows.par_chunks_mut(nt)
         .for_each_init(Vec::<f32>::new, |tmp, row| {
-            let vals: Vec<f32> = knots
+            let vals: Vec<Option<f32>> = knots
                 .iter()
                 .map(|&k| {
                     let (a, b) = (k.saturating_sub(half), (k + half + 1).min(nt));
                     tmp.clear();
-                    tmp.extend_from_slice(&row[a..b]);
+                    if let Some(support) = support {
+                        tmp.extend((a..b).filter(|&t| support[t]).map(|t| row[t]));
+                    } else {
+                        tmp.extend_from_slice(&row[a..b]);
+                    }
+                    if tmp.is_empty() {
+                        return None;
+                    }
                     let i = ((tmp.len() - 1) as f64 * p.floor_quantile) as usize;
                     let (_, v, _) = tmp.select_nth_unstable_by(i, f32::total_cmp);
-                    *v
+                    Some(*v)
                 })
                 .collect();
             for (t, v) in row.iter_mut().enumerate() {
                 let a = t / stride;
                 let base = if a + 1 < vals.len() {
                     let w = (t - knots[a]) as f32 / stride as f32;
-                    vals[a] * (1.0 - w) + vals[a + 1] * w
+                    match (vals[a], vals[a + 1]) {
+                        (Some(left), Some(right)) => left * (1.0 - w) + right * w,
+                        (Some(value), None) | (None, Some(value)) => value,
+                        (None, None) => 0.0,
+                    }
                 } else {
-                    vals[vals.len() - 1]
+                    vals[vals.len() - 1].unwrap_or(0.0)
                 };
                 *v -= base;
             }
             tmp.clear();
-            tmp.extend_from_slice(row);
+            if let Some(support) = support {
+                tmp.extend(
+                    row.iter()
+                        .zip(support)
+                        .filter_map(|(&v, &seen)| seen.then_some(v)),
+                );
+            } else {
+                tmp.extend_from_slice(row);
+            }
             let centre = median_f32(tmp);
             for x in tmp.iter_mut() {
                 *x = (*x - centre).abs();
             }
             let sigma = (1.4826 * median_f32(tmp)).max(1e-3);
-            for v in row.iter_mut() {
-                *v = (*v - centre) / sigma;
+            for (t, v) in row.iter_mut().enumerate() {
+                *v = if support.is_none_or(|seen| seen[t]) {
+                    (*v - centre) / sigma
+                } else {
+                    0.0
+                };
             }
         });
     let centres: Vec<f32> = (0..nt)
@@ -321,7 +356,14 @@ pub fn build_image(x: &[f32], sr: u32, p: &MatchParams) -> Result<CombImage, Str
     });
     let (t0, dt) = (lin.t[0], lin.dt());
     drop(lin);
-    whiten_rows(&mut rows, nt, nr, p, dt);
+    let support = crate::spectro::pcm_frame_support(x, sr, p.win_s, p.hop_s, nt).or_else(|| {
+        // The shared detector helper omits an all-empty mask. Retain it here:
+        // interpolation roundoff in a constant dB image is not audible evidence.
+        x.iter()
+            .all(|&sample| sample == 0.0)
+            .then(|| vec![false; nt])
+    });
+    whiten_rows(&mut rows, nt, nr, p, dt, support.as_deref());
     // A curve lands on the nearest row, and neither the bank's (v, d) nor f0 sit exactly on the
     // grid, so a pass may be a row away. One row either side, at a small cost, as in dopplerprint.
     let mut rows2 = rows.clone();
@@ -379,6 +421,7 @@ pub fn build_image(x: &[f32], sr: u32, p: &MatchParams) -> Result<CombImage, Str
         nt,
         nu,
         comb,
+        frame_support: support,
         whitened: Some(rows),
     })
 }
@@ -807,10 +850,19 @@ fn build_bank(im: &CombImage, p: &MatchParams) -> Bank {
                     im, &pth, tau as i64, r0, nf0, p.stat, &mut scratch, full, None,
                 ) {
                     *sc = s;
-                    rows[r] += 1;
+                    if im.frame_support.as_ref().is_none_or(|seen| seen[tau]) {
+                        rows[r] += 1;
+                    }
                 }
             }
-            let mut vals: Vec<f32> = score.iter().copied().filter(|s| s.is_finite()).collect();
+            let mut vals: Vec<f32> = score
+                .iter()
+                .enumerate()
+                .filter_map(|(tau, &s)| {
+                    (s.is_finite() && im.frame_support.as_ref().is_none_or(|seen| seen[tau]))
+                        .then_some(s)
+                })
+                .collect();
             let null = if vals.len() < 20 {
                 Null {
                     q50: 0.0,
@@ -3457,6 +3509,78 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn observed_curve_whitening_preserves_original_arithmetic() {
+        // Original unmasked arithmetic, evaluated serially as an independent reference.
+        let original = |rows: &mut [f32], nt: usize, nr: usize, p: &MatchParams, dt: f64| {
+            let half = ((0.5 * p.floor_window_s / dt).round() as usize).max(1);
+            let stride = ((p.floor_stride_s / dt).round() as usize).max(1);
+            let knots: Vec<_> = (0..nt).step_by(stride).collect();
+            let mut tmp = Vec::new();
+            for row in rows.chunks_mut(nt) {
+                let floors: Vec<_> = knots
+                    .iter()
+                    .map(|&k| {
+                        tmp.clear();
+                        tmp.extend_from_slice(&row[k.saturating_sub(half)..(k + half + 1).min(nt)]);
+                        let i = ((tmp.len() - 1) as f64 * p.floor_quantile) as usize;
+                        *tmp.select_nth_unstable_by(i, f32::total_cmp).1
+                    })
+                    .collect();
+                for (t, v) in row.iter_mut().enumerate() {
+                    let a = t / stride;
+                    *v -= if a + 1 < floors.len() {
+                        let w = (t - knots[a]) as f32 / stride as f32;
+                        floors[a] * (1.0 - w) + floors[a + 1] * w
+                    } else {
+                        floors[floors.len() - 1]
+                    };
+                }
+                tmp.clear();
+                tmp.extend_from_slice(row);
+                let centre = median_f32(&mut tmp);
+                for v in &mut tmp {
+                    *v = (*v - centre).abs();
+                }
+                let sigma = (1.4826 * median_f32(&mut tmp)).max(1e-3);
+                for v in row {
+                    *v = (*v - centre) / sigma;
+                }
+            }
+            for t in 0..nt {
+                tmp.clear();
+                tmp.extend((0..nr).map(|r| rows[r * nt + t]));
+                let centre = median_f32(&mut tmp);
+                for r in 0..nr {
+                    let v = &mut rows[r * nt + t];
+                    *v = (*v - centre).clamp(p.clip.0, p.clip.1);
+                }
+            }
+        };
+        let (nt, nr) = (37, 9);
+        let input: Vec<_> = (0..nt * nr)
+            .map(|i| ((i * 73 % 131) as f32 - 65.0) * 0.125)
+            .collect();
+        let seen = vec![true; nt];
+        for (window, stride) in [(60.0, 2.0), (5.0, 1.0), (7.0, 11.0)] {
+            let p = MatchParams {
+                floor_window_s: window,
+                floor_stride_s: stride,
+                ..MatchParams::default()
+            };
+            let mut expected = input.clone();
+            original(&mut expected, nt, nr, &p, 0.5);
+            for support in [None, Some(seen.as_slice())] {
+                let mut actual = input.clone();
+                whiten_rows(&mut actual, nt, nr, &p, 0.5, support);
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
     use crate::track::straight_track;
     use fdop_types::FlatElevation;
     use fdop_types::atmo::{Medium, UniformAtmosphere};
@@ -3872,6 +3996,186 @@ mod tests {
             refine_modes: 2,
             ..Default::default()
         }
+    }
+
+    fn digital_silence_scene() -> Case {
+        scene(
+            &[
+                ([900.0, 0.0, 700.0], [0.0, 60.0, 0.0], 55.0),
+                ([0.0, -1200.0, 900.0], [75.0, 0.0, 0.0], 650.0),
+            ],
+            3000.0,
+        )
+    }
+
+    #[test]
+    fn digital_silence_keeps_curve_images_empty_and_physical_passes_heard() {
+        let c = digital_silence_scene();
+        let p = params();
+        let dem = FlatElevation(0.0);
+        let atmo = UniformAtmosphere(Medium::still(BASE_C));
+        let idx: Vec<_> = c
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, tr)| ExactTrack::new(i, tr))
+            .collect();
+        let score = |pcm: &[f32], clock: f64| {
+            let im = build_image(pcm, 2800, &p).unwrap();
+            let bank = build_bank(&im, &p);
+            let inp = MatchInputs {
+                image: &im,
+                tracks: &c.tracks,
+                region: c.region,
+                start_lo: clock,
+                start_hi: clock,
+                duration_s: pcm.len() as f64 / 2800.0,
+                catalog: (f64::NEG_INFINITY, f64::INFINITY),
+                dem: &dem,
+                fine_dem: &dem,
+                atmo: &atmo,
+            };
+            let at = score_checkpoint(&inp, &p, &bank, &idx, (c.lat, c.lon, clock))
+                .expect("the physical passes retain an exact score");
+            let calibration = (
+                bank.surfaces
+                    .iter()
+                    .map(|s| (s.null.q50.to_bits(), s.null.beta.to_bits()))
+                    .collect::<Vec<_>>(),
+                bank.tones
+                    .iter()
+                    .map(|tone| tone.iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+            );
+            (im, at, calibration)
+        };
+        let (original_image, original, _) = score(&c.x, c.clock);
+        assert!(original_image.frame_support.is_none());
+        assert_eq!(original.n_heard, 2, "{original:?}");
+        let mut empty_peaks = Vec::new();
+        let mut interior_calibration = None;
+        for pad_s in [64.0, 180.0, c.x.len() as f64 / 2800.0] {
+            let pad = (pad_s * 2800.0) as usize;
+            let mut padded = vec![0.0; c.x.len() + 2 * pad];
+            padded[pad..pad + c.x.len()].copy_from_slice(&c.x);
+            let (im, shifted, calibration) = score(&padded, c.clock - pad_s);
+            if pad_s > p.half_max_s {
+                // Both pads contain every bank path. The observed centers then see
+                // identical samples and weights, so extra empty time cannot change
+                // either empirical distribution. Shorter pads can change edge weights.
+                if let Some(expected) = &interior_calibration {
+                    assert_eq!(&calibration, expected);
+                } else {
+                    interior_calibration = Some(calibration);
+                }
+            }
+            let support = im
+                .frame_support
+                .as_ref()
+                .expect("the original sound is surrounded by empty windows");
+            // The two half-supported boundary windows remain observations too.
+            assert_eq!(
+                support.iter().filter(|&&seen| seen).count(),
+                original_image.nt + 2,
+            );
+            for edge in [
+                support.iter().position(|&seen| seen).unwrap(),
+                support.iter().rposition(|&seen| seen).unwrap(),
+            ] {
+                assert!(
+                    im.comb[edge * im.nu..(edge + 1) * im.nu]
+                        .iter()
+                        .any(|&v| v != 0.0)
+                );
+            }
+            let empty_peak = support
+                .iter()
+                .enumerate()
+                .filter(|(_, observed)| !**observed)
+                .flat_map(|(t, _)| im.comb[t * im.nu..(t + 1) * im.nu].iter().copied())
+                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+            eprintln!(
+                "original: {original:?}\npadded {pad_s}s: {shifted:?}\nempty comb peak: {empty_peak}"
+            );
+            assert_eq!(shifted.n_heard, 2, "{shifted:?}");
+            assert_eq!(original.clock_unix - pad_s, shifted.clock_unix);
+            assert_eq!(shifted.passes.len(), 2);
+            for (key, source_tone) in [("F0", 90.0), ("F1", 115.0)] {
+                let prior = original.passes.iter().find(|pass| pass.key == key).unwrap();
+                let pass = shifted.passes.iter().find(|pass| pass.key == key).unwrap();
+                assert!(!pass.shared && !pass.at_track_end, "{pass:?}");
+                assert!(
+                    (pass.f0_hz / source_tone).log2().abs() * im.bpo <= 1.0,
+                    "{pass:?}"
+                );
+                assert_eq!(pass.emission_utc, prior.emission_utc);
+                assert!((pass.t_audio - prior.t_audio - pad_s).abs() < 1e-6);
+            }
+            let whitened = im.whitened.as_ref().unwrap();
+            for (t, _) in support.iter().enumerate().filter(|(_, seen)| !**seen) {
+                assert!((0..im.nu).all(|row| whitened[row * im.nt + t] == 0.0));
+            }
+            empty_peaks.push(empty_peak);
+        }
+        assert!(
+            empty_peaks.iter().all(|&peak| peak == 0.0),
+            "empty PCM windows cannot supply curve evidence: {empty_peaks:?}"
+        );
+        for steady in [false, true] {
+            let mut control = noise(c.x.len(), 42, 0.05);
+            if steady {
+                for (i, sample) in control.iter_mut().enumerate() {
+                    *sample += 0.5 * (2.0 * std::f64::consts::PI * 90.0 * i as f64 / 2800.0).sin();
+                }
+            }
+            for pad_s in [0.0, c.x.len() as f64 / 2800.0] {
+                let pad = (pad_s * 2800.0) as usize;
+                let mut padded = vec![0.0; control.len() + 2 * pad];
+                for (out, &sample) in padded[pad..pad + control.len()].iter_mut().zip(&control) {
+                    *out = sample as f32;
+                }
+                let (_, at, _) = score(&padded, c.clock - pad_s);
+                eprintln!("steady={steady}, padding={pad_s}s: {at:?}");
+                assert_eq!(at.n_heard, 0, "steady={steady}, padding={pad_s}s: {at:?}");
+            }
+        }
+        let silent = build_image(&vec![0.0; 8 * 2800], 2800, &p).unwrap();
+        assert!(
+            silent
+                .frame_support
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|&seen| !seen)
+        );
+        assert!(silent.comb.iter().all(|&v| v == 0.0));
+        let (_, silent_score, _) = score(&vec![0.0; c.x.len()], c.clock);
+        assert_eq!(silent_score.n_heard, 0, "{silent_score:?}");
+    }
+
+    #[test]
+    fn digital_silence_keeps_the_physical_curve_location() {
+        let mut c = digital_silence_scene();
+        let pad = c.x.len();
+        let mut padded = vec![0.0; 3 * pad];
+        padded[pad..2 * pad].copy_from_slice(&c.x);
+        c.x = padded;
+        c.clock -= pad as f64 / 2800.0;
+        let r = run_case(&c, &params(), c.clock, c.clock);
+        let top = r.modes.first().expect("the physical curves supply a mode");
+        let error = haversine_m(top.lat, top.lon, c.lat, c.lon);
+        eprintln!("padded curve location error {error} m: {top:?}");
+        assert!(error < 200.0, "error {error} m: {top:?}");
+        assert_eq!(top.clock_unix, c.clock);
+        assert_eq!(top.n_heard, 2, "{top:?}");
+        let mut heard: Vec<_> = top
+            .passes
+            .iter()
+            .filter(|pass| counts_as_heard(pass.value, pass.nats, pass.shared))
+            .map(|pass| pass.key.as_str())
+            .collect();
+        heard.sort_unstable();
+        assert_eq!(heard, ["F0", "F1"]);
     }
 
     /// The case's sky again every 1000 s, `copies` times either side, so decoy windows see flights
@@ -7613,6 +7917,7 @@ mod tests {
             nt: 3,
             nu: 12,
             comb: vec![0.0; 36],
+            frame_support: None,
             whitened: None,
         };
         let pth = [
@@ -7650,6 +7955,7 @@ mod tests {
             nt: 13,
             nu: 19,
             comb: (0..13 * 19).map(|i| ((i * 13 % 37) as f32 - 18.0) * 0.25).collect(),
+            frame_support: None,
             whitened: None,
         };
         let pth = [
