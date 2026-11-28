@@ -19,6 +19,21 @@ at that commit, not per-change commits.
 
 ## Unreleased
 
+### Preserve corrected-height flight segments beside accurate speed reports
+
+- Keep separately supported approach and departure models when accurate speed telemetry
+  returns on a preferred GNSS segment. Previously one accurate retained report disabled
+  missing-speed recovery, allowing discarded slow reports to remove both physical flanks.
+- Require every consecutive preferred position triplet and available horizontal report to
+  agree under the existing motion checks before using the existing subsonic envelope.
+  Preserve missing-speed corrected-source eligibility, original preferred models, gap and
+  vertical limits, and refusal for contradictory, stale, invalid, unknown or two-point support.
+- The new native regression fails on the preceding code with one model instead of three,
+  then passes at 215/245/270 m/s, three report positions and local/Unix timestamps. Restored
+  flank models remain identical and predict analytic received sound within 1 ms and
+  0.0001 Hz. All three existing corrected-recovery controls and the discarded-speed
+  regression pass. Release-CLI and reference/field replays remain unrun for this change.
+
 ### Require physical correctness in short-pass compatibility controls
 
 - Keep the unchanged early 215 m/s, 3 dB recording and require its known frequency,

@@ -1123,8 +1123,8 @@ fn recover_velocity_component(
 }
 
 /// Missing speed reports must not reinstate a slower envelope between models whose
-/// retained positions already support faster motion. Every retained preferred sample must
-/// lack a speed report; finite or invalid non-NaN reports keep the original envelope.
+/// retained positions already support faster motion. A mixed preferred model must
+/// corroborate every retained report against all consecutive position triplets.
 /// Discarded GNSS reports cannot disable this retry or supply its inferred speed.
 fn corrected_recovery_speed_limit(
     pts: &[fdop_types::store::TrackPoint],
@@ -1149,12 +1149,12 @@ fn corrected_recovery_speed_limit(
             // Unknown retained samples cannot establish missing-speed eligibility.
             return reported;
         }
-        // A report on any retained model keeps the original guard, including
-        // two-knot models that cannot independently infer a faster envelope.
-        if support.iter().any(|p| !p.gs_mps.is_nan()) {
-            return reported;
-        }
+        let has_report = support.iter().any(|p| !p.gs_mps.is_nan());
         if support.len() < 3 {
+            // A finite report without two independent chords retains the old guard.
+            if has_report {
+                return reported;
+            }
             continue;
         }
         let enu = Enu::new(support[0].lat, support[0].lon, 0.0);
@@ -1165,6 +1165,19 @@ fn corrected_recovery_speed_limit(
                 [e[0], e[1]]
             })
             .collect();
+        if has_report
+            && (support
+                .iter()
+                .any(|p| !p.track_deg.is_nan() && !(0.0..=360.0).contains(&p.track_deg))
+                || !support.windows(3).zip(xy.windows(3)).all(|(p, x)| {
+                    position_triplet_speed(p, x, bp).is_some()
+                        && triplet_reports_agree(p, x, &enu, bp, true)
+                }))
+        {
+            // One accurate report must not erase already supported coverage, but
+            // neither it nor an unverified neighbouring report can widen the bridge.
+            return reported;
+        }
         if let Some(inferred) = position_speed_limit(&support, &xy, bp) {
             limit = limit.max(inferred);
         }
@@ -7387,6 +7400,96 @@ mod tests {
     }
 
     #[test]
+    fn accurate_retained_speed_cannot_erase_supported_corrected_height_segments() {
+        let bp = BuildParams::default();
+        for speed in [215.0, 245.0, 270.0] {
+            for epoch in [0.0, 1_700_000_000.0] {
+                let (mut missing, enu) = partial_gnss_missing_speed_leg(speed);
+                for p in &mut missing.points {
+                    let t = p.t - 1000.0;
+                    p.t += epoch;
+                    if p.alt_src == alt_src::GEOM && !(480.0..=520.0).contains(&t) {
+                        // These reports already fail position cleaning. Their slower
+                        // speeds must not control a later, independently retained pass.
+                        p.gs_mps = ((speed - 40.0) / 1.5) as f32;
+                    }
+                }
+                let expected = build(&missing, &bp);
+                assert_eq!(expected.len(), 3, "the physical flanks already survive");
+                for reported_at in [1480.0, 1500.0, 1520.0] {
+                    let mut reported = missing.clone();
+                    reported
+                        .points
+                        .iter_mut()
+                        .find(|p| p.t == epoch + reported_at)
+                        .unwrap()
+                        .gs_mps = speed as f32;
+                    let mut gnss = reported.clone();
+                    gnss.points.retain(|p| p.alt_src == alt_src::GEOM);
+                    let preferred = build(&gnss, &NO_BRIDGE);
+                    assert_eq!(preferred.len(), 1);
+                    assert_eq!(preferred[0].t, expected[0].t);
+                    assert!(preferred[0].reported_vel_frac > 0.0);
+                    let actual = build(&reported, &bp);
+                    assert_eq!(
+                        actual.len(),
+                        3,
+                        "an accurate retained speed erased corrected-height coverage: speed={speed}, epoch={epoch}, reported_at={reported_at}"
+                    );
+                    assert_same_gap_model(&actual[0], &preferred[0]);
+                    for (actual, original) in actual[1..].iter().zip(&expected[1..]) {
+                        assert_same_gap_model(actual, original);
+                        // Independently check the restored sound against the known
+                        // straight trajectory, including the large-epoch time frame.
+                        let centre = 0.5 * (actual.t0() + actual.t1()) - epoch - 1000.0;
+                        let observer = enu.to_ecef([speed * centre, 1500.0, 0.0]);
+                        let velocity = enu.vec_to_ecef([speed, 0.0, 0.0]);
+                        for fraction in [0.2, 0.5, 0.8] {
+                            let te = actual.t0() + fraction * (actual.t1() - actual.t0());
+                            let q = te - epoch - 1000.0;
+                            let position = enu.to_ecef([speed * q, 0.0, 1200.0]);
+                            let rv = sub(position, observer);
+                            let range = norm(rv);
+                            let ratio = 1.0 / (1.0 + dot(rv, velocity) / (C_MPS * range));
+                            let received = te + range / C_MPS;
+                            let (actual_te, _, actual_ratio) = actual
+                                .solve_emission_p(received, observer, &Prop::still(C_MPS), None)
+                                .expect("the recovered flank must predict its received sound");
+                            assert!((actual_te - te).abs() < 1e-3);
+                            assert!((F0_HZ * (actual_ratio - ratio)).abs() < 1e-4);
+                        }
+                    }
+                    for invalid in ["magnitude", "heading", "stale", "invalid heading"] {
+                        let mut contradicted = reported.clone();
+                        let p = contradicted
+                            .points
+                            .iter_mut()
+                            .find(|p| p.t == epoch + reported_at)
+                            .unwrap();
+                        match invalid {
+                            "magnitude" => p.gs_mps = (speed - 60.0) as f32,
+                            "heading" => p.track_deg = (p.track_deg + 90.0) % 360.0,
+                            "stale" => p.flags |= pt_flags::STALE,
+                            _ => p.track_deg += 360.0,
+                        }
+                        let mut support = contradicted.clone();
+                        support.points.retain(|p| p.alt_src == alt_src::GEOM);
+                        let preferred = build(&support, &NO_BRIDGE);
+                        assert_eq!(preferred.len(), 1);
+                        let actual = build(&contradicted, &bp);
+                        assert_eq!(
+                            actual.len(),
+                            1,
+                            "{invalid} report supplied a faster bridge: speed={speed}, epoch={epoch}, reported_at={reported_at}"
+                        );
+                        assert_same_gap_model(&actual[0], &preferred[0]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rejected_speed_reports_do_not_erase_supported_corrected_height_tracks() {
         let bp = BuildParams::default();
         for speed in [215.0, 245.0, 270.0] {
@@ -7468,10 +7571,10 @@ mod tests {
                     }
 
                     if all_rejected {
-                        // Any retained report still governs the retry, including a
-                        // valid speed and a non-NaN invalid report. The junk majority
-                        // leaves the original reported envelope below the true speed.
-                        for report in [0.0, speed as f32, f32::INFINITY] {
+                        // Invalid or contradictory retained reports still govern the
+                        // retry. Accurate reports have their own physical positive
+                        // above; discarded reports cannot overrule that support.
+                        for report in [0.0, (speed - 60.0) as f32, f32::INFINITY] {
                             let mut limited = dirty.clone();
                             let retained = limited
                                 .points

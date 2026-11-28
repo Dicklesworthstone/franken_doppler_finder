@@ -1963,10 +1963,13 @@ Design notes:
   retained reports under the existing position, velocity and gap checks. When preferred models
   survive, recovery uses only observations more than the configured gap (180 s by default)
   outside their time coverage. Added models must also be physically reachable from their nearest
-  kept neighbours under the same motion limits and position allowances. When speed reports
-  on both sides are missing, retained preferred-model positions can supply the existing checked,
-  subsonic motion envelope for this reachability test. Rejected positions cannot set that limit;
-  nonnegative finite speeds and infinities retain the previous envelope. Preferred samples, velocities, order and
+  kept neighbours under the same motion limits and position allowances. When corrected-height
+  speed reports are missing, retained preferred-model positions can supply the existing checked,
+  subsonic motion envelope for this reachability test. A preferred model with reported speeds
+  must corroborate every consecutive position triplet and every available horizontal report;
+  an accurate report cannot erase otherwise supported coverage. Rejected positions cannot set
+  that limit. Contradictory, stale or invalid telemetry, unidentified support and reported speeds
+  on a two-point model retain the previous envelope. Preferred samples, velocities, order and
   keys stay intact; added parts use deterministic `#correctedN` suffixes.
   No spline crosses these gaps, and raw pressure altitudes cannot enter this recovery.
 - **Missing speed reports do not impose a 200 m/s aircraft limit.** Finite negative groundspeeds
@@ -2665,6 +2668,24 @@ second weather wait; a larger footprint can require another archive download.
 
 ## Testing
 
+### Keep corrected-height flight coverage when accurate speed telemetry returns
+
+`accurate_retained_speed_cannot_erase_supported_corrected_height_segments` reproduces a
+track-assembly failure: adding one accurate speed report to an already supported preferred
+segment reduced three physical models to one. Discarded slow reports regained control of
+the final reachability envelope and removed the separately supported approach and departure.
+
+The corrected path corroborates every consecutive triplet and available horizontal report
+before allowing mixed preferred telemetry to supply the existing subsonic envelope. The
+native regression passes for 215, 245 and 270 m/s, three retained report positions and both
+local and Unix timestamps. It preserves the preferred model and both restored flank models,
+with analytic received-time error below 1 ms and Doppler error below 0.0001 Hz. Wrong speeds,
+wrong or invalid headings and stale reports retain the refusal. All three existing
+`corrected_` controls and the discarded-speed regression also pass, including unknown and
+two-point support, invalid speeds and unreachable segments. No threshold, interpolation,
+confidence rule or corrected-source eligibility changes. These are synthetic native track
+results; release-CLI selftest and reference/field validation have not been rerun for this change.
+
 ### Keep aircraft evidence when a recording contains digital silence
 
 A native reproduction isolated the loss of the fast 83 Hz pass in a 30-second synthetic
@@ -2744,14 +2765,17 @@ Rust. The release selftest and reference/field replays have not been run for thi
 ### Retain supported fast flights despite discarded speed reports
 
 A speed attached to a rejected GNSS position could prevent separately supported, corrected-height
-approach and departure segments from entering the search. Missing-speed recovery now checks all
-retained preferred samples instead. Any speed report on retained support still keeps the original
-reported envelope; inferred speed uses the same checked positions and reachability limits.
+approach and departure segments from entering the search. Missing-speed recovery checks all
+retained preferred samples instead. The initial correction retained the original reported
+envelope whenever any retained speed was present; the corroborated mixed-telemetry extension
+above now also preserves coverage when those reports agree with every retained position triplet.
+Inferred speed uses the same checked positions and reachability limits.
 
 `rejected_speed_reports_do_not_erase_supported_corrected_height_tracks` exercises 215, 245 and
 270 m/s synthetic flights at local and Unix timestamps with one or many discarded reports. It checks
 unchanged retained geometry, restoration of both supported segments, analytic received Doppler and
-controls with valid, zero or infinite speeds on retained samples.
+controls with contradictory, zero or infinite speeds on retained samples. Accurate speeds are
+covered by the physical positive above.
 `corrected_speed_recovery_checks_every_retained_model` keeps the reported guard when a later
 two-knot model has speed reports or its original samples cannot be identified. Existing physical-reach
 tests continue to require rejection of unreachable segments and insufficient support. Both new native
